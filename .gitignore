@@ -1,0 +1,19 @@
+# Windows & Office 临时文件
+~$*.docx
+~$*.xlsx
+~$*.pptx
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 构建与运行缓存
+build/
+dist/
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+
+# 临时中间文件
+*.tmp
+*.log
