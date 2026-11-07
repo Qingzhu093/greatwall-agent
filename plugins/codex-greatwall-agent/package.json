@@ -1,0 +1,14 @@
+{
+  "name": "codex-greatwall-agent",
+  "version": "4.2.0",
+  "description": "Great Wall Agent V4.2 Codex plugin with its original Python MCP campaign engine and skill",
+  "license": "MIT",
+  "author": "Great Wall Agent Contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Qingzhu093/codex-greatwall-agent.git"
+  },
+  "files": ["plugin.json", "mcp.json", "skills", "rules", "agents", "assets", "bin", "lib", "tests", "README.md", "LICENSE"],
+  "publishConfig": {"access": "public"},
+  "scripts": {"test": "python tests/test_plugin_e2e.py"}
+}

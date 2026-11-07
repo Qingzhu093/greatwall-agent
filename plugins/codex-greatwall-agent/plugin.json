@@ -1,0 +1,10 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "codex-greatwall-agent",
+  "version": "4.2.0",
+  "description": "Great Wall Agent V4.2 campaign engine for Codex",
+  "author": {"name": "Great Wall Agent Contributors"},
+  "repository": "https://github.com/Qingzhu093/codex-greatwall-agent",
+  "license": "MIT",
+  "extensions": {"com.openai": {"interface": {"displayName": "Great Wall Agent", "shortDescription": "Long-running research and competition campaigns", "developerName": "Great Wall Agent Contributors"}}}
+}

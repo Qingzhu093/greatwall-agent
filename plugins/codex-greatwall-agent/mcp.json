@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "greatwall-agent": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["${PLUGIN_ROOT}/bin/gw_mcp_server.py"],
+      "cwd": "${PLUGIN_ROOT}",
+      "env": {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+    }
+  }
+}
