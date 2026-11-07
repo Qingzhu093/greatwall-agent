@@ -2,15 +2,16 @@
 """
 Great Wall Agent V4.2 — Pure Python Stdio MCP Server for Google Antigravity
 ===========================================================================
-零第三方依赖（100% Python 标准库），通过 JSON-RPC 2.0 over Stdio 向 Antigravity 暴露 8 个核心工具：
-1. gw_init_campaign      : 初始化无人值守攻关工作区与多模态数据探针清点 (Phase 0 消歧锁定)
-2. gw_lock_distillation  : 固化开局知识蒸馏四件套并实跑铸造【零号强基线 s_0】
-3. gw_allocate_slot      : 分配无 .git 的清洁室探索孤岛槽位并自动注入 L1 专属启动简报
-4. gw_surgical_replace   : MLE-STAR 式局部代码块 AST 微创热插拔替换 (防全量重写崩溃)
-5. gw_evaluate_slot      : 跨进程隔离评测 + AST 反作弊/防泄漏对账 + HMAC 签名成绩单
-6. gw_submit_legacy      : 校验节点五件套遗产包入库 (含原语单测验证)、更新榜单并五步墓碑回收孤岛
-7. gw_archive_query      : 按需读取 L0 索引、L2 单点详情或触发错误结论依赖树撤回 (Retraction Tree)
-8. gw_compile_delivery   : 终局防吹牛数字硬绑定审计并打包标准五件套交付目录 (final_delivery/)
+零第三方依赖（100% Python 标准库），通过 JSON-RPC 2.0 over Stdio 向 Antigravity 暴露 9 个核心工具：
+1. gw_init_campaign      : 初始化无人值守攻关工作区与确定性开局数据探针 (EDA Grounding + Phase 0 消歧锁定)
+2. gw_lock_distillation  : 固化开局知识蒸馏四件套，支持 M 候选基线竞技选优铸造【零号强基线 s_0】
+3. gw_allocate_slot      : 分配无 .git 的清洁室探索孤岛槽位并自动注入 L1 专属启动简报 (含 BarrierProof 死路拦截)
+4. gw_surgical_replace   : MLE-STAR 式局部代码块 AST 微创热插拔替换 (支持顶层函数/类及 ClassName.method 自动缩进对齐)
+5. gw_evaluate_slot      : 跨进程隔离评测 + AST 反作弊/过时模型/手搓轮子/多模态完整性对账 + HMAC 签名成绩单
+6. gw_submit_legacy      : 校验节点五件套遗产包入库 (含原语单测、死路反例验证、跨血统引用计数与共性死因自动补丁)
+7. gw_lineage_control    : 谱系与验证高级控制 (Soft Flush 原地软清栈、Ancestor Hard Fork 祖先硬分叉、60步内省室契约、跨分支差分互测、错题热勘误追溯平反)
+8. gw_archive_query      : 按需读取 L0 索引、L2 单点详情或触发错误结论依赖树撤回 (Retraction Tree)
+9. gw_compile_delivery   : 终局防吹牛数字硬绑定审计并打包标准五件套交付目录 (final_delivery/)
 """
 
 from __future__ import annotations
@@ -22,19 +23,17 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List
 
-# 将插件根目录加入 sys.path
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from lib.engine import GreatWallEngine
-from lib.evaluator import ASTCodeInspector
 
 
 TOOLS_SCHEMA: List[Dict[str, Any]] = [
     {
         "name": "gw_init_campaign",
-        "description": "【Phase 0 第一步】初始化长城 Agent V4.2 无人值守攻关工作区：自动扫描多模态数据资产，锁死题面消歧结论 (task_config.yaml)，建立 .kernel_vault、shared_readonly/archive 与 worktrees 清洁室目录树。",
+        "description": "【Phase 0 第一步】初始化长城 Agent V4.2 无人值守攻关工作区：自动运行确定性 EDA 数据探针扫描多模态数据资产，锁死题面消歧结论 (task_config.yaml)，建立 .kernel_vault、shared_readonly/archive 与 worktrees 清洁室目录树。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -67,6 +66,10 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                     "type": "integer",
                     "description": "最大并发工作槽位数（默认 4）",
                 },
+                "totalStepBudget": {
+                    "type": "integer",
+                    "description": "全局探索总步数预算（默认 240，用于计算 Stage 0~3 阶段压力）",
+                },
                 "resolvedAmbiguities": {
                     "type": "array",
                     "items": {
@@ -85,7 +88,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
     },
     {
         "name": "gw_lock_distillation",
-        "description": "【Phase 0 第二步】固化开局先蒸馏（Opening Distillation）四件套成果：写入现代正交 SOTA 方法族、过时模型禁用黑名单、调库 vs 造轮子边界清单、防踩坑红线卡，并在清洁室沙箱中实跑验分铸造【零号强基线 s_0】。",
+        "description": "【Phase 0 第二步】固化开局先蒸馏（Opening Distillation）四件套成果：写入现代正交 SOTA 方法族、过时模型禁用黑名单、调库 vs 造轮子边界清单、防踩坑红线卡，并在清洁室沙箱中实跑验分（支持传入多个 candidateBaselines 竞技选优）铸造【零号强基线 s_0】。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -110,7 +113,19 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                 },
                 "anchorBaselineCode": {
                     "type": "string",
-                    "description": "零号强基线 s_0 的完整可运行 Python 源码（将自动写入 src/main.py 并在沙箱实跑测定基准分）",
+                    "description": "单个零号强基线 s_0 的完整可运行 Python 源码（若使用 candidateBaselines 可留空）",
+                },
+                "candidateBaselines": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "code": {"type": "string"},
+                        },
+                        "required": ["name", "code"],
+                    },
+                    "description": "可选：M 个候选基线脚本列表，引擎将在沙箱中逐一实跑并按得分排序择优锁定为 s_0 (§2.3)",
                 },
                 "obsoleteBlacklist": {
                     "type": "array",
@@ -128,7 +143,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                     "description": "本任务防数据泄漏与多源数据完整性红线列表",
                 },
             },
-            "required": ["workspaceRoot", "orthogonalFamilies", "anchorBaselineCode"],
+            "required": ["workspaceRoot", "orthogonalFamilies"],
         },
     },
     {
@@ -165,7 +180,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
     },
     {
         "name": "gw_surgical_replace",
-        "description": "【内层循环 Step 2】MLE-STAR 式局部代码块 AST 微创热插拔替换：冻结脚本其余全部外围代码，仅精准定位并替换目标函数或类定义 `targetBlockName`，并自动验证全文件 AST 语法，彻底消除全量重写引发的崩溃。",
+        "description": "【内层循环 Step 2】MLE-STAR 式局部代码块 AST 微创热插拔替换：冻结脚本其余全部外围代码，支持顶层函数/类以及类内方法 (`ClassName.method_name` 或单方法名) 的自动缩进对齐原位替换，并自动生成 legacy_out/diff.patch。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -173,11 +188,11 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                 "slotId": {"type": "string", "description": "目标活跃槽位 ID（如 slot_01_node-001）"},
                 "targetBlockName": {
                     "type": "string",
-                    "description": "要原位替换或新增的目标函数名/类名（如 extract_features 或 solve）",
+                    "description": "要原位替换或新增的目标函数名/类名/类方法名（如 extract_features 或 Solver.step）",
                 },
                 "newBlockCode": {
                     "type": "string",
-                    "description": "该目标函数或类的完整新 Python 代码块定义",
+                    "description": "该目标函数、类或方法的完整新 Python 代码块定义",
                 },
                 "relScriptPath": {
                     "type": "string",
@@ -189,7 +204,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
     },
     {
         "name": "gw_evaluate_slot",
-        "description": "【内层循环 Step 3 & 独立审计环】对指定槽位执行 AST 静态反作弊/防泄漏/结构改动率对账、四元组剥皮查新与跨进程物理隔离评测（含同构扰动防背题检验），并在 legacy_out/metrics_receipt.json 生成带 HMAC-SHA256 签名的防伪成绩单与四级分诊结果。",
+        "description": "【内层循环 Step 3 & 独立审计环】对指定槽位执行 AST 静态反作弊/过时模型/手搓轮子/多模态数据完整性/结构改动率对账、四元组剥皮查新与跨进程物理隔离评测（含同构扰动防背题检验），并在 legacy_out/metrics_receipt.json 生成带 HMAC-SHA256 签名的防伪成绩单。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -205,6 +220,10 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                     "type": "string",
                     "description": "可选：节点自述的核心数学算子机制说明（用于剥皮查新并与《教科书常识黑名单》比对）",
                 },
+                "enforceDataCompleteness": {
+                    "type": "boolean",
+                    "description": "是否强制拦截遗漏了公共数据集中多模态文件 (A_data) 的脚本（默认 false）",
+                },
                 "timeoutSec": {
                     "type": "number",
                     "description": "单次评测超时秒数（默认 120 秒）",
@@ -215,7 +234,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
     },
     {
         "name": "gw_submit_legacy",
-        "description": "【节点退场交卷】严格验收探索节点在 legacy_out/ 下留下的【五件套遗产包】（150字墓志铭、HMAC签名成绩单、带单测的可复用原语 primitives/*.py、悬赏卡、1~3条临终接力遗嘱单），通过后入库轻量档案馆、更新排行榜与 60 步内省计数，并调用五步墓碑算法安全回收孤岛目录。",
+        "description": "【节点退场交卷】严格验收探索节点在 legacy_out/ 下留下的【五件套遗产包】（150字墓志铭、diff.patch+HMAC成绩单、带单测的可复用原语 primitives/*.py 与死路证明 barrier_proof.json、悬赏卡、1~3条临终接力遗嘱单），通过后入库轻量档案馆、统计跨血统原语引用、自动提炼共性死因补丁并回收孤岛目录。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -230,8 +249,40 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "gw_lineage_control",
+        "description": "【谱系回滚、60步原位内省室与交叉验证控制】支持：(1) soft_flush：原地软清栈回滚脏代码并将失败教训置顶；(2) hard_fork：退回祖先快照硬分叉（受 60 步深挖锁与 BarrierProof 约束）；(3) submit_reflection：提交 60 步原位 3 轮内省室审计契约；(4) differential_test：两条正交分支无标签极端算例差分互测；(5) deprecate_errata：废弃存在 Bug 的评测算例并自动追溯重算平反被误杀分支。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspaceRoot": {"type": "string", "description": "工作区根目录路径"},
+                "action": {
+                    "type": "string",
+                    "enum": ["soft_flush", "hard_fork", "submit_reflection", "differential_test", "deprecate_errata"],
+                    "description": "控制动作类型",
+                },
+                "slotId": {"type": "string", "description": "soft_flush 或 hard_fork 时的目标槽位 ID"},
+                "failureEpitaph": {"type": "string", "description": "soft_flush 时的失败原因简述（将置顶注入 scoped_brief.md）"},
+                "ancestorCommit": {"type": "string", "description": "hard_fork 时退回的祖先快照 Commit ID（默认退回 s_0）"},
+                "newFamilyId": {"type": "string", "description": "hard_fork 时转向的新正交方法族 ID"},
+                "newTargetedBlock": {"type": "string", "description": "soft_flush 或 hard_fork 时的新锁定代码块名称"},
+                "newHypothesis": {"type": "string", "description": "soft_flush 或 hard_fork 时的新攻关假说"},
+                "lineageId": {"type": "string", "description": "submit_reflection 时的目标血统 ID（如 LIN-FAM-01）"},
+                "turn1EvidenceAudit": {"type": "string", "description": "60步内省室第1轮：客观证据与主观臆想剥离结论"},
+                "turn2AttractorDiagnosis": {"type": "string", "description": "60步内省室第2轮：三大常见偷懒陷阱诊断结论"},
+                "turn3PivotDecision": {"type": "string", "description": "60步内省室第3轮：未来20步结构性转向决策"},
+                "next20StepsContract": {"type": "object", "description": "60步内省室产出的未来 20 步硬约束契约字典"},
+                "scriptAPath": {"type": "string", "description": "differential_test 时分支 A 的脚本路径"},
+                "scriptBPath": {"type": "string", "description": "differential_test 时分支 B 的脚本路径"},
+                "stressInputs": {"type": "array", "items": {}, "description": "differential_test 时的自定义极端测试输入列表"},
+                "errataCaseId": {"type": "string", "description": "deprecate_errata 时要废弃的错题算例 ID"},
+                "errataReason": {"type": "string", "description": "deprecate_errata 时废弃该算例的具体原因"},
+            },
+            "required": ["workspaceRoot", "action"],
+        },
+    },
+    {
         "name": "gw_archive_query",
-        "description": "【轻量级档案馆按需检索】支持读取 L0 全局目录索引（ARCHIVE_INDEX.md + PRIMITIVES_API.md）、按 ID 点读 L2 原语/引理/死胡同详情、查看全局状态与待排期遗嘱队列，或触发错误结论依赖树局部撤回（Retraction Tree）。",
+        "description": "【轻量级档案馆按需检索】支持读取 L0 全局目录索引（ARCHIVE_INDEX.md + PRIMITIVES_API.md）、按 ID 点读 L2 原语/引理/死胡同/死路证明详情、查看全局状态与阶段压力，或触发错误结论依赖树局部撤回（Retraction Tree）。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -247,7 +298,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                 },
                 "itemId": {
                     "type": "string",
-                    "description": "在 get_l2_item 或 retract_claim 时指定的条目编号（如 REC-001, CLM-002, 或原语模块名）",
+                    "description": "在 get_l2_item 或 retract_claim 时指定的条目编号（如 REC-001, CLM-002, BARRIER-001, 或原语模块名）",
                 },
                 "retractReason": {
                     "type": "string",
@@ -287,13 +338,15 @@ def handle_tool_call(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             primary_metric=str(args.get("primaryMetric", "score")),
             higher_is_better=bool(args.get("higherIsBetter", True)),
             max_concurrent_slots=int(args.get("maxConcurrentSlots", 4)),
+            total_step_budget=int(args.get("totalStepBudget", 240)),
             resolved_ambiguities=args.get("resolvedAmbiguities"),
         )
 
     if name == "gw_lock_distillation":
         return engine.lock_opening_distillation(
             orthogonal_families=list(args["orthogonalFamilies"]),
-            anchor_baseline_code=str(args["anchorBaselineCode"]),
+            anchor_baseline_code=str(args.get("anchorBaselineCode", "")),
+            candidate_baselines=args.get("candidateBaselines"),
             obsolete_blacklist=args.get("obsoleteBlacklist"),
             must_reuse_libraries=args.get("mustReuseLibraries"),
             pitfall_guardrails=args.get("pitfallGuardrails"),
@@ -324,6 +377,7 @@ def handle_tool_call(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             claimed_swept_variables=args.get("claimedSweptVariables"),
             operator_description=str(args.get("operatorDescription", "")),
             timeout_sec=float(args.get("timeoutSec", 120.0)),
+            enforce_data_completeness=bool(args.get("enforceDataCompleteness", False)),
         )
 
     if name == "gw_submit_legacy":
@@ -331,6 +385,48 @@ def handle_tool_call(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             slot_id=str(args["slotId"]),
             steps_consumed=int(args.get("stepsConsumed", 15)),
         )
+
+    if name == "gw_lineage_control":
+        act = str(args["action"])
+        if act == "soft_flush":
+            return engine.soft_flush_slot(
+                slot_id=str(args["slotId"]),
+                failure_epitaph=str(args.get("failureEpitaph", "局部代码改乱，执行原地软清栈回滚")),
+                new_targeted_block=args.get("newTargetedBlock"),
+                new_hypothesis=args.get("newHypothesis"),
+            )
+        if act == "hard_fork":
+            return engine.hard_fork_ancestor(
+                slot_id=str(args["slotId"]),
+                ancestor_commit=args.get("ancestorCommit"),
+                new_family_id=str(args["newFamilyId"]),
+                new_targeted_block=str(args.get("newTargetedBlock", "solve")),
+                new_hypothesis=str(args.get("newHypothesis", "从祖先快照硬分叉探索新方向")),
+                abandon_reason=str(args.get("failureEpitaph", "")),
+            )
+        if act == "submit_reflection":
+            return engine.submit_reflection_record(
+                lineage_id=str(args["lineageId"]),
+                turn1_evidence_audit=str(args.get("turn1EvidenceAudit", "")),
+                turn2_attractor_diagnosis=str(args.get("turn2AttractorDiagnosis", "")),
+                turn3_pivot_decision=str(args.get("turn3PivotDecision", "")),
+                next_20_steps_contract=dict(args.get("next20StepsContract") or {}),
+            )
+        if act == "differential_test":
+            return engine.evaluator.run_differential_test(
+                script_a_path=Path(str(args["scriptAPath"])),
+                script_b_path=Path(str(args["scriptBPath"])),
+                stress_inputs=args.get("stressInputs"),
+            )
+        if act == "deprecate_errata":
+            st = engine.load_state()
+            return engine.evaluator.deprecate_errata_case(
+                case_id=str(args["errataCaseId"]),
+                reason=str(args.get("errataReason", "Generator NaN/Inf bug")),
+                anchor_s0_score=float(st.get("anchor_s0_score", 0.0)),
+                higher_is_better=bool(st.get("higher_is_better", True)),
+            )
+        raise ValueError(f"未知的 gw_lineage_control action: {act}")
 
     if name == "gw_archive_query":
         action = str(args["action"])
@@ -340,7 +436,12 @@ def handle_tool_call(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         if action == "get_l2_item":
             return engine.archive.query_l2_item(str(args.get("itemId", "")))
         if action == "get_campaign_status":
-            return {"status": "OK", "campaign_state": engine.load_state()}
+            st = engine.load_state()
+            stage_info = engine.compute_campaign_stage(
+                int(st.get("total_steps_executed", 0)),
+                int(st.get("total_step_budget", 240)),
+            )
+            return {"status": "OK", "campaign_state": st, "campaign_stage": stage_info}
         if action == "retract_claim":
             affected = engine.archive.retract_claim(
                 target_claim_id=str(args.get("itemId", "")),
@@ -368,7 +469,6 @@ def send_jsonrpc(req_id: Any, result: Any = None, error: Any = None) -> None:
 
 
 def main() -> None:
-    # 强制 UTF-8 标准输入输出，防止 Windows 终端中文乱码
     if hasattr(sys.stdin, "reconfigure"):
         sys.stdin.reconfigure(encoding="utf-8", errors="replace")
     if hasattr(sys.stdout, "reconfigure"):

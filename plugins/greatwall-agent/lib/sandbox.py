@@ -1,15 +1,17 @@
 """
-Clean-Room Sandbox, Path Jail, Windows Job Object Hardware Limiter & WinError 32 Tombstone Purge.
-精简务实版沙箱基础设施：
-1. 无 .git 清洁室快照导出与提交 (支持 bare git repo 或基于 SHA-256 快照池的零泄漏克隆)；
-2. SandboxPathJail：把探索节点的文件读写锁死在自身孤岛与同血统公共只读区内；
-3. run_bounded_subprocess：环境变量脱敏清洗 + Windows Job Object 进程树连坐强杀与内存封顶；
-4. force_cleanup_directory：毫秒级原子重命名至墓园 + 指数退避清理，彻底解决 Windows WinError 32。
+Clean-Room Sandbox, Path Jail, Windows Job Object Hardware Limiter, Cross-Process File Lock & WinError 32 Purge.
+精简务实且经受对抗压测的沙箱基础设施：
+1. InterProcessFileLock：基于 OS 底层 `msvcrt.locking` / `fcntl.flock` 的跨进程互斥文件锁；
+2. SandboxPathJail：防御 `../../` 越界、符号链接 (Symlink/Junction) 逃逸与跨血统偷看；
+3. run_bounded_subprocess：环境变量脱敏清洗 + 真正绑定了 `argtypes/restype` 的 64 位 Windows Job Object 进程树连坐强杀与内存封顶；
+4. surgical_replace_block：支持顶层函数/类以及类内方法 (`ClassName.method_name` 或单方法名) 的自动缩进对齐 AST 微创热插拔替换。
 """
 
 from __future__ import annotations
 
+import ast
 import ctypes
+import difflib
 import gc
 import hashlib
 import io
@@ -20,7 +22,7 @@ import shutil
 import stat
 import subprocess
 import sys
-import tarfile
+import textwrap
 import time
 import uuid
 from dataclasses import dataclass
@@ -29,15 +31,74 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 # ============================================================================
-# 1. 路径牢笼 (SandboxPathJail) —— 防 ../../ 越界与跨血统偷看
+# 0. 跨进程文件互斥锁 (InterProcessFileLock) —— 防多槽位并发写烂 state_graph / jsonl
+# ============================================================================
+
+class InterProcessFileLock:
+    """
+    轻量级跨进程文件互斥锁（支持 Windows `msvcrt.locking` 与 POSIX `fcntl.flock`），
+    防止多个并发探索子智能体同时调用 MCP 工具时发生 Read-Modify-Write 竞态覆盖或 `WinError 32`。
+    """
+
+    def __init__(self, lock_file: Path, timeout_sec: float = 15.0) -> None:
+        self.lock_file = lock_file.resolve()
+        self.timeout_sec = timeout_sec
+        self._fd: Optional[int] = None
+
+    def __enter__(self) -> "InterProcessFileLock":
+        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + self.timeout_sec
+        while True:
+            try:
+                self._fd = os.open(str(self.lock_file), os.O_CREAT | os.O_RDWR)
+                if sys.platform == "win32":
+                    import msvcrt
+                    os.lseek(self._fd, 0, os.SEEK_SET)
+                    msvcrt.locking(self._fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except (OSError, PermissionError):
+                if self._fd is not None:
+                    try:
+                        os.close(self._fd)
+                    except Exception:
+                        pass
+                    self._fd = None
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"等待跨进程文件锁超时 ({self.timeout_sec}s): {self.lock_file}")
+                time.sleep(0.02 + random.uniform(0.0, 0.02))
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if self._fd is not None:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    os.lseek(self._fd, 0, os.SEEK_SET)
+                    msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self._fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            finally:
+                try:
+                    os.close(self._fd)
+                except Exception:
+                    pass
+                self._fd = None
+
+
+# ============================================================================
+# 1. 路径牢笼 (SandboxPathJail) —— 防 ../../ 越界、Symlink 逃逸与跨血统偷看
 # ============================================================================
 
 class SandboxPathJail:
     """
     强制将探索节点的文件访问锁死在：
-    - 读写白名单：自身孤岛目录 `island_root`
+    - 读写白名单：自身孤岛目录 `island_root`（严禁包含符号链接逃逸或 `.git`）
     - 只读白名单：公共只读目录 `shared_readonly_root`（其中 `lineage_notes/` 仅限读取本血统 `lineage_id`）
-    严禁访问 `.kernel_vault`、隔壁孤岛目录或宿主机外部路径。
     """
 
     def __init__(self, island_root: Path, shared_readonly_root: Path, allowed_lineage_id: str = "GLOBAL") -> None:
@@ -45,9 +106,17 @@ class SandboxPathJail:
         self.shared_readonly_root = shared_readonly_root.resolve()
         self.allowed_lineage_id = allowed_lineage_id
 
+    def _check_no_symlink_escape(self, raw_path: Path, resolved_path: Path) -> None:
+        """检查路径链路中是否存在指向孤岛/只读区外部的符号链接或 NTFS Junction"""
+        if raw_path.exists() and raw_path.is_symlink():
+            if not (resolved_path.is_relative_to(self.island_root) or resolved_path.is_relative_to(self.shared_readonly_root)):
+                raise PermissionError(f"符号链接逃逸拦截：'{raw_path}' 指向受保护区域外部 '{resolved_path}'")
+
     def validate_read(self, target_path: str | Path) -> Path:
         p = Path(target_path)
-        real_path = p.resolve() if p.is_absolute() else (self.island_root / p).resolve()
+        raw_p = p if p.is_absolute() else (self.island_root / p)
+        real_path = raw_p.resolve()
+        self._check_no_symlink_escape(raw_p, real_path)
 
         if real_path.is_relative_to(self.island_root):
             return real_path
@@ -55,7 +124,7 @@ class SandboxPathJail:
         if real_path.is_relative_to(self.shared_readonly_root):
             lineage_dir = (self.shared_readonly_root / "archive" / "lineage_notes").resolve()
             if real_path.is_relative_to(lineage_dir) and real_path != lineage_dir:
-                if self.allowed_lineage_id != "GLOBAL" and not real_path.name.startswith(self.allowed_lineage_id):
+                if self.allowed_lineage_id != "GLOBAL" and not real_path.name.startswith(f"{self.allowed_lineage_id}_"):
                     raise PermissionError(
                         f"跨血统隐私隔离拦截：节点血统 '{self.allowed_lineage_id}' 禁止读取其他血统笔记 '{real_path.name}'"
                     )
@@ -67,11 +136,13 @@ class SandboxPathJail:
 
     def validate_write(self, target_path: str | Path) -> Path:
         p = Path(target_path)
-        real_path = p.resolve() if p.is_absolute() else (self.island_root / p).resolve()
+        raw_p = p if p.is_absolute() else (self.island_root / p)
+        real_path = raw_p.resolve()
+        self._check_no_symlink_escape(raw_p, real_path)
 
         if real_path.is_relative_to(self.island_root):
-            # 严禁在孤岛内部创建伪造的 .git 目录
-            if ".git" in real_path.relative_to(self.island_root).parts:
+            rel_parts = real_path.relative_to(self.island_root).parts
+            if ".git" in rel_parts:
                 raise PermissionError("清洁室安全拦截：严禁在探索孤岛内创建或修改 .git 目录")
             return real_path
 
@@ -109,7 +180,7 @@ def force_cleanup_directory(target_dir: Path, graveyard_dir: Path) -> bool:
     2. 毫秒级原子重命名 (os.replace) 移入 .trash_graveyard 瞬间腾出槽位；
     3. 若重命名被外部子进程锁死，在 Windows 下按命令行路径匹配强杀残留进程；
     4. 清除只读权限位 (stat.S_IWRITE) + 指数退避重试删除；
-    5. 顽固文件逐个疏散至墓园，确保原槽位路径 100% 干净可用。
+    5. 顽固文件逐个疏散至墓园，并顺带清扫墓园历史残留，确保原槽位路径 100% 干净可用。
     """
     target_dir = target_dir.resolve()
     if not target_dir.exists():
@@ -195,11 +266,18 @@ def force_cleanup_directory(target_dir: Path, graveyard_dir: Path) -> bool:
         except Exception:
             pass
 
+    # 顺带尝试清理墓园中已释放锁的陈旧残留
+    try:
+        for old_item in list(graveyard_dir.iterdir()):
+            shutil.rmtree(old_item, ignore_errors=True)
+    except Exception:
+        pass
+
     return not target_dir.exists()
 
 
 # ============================================================================
-# 3. 进程级硬件限额执行器 (Windows Job Object + 环境变量脱敏)
+# 3. 进程级硬件限额执行器 (64位 Windows Job Object 严格签名 + 环境变量脱敏)
 # ============================================================================
 
 @dataclass
@@ -233,7 +311,6 @@ def build_sanitized_env(island_dir: Path, shared_readonly_dir: Path, extra_env: 
     clean_env["HTTP_PROXY"] = ""
     clean_env["HTTPS_PROXY"] = ""
 
-    # 将孤岛 src、孤岛根目录、shared_readonly 加入 PYTHONPATH
     py_paths = [
         str((island_dir / "src").resolve()),
         str(island_dir.resolve()),
@@ -250,13 +327,31 @@ def build_sanitized_env(island_dir: Path, shared_readonly_dir: Path, extra_env: 
 
 
 def _attach_windows_job_object(proc_handle: int, max_memory_mb: int = 8192) -> Optional[Tuple[int, Any]]:
-    """Windows 专用：创建内核 Job Object，绑定进程树连坐强杀 (KILL_ON_JOB_CLOSE) 与物理内存上限"""
-    if sys.platform != "win32":
+    """
+    Windows 64 位专用：显式声明 Win32 API `argtypes` 与 `restype` (c_void_p 64位句柄)，
+    彻底修复默认 32 位 `c_int` 截断导致 Job Object 静默绑定失败的隐患！
+    """
+    if sys.platform != "win32" or not proc_handle:
         return None
     try:
         from ctypes import wintypes
 
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+
         job_handle = kernel32.CreateJobObjectW(None, None)
         if not job_handle:
             return None
@@ -309,39 +404,63 @@ def _attach_windows_job_object(proc_handle: int, max_memory_mb: int = 8192) -> O
         info.ProcessMemoryLimit = mem_bytes
         info.JobMemoryLimit = mem_bytes
 
-        kernel32.SetInformationJobObject(
+        ok_set = kernel32.SetInformationJobObject(
             job_handle,
             JobObjectExtendedLimitInformation,
             ctypes.byref(info),
             ctypes.sizeof(info),
         )
-        kernel32.AssignProcessToJobObject(job_handle, ctypes.c_void_p(int(proc_handle)))
-        return job_handle, JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        ok_assign = kernel32.AssignProcessToJobObject(job_handle, wintypes.HANDLE(int(proc_handle)))
+        if not ok_set or not ok_assign:
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle(job_handle)
+            return None
+        return int(job_handle), JOBOBJECT_EXTENDED_LIMIT_INFORMATION
     except Exception:
         return None
 
 
-def _query_and_close_job_object(job_tuple: Optional[Tuple[int, Any]]) -> float:
-    """读取 Windows Job Object 峰值内存占用 (MB) 并关闭句柄（自动触发子孙进程连坐强杀）"""
+def _query_and_close_job_object(job_tuple: Optional[Tuple[int, Any]], terminate_first: bool = False) -> float:
+    """读取 Windows Job Object 峰值内存占用 (MB)，按需立即强杀整个进程树并关闭句柄"""
     if not job_tuple or sys.platform != "win32":
         return 0.0
     job_handle, struct_cls = job_tuple
     peak_mb = 0.0
     try:
-        kernel32 = ctypes.windll.kernel32
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.QueryInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+        kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
         info = struct_cls()
-        ret_len = ctypes.c_ulong(0)
+        ret_len = wintypes.DWORD(0)
         res = kernel32.QueryInformationJobObject(
-            job_handle, 9, ctypes.byref(info), ctypes.sizeof(info), ctypes.byref(ret_len)
+            wintypes.HANDLE(job_handle), 9, ctypes.byref(info), ctypes.sizeof(info), ctypes.byref(ret_len)
         )
         if res:
             peak_bytes = max(info.PeakJobMemoryUsed, info.PeakProcessMemoryUsed)
             peak_mb = round(peak_bytes / (1024.0 * 1024.0), 2)
+        if terminate_first:
+            kernel32.TerminateJobObject(wintypes.HANDLE(job_handle), 1)
     except Exception:
         pass
     finally:
         try:
-            ctypes.windll.kernel32.CloseHandle(job_handle)
+            from ctypes import wintypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle(wintypes.HANDLE(job_handle))
         except Exception:
             pass
     return peak_mb
@@ -370,20 +489,29 @@ def run_bounded_subprocess(
     )
     job_tuple = _attach_windows_job_object(getattr(proc, "_handle", 0), max_memory_mb=max_memory_mb)
     is_timeout = False
+    peak_mb = 0.0
     try:
         stdout, stderr = proc.communicate(timeout=timeout_sec)
         exit_code = proc.returncode if proc.returncode is not None else -1
     except subprocess.TimeoutExpired:
         is_timeout = True
+        # 立即通过 Job Object 连坐强杀父进程与全部派生的孙子进程，释放管道句柄
+        peak_mb = _query_and_close_job_object(job_tuple, terminate_first=True)
+        job_tuple = None
         proc.kill()
         try:
-            stdout, stderr = proc.communicate(timeout=3.0)
+            stdout, stderr = proc.communicate(timeout=2.0)
         except Exception:
             stdout, stderr = "", "Subprocess hard timeout expired and killed by Job Object."
+        try:
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
         exit_code = 124
     finally:
         elapsed = round(time.perf_counter() - t0, 4)
-        peak_mb = _query_and_close_job_object(job_tuple)
+        if job_tuple is not None:
+            peak_mb = _query_and_close_job_object(job_tuple, terminate_first=False)
 
     return SubprocessRunResult(
         exit_code=exit_code,
@@ -396,15 +524,14 @@ def run_bounded_subprocess(
 
 
 # ============================================================================
-# 4. 无 .git 清洁室孤岛快照导出与提交管理器 (CleanRoomSandbox)
+# 4. 无 .git 清洁室孤岛快照导出与 AST 微创替换管理器 (CleanRoomSandbox)
 # ============================================================================
 
 class CleanRoomSandbox:
     """
     管理 `.kernel_vault/snapshots/` 与 `worktrees/slot_xx_node_yy/` 之间的纯净代码快照流转：
     - 导出给探索节点的孤岛目录内部 100% 不含 `.git` 目录或历史分支信息；
-    - 每个 Commit 以确定性 SHA-256 内容寻址快照存储在 `.kernel_vault/snapshots/<commit_hash>/` 中，
-      彻底避免外部 Git 配置冲突，同时支持毫秒级跨分支检出、回滚与代码块热插拔替换。
+    - 支持顶层函数/类以及类内方法 (`ClassName.method_name`) 的自动缩进对齐 AST 微创热插拔替换。
     """
 
     def __init__(self, workspace_root: Path) -> None:
@@ -428,9 +555,9 @@ class CleanRoomSandbox:
         if not src_dir.exists():
             return hasher.hexdigest()[:16], file_manifest
 
-        ignored_Top = {"legacy_out", "__pycache__", ".pytest_cache", ".git"}
+        ignored_top = {"legacy_out", "__pycache__", ".pytest_cache", ".git"}
         for root, dirs, files in os.walk(src_dir):
-            dirs[:] = sorted([d for d in dirs if d not in ignored_Top and not d.startswith(".")])
+            dirs[:] = sorted([d for d in dirs if d not in ignored_top and not d.startswith(".")])
             for fname in sorted(files):
                 if fname.endswith((".pyc", ".pyo")) or fname == "scoped_brief.md":
                     continue
@@ -467,11 +594,7 @@ class CleanRoomSandbox:
         return commit_hash
 
     def checkout_clean_island(self, commit_hash: str, slot_dir_name: str, scoped_brief_md: str = "") -> Path:
-        """
-        将指定 Commit 快照导出到 `worktrees/<slot_dir_name>/` 清洁室孤岛目录：
-        - 内部零 `.git` 元数据；
-        - 自动初始化 `src/`、`local_tests/`、`legacy_out/` 目录与 `scoped_brief.md`。
-        """
+        """将指定 Commit 快照导出到 `worktrees/<slot_dir_name>/` 清洁室孤岛目录（零 `.git` 残留）"""
         island_dir = self.worktrees_dir / slot_dir_name
         if island_dir.exists():
             force_cleanup_directory(island_dir, self.graveyard_dir)
@@ -496,16 +619,66 @@ class CleanRoomSandbox:
 
         return island_dir
 
+    def generate_unified_diff(self, base_commit: str, island_dir: Path) -> str:
+        """
+        对比基底快照 `base_commit` 与当前孤岛目录 `island_dir` 的源码改动，
+        自动生成标准 Unified Diff 补丁并写入 `legacy_out/diff.patch`（对应五件套遗产 ②）。
+        """
+        base_files_dir = self.snapshots_dir / base_commit / "files"
+        _, curr_manifest = self.compute_directory_hash(island_dir, parent_commit=base_commit)
+
+        base_manifest: Dict[str, str] = {}
+        meta_path = self.snapshots_dir / base_commit / "commit_meta.json"
+        if meta_path.exists():
+            try:
+                base_manifest = json.loads(meta_path.read_text(encoding="utf-8")).get("file_manifest", {})
+            except Exception:
+                base_manifest = {}
+
+        all_rels = sorted(set(base_manifest.keys()) | set(curr_manifest.keys()))
+        diff_chunks: List[str] = []
+
+        for rel in all_rels:
+            old_path = base_files_dir / rel
+            new_path = island_dir / rel
+            old_lines = (
+                old_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+                if old_path.exists()
+                else []
+            )
+            new_lines = (
+                new_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+                if new_path.exists()
+                else []
+            )
+            if old_lines == new_lines:
+                continue
+            patch_lines = list(
+                difflib.unified_diff(
+                    old_lines,
+                    new_lines,
+                    fromfile=f"a/{rel}",
+                    tofile=f"b/{rel}",
+                )
+            )
+            if patch_lines:
+                diff_chunks.append("".join(patch_lines))
+
+        full_patch = "\n".join(diff_chunks)
+        legacy_out = island_dir / "legacy_out"
+        legacy_out.mkdir(parents=True, exist_ok=True)
+        (legacy_out / "diff.patch").write_text(full_patch, encoding="utf-8")
+        return full_patch
+
     @staticmethod
     def surgical_replace_block(script_path: Path, target_block_name: str, new_block_code: str) -> Tuple[bool, str]:
         """
         MLE-STAR 式局部代码块微创热插拔替换 (`s_t.replace(c_t, c_t^{(k)})`)：
-        - 利用 Python AST 精准定位脚本中的目标函数或类定义 `target_block_name` 的起止行号；
-        - 冻结脚本其余全部代码，仅原位替换该目标函数/类定义，并自动验证替换后的全文件 AST 语法合法性，
-          从根源上消除全量重写导致的 41.7% 语法崩溃与变量遗漏。
+        - 支持顶层函数/类 (`solve`)、点号类方法 (`Solver.step`) 以及自动在唯一类中搜寻同名方法 (`step`)；
+        - 自动对 `new_block_code` 执行 `textwrap.dedent` 并按原节点所在的列缩进 (`col_offset`) 重新对齐缩进；
+        - 严禁盲目把写错名字的类方法塞到文件末尾，若为类内方法新增则精准追加至目标类末尾；
+        - 替换后强制通过全文件 `ast.parse` 语法校验，失败则 100% 保持原文件不动。
         """
-        import ast
-
         if not script_path.exists():
             return False, f"目标脚本不存在: {script_path}"
 
@@ -515,29 +688,85 @@ class CleanRoomSandbox:
         except SyntaxError as e:
             return False, f"原脚本存在语法错误: {e}"
 
-        # 校验新代码块本身的语法
+        dedented_new = textwrap.dedent(new_block_code).strip()
         try:
-            new_tree = ast.parse(new_block_code)
+            new_tree = ast.parse(dedented_new)
         except SyntaxError as e:
             return False, f"提交的新代码块 '{target_block_name}' 存在语法错误，拒绝合入: {e}"
 
+        if not new_tree.body or not isinstance(new_tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return False, f"提交的新代码块必须是一个函数或类定义 (def / class)，当前顶层节点为: {new_tree.body}"
+
+        submitted_def_name = new_tree.body[0].name
+        expected_short_name = target_block_name.split(".")[-1]
+        if submitted_def_name != expected_short_name:
+            return (
+                False,
+                f"提交的代码块定义名称 '{submitted_def_name}' 与目标名称 '{expected_short_name}' 不一致，拒绝合入！",
+            )
+
         target_node: Optional[ast.AST] = None
-        for node in tree.body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == target_block_name:
-                target_node = node
-                break
+        parent_class_node: Optional[ast.ClassDef] = None
+
+        if "." in target_block_name:
+            cls_name, meth_name = target_block_name.split(".", 1)
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef) and node.name == cls_name:
+                    parent_class_node = node
+                    for child in node.body:
+                        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == meth_name:
+                            target_node = child
+                            break
+                    break
+            if parent_class_node is None:
+                return False, f"找不到目标类 '{cls_name}' (target_block_name='{target_block_name}')"
+        else:
+            # 1. 先在模块顶层寻找同名函数或类
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == target_block_name:
+                    target_node = node
+                    break
+            # 2. 若顶层未找到，在顶层类的内部方法中寻找同名方法
+            if target_node is None:
+                matching_methods: List[Tuple[ast.ClassDef, ast.AST]] = []
+                for node in tree.body:
+                    if isinstance(node, ast.ClassDef):
+                        for child in node.body:
+                            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == target_block_name:
+                                matching_methods.append((node, child))
+                if len(matching_methods) == 1:
+                    parent_class_node, target_node = matching_methods[0]
+                elif len(matching_methods) > 1:
+                    cls_names = [m[0].name for m in matching_methods]
+                    return (
+                        False,
+                        f"在多个类 {cls_names} 中均存在同名方法 '{target_block_name}'，请使用 'ClassName.{target_block_name}' 明确指定！",
+                    )
 
         lines = original_source.splitlines(keepends=True)
+
         if target_node is not None and hasattr(target_node, "lineno") and hasattr(target_node, "end_lineno"):
-            # 若存在装饰器，从第一个装饰器行开始替换
             decorator_list = getattr(target_node, "decorator_list", [])
             start_line = min([target_node.lineno] + [d.lineno for d in decorator_list]) - 1
             end_line = target_node.end_lineno
-            replacement = new_block_code if new_block_code.endswith("\n") else new_block_code + "\n"
-            updated_source = "".join(lines[:start_line]) + replacement + "".join(lines[end_line:])
-            action_msg = f"已原位微创替换代码块 '{target_block_name}' (原第 {start_line + 1}~{end_line} 行)"
+            # 提取原代码块首行的前导空格缩进
+            orig_first_line = lines[start_line]
+            indent_prefix = orig_first_line[: len(orig_first_line) - len(orig_first_line.lstrip(" \t"))]
+            indented_replacement = textwrap.indent(dedented_new, indent_prefix) + "\n"
+            updated_source = "".join(lines[:start_line]) + indented_replacement + "".join(lines[end_line:])
+            scope_label = f"{parent_class_node.name}.{expected_short_name}" if parent_class_node else target_block_name
+            action_msg = f"已原位微创替换代码块 '{scope_label}' (原第 {start_line + 1}~{end_line} 行)"
+        elif parent_class_node is not None and hasattr(parent_class_node, "end_lineno"):
+            # 在指定类中新增方法：按类体缩进追加至该类末尾
+            cls_end = parent_class_node.end_lineno
+            cls_line = lines[parent_class_node.lineno - 1]
+            cls_indent = cls_line[: len(cls_line) - len(cls_line.lstrip(" \t"))]
+            method_indent = cls_indent + "    "
+            indented_replacement = "\n" + textwrap.indent(dedented_new, method_indent) + "\n"
+            updated_source = "".join(lines[:cls_end]) + indented_replacement + "".join(lines[cls_end:])
+            action_msg = f"已在类 '{parent_class_node.name}' 末尾新增方法 '{expected_short_name}'"
         else:
-            # 若目标函数为新增算子，安全追加在文件末尾（或 if __name__ == '__main__' 之前）
+            # 顶层新增函数或类：安全挂载在 if __name__ == '__main__' 之前
             main_guard_idx = None
             for node in tree.body:
                 if isinstance(node, ast.If):
@@ -545,14 +774,13 @@ class CleanRoomSandbox:
                     if "__name__" in unparsed_test and "__main__" in unparsed_test:
                         main_guard_idx = node.lineno - 1
                         break
-            replacement = "\n\n" + new_block_code.strip() + "\n\n"
+            replacement = "\n\n" + dedented_new + "\n\n"
             if main_guard_idx is not None:
                 updated_source = "".join(lines[:main_guard_idx]) + replacement + "".join(lines[main_guard_idx:])
             else:
                 updated_source = original_source.rstrip() + replacement
-            action_msg = f"未找到同名旧块，已将新代码块 '{target_block_name}' 安全挂载至脚本主入口前"
+            action_msg = f"已将新顶层代码块 '{target_block_name}' 安全挂载至脚本主入口前"
 
-        # 最终全文件 AST 二次校验
         try:
             ast.parse(updated_source)
         except SyntaxError as e:
