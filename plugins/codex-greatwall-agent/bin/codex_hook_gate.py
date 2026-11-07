@@ -28,7 +28,7 @@ def main():
 
     result = evaluate_hook({"toolCall": {"name": legacy_name, "args": {"Path": path, "CommandLine": command}}})
     if result["decision"] == "deny":
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": result["reason"]}}, ensure_ascii=False))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": result["reason"]}}))
 
 
 if __name__ == "__main__":
