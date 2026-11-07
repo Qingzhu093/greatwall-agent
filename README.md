@@ -13,12 +13,18 @@
 ├── 15_长城Agent_V4无人值守架构与沙箱工程实战规范.md        # 【现行主规范 B】V4.2 去黑话、重沙箱基础设施与代码落地的终极规范
 │
 ├── plugins/
-│   └── greatwall-agent/                                # 【V4.2 原生落地插件】Google Antigravity 插件全套代码与 MCP 引擎
+│   ├── greatwall-agent/                                # 【V4.2 原生落地插件】Google Antigravity 插件全套代码与 MCP 引擎
 │       ├── plugin.json / mcp_config.json / hooks.json  # 插件清单、Stdio MCP 服务端注册与清洁室 PreToolUse 钩子
 │       ├── bin/ (gw_mcp_server.py, hook_gate.py)       # 8 大核心 MCP 工具入口与零误伤边界守护脚本
 │       ├── lib/ (sandbox, archive, evaluator, engine)  # 务实精简的 Python 核心四模块 (~1,100 行，零第三方依赖)
 │       ├── rules/ & skills/ & agents/                  # 攻关规则、四阶段标准作业手册与三大专用子智能体定义
 │       └── tests/test_plugin_e2e.py                    # 全链路自动化端到端验收测试套件
+│   └── dsh-greatwall-agent/                            # 【DSH 移植版插件】DeepSeek Harness 插件包（内核逐字节随包 + MCP/技能/门禁三宿主映射）
+│       ├── package.json / cordis.patch.yml             # npm 清单、engines 与单行 bundle patch
+│       ├── lib/ (index.js, gate.js, skillpack.js)      # DSH 宿主壳：MCP 挂载、清洁室工具守卫与技能注册
+│       ├── greatwall-agent/                            # 原 Antigravity 插件树逐字节副本（18 文件，SHA-256 可校验）
+│       ├── market/ & tools/                            # 插件市场索引与「内核逐字节」校验脚本
+│       └── docs/ (INSTALL.md, ARCHITECTURE.md)         # 安装/验证/排障与文件级移植架构说明
 │
 ├── 01_核心代码原型_v3_kernel/                           # 原「长程 Agent 设计系统」Python 内核原型与测试套件
 │   ├── src/core/                                       # 状态机 (state.py)、WAL 日志 (wal.py)、调度器 (scheduler.py)、账本 (ledger.py)
@@ -51,3 +57,4 @@
 1. **查阅最新 V4 总体设计与落地规范**：请直接阅读根目录下的 [`15_长城Agent_V4无人值守架构与沙箱工程实战规范.md`](./15_长城Agent_V4无人值守架构与沙箱工程实战规范.md) 与 [`V4_总体架构与工程规范_全编整合版.md`](./V4_总体架构与工程规范_全编整合版.md)。
 2. **复用/重构底层 Python 代码**：请直接进入 [`01_核心代码原型_v3_kernel/src/`](./01_核心代码原型_v3_kernel/src/)，其中已包含经过对抗测试的 WAL 日志、状态机与 Worktree 管理基础骨架。
 3. **查阅实战踩坑记录（为什么 V4 要这样设计）**：请阅读 [`03_实战复盘与评测归档/04_三版实战复盘.md`](./03_实战复盘与评测归档/04_三版实战复盘.md) 及 V2/V3 独立审计报告。
+4. **安装/移植 DSH 版插件**：请阅读 [`plugins/dsh-greatwall-agent/README.md`](./plugins/dsh-greatwall-agent/README.md) 与 [`17_长城Agent_V4-DSH插件移植档案.md`](./17_长城Agent_V4-DSH插件移植档案.md)，其中记录了物理位置、三项宿主能力映射、发布地址与维护命令。

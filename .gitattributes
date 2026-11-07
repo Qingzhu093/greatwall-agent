@@ -1,0 +1,12 @@
+# Line endings for a byte-stable plugin tree
+#
+# `plugins/greatwall-agent/` is the original Antigravity plugin, and
+# `plugins/dsh-greatwall-agent/greatwall-agent/` is its byte-identical copy pinned
+# by `core-manifest.sha256`. With `core.autocrlf=true` (the Windows default) a
+# clone would rewrite LF to CRLF and make `node tools/verify-core.mjs` fail
+# through no fault of the package, so Git must never translate endings there.
+#
+# Everything else is ordinary text stored with LF.
+* text=auto eol=lf
+plugins/greatwall-agent/** -text
+plugins/dsh-greatwall-agent/** -text
