@@ -10,7 +10,15 @@
 长城Agent_框架设计/
 ├── README.md                                           # 本全局导航总索引
 ├── V4_总体架构与工程规范_全编整合版.md                    # 【现行主规范 A】V4.1 全景多环架构与 14 实体全编版
-├── 15_长城Agent_V4无人值守架构与沙箱工程实战规范.md        # 【现行主规范 B】去黑话、重沙箱基础设施与代码落地的实战规范
+├── 15_长城Agent_V4无人值守架构与沙箱工程实战规范.md        # 【现行主规范 B】V4.2 去黑话、重沙箱基础设施与代码落地的终极规范
+│
+├── plugins/
+│   └── greatwall-agent/                                # 【V4.2 原生落地插件】Google Antigravity 插件全套代码与 MCP 引擎
+│       ├── plugin.json / mcp_config.json / hooks.json  # 插件清单、Stdio MCP 服务端注册与清洁室 PreToolUse 钩子
+│       ├── bin/ (gw_mcp_server.py, hook_gate.py)       # 8 大核心 MCP 工具入口与零误伤边界守护脚本
+│       ├── lib/ (sandbox, archive, evaluator, engine)  # 务实精简的 Python 核心四模块 (~1,100 行，零第三方依赖)
+│       ├── rules/ & skills/ & agents/                  # 攻关规则、四阶段标准作业手册与三大专用子智能体定义
+│       └── tests/test_plugin_e2e.py                    # 全链路自动化端到端验收测试套件
 │
 ├── 01_核心代码原型_v3_kernel/                           # 原「长程 Agent 设计系统」Python 内核原型与测试套件
 │   ├── src/core/                                       # 状态机 (state.py)、WAL 日志 (wal.py)、调度器 (scheduler.py)、账本 (ledger.py)
