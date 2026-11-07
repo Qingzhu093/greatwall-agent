@@ -8,7 +8,7 @@
     "type": "git",
     "url": "git+https://github.com/Qingzhu093/codex-greatwall-agent.git"
   },
-  "files": ["plugin.json", "mcp.json", "skills", "rules", "agents", "assets", "bin/*.py", "lib/*.py", "tests/*.py", "README.md", "LICENSE"],
+  "files": ["plugin.json", "mcp.json", "skills", "rules", "agents", "assets", "hooks", "bin/*.py", "lib/*.py", "tests/*.py", "README.md", "LICENSE"],
   "publishConfig": {"access": "public"},
   "scripts": {"test": "python tests/test_plugin_e2e.py"}
 }

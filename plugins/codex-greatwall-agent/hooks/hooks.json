@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ${PLUGIN_ROOT}/bin/codex_hook_gate.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
