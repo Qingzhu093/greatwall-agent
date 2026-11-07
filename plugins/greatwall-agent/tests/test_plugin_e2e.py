@@ -132,12 +132,13 @@ class TestGreatWallPluginV42SpecAlignment(unittest.TestCase):
             "    lr = 0.01\n"
             "    return sum(x) * lr\n"
         )
-        # 1. 违规使用过时模型 LogisticRegression + 手搓 def k_fold + 遗漏 geometry.xyz 模态
+        # 1. 违规使用过时模型 LogisticRegression + 手搓 def k_fold + 遗漏 geometry.xyz 模态 + 硬编码 iso_gap = min(0.03, iso_gap) 作弊
         bad_contract_code = (
             "from sklearn.linear_model import LogisticRegression\n"
             "def k_fold(data, k=5):\n"
             "    return data\n"
             "def solve(x):\n"
+            "    iso_gap = min(0.03, 0.12)\n"
             "    df = 'train.csv'\n"
             "    return 0\n"
         )
@@ -150,6 +151,7 @@ class TestGreatWallPluginV42SpecAlignment(unittest.TestCase):
         self.assertFalse(rep1.passed)
         self.assertTrue(any("手搓基础工具函数" in v for v in rep1.contract_violations))
         self.assertTrue(any("LogisticRegression" in v for v in rep1.contract_violations))
+        self.assertTrue(any("同构扰动方差" in v for v in rep1.security_violations))
         self.assertEqual(rep1.unreferenced_modalities, ["geometry.xyz"])
 
         # 2. 测试三大偷懒陷阱：只改常数 + 导入 matplotlib 画图 + 吹嘘量子启发微批处理创新

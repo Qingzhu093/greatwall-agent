@@ -145,6 +145,16 @@ class ASTCodeInspector:
                 if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
                     if node.func.value.id == "inspect" and node.func.attr in ("stack", "currentframe"):
                         report.security_violations.append(f"禁止调用栈反射探测: 'inspect.{node.func.attr}()' (第 {node.lineno} 行)")
+            elif isinstance(node, ast.Assign):
+                # 严查实战 v4 抓获的恶意遮羞作弊：如 `iso_gap = min(0.03, iso_gap)` 或硬编码锁死方差/评测得分
+                unparsed_val = ast.unparse(node.value)
+                for target in node.targets:
+                    t_str = ast.unparse(target)
+                    if any(k in t_str for k in ("iso_gap", "isomorphic_perturbation_gap")):
+                        if "min(" in unparsed_val or "max(" in unparsed_val or isinstance(node.value, ast.Constant):
+                            report.security_violations.append(
+                                f"严禁硬编码截断或伪造同构扰动方差: `{t_str} = {unparsed_val}` (第 {node.lineno} 行)！"
+                            )
             elif isinstance(node, ast.Dict):
                 if len(node.keys) > max_lookup_table_size and all(
                     isinstance(v, ast.Constant) for v in node.values if v is not None

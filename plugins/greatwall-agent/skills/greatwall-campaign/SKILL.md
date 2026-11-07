@@ -5,73 +5,71 @@ description: 长城 Agent V4.2 无人值守科研与竞赛全周期编排技能�
 
 # 长城 Agent V4.2 无人值守攻关标准作业规程 (Great Wall Campaign Runbook)
 
-本技能驱动 `greatwall-agent` MCP 服务器提供的 8 个原生工具，将长程无人值守攻关划分为 **4 个确定性阶段**。
+本技能驱动 `greatwall-agent` MCP 服务器提供的 9 个原生工具与 3 个专用子智能体（`gw-distiller`、`gw-explorer`、`gw-auditor`），将长程无人值守攻关划分为 **4 个确定性阶段**。
+
+> [!CAUTION]
+> **总管（Orchestrator）最高角色隔离铁律（严禁犯“包工头越位综合征”！）**
+> 1. **总管只管顶层架构、资源调度与裁决**：总管**绝对禁止**跳过 `invoke_subagent` 自己在主控会话里手搓 `NODE-001 ~ NODE-004` 的探索代码！
+> 2. **三权分立强制派发**：
+>    - **开局蒸馏与造尺**：必须调用 `invoke_subagent(TypeName="gw-distiller")` 派发开局蒸馏专家；
+>    - **清洁室孤岛攻关**：每次 `gw_allocate_slot` 分配槽位后，必须调用 `invoke_subagent(TypeName="gw-explorer")` 派发独立的探索节点进驻 `worktrees/<slot_id>/` 内部迭代；
+>    - **独立扒皮审计与内省**：每轮关键突破、满 60 步内省室及终局交付前，必须调用 `invoke_subagent(TypeName="gw-auditor")` 派发手握一票否决权的独立审计官进行穿透审查！
+> 3. **严禁既当运动员又当记分员**：评测基准（`.kernel_vault/evaluator_suite/evaluate_runner.py`）必须在 Phase 0 锁死在内核保险箱中；严禁在候选脚本里写 `iso_gap = min(0.03, iso_gap)` 等截断作弊代码，严禁把“含未清除惩罚的折合耗时”谎报为“100% 清除率”！
 
 ---
 
-## 阶段 0：开局前置消歧与先蒸馏引擎 (Phase 0: Pre-Flight & Opening Distillation)
+## 阶段 0：开局前置消歧、盲态造尺与先蒸馏引擎 (Phase 0: Pre-Flight & Opening Distillation)
 
 ### Step 0.1：三步前置消歧与工作区初始化 (`gw_init_campaign`)
-1. **数据静态探针（EDA Grounding）**：将公开数据集放入 `<workspace>/shared_readonly/datasets_public/`，检查字段类型、缺失率与分组键，消除 70% 的伪歧义。
-2. **锁定规则性歧义**：若有数据无法判断的规则歧义，让人类花 30 秒拍板（或调用低幻觉旗舰模型单次仲裁），**绝对禁止在盘中分裂 $A / \neg A$ 歧义分支**！
-3. 调用 `gw_init_campaign` 初始化工作区目录树（`.kernel_vault/`、`shared_readonly/archive/`、`worktrees/`）。
+1. **数据静态探针（EDA Grounding）**：将解析后的题面与公开数据集放入 `<workspace>/shared_readonly/datasets_public/`，调用 `gw_init_campaign` 自动执行确定性 EDA 探针并生成 `eda_probe_report.json`，锁死 `task_config.yaml`（**绝对禁止在盘中分裂 $A / \neg A$ 歧义分支**）。
+2. **盲态造尺锁定（Immutable Evaluator Suite）**：在 `.kernel_vault/evaluator_suite/evaluate_runner.py` 中锁死独立评测器（严格对齐官方单狗/边界/无作弊完成信号规则，分离输出综合得分与真实目标清除率 `clearance_rate` 等分项诊断指标），严禁后续探索节点篡改评测逻辑。
 
-### Step 0.2：开局知识蒸馏与铸造【零号强基线 $s_0$】(`gw_lock_distillation`)
-1. 委派 `gw-distiller` 子智能体（或在主控直接调用 `search_web`）检索近 3 年同类任务 SOTA 方案。
-2. 编写结构清晰、模块化分块的【零号强基线 $s_0$】代码（例如将特征工程拆为 `def extract_features(data):`、求解器拆为 `def solve(inputs):`、评测拆为 `def evaluate():`）。
-3. 调用 `gw_lock_distillation` 传入：
-   - `orthogonalFamilies`：2~4 个正交现代方法族（如 `FAM-01` 树模型与物理特征、`FAM-02` 深度学习表征、`FAM-03` 混合整数规划与启发式邻域搜索）；
-   - `obsoleteBlacklist`：禁止把 2015 `ResNet`、裸 `LogisticRegression` 或三重未向量化循环当主力；
-   - `mustReuseLibraries`：强制调库的基础设施清单；
-   - `anchorBaselineCode`：零号强基线源码（内核将自动在沙箱实跑测定基准分 `anchor_s0_score`）。
+### Step 0.2：委派 `gw-distiller` 开局知识蒸馏与铸造【零号强基线 $s_0$】(`gw_lock_distillation`)
+1. **强制调用 `invoke_subagent(TypeName="gw-distiller")`**：在独立上下文中检索近 3 年同类任务现代 SOTA 方案，划清《反预训练偏见黑名单》与《调库 vs 造轮子边界清单》。
+2. 编写 1~3 个结构清晰、模块化分块的候选基线代码（拆分为 `extract_features`、`solve` 等独立代码块），调用 `gw_lock_distillation` 在沙箱实跑竞技选优，铸造【零号强基线 $s_0$】（测定 `anchor_s0_score`）。
 
 ---
 
 ## 阶段 1 & 2：清洁室孤岛并发深耕与微创代码手术 (Clean-Room Slot Loop)
 
-### Step 1.1：分配无 `.git` 清洁室孤岛 (`gw_allocate_slot`)
-- 调用 `gw_allocate_slot` 为指定 `familyId` 分配槽位，明确指明本轮锁定的单一微创手术代码块 `targetedCodeBlock`（如 `extract_features`）与可证伪假说 `hypothesis`。
-- 内核将在 `worktrees/<slot_id>/` 下导出不含 `.git` 的纯净快照，并自动生成 `scoped_brief.md`（L1 启动简报，含 `PRIMITIVES_API` 可直接 `import` 的原语函数签名表与近期死胡同避坑表）。
+### Step 1.1：总管分配无 `.git` 清洁室孤岛 (`gw_allocate_slot`) 并派发 `gw-explorer`
+- 总管调用 `gw_allocate_slot` 为指定 `familyId` 分配槽位，明确指明本轮锁定的单一微创手术代码块 `targetedCodeBlock` 与可证伪假说 `hypothesis`。
+- 总管调用 `invoke_subagent(TypeName="gw-explorer")`，将 `<island_path>` 与 `<slot_id>` 交给探索节点子智能体独立执行（支持并行启动多个 `gw-explorer` 探索不同正交方法族）。
 
-### Step 1.2：MLE-STAR 式局部代码块微创替换 (`gw_surgical_replace`)
-- 在孤岛内迭代时，**严禁全量重写整个 Python 文件**！
-- 调用 `gw_surgical_replace` 传入 `slotId`、`targetBlockName` 与 `newBlockCode`，内核利用 AST 精准原位替换目标函数/类并自动验证全文件语法。
+### Step 1.2：`gw-explorer` 在孤岛内执行代码块微创替换 (`gw_surgical_replace`)
+- `gw-explorer` 先读取 `<island_path>/scoped_brief.md`（含 `PRIMITIVES_API.md` 可直接 `import` 的原语函数签名表与死胡同避坑表）。
+- 调用 `gw_surgical_replace` 传入 `slotId`、`targetBlockName`（支持顶层函数/类及 `ClassName.method`）与 `newBlockCode`，原位微创替换目标代码块并自动生成 `legacy_out/diff.patch`。
+- 若中途改乱代码，可调用 `gw_lineage_control(action="soft_flush")` 原地软清栈回滚至干净基底快照。
 
 ### Step 1.3：跨进程防作弊评测与四级分诊 (`gw_evaluate_slot`)
-- 调用 `gw_evaluate_slot` 在 Windows Job Object 硬件限额与脱敏环境变量下运行跨进程隔离评测：
-  - 自动执行 AST 安全扫描、MLE-STAR 数据泄漏扫描、计算图结构改动率对账（拦截只改数字 0% 结构改动的伪创新）、四元组剥皮查新与同构置换扰动测试（抓捕背题号作弊）；
-  - 在 `legacy_out/metrics_receipt.json` 生成带 HMAC-SHA256 防伪签名的成绩单，并返回四级分诊结果：
-    - `PARETO_PROMOTE`：总分超越 $s_0$，晋升为主干新基线并自动获 $+25$ 步续期奖励；
-    - `NICHE_CHAMPION`：在极端困难算例上表现卓越，保留其偏科原语留待跨分支拼图；
-    - `IN_PLACE_REPAIR`：存在运行时报错，保留孤岛目录给 3 步快速原地修补机会；
-    - `DEAD_END_ARCHIVE`：性能退化或违规，提取墓志铭归档黑名单。
+- 调用 `gw_evaluate_slot` 在 64 位 Windows Job Object 硬件限额与脱敏环境变量下运行跨进程隔离评测：
+  - 自动执行 AST 安全扫描（拦截 `min(0.03, iso_gap)` 等遮羞作弊）、过时模型与手搓轮子拦截、多模态完整性对账与同构置换扰动测试；
+  - 在 `legacy_out/metrics_receipt.json` 生成带 HMAC-SHA256 防伪签名的成绩单，并返回四级分诊结果（`PARETO_PROMOTE` / `NICHE_CHAMPION` / `IN_PLACE_REPAIR` / `DEAD_END_ARCHIVE`）。
 
 ### Step 1.4：五件套遗产验收入库与五步墓碑回收 (`gw_submit_legacy`)
-- 节点退场前，在 `<island_path>/legacy_out/` 下写入：
-  1. `epitaph.md`：$\le 150$ 字死胡同避坑或核心实验结论总结；
-  2. `metrics_receipt.json`：已由 `gw_evaluate_slot` 自动生成；
-  3. `primitives/<name>.py`（可选但强烈推荐）：将提分的独立纯函数抽离出来，必须包含类型注解、Docstring 以及 `def test_<name>():` 单元测试函数；
-  4. `anomalies_and_bounties.json`（可选）：反常实验现象与悬赏；
-  5. `last_will_proposals.json`：1~3 条下一步接力遗嘱提案（含 `action_type` 与 `falsifiable_hypothesis`）。
-- 调用 `gw_submit_legacy`：内核自动在沙箱实跑 `primitives/*.py` 的单元测试，通过后正式入库 `archive/ledger/primitives/` 并刷新 `PRIMITIVES_API.md`，最后用五步墓碑算法（防 `WinError 32`）瞬间回收孤岛目录。
+- `gw-explorer` 退场前，在 `<island_path>/legacy_out/` 下备齐【五件套遗产包】：
+  1. `epitaph.md`：$\le 150$ 字死胡同避坑或核心物理机理总结；
+  2. `diff.patch` + `metrics_receipt.json`（已自动生成）；
+  3. `primitives/<name>.py`（附类型注解、Docstring 与 `def test_<name>():` 单元测试）或 `barrier_proof.json`（死路反例验证脚本）；
+  4. `anomalies_and_bounties.json`（可选）；
+  5. `last_will_proposals.json`：1~3 条下一步接力遗嘱提案（`REPAIR | GRAFT | EXTEND | ORTHOGONAL`）。
+- 调用 `gw_submit_legacy` 验收入库、统计跨血统原语真实引用次数、自动提炼共性死因补丁并回收孤岛目录。
 
 ---
 
-## 阶段 3：60 步原位内省室与品味校准 (Reflection Chamber & Taste Calibration)
+## 阶段 3：独立审计官穿透审查与 60 步原位内省室 (`gw-auditor`)
 
-当 `gw_submit_legacy` 返回 `trigger_60_step_reflection_chamber: true`（或全局陷入平台期）时：
-1. 暂停常规 `EXTEND` 派发，切换至高品味审查视角（或唤醒 `gw-auditor`），按**原位 3 轮内省室九大拷问**对当前谱系进行冷酷解剖：
-   - **第 1 轮（扒掉虚假繁荣）**：对照《正反品味锚点表》，检查是否掉进了“定性画图自嗨”、“静态边角料路灯效应”或“超参网格微调”三大摸鱼陷阱；
-   - **第 2 轮（解剖最差算例）**：找出错得最离谱的 3 个算例，判断底层假设是否破裂，并调用 `gw_archive_query` 查看其他方法族是否已入库可互补的原语函数；
-   - **第 3 轮（做减法与签军令状）**：删掉无边际贡献的冗余代码，锁定未来 20 步唯一攻克的代码块与证伪阈值（若证伪则提交《结构障碍证明》体面结题）。
+1. **穿透式反自欺审计**：
+   - 总管调用 `invoke_subagent(TypeName="gw-auditor")` 进驻审查：编写极限边界压测脚本（如小交角 GDOP 发散、50 随机种子盲测）或调用 `gw_lineage_control(action="differential_test")` 开展跨分支无标签差分互测，对任何虚报清除率或物理伪解行使**一票否决权（REJECT）**！
+2. **60 步原位 3 轮内省室 (`submit_reflection`)**：
+   - 当某方法族谱系累计运行满 60 步（`trigger_60_step_reflection_chamber: true`）时，由 `gw-auditor` 主持三轮九大拷问，并调用 `gw_lineage_control(action="submit_reflection")` 将未来 20 步军令状持久化至 `.kernel_vault/reflections/`。
 
 ---
 
-## 阶段 4：四步跨分支结构拼图与终局五件套交付 (`gw_compile_delivery`)
+## 阶段 4：跨分支结构拼图与终局五件套交付 (`gw_compile_delivery`)
 
 1. **跨分支结构拼图（Structural Synthesis）**：
-   - 调用 `gw_archive_query(action="get_l0_index")` 查阅 `PRIMITIVES_API.md` 中各方法族沉淀的优质原语；
-   - 分配拼图槽位（`action_type: GRAFT`），在主干最优方案中直接 `from archive.ledger.primitives.xxx import yyy` 嫁接互补算子，实跑消融验证净收益。
-2. **编译终局五件套交付信封 (`gw_compile_delivery`)**：
-   - 调用 `gw_compile_delivery` 传入 `executiveSummaryMd`（严禁包含 `TODO / TBD / Conclusions Here` 占位符）；
-   - 内核自动从 HMAC 签名收据硬绑定渲染全套实验得分对比表，在 `<workspace>/final_delivery/` 下生成标准五件套（报告、纯净源码与原语库、证据总账本、PowerShell 一键复现脚本、适用边界与死胡同避坑指南）。
+   - 调用 `gw_archive_query(action="get_l0_index")` 查阅 `PRIMITIVES_API.md` 中各方法族沉淀的高引用原语；
+   - 派发拼图槽位（`action_type: GRAFT`），直接 `from archive.ledger.primitives.xxx import yyy` 嫁接互补算子，实跑消融验证净收益。
+2. **编译终局五件套交付信封 (`gw_compile_delivery`) 并由 `gw-auditor` 终审签字**：
+   - 调用 `gw_compile_delivery` 生成 `final_delivery/`（报告、脱机自包含源码与原语包、HMAC 证据总账本、带 UTF-8 BOM 兼容 PowerShell 5.1/7 的 `04_reproduce_all.ps1`、适用边界与死胡同避坑档案）。

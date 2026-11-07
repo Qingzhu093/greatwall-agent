@@ -1032,6 +1032,14 @@ class GreatWallEngine:
             shutil.copytree(best_snap_files, code_out_dir, dirs_exist_ok=True)
         if self.archive.primitives_dir.exists():
             shutil.copytree(self.archive.primitives_dir, code_out_dir / "primitives", dirs_exist_ok=True)
+            # 同时保留 archive/ledger/primitives 包结构，确保脱机运行 `from archive.ledger.primitives.xxx import yyy` 100% 自包含不报错
+            offline_pkg_dir = code_out_dir / "archive" / "ledger" / "primitives"
+            offline_pkg_dir.mkdir(parents=True, exist_ok=True)
+            for p_parent in (code_out_dir / "archive", code_out_dir / "archive" / "ledger", offline_pkg_dir):
+                init_f = p_parent / "__init__.py"
+                if not init_f.exists():
+                    init_f.write_text('"""Offline Self-Contained Archive Primitives."""\n', encoding="utf-8")
+            shutil.copytree(self.archive.primitives_dir, offline_pkg_dir, dirs_exist_ok=True)
 
         prim_manifest = json.loads(self.archive.primitives_manifest_file.read_text(encoding="utf-8")) if self.archive.primitives_manifest_file.exists() else {}
         ledger_bundle = {
@@ -1056,11 +1064,12 @@ class GreatWallEngine:
             "$env:PYTHONHASHSEED = '42'\n"
             "$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path\n"
             "$env:PYTHONPATH = \"$ScriptDir/02_verified_source_code;$ScriptDir/../shared_readonly\"\n"
-            "Write-Host '🚀 正在清洁室环境中复现最优冠军解...' -ForegroundColor Cyan\n"
+            "Write-Host '[GreatWall V4.2] Reproducing verified champion solution in clean room...' -ForegroundColor Cyan\n"
             "python \"$ScriptDir/02_verified_source_code/src/main.py\"\n"
-            "Write-Host '✅ 复现执行完成！' -ForegroundColor Green\n"
+            "Write-Host '[GreatWall V4.2] Clean-room reproduction completed successfully!' -ForegroundColor Green\n"
         )
-        (delivery_dir / "04_reproduce_all.ps1").write_text(repro_ps1, encoding="utf-8")
+        # 使用 utf-8-sig (带 BOM) 写入 .ps1，彻底杜绝旧版 Windows PowerShell 5.1 因中文/无BOM编码崩溃
+        (delivery_dir / "04_reproduce_all.ps1").write_text(repro_ps1, encoding="utf-8-sig")
 
         dead_lines = [
             "# 🚧 算法适用边界与死胡同避坑档案 (Boundary & Dead-Ends Report)\n",
