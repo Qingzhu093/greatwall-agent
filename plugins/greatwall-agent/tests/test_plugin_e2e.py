@@ -66,21 +66,53 @@ class TestGreatWallPluginV42SpecAlignment(unittest.TestCase):
         self.assertEqual(csv_mod["num_columns"], 4)
         self.assertAlmostEqual(csv_mod["missing_rates"]["feat_a"], 0.3333, places=3)
 
-        # 传入 M=2 个候选基线：CAND_WEAK (得分 60.0) vs CAND_STRONG (得分 88.5)，验证自动选优锁定 88.5 为 s_0
+        # 1. 测试故意在 simulator_code 中塞入 `is_all_cleared` 上帝视角完成信号，验证被拦截
+        cheat_sim_res = engine.lock_opening_distillation(
+            orthogonal_families=[{"family_id": "FAM-01", "family_name": "Test"}],
+            simulator_code="def step():\n    is_all_cleared = True\n    return is_all_cleared\n",
+        )
+        self.assertEqual(cheat_sim_res["status"], "SIMULATOR_CHEAT_SIGNAL_DETECTED")
+
+        # 2. 传入合法的只读模拟器 (含单元测试) + 特权三级级联盲态评测器 + M=2 个候选基线
+        valid_simulator = (
+            "def run_physics(gain: float) -> float:\n"
+            "    return gain * 10.0\n\n"
+            "def test_physics():\n"
+            "    assert abs(run_physics(2.5) - 25.0) < 1e-6\n"
+        )
+        valid_evaluator = (
+            "import simulator\n"
+            "def evaluate_candidate(cand_mod):\n"
+            "    sc = float(cand_mod.solve_with_sim())\n"
+            "    cr = 0.85 if sc > 80.0 else 0.577\n"
+            "    return {\n"
+            "        'frozen_score': sc,\n"
+            "        'live_score': sc - 1.5,\n"
+            "        'clearance_rate': cr,\n"
+            "        'cascade_level': 'L3_ADVERSARIAL',\n"
+            "        'isomorphic_perturbation_gap': 0.01,\n"
+            "        'diagnostics': {'waste_ratio': 0.12},\n"
+            "    }\n"
+        )
         lock_res = engine.lock_opening_distillation(
             orthogonal_families=[
                 {"family_id": "FAM-GNN", "family_name": "Equivariant GNN"},
                 {"family_id": "FAM-GBDT", "family_name": "Modern GBDT + Graph Descriptors"},
             ],
+            simulator_code=valid_simulator,
+            evaluator_runner_code=valid_evaluator,
             candidate_baselines=[
-                {"name": "CAND_WEAK", "code": "def evaluate():\n    return {'frozen_score': 60.0, 'live_score': 59.0}\n"},
-                {"name": "CAND_STRONG", "code": "def evaluate():\n    return {'frozen_score': 88.5, 'live_score': 87.0}\n"},
+                {"name": "CAND_WEAK", "code": "import simulator\ndef solve_with_sim():\n    return simulator.run_physics(6.0)\n"},
+                {"name": "CAND_STRONG", "code": "import simulator\ndef solve_with_sim():\n    return simulator.run_physics(8.85)\n"},
             ],
         )
         self.assertEqual(lock_res["status"], "OK")
         self.assertAlmostEqual(lock_res["anchor_s0_score"], 88.5)
+        self.assertAlmostEqual(lock_res["s0_evaluation"]["scores"]["clearance_rate"], 0.85)
+        self.assertEqual(lock_res["s0_evaluation"]["scores"]["cascade_level"], "L3_ADVERSARIAL")
+        self.assertEqual(lock_res["s0_evaluation"]["diagnostics"]["waste_ratio"], 0.12)
         self.assertEqual(len(lock_res["candidate_tournament_log"]), 2)
-        self.assertIn("88.5", (self.tmp_dir / "shared_readonly" / "distilled" / "anchor_baseline.py").read_text(encoding="utf-8"))
+        self.assertIn("8.85", (self.tmp_dir / "shared_readonly" / "distilled" / "anchor_baseline.py").read_text(encoding="utf-8"))
 
     def test_02_surgical_replace_top_func_and_indented_class_method(self) -> None:
         """测试 §2.2 & §5.3：顶层函数与缩进类方法 (`Solver.step` 及单方法名) 的 AST 微创替换与缩进自动对齐"""

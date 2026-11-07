@@ -88,7 +88,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
     },
     {
         "name": "gw_lock_distillation",
-        "description": "【Phase 0 第二步】固化开局先蒸馏（Opening Distillation）四件套成果：写入现代正交 SOTA 方法族、过时模型禁用黑名单、调库 vs 造轮子边界清单、防踩坑红线卡，并在清洁室沙箱中实跑验分（支持传入多个 candidateBaselines 竞技选优）铸造【零号强基线 s_0】。",
+        "description": "【Phase 0 第二步：盲态造尺造锤 + 零号强基线铸造】固化开局先蒸馏（Opening Distillation）成果：1) 锁定只读物理模拟器 simulatorCode (写入 shared_readonly/simulator.py 并自动运行单元测试与反作弊检查)；2) 锁定特权盲态三级级联评测器 evaluatorRunnerCode (写入 .kernel_vault/evaluator_suite/evaluate_runner.py，物理隔离防节点篡改)；3) 写入现代正交 SOTA 方法族、过时模型黑名单、调库边界清单与防踩坑红线；4) 在沙箱中实跑验分铸造【零号强基线 s_0】。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -110,6 +110,14 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                         "required": ["family_id", "family_name"],
                     },
                     "description": "开局拆分的 2~4 个正交现代 SOTA 方法族列表",
+                },
+                "simulatorCode": {
+                    "type": "string",
+                    "description": "推荐（仿真/建模任务必传）：独立只读物理模拟器源码，引擎将写入 shared_readonly/simulator.py 并自动执行 def test_*(): 自检与防上帝视角作弊检查；所有孤岛可直接 import simulator 复用",
+                },
+                "evaluatorRunnerCode": {
+                    "type": "string",
+                    "description": "推荐（防篡改盲测必传）：独立三级级联盲态评测器源码（建议定义 def evaluate_candidate(cand_mod) -> dict 返回 frozen_score, live_score, clearance_rate, cascade_level, isomorphic_perturbation_gap, diagnostics），引擎将锁入特权库 .kernel_vault/evaluator_suite/evaluate_runner.py",
                 },
                 "anchorBaselineCode": {
                     "type": "string",
@@ -350,6 +358,8 @@ def handle_tool_call(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             obsolete_blacklist=args.get("obsoleteBlacklist"),
             must_reuse_libraries=args.get("mustReuseLibraries"),
             pitfall_guardrails=args.get("pitfallGuardrails"),
+            simulator_code=str(args.get("simulatorCode", "")),
+            evaluator_runner_code=str(args.get("evaluatorRunnerCode", "")),
         )
 
     if name == "gw_allocate_slot":

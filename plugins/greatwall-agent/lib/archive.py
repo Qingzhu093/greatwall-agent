@@ -213,10 +213,12 @@ class LightweightArchive:
             lb_lines.append("*(尚无提交记录，等待零号强基线 s_0 或首个探索分支入榜)*")
         else:
             for idx, item in enumerate(entries, 1):
+                cr_val = item.get("clearance_rate")
+                cr_str = f" | 真实清除率: `{float(cr_val)*100:.1f}%`" if isinstance(cr_val, (int, float)) else ""
                 lb_lines.append(
                     f"{idx}. **`[{item.get('node_id', 's_0')}]`** (Family: `{item.get('family_id', 'ANCHOR')}`, "
                     f"Commit: `{item.get('commit_hash', '')[:8]}`) — "
-                    f"**Frozen得分: `{item.get('frozen_score')}`** | Live得分: `{item.get('live_score')}` | "
+                    f"**Frozen得分: `{item.get('frozen_score')}`** | Live得分: `{item.get('live_score')}`{cr_str} | "
                     f"耗时: `{item.get('wall_time_sec', 0):.2f}s` | 摘要: {item.get('summary', '')}"
                 )
 
@@ -739,6 +741,8 @@ class LightweightArchive:
         wall_time_sec: float,
         summary: str,
         higher_is_better: bool = True,
+        clearance_rate: Optional[float] = None,
+        cascade_level: str = "L2_BENCHMARK",
     ) -> int:
         """在文件锁保护下幂等更新全局排行榜（按 `(node_id, commit_hash)` 自动去重）并返回当前排名 (1-based)"""
         with InterProcessFileLock(self.lock_file):
@@ -747,18 +751,20 @@ class LightweightArchive:
                 e for e in lb_data.get("entries", [])
                 if not (e.get("node_id") == node_id and e.get("commit_hash") == commit_hash)
             ]
-            entries.append(
-                {
-                    "node_id": node_id,
-                    "family_id": family_id,
-                    "commit_hash": commit_hash,
-                    "frozen_score": frozen_score,
-                    "live_score": live_score,
-                    "wall_time_sec": wall_time_sec,
-                    "summary": summary[:120],
-                    "timestamp": time.time(),
-                }
-            )
+            entry_item: Dict[str, Any] = {
+                "node_id": node_id,
+                "family_id": family_id,
+                "commit_hash": commit_hash,
+                "frozen_score": frozen_score,
+                "live_score": live_score,
+                "cascade_level": cascade_level,
+                "wall_time_sec": wall_time_sec,
+                "summary": summary[:120],
+                "timestamp": time.time(),
+            }
+            if clearance_rate is not None:
+                entry_item["clearance_rate"] = round(float(clearance_rate), 6)
+            entries.append(entry_item)
             entries.sort(
                 key=lambda x: (x.get("frozen_score", 0.0), x.get("live_score", 0.0)),
                 reverse=higher_is_better,

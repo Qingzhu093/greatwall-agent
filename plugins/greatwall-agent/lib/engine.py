@@ -272,9 +272,13 @@ class GreatWallEngine:
         anchor_baseline_code: str = "",
         candidate_baselines: Optional[List[Dict[str, str]]] = None,
         commonsense_blacklist: Optional[List[str]] = None,
+        simulator_code: str = "",
+        evaluator_runner_code: str = "",
     ) -> Dict[str, Any]:
         r"""
-        固化 Phase 0 开局蒸馏四件套，并在沙箱中实跑验分铸造【零号强基线 s_0】(§2.3)：
+        固化 Phase 0 开局蒸馏四件套 + 盲态造尺造锤 (`simulator.py` & `evaluate_runner.py`)，并在沙箱中实跑验分铸造【零号强基线 s_0】(§2.3)：
+        - 若传入 `simulator_code`，写入 `shared_readonly/simulator.py` 并运行自检单元测试 + 上帝视角反作弊扫描；
+        - 若传入 `evaluator_runner_code`，写入 `.kernel_vault/evaluator_suite/evaluate_runner.py` 锁定盲态三级级联评测器；
         - 支持传入单个 `anchor_baseline_code` 或多个候选基线 `candidate_baselines: [{"name": "...", "code": "..."}]`；
         - 当传入 M 个候选基线时，在隔离沙箱中逐一实跑评测，按验证分 $h(s_{(1)}) \ge \dots \ge h(s_{(M)})$ 排序择优（满足 $h(s_{cand}) > h(s_0) + \epsilon_{min}$ 贪心晋级），锁入 `anchor_baseline.py`！
         """
@@ -284,6 +288,18 @@ class GreatWallEngine:
                 raise RuntimeError("工作区尚未初始化，请先调用 gw_init_campaign！")
 
             higher_is_better = bool(state.get("higher_is_better", True))
+
+            simulator_status: Optional[Dict[str, Any]] = None
+            if simulator_code.strip():
+                simulator_status = self.evaluator.install_readonly_simulator(simulator_code)
+                if simulator_status.get("status") != "OK":
+                    return simulator_status
+
+            evaluator_status: Optional[Dict[str, Any]] = None
+            if evaluator_runner_code.strip():
+                evaluator_status = self.evaluator.install_blind_evaluator_runner(evaluator_runner_code)
+                if evaluator_status.get("status") != "OK":
+                    return evaluator_status
 
             sota_pack = {
                 "obsolete_familiarity_blacklist": obsolete_blacklist or [
@@ -397,6 +413,8 @@ class GreatWallEngine:
                         wall_time_sec=float(s0_eval_receipt["resource_profile"]["wall_time_sec"]),
                         summary=f"Phase 0 开局蒸馏实跑选优固化的零号强基线 s_0 (共竞技 {len(candidates_to_run)} 个候选)",
                         higher_is_better=higher_is_better,
+                        clearance_rate=s0_eval_receipt["scores"].get("clearance_rate"),
+                        cascade_level=str(s0_eval_receipt["scores"].get("cascade_level", "L2_BENCHMARK")),
                     )
 
             # 初始化各正交方法族的谱系追踪 (Lineage BeliefState)
@@ -417,6 +435,10 @@ class GreatWallEngine:
 
             state["anchor_s0_commit"] = s0_commit
             state["anchor_s0_score"] = s0_score
+            if simulator_status:
+                state["readonly_simulator_locked"] = True
+            if evaluator_status:
+                state["blind_evaluator_locked"] = True
             self.save_state(state)
             self.archive.rebuild_l0_index()
             self._append_wal("LOCK_DISTILLATION", {"s0_commit": s0_commit, "s0_score": s0_score, "candidates": len(candidates_to_run)})
@@ -425,6 +447,8 @@ class GreatWallEngine:
                 "status": "OK",
                 "anchor_s0_commit": s0_commit,
                 "anchor_s0_score": s0_score,
+                "simulator_locked": simulator_status,
+                "evaluator_locked": evaluator_status,
                 "candidate_tournament_log": candidate_tournament_log,
                 "registered_families": [f.get("family_id") for f in orthogonal_families],
                 "s0_evaluation": s0_eval_receipt,
@@ -675,6 +699,8 @@ class GreatWallEngine:
                 wall_time_sec=float(receipt["resource_profile"]["wall_time_sec"]),
                 summary=slot_info.get("hypothesis", ""),
                 higher_is_better=bool(state.get("higher_is_better", True)),
+                clearance_rate=receipt["scores"].get("clearance_rate"),
+                cascade_level=str(receipt["scores"].get("cascade_level", "L2_BENCHMARK")),
             )
 
             # 3. 读取遗嘱提案排入调度器队列
@@ -1007,13 +1033,15 @@ class GreatWallEngine:
 
         table_lines = [
             "## 📊 独立沙箱实测性能演进总表（由内核从 HMAC 签名收据硬绑定生成）\n",
-            "| 排名 | 节点编号 | 方法族 (Family) | 快照 Commit | Frozen 基准得分 | Live 挑战得分 | 运行耗时 (s) | 核心改进摘要 |",
-            "| :---: | :--- | :--- | :--- | :---: | :---: | :---: | :--- |",
+            "| 排名 | 节点编号 | 方法族 (Family) | 快照 Commit | Frozen 基准得分 | Live 挑战得分 | 真实清除率 | 耗时 (s) | 核心改进摘要 |",
+            "| :---: | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :--- |",
         ]
         for idx, item in enumerate(entries[:10], 1):
+            cr_val = item.get("clearance_rate")
+            cr_str = f"**{float(cr_val)*100:.1f}%**" if isinstance(cr_val, (int, float)) else "N/A"
             table_lines.append(
                 f"| {idx} | `{item['node_id']}` | `{item['family_id']}` | `{item['commit_hash'][:8]}` | "
-                f"**{item['frozen_score']:.6f}** | {item['live_score']:.6f} | {item['wall_time_sec']:.2f} | {item['summary']} |"
+                f"**{item['frozen_score']:.6f}** | {item['live_score']:.6f} | {cr_str} | {item['wall_time_sec']:.2f} | {item['summary']} |"
             )
 
         report_content = (
@@ -1030,6 +1058,9 @@ class GreatWallEngine:
         best_snap_files = self.sandbox.snapshots_dir / best_commit / "files"
         if best_snap_files.exists():
             shutil.copytree(best_snap_files, code_out_dir, dirs_exist_ok=True)
+        readonly_sim = self.sandbox.shared_readonly_dir / "simulator.py"
+        if readonly_sim.exists():
+            shutil.copy2(readonly_sim, code_out_dir / "simulator.py")
         if self.archive.primitives_dir.exists():
             shutil.copytree(self.archive.primitives_dir, code_out_dir / "primitives", dirs_exist_ok=True)
             # 同时保留 archive/ledger/primitives 包结构，确保脱机运行 `from archive.ledger.primitives.xxx import yyy` 100% 自包含不报错

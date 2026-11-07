@@ -439,6 +439,88 @@ class IsolatedEvaluator:
 
         return obsolete_list, commonsense_list, data_modalities
 
+    def install_readonly_simulator(self, simulator_code: str) -> Dict[str, Any]:
+        """
+        【Phase 0 盲态造锤】：安装并自检只读物理模拟器 `shared_readonly/simulator.py`。
+        - 执行 AST 语法与反作弊检查（严禁暴露 `is_all_cleared` 等题面未授权的上帝视角完成信号）；
+        - 写入 `shared_readonly/simulator.py`（所有探索孤岛可直接 `import simulator` 且受 `hook_gate.py` 只读保护）；
+        - 自动在隔离沙箱中运行 `simulator.py` 内的 `def test_*():` 单元测试，确保物理规则 100% 跑通！
+        """
+        try:
+            tree = ast.parse(simulator_code)
+        except SyntaxError as e:
+            return {
+                "status": "SIMULATOR_SYNTAX_ERROR",
+                "message": f"simulator.py 存在 Python 语法错误 (第 {e.lineno} 行): {e.msg}",
+            }
+
+        # 严禁在模拟器返回值或公开属性中塞入 `is_all_cleared` 等上帝视角作弊信号
+        forbidden_signals = [
+            n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id in ("is_all_cleared", "god_mode_targets")
+        ]
+        if forbidden_signals:
+            return {
+                "status": "SIMULATOR_CHEAT_SIGNAL_DETECTED",
+                "message": f"simulator.py 中检测到违规的上帝视角完成信号 `{sorted(set(forbidden_signals))}`，违反物理保真盲态原则！",
+            }
+
+        test_funcs = [
+            n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test_")
+        ]
+        sim_path = self.shared_readonly_dir / "simulator.py"
+        sim_path.parent.mkdir(parents=True, exist_ok=True)
+        sim_path.write_text(simulator_code, encoding="utf-8")
+
+        runner_code = (
+            f"import importlib.util, sys\n"
+            f"spec = importlib.util.spec_from_file_location('simulator', r'{str(sim_path.resolve())}')\n"
+            f"mod = importlib.util.module_from_spec(spec)\n"
+            f"spec.loader.exec_module(mod)\n"
+            f"for fn_name in {test_funcs!r}:\n"
+            f"    getattr(mod, fn_name)()\n"
+            f"print('SIMULATOR_SELF_TEST_OK')\n"
+        )
+        run_res = run_bounded_subprocess(
+            cmd=[sys.executable, "-c", runner_code],
+            cwd=self.shared_readonly_dir,
+            shared_readonly_dir=self.shared_readonly_dir,
+            timeout_sec=30.0,
+            max_memory_mb=2048,
+        )
+        if run_res.exit_code != 0 or "SIMULATOR_SELF_TEST_OK" not in run_res.stdout:
+            err_detail = (run_res.stderr or run_res.stdout).strip()[-400:]
+            return {
+                "status": "SIMULATOR_SELF_TEST_FAILED",
+                "message": f"simulator.py 沙箱自检未通过 (exit={run_res.exit_code}): {err_detail}",
+            }
+
+        return {
+            "status": "OK",
+            "simulator_path": str(sim_path),
+            "unit_tests_passed": test_funcs,
+        }
+
+    def install_blind_evaluator_runner(self, evaluator_runner_code: str) -> Dict[str, Any]:
+        """
+        【Phase 0 盲态造尺】：将特权三级级联评测器写入 `.kernel_vault/evaluator_suite/evaluate_runner.py`。
+        探索节点对 `.kernel_vault` 物理不可见且不可写，彻底杜绝节点篡改 `evaluate()` 自评规则！
+        """
+        try:
+            ast.parse(evaluator_runner_code)
+        except SyntaxError as e:
+            return {
+                "status": "EVALUATOR_SYNTAX_ERROR",
+                "message": f"evaluate_runner.py 存在 Python 语法错误 (第 {e.lineno} 行): {e.msg}",
+            }
+
+        runner_path = self.eval_suite_dir / "evaluate_runner.py"
+        runner_path.parent.mkdir(parents=True, exist_ok=True)
+        runner_path.write_text(evaluator_runner_code, encoding="utf-8")
+        return {
+            "status": "OK",
+            "evaluator_runner_path": str(runner_path),
+        }
+
     def evaluate_island(
         self,
         island_dir: Path,
@@ -495,16 +577,14 @@ class IsolatedEvaluator:
         deprecated_cases = self.get_deprecated_cases()
 
         if custom_eval_runner.exists():
-            cmd = [
-                sys.executable,
-                str(custom_eval_runner),
-                "--candidate-script",
-                str(script_path.resolve()),
-                "--island-dir",
-                str(island_dir.resolve()),
-                "--run-nonce",
-                run_nonce,
-            ]
+            harness_code = self._build_custom_eval_harness(
+                runner_abs_path=str(custom_eval_runner.resolve()),
+                script_abs_path=str(script_path.resolve()),
+                island_abs_dir=str(island_dir.resolve()),
+                run_nonce=run_nonce,
+                deprecated_cases=deprecated_cases,
+            )
+            cmd = [sys.executable, "-c", harness_code]
         else:
             harness_code = self._build_builtin_eval_harness(str(script_path.resolve()), run_nonce, deprecated_cases)
             cmd = [sys.executable, "-c", harness_code]
@@ -545,6 +625,12 @@ class IsolatedEvaluator:
         iso_gap = float(parsed_metrics.get("isomorphic_perturbation_gap", 0.0))
         niche_score = float(parsed_metrics.get("niche_hard_cases_score", live_score))
 
+        # 显式提取真实目标清除率/通过率 (clearance_rate) 与三级级联状态 (cascade_level)，彻底杜绝与含惩罚总分混淆
+        raw_clearance = parsed_metrics.get("clearance_rate", parsed_metrics.get("pass_rate"))
+        clearance_rate: Optional[float] = round(float(raw_clearance), 6) if isinstance(raw_clearance, (int, float)) else None
+        cascade_level = str(parsed_metrics.get("cascade_level", "L2_BENCHMARK"))
+        diagnostics: Dict[str, Any] = parsed_metrics.get("diagnostics", {}) if isinstance(parsed_metrics.get("diagnostics"), dict) else {}
+
         # 3. 同构变换扰动防背题检验
         if iso_gap > 0.05:
             return {
@@ -564,20 +650,26 @@ class IsolatedEvaluator:
 
         # 5. 签发带 HMAC-SHA256 签名的防伪成绩单收据
         sig = self.sign_receipt(node_id, commit_hash, run_nonce, frozen_score, live_score)
-        receipt = {
+        scores_dict: Dict[str, Any] = {
+            "frozen_benchmark": round(frozen_score, 6),
+            "live_challenge": round(live_score, 6),
+            "isomorphic_perturbation_gap": round(iso_gap, 6),
+            "niche_hard_cases_score": round(niche_score, 6),
+            "cascade_level": cascade_level,
+        }
+        if clearance_rate is not None:
+            scores_dict["clearance_rate"] = clearance_rate
+
+        receipt: Dict[str, Any] = {
             "receipt_id": f"RCPT-{int(time.time())}-{node_id}",
             "node_id": node_id,
             "commit_hash": commit_hash,
             "run_nonce": run_nonce,
             "hmac_sha256_signature": sig,
             "triage_tier": triage_tier,
-            "scores": {
-                "frozen_benchmark": round(frozen_score, 6),
-                "live_challenge": round(live_score, 6),
-                "isomorphic_perturbation_gap": round(iso_gap, 6),
-                "niche_hard_cases_score": round(niche_score, 6),
-            },
+            "scores": scores_dict,
             "case_scores": case_scores,
+            "diagnostics": diagnostics,
             "resource_profile": {
                 "wall_time_sec": sub_res.wall_time_sec,
                 "peak_memory_mb": sub_res.peak_memory_mb,
@@ -820,10 +912,82 @@ print("__GW_DIFF_JSON__:" + json.dumps(results))
             return "DEAD_END_ARCHIVE"
 
     @staticmethod
+    def _build_custom_eval_harness(
+        runner_abs_path: str,
+        script_abs_path: str,
+        island_abs_dir: str,
+        run_nonce: str,
+        deprecated_cases: Optional[Set[str]] = None,
+    ) -> str:
+        """
+        构建跨进程特权外部评测驱动脚本 (`evaluate_runner.py`)：
+        - 优先检查 `evaluate_runner.py` 是否定义了 `evaluate_candidate(cand_mod)` 或 `evaluate_script(script_path)`；
+        - 若未定义上述函数，则自动以 CLI 方式 (`--candidate-script ... --island-dir ... --run-nonce ...`) 执行 `evaluate_runner.py`；
+        - 自动剔除勘误表 (`deprecated_cases`) 中的废弃错题并输出标准 `__GW_METRICS_JSON__:`。
+        """
+        dep_list = sorted(deprecated_cases or [])
+        return f"""
+import importlib.util, json, runpy, sys
+
+runner_path = r"{runner_abs_path}"
+script_path = r"{script_abs_path}"
+island_dir = r"{island_abs_dir}"
+run_nonce = "{run_nonce}"
+deprecated = set({json.dumps(dep_list)})
+
+spec_eval = importlib.util.spec_from_file_location("gw_eval_runner", runner_path)
+eval_mod = importlib.util.module_from_spec(spec_eval)
+spec_eval.loader.exec_module(eval_mod)
+
+res = None
+if hasattr(eval_mod, "evaluate_candidate") and callable(eval_mod.evaluate_candidate):
+    spec_cand = importlib.util.spec_from_file_location("cand_mod", script_path)
+    cand_mod = importlib.util.module_from_spec(spec_cand)
+    spec_cand.loader.exec_module(cand_mod)
+    res = eval_mod.evaluate_candidate(cand_mod)
+elif hasattr(eval_mod, "evaluate_script") and callable(eval_mod.evaluate_script):
+    res = eval_mod.evaluate_script(script_path)
+else:
+    sys.argv = [
+        runner_path,
+        "--candidate-script", script_path,
+        "--island-dir", island_dir,
+        "--run-nonce", run_nonce,
+    ]
+    runpy.run_path(runner_path, run_name="__main__")
+    sys.exit(0)
+
+metrics = {{"frozen_score": 0.0, "live_score": 0.0, "isomorphic_perturbation_gap": 0.0, "niche_hard_cases_score": 0.0, "case_scores": {{}}, "diagnostics": {{}}}}
+if isinstance(res, dict):
+    for k, v in res.items():
+        if isinstance(v, (int, float)):
+            metrics[k] = float(v)
+        elif isinstance(v, str):
+            metrics[k] = v
+        elif k == "case_scores" and isinstance(v, dict):
+            metrics["case_scores"] = {{str(ck): float(cv) for ck, cv in v.items() if isinstance(cv, (int, float))}}
+        elif k == "diagnostics" and isinstance(v, dict):
+            metrics["diagnostics"] = v
+    if metrics["case_scores"]:
+        valid_vals = [val for cid, val in metrics["case_scores"].items() if cid not in deprecated]
+        if valid_vals and "frozen_score" not in res:
+            avg_s = sum(valid_vals) / len(valid_vals)
+            metrics["frozen_score"] = avg_s
+            metrics["live_score"] = avg_s
+            metrics["niche_hard_cases_score"] = avg_s
+elif isinstance(res, (int, float)):
+    metrics["frozen_score"] = float(res)
+    metrics["live_score"] = float(res)
+    metrics["niche_hard_cases_score"] = float(res)
+
+print("__GW_METRICS_JSON__:" + json.dumps(metrics))
+"""
+
+    @staticmethod
     def _build_builtin_eval_harness(script_abs_path: str, run_nonce: str, deprecated_cases: Optional[Set[str]] = None) -> str:
         """
         构建跨进程内置评测驱动脚本：
-        - 若被测模块定义了 `evaluate()`，直接调用（支持返回含 `case_scores` 的字典）；
+        - 若被测模块定义了 `evaluate()`，直接调用（支持返回含 `case_scores`、`clearance_rate`、`diagnostics` 的字典）；
         - 若被测模块定义了 `solve(inputs)`，自动用标准算例与打乱顺序后的同构算例分别测试，检验是否背题号；
         - 输出带 `__GW_METRICS_JSON__:` 前缀的纯数据行。
         """
@@ -836,7 +1000,7 @@ mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
 deprecated = set({json.dumps(dep_list)})
-metrics = {{"frozen_score": 0.0, "live_score": 0.0, "isomorphic_perturbation_gap": 0.0, "niche_hard_cases_score": 0.0, "case_scores": {{}}}}
+metrics = {{"frozen_score": 0.0, "live_score": 0.0, "isomorphic_perturbation_gap": 0.0, "niche_hard_cases_score": 0.0, "case_scores": {{}}, "diagnostics": {{}}}}
 
 if hasattr(mod, "evaluate") and callable(mod.evaluate):
     res = mod.evaluate()
@@ -844,8 +1008,12 @@ if hasattr(mod, "evaluate") and callable(mod.evaluate):
         for k, v in res.items():
             if isinstance(v, (int, float)):
                 metrics[k] = float(v)
+            elif isinstance(v, str):
+                metrics[k] = v
             elif k == "case_scores" and isinstance(v, dict):
                 metrics["case_scores"] = {{str(ck): float(cv) for ck, cv in v.items() if isinstance(cv, (int, float))}}
+            elif k == "diagnostics" and isinstance(v, dict):
+                metrics["diagnostics"] = v
         if metrics["case_scores"]:
             valid_vals = [val for cid, val in metrics["case_scores"].items() if cid not in deprecated]
             if valid_vals and "frozen_score" not in res:

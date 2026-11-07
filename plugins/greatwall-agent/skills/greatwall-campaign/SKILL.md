@@ -24,9 +24,12 @@ description: 长城 Agent V4.2 无人值守科研与竞赛全周期编排技能�
 1. **数据静态探针（EDA Grounding）**：将解析后的题面与公开数据集放入 `<workspace>/shared_readonly/datasets_public/`，调用 `gw_init_campaign` 自动执行确定性 EDA 探针并生成 `eda_probe_report.json`，锁死 `task_config.yaml`（**绝对禁止在盘中分裂 $A / \neg A$ 歧义分支**）。
 2. **盲态造尺锁定（Immutable Evaluator Suite）**：在 `.kernel_vault/evaluator_suite/evaluate_runner.py` 中锁死独立评测器（严格对齐官方单狗/边界/无作弊完成信号规则，分离输出综合得分与真实目标清除率 `clearance_rate` 等分项诊断指标），严禁后续探索节点篡改评测逻辑。
 
-### Step 0.2：委派 `gw-distiller` 开局知识蒸馏与铸造【零号强基线 $s_0$】(`gw_lock_distillation`)
+### Step 0.2：委派 `gw-distiller` 盲态造锤造尺、开局知识蒸馏与铸造【零号强基线 $s_0$】(`gw_lock_distillation`)
 1. **强制调用 `invoke_subagent(TypeName="gw-distiller")`**：在独立上下文中检索近 3 年同类任务现代 SOTA 方案，划清《反预训练偏见黑名单》与《调库 vs 造轮子边界清单》。
-2. 编写 1~3 个结构清晰、模块化分块的候选基线代码（拆分为 `extract_features`、`solve` 等独立代码块），调用 `gw_lock_distillation` 在沙箱实跑竞技选优，铸造【零号强基线 $s_0$】（测定 `anchor_s0_score`）。
+2. **一等公民锁定物理模拟器与盲态评测器（杜绝模拟器和 `evaluate()` 混入 `src/main.py`）**：
+   - 在调用 `gw_lock_distillation` 时，必须通过 `simulatorCode` 传入带 `def test_*():` 自检函数的独立物理模拟器（引擎自动验证无 `is_all_cleared` 作弊信号后写入 `shared_readonly/simulator.py` 供所有孤岛只读 `import simulator`）；
+   - 必须通过 `evaluatorRunnerCode` 传入定义有 `def evaluate_candidate(cand_mod) -> dict:` 的三级级联盲态评测器（引擎自动锁入 `.kernel_vault/evaluator_suite/evaluate_runner.py`，显式分离输出 `clearance_rate` 真实清除率、`cascade_level` 与 `frozen_score` 含惩罚折合分）。
+3. **候选基线竞技选优**：编写 1~3 个结构清晰、通过 `import simulator` 调用环境的候选基线代码，传入 `candidateBaselines`（或 `anchorBaselineCode`），在沙箱实跑竞技选优铸造【零号强基线 $s_0$】（测定 `anchor_s0_score` 与基线真实清除率）。
 
 ---
 
