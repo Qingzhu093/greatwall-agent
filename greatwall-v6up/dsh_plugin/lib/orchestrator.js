@@ -406,10 +406,10 @@ export class GreatwallOrchestrator {
               shortTransaction: false,
               signal: sig,
               taskContextText: this._appendInterventions(
-                `### 当前课题与子题列表\n${snap.goal_md || ''}\n### 子题契约\n${JSON.stringify(snap.contracts || {}, null, 2)}`,
+                `### 当前课题与子题列表\n${snap.goal_md || ''}\n### 子题契约\n${JSON.stringify(snap.contracts || {}, null, 2)}${snap.invalid_protocol_hooks?.length ? `\n### 协议自检未通过钩子\n${JSON.stringify(snap.invalid_protocol_hooks, null, 2)}` : ''}`,
                 'works_engineer',
               ),
-              prompt: `Stage 1 (Parse 0)：请为子题 ${snap.missing_hooks_or_fidelity.join(', ')} 编写各自隔离基线 baselines/baseline_<Q>.py 与钩子 evaluators/hooks/hook_<Q>.py（metrics 含 rank_score 且严禁 mpmath 慢循环），并调用 register_question_domain_hook 逐一注册（必须传入 public_input_sample，保证误差 <5%）。`,
+              prompt: `Stage 1 (Parse 0)：请为子题 ${snap.missing_hooks_or_fidelity.join(', ')} 编写各自隔离基线 baselines/baseline_<Q>.py 与钩子 evaluators/hooks/hook_<Q>.py。\n强制要求：钩子文件必须导出 def evaluate_candidate(cand_data, spec): 并严格返回 {"passed": bool, "metrics": {"rank_score": float, ...}, "details": str}（严禁只写 compute_metrics 或使用 valid 键，严禁 mpmath 慢循环），并调用 register_question_domain_hook 逐一注册（必须传入 public_input_sample，保证误差 <5%）。`,
             }),
           )
           continue
@@ -500,15 +500,24 @@ export class GreatwallOrchestrator {
         }
       }
 
-      if (snap.open_works_tickets?.length > 0 || snap.pending_revalidation?.length > 0) {
+      const brokenHooks = snap.invalid_protocol_hooks || []
+      const brokenQSet = new Set(snap.protocol_broken_questions || brokenHooks.map((h) => h.question_id))
+      if (brokenHooks.length > 0 || snap.open_works_tickets?.length > 0 || snap.pending_revalidation?.length > 0) {
         if (this._launchGovTask('works:queue', () =>
           this.spawnAndRunAgent({
             role: 'works_engineer',
-            uiLabel: '[工造司] 痛点/局部重评',
+            uiLabel: brokenHooks.length > 0
+              ? `[工造司] 协议熔断修复 (${brokenHooks.map((h) => h.question_id).join(',')})`
+              : '[工造司] 痛点/局部重评',
             shortTransaction: false,
             signal: sig,
-            taskContextText: this._appendInterventions('', 'works_engineer'),
-            prompt: '请调 get_works_engineering_queue 检查未处理痛点与待重评队列：存在待重评观测请逐条调 recompute_stage_b_only；需要升版钩子请走 upgrade_hook_with_rqgm_gate。',
+            taskContextText: this._appendInterventions(
+              brokenHooks.length > 0 ? `### 协议熔断钩子清单\n${JSON.stringify(brokenHooks, null, 2)}` : '',
+              'works_engineer',
+            ),
+            prompt: brokenHooks.length > 0
+              ? `发现 ${brokenHooks.length} 个子题在位验证钩子触发协议熔断 (${brokenHooks.map((h) => h.question_id).join(', ')})：缺失 evaluate_candidate(cand_data, spec) 或未返回 {"passed": bool, "metrics": {"rank_score": float}, "details": str}！\n请先调 get_works_engineering_queue 查看现有钩子路径，立即重写这些钩子脚本使其导出 def evaluate_candidate(cand_data, spec): 并严格返回 {"passed": bool, "metrics": {"rank_score": float, ...}, "details": str}（禁仅写 compute_metrics 或 valid 键），随后直接调用 register_question_domain_hook 覆盖修复（熔断态已自动解锁重注册），最后若队列中有待重评观测请逐条调 recompute_stage_b_only！`
+              : '请调 get_works_engineering_queue 检查未处理痛点与待重评队列：存在待重评观测请逐条调 recompute_stage_b_only；需要升版钩子请走 upgrade_hook_with_rqgm_gate。',
           }),
         )) {
           dispatchedSomething = true
@@ -596,6 +605,7 @@ export class GreatwallOrchestrator {
       for (const node of snap.explorers_ready_to_run || []) {
         if (this._runningExplorers.size >= slotCap) break
         if (this._runningExplorers.has(node.node_id)) continue
+        if (brokenQSet.has(node.question_id)) continue
         dispatchedSomething = true
         this._launchExplorerWorker(node, snap, sig)
       }

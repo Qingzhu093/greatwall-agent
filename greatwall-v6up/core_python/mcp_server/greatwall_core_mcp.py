@@ -576,7 +576,11 @@ def dispatch_control_call(method: str, params: dict[str, Any] | None) -> dict[st
             )
             return {"ok": True, "data": res}
         if method == "control_plane/schedule_snapshot":
-            res = schedule_control_plane_snapshot(conn, max_concurrent_workers=p.get("max_concurrent_workers"))
+            res = schedule_control_plane_snapshot(
+                conn,
+                max_concurrent_workers=p.get("max_concurrent_workers"),
+                workspace_root=eff_ws,
+            )
             return {"ok": True, "data": res}
         if method == "control_plane/sync_pressure":
             res = sync_session_pressure(conn, node_id=str(p["node_id"]), pressure_tokens=int(p["pressure_tokens"]))

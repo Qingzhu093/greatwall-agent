@@ -12,8 +12,11 @@
 
 from __future__ import annotations
 
+import ast
+import copy
 import hashlib
 import importlib.util
+import inspect
 import json
 import math
 import os
@@ -263,6 +266,134 @@ def _fail_verdict(
         "comparable_rank_score": None,
         "failure_category": failure_category,
     }
+
+
+def _validate_eval_fn_ast_returns(hook_file: Path, entry_name: str) -> str | None:
+    """静态检查钩子函数体直接返回的字典字面量，防止含 valid/缺 passed|metrics|details 的旧/假协议通过。"""
+    try:
+        tree = ast.parse(hook_file.read_text(encoding="utf-8", errors="replace"), filename=str(hook_file))
+    except SyntaxError as exc:
+        return f"钩子语法错误: {exc}"
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == entry_name:
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Return) and isinstance(sub.value, ast.Dict):
+                    keys = {k.value for k in sub.value.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+                    missing = [k for k in ("passed", "metrics", "details") if k not in keys]
+                    if missing:
+                        return f"{entry_name} 返回字典字面量缺少必需字段 {missing}（当前键={sorted(keys)}）"
+            return None
+    return None
+
+
+def _run_baseline_probe_output(baseline_file: Path | None, sample_payload: dict[str, Any] | None) -> tuple[dict[str, Any] | None, bool]:
+    """若同题 baseline 导出了 run(public_input) 且 sample_payload 非空，实跑获取真实 Stage A 载荷用于冒烟测试。"""
+    if baseline_file is None or not baseline_file.is_file() or not sample_payload:
+        return None, False
+    try:
+        bspec = importlib.util.spec_from_file_location("_gw_baseline_probe", str(baseline_file))
+        if bspec is None or bspec.loader is None:
+            return None, False
+        bmod = importlib.util.module_from_spec(bspec)
+        bspec.loader.exec_module(bmod)
+        run_fn = getattr(bmod, "run", None)
+        if not callable(run_fn):
+            return None, False
+        out = run_fn(copy.deepcopy(sample_payload))
+        if isinstance(out, dict):
+            return out, True
+    except Exception:
+        return None, False
+    return None, False
+
+
+def _validate_hook_return_contract(raw_res: Any, entry_name: str) -> tuple[bool, str]:
+    """严格校验钩子返回是否符合 {passed: bool, metrics: dict, details: str} 协议。"""
+    if not isinstance(raw_res, dict):
+        return False, f"{entry_name} 返回值必须为 dict，实收 {type(raw_res).__name__}"
+    if "passed" not in raw_res or not isinstance(raw_res["passed"], bool):
+        return False, f"{entry_name} 返回缺少布尔型 'passed' 字段（严禁用 'valid' 替代；实收键={sorted(raw_res.keys())}）"
+    if "metrics" not in raw_res or not isinstance(raw_res["metrics"], dict):
+        return False, f"{entry_name} 返回缺少字典型 'metrics' 字段（实收键={sorted(raw_res.keys())}）"
+    if "details" not in raw_res or not isinstance(raw_res["details"], str):
+        return False, f"{entry_name} 返回缺少字符串型 'details' 字段（实收键={sorted(raw_res.keys())}）"
+    return True, "OK"
+
+
+def probe_domain_hook_protocol(
+    hook_path: str | Path,
+    sample_payload: dict[str, Any] | None = None,
+    baseline_path: str | Path | None = None,
+    spec: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """对验证钩子执行导出签名 + Smoke Call 协议检验，阻止求解器或非标返回值误锁入 Stage 2。"""
+    hook_file = Path(hook_path)
+    if not hook_file.is_file():
+        return False, f"钩子文件不存在: {hook_file}"
+    try:
+        mod_spec = importlib.util.spec_from_file_location("_gw_domain_hook_probe", str(hook_file))
+        if mod_spec is None or mod_spec.loader is None:
+            return False, f"无法加载钩子模块: {hook_file}"
+        hook_mod = importlib.util.module_from_spec(mod_spec)
+        mod_spec.loader.exec_module(hook_mod)
+    except Exception as exc:
+        return False, f"加载钩子模块失败: {type(exc).__name__}: {exc}"
+
+    entry_name = ""
+    eval_fn = getattr(hook_mod, "evaluate_candidate", None)
+    if callable(eval_fn):
+        entry_name = "evaluate_candidate"
+    else:
+        eval_legacy = getattr(hook_mod, "evaluate", None)
+        if callable(eval_legacy):
+            eval_fn = eval_legacy
+            entry_name = "evaluate"
+
+    if not callable(eval_fn):
+        return (
+            False,
+            "钩子缺少必需的可调用入口 evaluate_candidate(cand_data, spec)（严禁仅提供 compute_metrics / solve）",
+        )
+
+    try:
+        sig = inspect.signature(eval_fn)
+        sig.bind({}, {})
+    except TypeError as exc:
+        return False, f"{entry_name} 参数签名不兼容 (cand_data, spec): {exc}"
+
+    ast_err = _validate_eval_fn_ast_returns(hook_file, entry_name)
+    if ast_err:
+        return False, ast_err
+
+    base_file = Path(baseline_path) if baseline_path else None
+    sample_dict = dict(sample_payload) if isinstance(sample_payload, dict) else {}
+    baseline_out, from_baseline = _run_baseline_probe_output(base_file, sample_dict)
+    probe_art = baseline_out if baseline_out is not None else dict(sample_dict)
+    probe_spec = dict(spec or {})
+
+    # 执行 Smoke Call：遇 KeyError（缺特定输出字段且无 baseline.run）时填充探测浮点重试最多 4 次
+    for _ in range(5):
+        try:
+            raw_res = eval_fn(copy.deepcopy(probe_art), copy.deepcopy(probe_spec))
+            return _validate_hook_return_contract(raw_res, entry_name)
+        except KeyError as ke:
+            missing_k = ke.args[0] if ke.args else None
+            if isinstance(missing_k, str) and missing_k not in probe_art and not from_baseline:
+                probe_art[missing_k] = 1.0
+                continue
+            return False, f"Smoke Test 运行 {entry_name} 缺少字段 KeyError: {ke}"
+        except TypeError as te:
+            return False, f"Smoke Test 调用 {entry_name} 类型错误: {te}"
+        except ValueError as ve:
+            if not from_baseline and not sample_dict:
+                # 无基准输出也无样例时，严谨钩子按契约对空输入 raise ValueError 属于预期；已过签名与 AST 字面量检查
+                return True, "OK"
+            return False, f"Smoke Test 调用 {entry_name} 在样例输出上抛出 ValueError: {ve}"
+        except Exception as exc:
+            if not from_baseline and not sample_dict:
+                return False, f"Smoke Test 调用 {entry_name} 异常: {type(exc).__name__}: {exc}"
+            return False, f"Smoke Test 在 baseline/样例输出上调用 {entry_name} 崩溃: {type(exc).__name__}: {exc}"
+    return False, f"Smoke Test 重试填充后仍无法完成 {entry_name} 调用"
 
 
 def _stage_b_evaluate(domain: str, spec: dict[str, Any], cand_out_path: Path) -> dict[str, Any]:

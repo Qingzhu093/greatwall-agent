@@ -20,6 +20,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from evaluators.isolated_runner import probe_domain_hook_protocol
+
 from .db_schema import (
     ERR_INVALID_INPUT,
     ERR_LOCKED,
@@ -29,7 +31,7 @@ from .db_schema import (
     rw_immediate_tx,
     utc_now_iso,
 )
-from .mcp_core_helpers import load_runtime_config
+from .mcp_core_helpers import core_python_root, load_runtime_config
 
 _SENSITIVE_COMMENT_RE = re.compile(
     r"\b(?:branch|node|session|explorer|author)_[a-zA-Z0-9_-]+\b"
@@ -359,7 +361,101 @@ def get_question_dependency_status(
     return status_map
 
 
-def schedule_control_plane_snapshot(conn: sqlite3.Connection, max_concurrent_workers: int | None = None) -> dict[str, Any]:
+def _resolve_ws_hint(conn: sqlite3.Connection, workspace_root: str) -> Path | None:
+    """尽最大努力获取当前工作区物理根，供控制面健康探针定位钩子文件。"""
+    if str(workspace_root or "").strip():
+        p = Path(os.path.realpath(workspace_root))
+        if p.is_dir():
+            return p
+    row = conn.execute(
+        "SELECT worktree_abs_path FROM lineage_nodes WHERE worktree_abs_path IS NOT NULL AND worktree_abs_path != '' LIMIT 1"
+    ).fetchone()
+    if row:
+        wt = Path(os.path.realpath(str(row["worktree_abs_path"])))
+        for cand in [wt, *wt.parents]:
+            if (cand / "evaluators").is_dir() or (cand / "baselines").is_dir():
+                return cand
+    return None
+
+
+def _scan_invalid_protocol_hooks(
+    conn: sqlite3.Connection,
+    hooks: list[sqlite3.Row],
+    workspace_root: str = "",
+) -> list[dict[str, Any]]:
+    """探测已注册钩子的签名与返回值协议健康度，识别协议损坏或触发熔断的子题钩子。"""
+    ws_hint = _resolve_ws_hint(conn, workspace_root)
+    core_root = core_python_root()
+    invalid: list[dict[str, Any]] = []
+
+    for r in hooks:
+        qid = str(r["question_id"])
+        hook_rel = str(r["hook_rel_path"] or "")
+        base_rel = str(r["baseline_rel_path"] or "")
+        hook_sha = str(r["hook_sha256"] or "")
+        pub_sample = json.loads(r["public_input_sample_json"] or "{}")
+        if not isinstance(pub_sample, dict):
+            pub_sample = {}
+
+        reason = ""
+        hook_file: Path | None = None
+        if ws_hint and hook_rel:
+            c1 = Path(os.path.realpath(ws_hint / hook_rel))
+            if c1.is_file():
+                hook_file = c1
+        if hook_file is None and hook_rel:
+            c2 = Path(os.path.realpath(core_root / hook_rel))
+            if c2.is_file():
+                hook_file = c2
+
+        base_file: Path | None = None
+        if ws_hint and base_rel:
+            b1 = Path(os.path.realpath(ws_hint / base_rel))
+            if b1.is_file():
+                base_file = b1
+        if base_file is None and base_rel:
+            b2 = Path(os.path.realpath(core_root / base_rel))
+            if b2.is_file():
+                base_file = b2
+
+        if hook_file is not None:
+            ok, err = probe_domain_hook_protocol(hook_file, sample_payload=pub_sample, baseline_path=base_file)
+            if not ok:
+                reason = err
+        elif ws_hint is not None:
+            reason = f"找不到已注册钩子文件: {hook_rel!r}"
+
+        if not reason:
+            obs_rows = conn.execute(
+                "SELECT obs_status, metrics_json, details_text, domain_hook_sha256 FROM observations WHERE question_id = ?",
+                (qid,),
+            ).fetchall()
+            valid_total = sum(1 for o in obs_rows if str(o["obs_status"]) == "VALID")
+            proto_fails = [
+                o for o in obs_rows
+                if str(o["domain_hook_sha256"] or "") == hook_sha
+                and str(o["obs_status"]) in ("INVALIDATED", "EXECUTION_ERROR")
+                and (
+                    str(o["metrics_json"] or "").strip() in ("", "{}")
+                    or "evaluate" in str(o["details_text"] or "").lower()
+                    or "hook" in str(o["details_text"] or "").lower()
+                    or "protocol" in str(o["details_text"] or "").lower()
+                )
+            ]
+            if valid_total == 0 and len(proto_fails) >= 2:
+                reason = f"协议熔断：子题 {qid} 在当前钩子下 0 VALID 且已有 {len(proto_fails)} 次协议/空指标失败"
+
+        if reason:
+            invalid.append({"question_id": qid, "hook_rel_path": hook_rel, "reason": reason})
+
+    return invalid
+
+
+def schedule_control_plane_snapshot(
+    conn: sqlite3.Connection,
+    max_concurrent_workers: int | None = None,
+    workspace_root: str = "",
+) -> dict[str, Any]:
     """为 DSH External Orchestrator 生成 Question-Fair 确定性事件调度快照。"""
     cfg = load_runtime_config()
     hard_cap = int(cfg.get("max_concurrent_workers_hard_cap", 10))
@@ -373,14 +469,21 @@ def schedule_control_plane_snapshot(conn: sqlite3.Connection, max_concurrent_wor
     stage = str(ep["stage"]) if ep else "STAGE1_PARSE0"
     non_l1 = int(ep["consecutive_non_l1_handoffs"]) if ep else 0
 
-    hooks = conn.execute("SELECT question_id, fidelity_max_error_pct, public_input_sample_json FROM domain_hooks_by_question").fetchall()
+    hooks = conn.execute(
+        "SELECT question_id, hook_rel_path, baseline_rel_path, hook_sha256, fidelity_max_error_pct, public_input_sample_json FROM domain_hooks_by_question"
+    ).fetchall()
     hook_map = {str(r["question_id"]): float(r["fidelity_max_error_pct"]) for r in hooks}
     public_samples_by_q = {
         str(r["question_id"]): json.loads(r["public_input_sample_json"] or "{}")
         for r in hooks
     }
+    invalid_protocol_hooks = _scan_invalid_protocol_hooks(conn, hooks, workspace_root=workspace_root)
+    broken_qids = [h["question_id"] for h in invalid_protocol_hooks]
     max_err = float(cfg.get("simulator_fidelity_max_error_pct", 5.0))
-    missing_hooks = [q for q in req_qs if q not in hook_map or hook_map[q] >= max_err]
+    missing_hooks = [
+        q for q in req_qs
+        if q not in hook_map or hook_map[q] >= max_err or (stage == "STAGE1_PARSE0" and q in broken_qids)
+    ]
     dep_status = get_question_dependency_status(conn, contracts=contracts, required_questions=req_qs)
 
     active_exploring = conn.execute(
@@ -449,6 +552,8 @@ def schedule_control_plane_snapshot(conn: sqlite3.Connection, max_concurrent_wor
         "external_literature_count": external_lit_count,
         "slot_cap": slot_cap,
         "missing_hooks_or_fidelity": missing_hooks,
+        "invalid_protocol_hooks": invalid_protocol_hooks,
+        "protocol_broken_questions": broken_qids,
         "pending_surveys": [dict(r) for r in pending_surveys],
         "open_works_tickets": [dict(r) for r in open_works],
         "pending_revalidation": [dict(r) for r in pending_reval],

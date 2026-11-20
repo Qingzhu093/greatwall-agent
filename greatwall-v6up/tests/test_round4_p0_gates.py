@@ -519,6 +519,95 @@ class TestRound4P0Gates(unittest.TestCase):
         )
         self.assertTrue(ok_long["ok"], ok_long)
 
+    def test_hook_protocol_smoke_and_circuit_breaker(self) -> None:
+        """入口 Smoke Test 拦截坏钩子 + Stage 2 在位协议损坏熔断解锁 RQGM 与重注册。"""
+        (self.ws / "evaluators" / "hook_no_entry.py").write_text(
+            "def compute_metrics(x):\n    return {'score': 1.0}\n",
+            encoding="utf-8",
+        )
+        (self.ws / "evaluators" / "hook_wrong_keys.py").write_text(
+            "def evaluate_candidate(cand, spec):\n    return {'valid': True, 'rank_score': 0.9}\n",
+            encoding="utf-8",
+        )
+        dispatch_control_call(
+            "control_plane/init_epoch",
+            {"workspace_root": str(self.ws), "required_questions": ["Q1"], "goal_md": "Hook Smoke"},
+        )
+
+        # 1. 仅导出 compute_metrics 或返回 {"valid": ...} 必须被 Parse0 Smoke Test 拦截
+        r1 = self._call(
+            "register_question_domain_hook",
+            "works_engineer",
+            "sess_w_s1",
+            question_id="Q1",
+            hook_rel_path="evaluators/hook_no_entry.py",
+            baseline_rel_path="baselines/Q1/b1.py",
+            fidelity_max_error_pct=1.0,
+            public_input_sample={"val": 1.0},
+        )
+        self.assertFalse(r1["ok"])
+        self.assertIn("HOOK_PROTOCOL_SMOKE_FAILED", r1["error"])
+
+        r2 = self._call(
+            "register_question_domain_hook",
+            "works_engineer",
+            "sess_w_s1",
+            question_id="Q1",
+            hook_rel_path="evaluators/hook_wrong_keys.py",
+            baseline_rel_path="baselines/Q1/b1.py",
+            fidelity_max_error_pct=1.0,
+            public_input_sample={"val": 1.0},
+        )
+        self.assertFalse(r2["ok"])
+        self.assertIn("HOOK_PROTOCOL_SMOKE_FAILED", r2["error"])
+
+        # 2. 模拟历史已进入 STAGE2_EVOLVE 且库中遗留一个无 evaluate_candidate 的坏钩子（含平局 bb_epsilon_score=0.9757）
+        conn = open_rw_connection(resolve_storage_paths(str(self.ws))["db_path"], init_schema=False)
+        try:
+            conn.execute("UPDATE epoch_config SET stage = 'STAGE2_EVOLVE' WHERE config_id = 'active'")
+            conn.execute(
+                """
+                INSERT INTO domain_hooks_by_question(
+                    question_id, hook_rel_path, hook_sha256, baseline_rel_path,
+                    fidelity_max_error_pct, plugin_protocol_version, eval_epoch_version,
+                    bb_epsilon_score, public_input_sample_json, created_at, updated_at
+                ) VALUES ('Q1', 'evaluators/hook_no_entry.py', 'deadbeef', 'baselines/Q1/b1.py', 1.0, 'v1', 1, 0.9757, '{"val":1.0}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        snap = dispatch_control_call("control_plane/schedule_snapshot", {"workspace_root": str(self.ws)})
+        self.assertTrue(snap["ok"])
+        self.assertIn("Q1", snap["data"]["protocol_broken_questions"])
+
+        # 3a. RQGM 面对协议失效的 incumbent 时，即使新钩子正常样本计算 BB_eps 也约等于原值，也必须放行替换！
+        r_rqgm = self._call(
+            "upgrade_hook_with_rqgm_gate",
+            "works_engineer",
+            "sess_w_s2",
+            question_id="Q1",
+            new_hook_rel_path="evaluators/hook_q1.py",
+            gt_success_count=6,
+            gt_failure_count=0,
+        )
+        self.assertTrue(r_rqgm["ok"], r_rqgm)
+        self.assertTrue(r_rqgm["data"]["incumbent_protocol_broken"])
+
+        # 3b. 一旦已替换为健康钩子，再度强行用 register_question_domain_hook 静默覆盖仍严格被锁
+        r_lock = self._call(
+            "register_question_domain_hook",
+            "works_engineer",
+            "sess_w_s2",
+            question_id="Q1",
+            hook_rel_path="evaluators/hook_q1.py",
+            baseline_rel_path="baselines/Q1/b1.py",
+            fidelity_max_error_pct=1.0,
+        )
+        self.assertFalse(r_lock["ok"])
+        self.assertEqual(r_lock["error_code"], ERR_LOCKED)
+
 
 if __name__ == "__main__":
     unittest.main()
