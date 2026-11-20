@@ -1,0 +1,36 @@
+# Python caches & envs
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+
+# Node / DSH runtime caches
+node_modules/
+.cordis/
+*.tsbuildinfo
+
+# Local SQLite DBs, logs, compressed sessions & temp artifacts
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.zstd
+*.log
+*.tmp
+.env
+.env.*
+worktrees/
+eval_artifacts/
+
+# Stress harness runtime git fixtures & local legacy archives (kept locally, excluded from GitHub)
+.agents/
+archive/
+tests/stress_harness/git_lock_repo/
+tests/stress_harness/git_stress_repo/
+
+# OS / IDE metadata
+.DS_Store
+Thumbs.db

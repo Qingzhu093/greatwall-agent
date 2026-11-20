@@ -1,0 +1,58 @@
+{
+  "session_context_clock": {
+    "context_window_tokens": 500000,
+    "clock_formula": "pressureTokens / 500000",
+    "min_evals_before_reflection": 1,
+    "context_reflect_hint_pct": 0.37,
+    "context_handoff_pct": 0.70,
+    "reflection_sequential_turn_boundary": true,
+    "reflection_max_turns": 2,
+    "reflection_max_chars_per_turn": 300,
+    "cost_note_enable": true,
+    "max_handoff_chars": 2000,
+    "max_briefing_chars": 2200,
+    "briefing_section_char_budgets": {
+      "sec1_mechanism": 200,
+      "sec2_verified_baseline": 400,
+      "sec3_bottleneck": 350,
+      "sec4_dead_ends": 650,
+      "sec5_immediate_will": 400
+    }
+  },
+  "orchestration_and_eval": {
+    "stateless_event_driven_all_roles": true,
+    "allowed_role_presets": [
+      "explorer",
+      "lineage_companion",
+      "logistics_coordinator",
+      "library_surveyor",
+      "library_verifier",
+      "works_engineer",
+      "supervisory_committee"
+    ],
+    "forbid_process_markdown_files_on_disk": true,
+    "handoff_single_writer_role": "lineage_companion",
+    "store_sanitized_code_diff_in_db": true,
+    "external_r_open_from_0pct": true,
+    "unlock_internal_l2_l3_immediately_on_37pct_reflection": true,
+    "min_initial_method_families_per_question": 2,
+    "max_concurrent_workers": 6,
+    "max_concurrent_workers_hard_cap": 10,
+    "question_fair_slot_scheduling": true,
+    "require_evidence_for_level4a": true,
+    "stagnation_consecutive_non_l1_handoffs": 8,
+    "level2_max_inplace_repairs": 3,
+    "auto_write_l2_on_stage1_or_stage2_reject_or_l2_exhausted": true,
+    "evaluator_plugin_protocol": "{passed, metrics, details}",
+    "simulator_fidelity_max_error_pct": 5.0,
+    "require_per_question_domain_hook": true,
+    "persist_stage_a_artifacts": true,
+    "scoped_invalidation_by_depends_on_only": true,
+    "hard_lock_closure_min_l3_verified_per_question": 1,
+    "eval_anchor_epsilon": 0.05,
+    "eval_anchor_min_samples": 5,
+    "review_two_stage_db_only": true,
+    "stage1_ledger_immutable": true,
+    "auditor_salvage_enqueue_stage1_blind_different_session": true
+  }
+}

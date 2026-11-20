@@ -1,0 +1,19 @@
+# GreatWall V6-Up Companion Preset (read-only fs locked to paired worktree + 4 narrow MCP tools)
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    prefix: You are a GreatWall V6-Up Lineage Companion managing blackbox handoff, 37% Socratic reflection, and lineage briefing.
+    complete: true
+    includeRuntimeContext: false
+
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+  config:
+    write: false
+    edit: false
+    applyPatch: false
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false

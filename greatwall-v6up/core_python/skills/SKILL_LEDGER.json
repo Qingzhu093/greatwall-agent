@@ -1,0 +1,39 @@
+{
+  "schema_version": "2.2.0",
+  "description": "长城 Agent V6-Up (v2.2) 共享工具、探针与编排技能演进账本（Bayesian-Agent 原生 (S, F) 分母 + No File 物理落盘校验）",
+  "skills": {
+    "greatwall_research_loop": {
+      "skill_id": "greatwall_research_loop",
+      "applicable_scope": "面向长周期 AI for Science 攻关的 DSH ctx.agents.create() 外部控制面 × Python 31 窄工具 MCP 一委三部闭环调度",
+      "version": 3,
+      "raw_success_count": 0,
+      "raw_failure_count": 0,
+      "verified_artifact_rel_path": "skills/greatwall-research-loop/SKILL.md",
+      "rollback_pointer": "skills/greatwall-research-loop/SKILL.md",
+      "last_no_file_passed": true,
+      "updated_at": "2026-11-19T00:00:00.000000Z"
+    },
+    "works_shared_probes": {
+      "skill_id": "works_shared_probes",
+      "applicable_scope": "工造司从分支 <worktree>/tools/ 晋升或自主锻造的 B 档全社区共享诊断探针与按子题验证钩子",
+      "version": 2,
+      "raw_success_count": 0,
+      "raw_failure_count": 0,
+      "verified_artifact_rel_path": "evaluators/isolated_runner.py",
+      "rollback_pointer": "evaluators/isolated_runner.py",
+      "last_no_file_passed": true,
+      "updated_at": "2026-11-19T00:00:00.000000Z"
+    },
+    "library_two_stage_blind_review": {
+      "skill_id": "library_two_stage_blind_review",
+      "applicable_scope": "中央图书馆外藏/内藏物理分表、零磁盘盲审 Stage 1 短路入 L2 -> Stage 2 横审入 L3/L2 及 Auditor 异会话复验",
+      "version": 3,
+      "raw_success_count": 0,
+      "raw_failure_count": 0,
+      "verified_artifact_rel_path": "mcp_server/tools_governance.py",
+      "rollback_pointer": "mcp_server/db_schema.py",
+      "last_no_file_passed": true,
+      "updated_at": "2026-11-19T00:00:00.000000Z"
+    }
+  }
+}

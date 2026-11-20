@@ -1,0 +1,142 @@
+# dsh-greatwall-v6up v2.2 Cordis Bundle 声明（100% 对齐 DSH 0.2.2-rc.3）
+# - 通过 `@deepseek-ai/dsh-agent-preset` 正式注册 5 套长城子角色独立预设（彻底替代已废弃的 .agent-presets 目录）
+# - 保留桌面用户默认 preset (`standard`/`ptc` 等) 原能力不变，绝不覆盖主控配置
+- insert:
+    - id: greatwall-v6up
+      name: 'dsh-greatwall-v6up'
+      config:
+        contextWindowTokens: 500000
+        reflectPct: 0.37
+        handoffPct: 0.70
+        maxConcurrentWorkers: 6
+        hardCapWorkers: 10
+        autoRecordFactLog: true
+        enableSandboxGuard: true
+
+    - id: preset-greatwall-explorer
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: greatwall-explorer
+        name: '长城 · 探索者 (Explorer)'
+        description: '隔离分支探索与科研求解预设（无 ptc / 无压缩 / 无网络 / 无 cwd 模板）'
+        order: 50
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: 'You are a GreatWall V6-Up scientific explorer operating strictly inside your assigned branch worktree.'
+              complete: true
+              includeRuntimeContext: false
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+
+    - id: preset-greatwall-verifier
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: greatwall-verifier
+        name: '长城 · 盲审净室 (Verifier)'
+        description: '物理零磁盘零终端零网络盲审预设'
+        order: 51
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: 'You are a GreatWall V6-Up zero-disk cleanroom Library Verifier executing two-stage blind review.'
+              complete: true
+              includeRuntimeContext: false
+
+    - id: preset-greatwall-companion
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: greatwall-companion
+        name: '长城 · 伴随助手 (Companion)'
+        description: '单向只读配对工作树预设（含 37% 反思与交接）'
+        order: 52
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: 'You are a GreatWall V6-Up Lineage Companion managing blackbox handoff, 37% Socratic reflection, and lineage briefing.'
+              complete: true
+              includeRuntimeContext: false
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              write: false
+              edit: false
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+
+    - id: preset-greatwall-works
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: greatwall-works
+        name: '长城 · 工造司 (Works)'
+        description: '验证钩子、隔离基线与 B 档探针锻造预设'
+        order: 53
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: 'You are a GreatWall V6-Up Works Engineer forging verification hooks, isolated baselines, and shared diagnostic probes.'
+              complete: true
+              includeRuntimeContext: false
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+
+    - id: preset-greatwall-governance
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: greatwall-governance
+        name: '长城 · 治理与查新 (Governance)'
+        description: '后勤、查新采编与监察委共用底座（运行期二次精准裁剪权限）'
+        order: 54
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: 'You are a GreatWall V6-Up Governance or Library Survey node strictly following narrow role authorization.'
+              complete: true
+              includeRuntimeContext: false
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              write: false
+              edit: false
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
