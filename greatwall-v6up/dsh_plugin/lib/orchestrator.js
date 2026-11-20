@@ -10,7 +10,7 @@ import path from 'node:path'
 import { loadCoreRuntimeConfig, loadRolePrompts } from './prompts.js'
 import { ensurePresetsInstalled } from './presets.js'
 import { TelemetryCollector } from './telemetry.js'
-import { AgentSessionHost } from './agent_session_host.js'
+import { AgentSessionHost, createUserTextMessage } from './agent_session_host.js'
 import { driveExplorerCompanionPair } from './pair_lifecycle.js'
 
 export class GreatwallOrchestrator {
@@ -96,6 +96,22 @@ export class GreatwallOrchestrator {
     })
     if (!matched.length) return ''
     return '## 人类 / 主控最新定向纠偏指令\n' + matched.slice(-5).map((m) => `- [${m.at}] (${m.targetType}:${m.targetId}) ${m.directive}`).join('\n')
+  }
+
+  _appendInterventions(baseText, role, questionId = '', nodeId = '') {
+    const iv = this._formatInterventionsForTarget(role, questionId, nodeId)
+    const base = String(baseText || '').trim()
+    if (!iv) return base
+    return base ? `${iv}\n\n${base}` : iv
+  }
+
+  _interventionMatchesSession(entry, sessEntry) {
+    if (!sessEntry) return false
+    if (entry.targetType === 'global') return true
+    if (entry.targetType === 'role') return sessEntry.role === entry.targetId
+    if (entry.targetType === 'question') return Boolean(sessEntry.questionId) && sessEntry.questionId === entry.targetId
+    if (entry.targetType === 'node') return Boolean(sessEntry.nodeId) && sessEntry.nodeId === entry.targetId
+    return false
   }
 
   _wakeLoop() {
@@ -199,7 +215,30 @@ export class GreatwallOrchestrator {
     const entry = { targetType, targetId, directive: String(directive || ''), action: cleanAct }
     this._interventions.push({ at: new Date().toISOString(), ...entry })
     this.telemetry.addIntervention(entry)
-    this.telemetry.recordEvent('human_intervention', entry)
+
+    const steeredSessions = []
+    if (cleanAct === 'steer' && entry.directive.trim()) {
+      for (const [sid, sessEntry] of this.liveSessions.entries()) {
+        if (!this._interventionMatchesSession(entry, sessEntry)) continue
+        const steerFn = sessEntry?.handle?.agent?.steer
+        if (typeof steerFn !== 'function') continue
+        try {
+          steerFn.call(
+            sessEntry.handle.agent,
+            createUserTextMessage(
+              `[人类/主控实时定向纠偏 (${entry.targetType}:${entry.targetId})]\n请立即优先执行以下纠偏指令，勿继续无效重复检索或循环：\n${entry.directive}`,
+              'user',
+            ),
+          )
+          steeredSessions.push({
+            sessionId: sid,
+            role: sessEntry.role || '',
+            questionId: sessEntry.questionId || '',
+            nodeId: sessEntry.nodeId || '',
+          })
+        } catch {}
+      }
+    }
 
     if (cleanAct === 'abort_node' && targetId) {
       const running = this._runningExplorers.get(targetId)
@@ -210,8 +249,9 @@ export class GreatwallOrchestrator {
         } catch {}
       }
     }
+    this.telemetry.recordEvent('human_intervention', { ...entry, steeredSessions })
     this._wakeLoop()
-    return { intervened: true, intervention: entry, status: await this.getControlStatus() }
+    return { intervened: true, intervention: entry, steeredSessions, status: await this.getControlStatus() }
   }
 
   async getControlStatus() {
@@ -341,7 +381,12 @@ export class GreatwallOrchestrator {
               uiLabel: `[伴随-${info.node.question_id}] 崩溃打捞 ${nid}`,
               shortTransaction: true,
               signal: sig,
-              taskContextText: `### 节点意外中断打捞 (${info.reason})\n${info.blackboxSummary}`,
+              taskContextText: this._appendInterventions(
+                `### 节点意外中断打捞 (${info.reason})\n${info.blackboxSummary}`,
+                'lineage_companion',
+                info.node.question_id,
+                nid,
+              ),
               prompt: `探索者 ${nid} 异常中断（${info.reason}）。请调 get_companion_context(branch_id="${info.node.branch_id}", node_id="${nid}", mode="HANDOFF_70")，扫描实测与 worktree，有 [Obs###] 则 submit_node_handoff 入 DAG，若零实测崩溃则设 is_zero_eval_crash=true 写 scratch_log！`,
             })
             this._handoffsSinceHeartbeat += 1
@@ -360,7 +405,10 @@ export class GreatwallOrchestrator {
               uiLabel: `[工造司] Parse0 建钩 (${snap.missing_hooks_or_fidelity.join(',')})`,
               shortTransaction: false,
               signal: sig,
-              taskContextText: `### 当前课题与子题列表\n${snap.goal_md || ''}\n### 子题契约\n${JSON.stringify(snap.contracts || {}, null, 2)}`,
+              taskContextText: this._appendInterventions(
+                `### 当前课题与子题列表\n${snap.goal_md || ''}\n### 子题契约\n${JSON.stringify(snap.contracts || {}, null, 2)}`,
+                'works_engineer',
+              ),
               prompt: `Stage 1 (Parse 0)：请为子题 ${snap.missing_hooks_or_fidelity.join(', ')} 编写各自隔离基线 baselines/baseline_<Q>.py 与钩子 evaluators/hooks/hook_<Q>.py（metrics 含 rank_score 且严禁 mpmath 慢循环），并调用 register_question_domain_hook 逐一注册（必须传入 public_input_sample，保证误差 <5%）。`,
             }),
           )
@@ -375,8 +423,11 @@ export class GreatwallOrchestrator {
               uiLabel: '[图书馆采编] 开局文献建卡',
               shortTransaction: false,
               signal: sig,
-              taskContextText: `### 课题 Goal\n${snap.goal_md || ''}`,
-              prompt: `Stage 1 开局外藏建设：目前 external_literature_cards 为 0。请针对课题 ${JSON.stringify(snap.required_questions || [])} 的核心数学定理/算法标准文献，调 publish_external_literature_card 至少建立 1 张高质量外藏卡片 [R001] 供所有探索者 0% 起查阅。`,
+              taskContextText: this._appendInterventions(
+                `### 课题 Goal\n${snap.goal_md || ''}`,
+                'library_surveyor',
+              ),
+              prompt: `Stage 1 开局快速外藏建设：目前 external_literature_cards 为 0（阻塞后续编排启动）。\n1. 请直接依据课题 Goal 中的子题 ${JSON.stringify(snap.required_questions || [])} 核心数学物理机制，立即构造标准定理/解析算子卡片 [R001] 并调用 publish_external_literature_card 入库（无需在 Stage 1 执着连续多轮网搜或反复阅读工作区 baselines 脚本）。\n2. 严格遵守 Schema 约束：support_scope 必须使用英文枚举（如 DIRECT_PROOF_OR_EXACT_MEASUREMENT），read_depth 使用英文枚举（full_text | specified_sections | abstract_only），abstract_md 长度需在 60–1500 字之间（推荐 120–500 字独立高密度摘要）。\n3. 一旦成功发布 [R001] 并收到 ok: true，立即结束本会话以放行编排！`,
             }),
           )
           continue
@@ -390,7 +441,10 @@ export class GreatwallOrchestrator {
               uiLabel: '[后勤总管] Parse0 学派建档',
               shortTransaction: false,
               signal: sig,
-              taskContextText: `### 课题 Goal\n${snap.goal_md || ''}\n### 依赖状态\n${JSON.stringify(snap.question_dependencies || {}, null, 2)}\n### 公开输入契约\n${JSON.stringify(snap.public_input_samples || {}, null, 2)}`,
+              taskContextText: this._appendInterventions(
+                `### 课题 Goal\n${snap.goal_md || ''}\n### 依赖状态\n${JSON.stringify(snap.question_dependencies || {}, null, 2)}\n### 公开输入契约\n${JSON.stringify(snap.public_input_samples || {}, null, 2)}`,
+                'logistics_coordinator',
+              ),
               prompt: `Stage 1 初始学派建档：请先调 get_logistics_dashboard 查看完整 goal_md 与 question_dependencies（只读 problem_pack/ 核实原题约束），为已解锁的子题各 register_method_family 至少 2 个贴合本题的正交学派并 fork_branch 开启探索分支（勿对未解锁前置依赖的子题浪费槽位）。`,
             }),
           )
@@ -404,6 +458,7 @@ export class GreatwallOrchestrator {
             uiLabel: '[监察委员会] Stage1 门禁',
             shortTransaction: false,
             signal: sig,
+            taskContextText: this._appendInterventions('', 'supervisory_committee'),
             prompt: '请调用 get_supervisory_audit_snapshot 与 record_compliance_check(stage="STAGE1_GATE", status="PASSED") 核验钩子保真 <5% 并放行进入 STAGE2_EVOLVE。',
           }),
         )
@@ -437,6 +492,7 @@ export class GreatwallOrchestrator {
             uiLabel: `[图书馆采编] 响应查新 (${reqIds.length}单)`,
             shortTransaction: false,
             signal: sig,
+            taskContextText: this._appendInterventions('', 'library_surveyor'),
             prompt: `待采编外部文献请求 ${JSON.stringify(reqIds)} 已就绪，请先调 get_survey_requests 查看具体问题与检索词，然后调 publish_external_literature_card 写入标准外藏卡片 [R###]（务必传入对应的 fulfilled_request_ids 以精准核销！）。`,
           }),
         )) {
@@ -451,6 +507,7 @@ export class GreatwallOrchestrator {
             uiLabel: '[工造司] 痛点/局部重评',
             shortTransaction: false,
             signal: sig,
+            taskContextText: this._appendInterventions('', 'works_engineer'),
             prompt: '请调 get_works_engineering_queue 检查未处理痛点与待重评队列：存在待重评观测请逐条调 recompute_stage_b_only；需要升版钩子请走 upgrade_hook_with_rqgm_gate。',
           }),
         )) {
@@ -467,7 +524,10 @@ export class GreatwallOrchestrator {
             uiLabel: `[后勤总管] ${triageCount > 0 ? `分诊 (${triageCount}节点)` : `解锁派单 (${needQs.join(',')})`}`,
             shortTransaction: false,
             signal: sig,
-            taskContextText: `${this._formatInterventionsForTarget('logistics_coordinator')}\n### 依赖状态\n${JSON.stringify(snap.question_dependencies || {}, null, 2)}`,
+            taskContextText: this._appendInterventions(
+              `### 依赖状态\n${JSON.stringify(snap.question_dependencies || {}, null, 2)}`,
+              'logistics_coordinator',
+            ),
             prompt: triageCount > 0
               ? `有 ${triageCount} 个节点处于 AWAITING_TRIAGE！请调 get_logistics_dashboard 查看观测分数 (comparable_rank_score)、依赖状态与停滞计数，逐一调用 triage_node 裁决，并在满足前置依赖解锁时派生新分支！`
               : `子题 ${needQs.join(', ')} 前置依赖已解锁且尚无探索分支！请调 get_logistics_dashboard 检查依赖与学派状态，为这些子题调用 register_method_family / fork_branch 开启探索分支！`,
@@ -488,6 +548,7 @@ export class GreatwallOrchestrator {
             uiLabel: `[图书馆盲审] ${rev.question_id || ''} ${rev.review_id}`.trim(),
             shortTransaction: true,
             signal: sig,
+            taskContextText: this._appendInterventions('', 'library_verifier', rev.question_id || ''),
             prompt: rev.review_status === 'STAGE1_BLIND'
               ? `请以异会话执行盲审单 ${rev.review_id} (${rev.question_id})：先调 get_blind_manuscript，完成 Stage 1 不可逆账本；若通过，再调 get_unblinded_manuscript_and_peers 与 submit_stage2_unblind_verdict。`
               : `请对审稿单 ${rev.review_id} (${rev.question_id}) 调用 get_unblinded_manuscript_and_peers 与 submit_stage2_unblind_verdict 完成 Stage 2 终审。`,
@@ -504,6 +565,7 @@ export class GreatwallOrchestrator {
             uiLabel: '[后勤总管] 停滞五车道打散',
             shortTransaction: false,
             signal: sig,
+            taskContextText: this._appendInterventions('', 'logistics_coordinator'),
             prompt: '停滞看门狗已触发！请立即调用 get_logistics_dashboard 与 dispatch_stagnation_five_lanes 对停滞分支执行五车道重排。',
           }),
         )) {
@@ -521,6 +583,7 @@ export class GreatwallOrchestrator {
             uiLabel: '[监察委员会] Stage2 心跳对账',
             shortTransaction: false,
             signal: sig,
+            taskContextText: this._appendInterventions('', 'supervisory_committee'),
             prompt: '执行 STAGE2_HEARTBEAT 周期对账：请调 get_supervisory_audit_snapshot 核对未读声明引用与越权告警，调 record_compliance_check(stage="STAGE2_HEARTBEAT", status="PASSED" 或 "ALERT") 落库。',
           })
         })) {
@@ -545,6 +608,7 @@ export class GreatwallOrchestrator {
             uiLabel: '[监察委员会] Stage2 结题锁',
             shortTransaction: false,
             signal: sig,
+            taskContextText: this._appendInterventions('', 'supervisory_committee'),
             prompt: '全卷子题 L3_VERIFIED 均已达标！请调用 check_stage2_closure_gate 并签发 record_compliance_check(stage="STAGE2_CLOSURE_GATE", status="PASSED")。',
           })
           await this.spawnAndRunAgent({
@@ -553,6 +617,7 @@ export class GreatwallOrchestrator {
             uiLabel: '[图书馆盲审] Stage3 Comparator 择优',
             shortTransaction: true,
             signal: sig,
+            taskContextText: this._appendInterventions('', 'library_verifier'),
             prompt: '进入 Stage 3 Comparator！请调用 get_unblinded_manuscript_and_peers(review_id="STAGE3_COMPARATOR") 拉取全卷 active L3_VERIFIED 及其 best_comparable_rank_score，比较各子题最优条目并输出结构化推荐排名（无需改写库）。',
           })
           await this.spawnAndRunAgent({
@@ -560,6 +625,7 @@ export class GreatwallOrchestrator {
             uiLabel: '[图书馆采编] Stage3 论文汇编导出',
             shortTransaction: false,
             signal: sig,
+            taskContextText: this._appendInterventions('', 'library_surveyor'),
             prompt: 'Comparator 择优就绪！请调 get_survey_requests 读取 stage3_synthesis_bundle，撰写正式综合论文报告并调用 export_stage3_final_delivery 导出 final_delivery 五件套。',
           })
           await this.spawnAndRunAgent({
@@ -567,6 +633,7 @@ export class GreatwallOrchestrator {
             uiLabel: '[监察委员会] Stage3 终审闭环',
             shortTransaction: false,
             signal: sig,
+            taskContextText: this._appendInterventions('', 'supervisory_committee'),
             prompt: '请执行最终核对，调用 get_supervisory_audit_snapshot 与 record_compliance_check(stage="STAGE3_FINAL_AUDIT", status="PASSED") 正式闭环。',
           })
           this._stage3Done = true

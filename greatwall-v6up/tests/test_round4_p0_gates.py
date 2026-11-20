@@ -30,7 +30,10 @@ if str(CORE_PYTHON) not in sys.path:
 
 from mcp_server.control_plane_service import extract_sanitized_code_diff_md, schedule_control_plane_snapshot  # noqa: E402
 from mcp_server.db_schema import (  # noqa: E402
+    ALLOWED_READ_DEPTHS,
+    ALLOWED_SUPPORT_SCOPES,
     ERR_CONFLICT,
+    ERR_INVALID_INPUT,
     ERR_INVARIANT,
     ERR_LOCKED,
     open_ro_connection,
@@ -38,7 +41,7 @@ from mcp_server.db_schema import (  # noqa: E402
     propagate_dependency_recheck,
     resolve_storage_paths,
 )
-from mcp_server.greatwall_core_mcp import dispatch_control_call, dispatch_tool_call  # noqa: E402
+from mcp_server.greatwall_core_mcp import TOOL_DEFINITIONS, dispatch_control_call, dispatch_tool_call  # noqa: E402
 
 
 class TestRound4P0Gates(unittest.TestCase):
@@ -457,6 +460,64 @@ class TestRound4P0Gates(unittest.TestCase):
         l2_entry = self._call("get_library_entry", "explorer", "sess_e1", node_id=nid, entry_id="L2-901")
         self.assertTrue(l2_entry["ok"], l2_entry)
         self.assertNotIn("method_family_id", l2_entry["data"]["entry"])
+
+    def test_all_31_schemas_and_literature_card_bounds(self) -> None:
+        """全量 31 工具 Schema 均带 description 与枚举提示，且文献摘要放宽至 60-1500 字。"""
+        self.assertEqual(len(TOOL_DEFINITIONS), 31)
+        for tdef in TOOL_DEFINITIONS:
+            props = tdef["inputSchema"].get("properties", {})
+            for pname, pschema in props.items():
+                self.assertIn("description", pschema, f"工具 {tdef['name']} 参数 {pname} 缺失 description")
+
+        pub = next(t for t in TOOL_DEFINITIONS if t["name"] == "publish_external_literature_card")
+        pub_props = pub["inputSchema"]["properties"]
+        self.assertEqual(pub_props["support_scope"].get("enum"), sorted(ALLOWED_SUPPORT_SCOPES))
+        self.assertEqual(pub_props["read_depth"].get("enum"), sorted(ALLOWED_READ_DEPTHS))
+        self.assertEqual(pub_props["abstract_md"].get("minLength"), 60)
+        self.assertEqual(pub_props["abstract_md"].get("maxLength"), 1500)
+
+        dispatch_control_call(
+            "control_plane/init_epoch",
+            {"workspace_root": str(self.ws), "required_questions": ["Q1"], "goal_md": "Schema 验收"},
+        )
+        # 非法 support_scope 必须返回清晰英文枚举提示
+        bad_scope = self._call(
+            "publish_external_literature_card",
+            "library_surveyor",
+            "sess_surv_schema",
+            ref_id="R099",
+            question_id="Q1",
+            title="中文错枚举拦截测试",
+            abstract_md="这是一段足够长的标准机理测试摘要，包含核心适用范围、时间尺度边界以及理论物理推导的独立前提限制条件，共约八十余字用于通过长度测试。",
+            exact_preconditions_md="前提 1",
+            formulas_or_operators_md="f(x) = x^2",
+            read_depth="full_text",
+            support_scope="直接支撑",
+            source_citation="Test Ref",
+        )
+        self.assertFalse(bad_scope["ok"])
+        self.assertEqual(bad_scope["error_code"], ERR_INVALID_INPUT)
+        self.assertIn("DIRECT_PROOF_OR_EXACT_MEASUREMENT", bad_scope["error"])
+
+        # 实测 950 字高密度摘要可正常入库（不再被旧 600 字阈值误杀）
+        long_abs = "标准热扩散与阿伦尼乌斯耦合定理明确给出反应速率常数的精确指数依赖边界，以及粒子在非均匀多孔介质中的有效扩散率上界。" * 16
+        self.assertGreater(len(long_abs), 900)
+        self.assertLessEqual(len(long_abs), 1500)
+        ok_long = self._call(
+            "publish_external_literature_card",
+            "library_surveyor",
+            "sess_surv_schema",
+            ref_id="R099",
+            question_id="Q1",
+            title="950 字摘要入库验收",
+            abstract_md=long_abs,
+            exact_preconditions_md="前提 1",
+            formulas_or_operators_md="f(x) = x^2",
+            read_depth="full_text",
+            support_scope="DIRECT_PROOF_OR_EXACT_MEASUREMENT",
+            source_citation="Test Ref 2026",
+        )
+        self.assertTrue(ok_long["ok"], ok_long)
 
 
 if __name__ == "__main__":

@@ -390,7 +390,10 @@ def tool_query_library_catalog(
 
     scope_u = (scope or "ALL").strip().upper()
     if scope_u not in ("EXTERNAL_R", "INTERNAL_L3", "INTERNAL_L2", "ALL"):
-        raise FailClosedError(ERR_INVALID_INPUT, f"非法 scope: {scope!r}")
+        raise FailClosedError(
+            ERR_INVALID_INPUT,
+            f"非法 scope: {scope!r}，仅允许 ['ALL', 'EXTERNAL_R', 'INTERNAL_L2', 'INTERNAL_L3']",
+        )
 
     cards: list[dict[str, Any]] = []
     kw = (keyword or "").strip()

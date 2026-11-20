@@ -147,9 +147,15 @@ def tool_record_compliance_check(
     st_u = (stage or "").strip().upper()
     stat_u = (status or "").strip().upper()
     if st_u not in ("STAGE1_GATE", "STAGE2_HEARTBEAT", "STAGE2_CLOSURE_GATE", "STAGE3_FINAL_AUDIT"):
-        raise FailClosedError(ERR_INVALID_INPUT, f"非法 stage: {stage!r}")
+        raise FailClosedError(
+            ERR_INVALID_INPUT,
+            f"非法 stage: {stage!r}，仅允许 ['STAGE1_GATE', 'STAGE2_HEARTBEAT', 'STAGE2_CLOSURE_GATE', 'STAGE3_FINAL_AUDIT']",
+        )
     if stat_u not in ("PASSED", "ALERT", "BLOCKED"):
-        raise FailClosedError(ERR_INVALID_INPUT, f"非法 status: {status!r}")
+        raise FailClosedError(
+            ERR_INVALID_INPUT,
+            f"非法 status: {status!r}，仅允许 ['PASSED', 'ALERT', 'BLOCKED']",
+        )
 
     if st_u == "STAGE2_CLOSURE_GATE" and stat_u == "PASSED":
         gate = check_stage2_closure_gate_data(conn)

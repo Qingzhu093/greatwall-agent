@@ -881,3 +881,171 @@ test('Hard Gate #7: DSH 0.2.2-rc.3 AgentPresetRegistry Declarative Register Fall
     /缺少关键原生工具/,
   )
 })
+
+test('Hard Gate #8: Stage 1 Governance Interventions Injection & Live Agent Steer Delivery', async (t) => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_gate8_'))
+  const wsRoot = path.join(tmpRoot, 'ws')
+  const dataDir = path.join(tmpRoot, 'data')
+  fs.mkdirSync(path.join(wsRoot, 'evaluators'), { recursive: true })
+  fs.mkdirSync(path.join(wsRoot, 'baselines', 'Q1'), { recursive: true })
+  fs.writeFileSync(path.join(wsRoot, 'baselines', 'Q1', 'b1.py'), 'X = 1\n', 'utf8')
+  fs.writeFileSync(
+    path.join(wsRoot, 'evaluators', 'hook_q1.py'),
+    "def evaluate_candidate(art, spec):\n    val = float(art.get('val', 1.0))\n    return {'passed': val >= 1.0, 'metrics': {'rank_score': val}, 'details': 'ok'}\n",
+    'utf8',
+  )
+  fs.mkdirSync(dataDir, { recursive: true })
+
+  const ctx = new cordis.Context()
+  await Promise.all([
+    ctx.plugin(sessionMod.SessionStore),
+    ctx.plugin(projMod.SessionProjectionRegistry),
+    ctx.plugin(sqSqliteMod.default, { path: ':memory:', openAt: 'never' }),
+    ctx.plugin(sysPromptMod.SystemPrompt, { personaPrefix: 'p', personaSuffix: 's' }),
+    ctx.plugin(toolsMod.ToolRuntime, { mode: 'native' }),
+    ctx.plugin(tokenMeterMod.TokenMeter),
+    ctx.plugin(skillMod.SkillRegistry),
+    ctx.plugin(llmMod.LlmRuntime),
+    ctx.plugin(agentMod.AgentRegistry),
+    ctx.plugin(agentLoopMod.AgentLoop, { agents: [] }),
+    ctx.plugin(
+      class OkPresetsRegistry extends cordis.Service {
+        constructor(pCtx) {
+          super(pCtx, 'agentPresets')
+          this.defs = new Map()
+        }
+        async register(def) {
+          this.defs.set(def.id, def)
+          return () => this.defs.delete(def.id)
+        }
+        async resolve(id) {
+          if (!this.defs.has(id)) throw new Error(`Unknown agent preset: ${id}`)
+          return { id }
+        }
+        async mount(_agentCtx, id) {
+          return { id }
+        }
+      },
+    ),
+  ])
+  await ctx.plugin(greatwallPlugin)
+  const gwSvc = ctx.get?.('greatwall') || ctx.greatwall
+
+  const seenStepMessages = []
+  let surveyorStep = 0
+  let resolveFirstStepRunning = null
+  const firstStepRunning = new Promise((r) => { resolveFirstStepRunning = r })
+  let releaseSecondStep = null
+  const secondStepGate = new Promise((r) => { releaseSecondStep = r })
+
+  const unregLlm = ctx.llm.registerAdapter(
+    ['test-provider'],
+    new GateLlmAdapter(async (options) => {
+      const msgText = JSON.stringify(options.messages || [])
+      seenStepMessages.push(msgText)
+      surveyorStep += 1
+      if (surveyorStep === 1) {
+        // 第 1 步触发一次查询并通知外部：正在 liveSessions 运行中，测试实时 steer 注入！
+        resolveFirstStepRunning()
+        await secondStepGate
+        return {
+          text: '先查采编列表。',
+          toolCalls: [{ name: 'get_survey_requests', arguments: { question_id: 'ALL' } }],
+        }
+      }
+      return {
+        text: '按纠偏指令立即发布 R001。',
+        toolCalls: [
+          {
+            name: 'publish_external_literature_card',
+            arguments: {
+              ref_id: 'R001',
+              question_id: 'Q1',
+              title: 'Stage 1 实时 Steer 测试卡片',
+              abstract_md: '本测试验证采编角色在 Stage 1 初始化阶段能够自动接收历史定向干预并在运行中接收实时 steer 纠偏，从而快速使用英文枚举入库 R001。',
+              exact_preconditions_md: '适用全测试域',
+              formulas_or_operators_md: 'J = k * C',
+              read_depth: 'full_text',
+              support_scope: 'DIRECT_PROOF_OR_EXACT_MEASUREMENT',
+              source_citation: 'Gate 8 Spec 2026',
+            },
+          },
+        ],
+      }
+    }),
+  )
+
+  let ctrl = null
+  t.after(async () => {
+    unregLlm()
+    try { releaseSecondStep?.() } catch {}
+    try { await ctrl?.dispose?.() } catch {}
+    try { await ctx.fiber.dispose() } catch {}
+    try { fs.rmSync(tmpRoot, { recursive: true, force: true }) } catch {}
+  })
+
+  ctrl = gwSvc.createSessionController({
+    workspaceRoot: wsRoot,
+    dataDir,
+    defaultAgentOptions: { provider: 'test-provider', model: 'test-model', reasoningEffort: 'low' },
+  })
+  await ctrl.bridge.control('control_plane/init_epoch', {
+    workspace_root: wsRoot,
+    required_questions: ['Q1'],
+    goal_md: 'Gate 8 Stage 1 Steer Test',
+  })
+  const hookRes = await ctrl.bridge.callTool(
+    'register_question_domain_hook',
+    {
+      question_id: 'Q1',
+      hook_rel_path: 'evaluators/hook_q1.py',
+      baseline_rel_path: 'baselines/Q1/b1.py',
+      fidelity_max_error_pct: 0.5,
+      public_input_sample: { val: 1.0 },
+    },
+    { role: 'works_engineer', sessionId: 'sess_g8_works', workspaceRoot: wsRoot },
+  )
+  assert.equal(hookRes.ok, true, JSON.stringify(hookRes))
+
+  // 1. 启动前先下发针对 library_surveyor 的历史定向干预
+  await ctrl.orchestrator.intervene({
+    targetType: 'role',
+    targetId: 'library_surveyor',
+    directive: '历史定向指令：开局优先速建 R001',
+  })
+
+  // 仅跑一步 Stage 1 surveyor 唤醒并在入库后暂停
+  const bg = await ctrl.orchestrator.startBackground({ maxConcurrentWorkers: 1 })
+  assert.ok(bg)
+
+  await firstStepRunning
+  // 2. 在 library_surveyor 处于 liveSessions 运行期间实时下发 steer
+  const steerRes = await ctrl.orchestrator.intervene({
+    targetType: 'role',
+    targetId: 'library_surveyor',
+    directive: '实时 Steer 指令：support_scope 必须填 DIRECT_PROOF_OR_EXACT_MEASUREMENT',
+  })
+  assert.equal(steerRes.steeredSessions.length, 1)
+  assert.equal(steerRes.steeredSessions[0].role, 'library_surveyor')
+
+  releaseSecondStep()
+
+  // 等待 R001 落库后停止后台编排，避免继续进入 logistics_init
+  const deadline = Date.now() + 10_000
+  let litCount = 0
+  while (Date.now() < deadline) {
+    const st = await ctrl.orchestrator.getControlStatus()
+    litCount = Number(st.snapshot?.external_literature_count || 0)
+    if (litCount >= 1) break
+    await new Promise((r) => setTimeout(r, 40))
+  }
+  await ctrl.orchestrator.stopBackground('GATE8_DONE')
+
+  assert.equal(litCount, 1)
+  assert.ok(seenStepMessages.length >= 2)
+  assert.match(seenStepMessages[0], /历史定向指令：开局优先速建 R001/)
+  assert.ok(
+    seenStepMessages.slice(1).some((m) => m.includes('实时 Steer 指令：support_scope 必须填 DIRECT_PROOF_OR_EXACT_MEASUREMENT')),
+    'running library_surveyor session must receive live steer directive in next LLM step',
+  )
+})

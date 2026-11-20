@@ -161,17 +161,23 @@ def tool_publish_external_literature_card(
     if not rid:
         raise FailClosedError(ERR_INVALID_INPUT, "ref_id 不能为空")
     abs_clean = (abstract_md or "").strip()
-    if len(abs_clean) < 60 or len(abs_clean) > 600:
+    if len(abs_clean) < 60 or len(abs_clean) > 1500:
         raise FailClosedError(
             ERR_INVALID_INPUT,
-            f"abstract_md 长度必须为 60–600 字的独立高密度摘要（实收 {len(abs_clean)} 字，严禁空洞敷衍或 [:120] 伪摘要）",
+            f"abstract_md 长度必须为 60–1500 字的独立高密度摘要（实收 {len(abs_clean)} 字，建议 120–500 字，严禁空洞敷衍或 [:120] 伪摘要）",
         )
     if not (exact_preconditions_md or "").strip() or not (formulas_or_operators_md or "").strip():
         raise FailClosedError(ERR_INVALID_INPUT, "exact_preconditions_md 与 formulas_or_operators_md 不能为空（离线亦须提供完整定理/算子公式）")
     if read_depth not in ALLOWED_READ_DEPTHS:
-        raise FailClosedError(ERR_INVALID_INPUT, f"非法 read_depth: {read_depth!r}")
+        raise FailClosedError(
+            ERR_INVALID_INPUT,
+            f"非法 read_depth: {read_depth!r}，仅允许英文枚举 {sorted(ALLOWED_READ_DEPTHS)}",
+        )
     if support_scope not in ALLOWED_SUPPORT_SCOPES:
-        raise FailClosedError(ERR_INVALID_INPUT, f"非法 support_scope: {support_scope!r}")
+        raise FailClosedError(
+            ERR_INVALID_INPUT,
+            f"非法 support_scope: {support_scope!r}，仅允许英文枚举 {sorted(ALLOWED_SUPPORT_SCOPES)}",
+        )
 
     req_ids_clean = [str(r).strip() for r in (fulfilled_request_ids or []) if str(r).strip()]
     now = utc_now_iso()
@@ -622,7 +628,10 @@ def tool_submit_stage2_unblind_verdict(
             for ref_dst, new_etype in edge_type_overrides.items():
                 nt = str(new_etype).strip().upper()
                 if nt not in ALLOWED_CLAIMED_EDGE_TYPES:
-                    raise FailClosedError(ERR_INVALID_INPUT, f"edge_type_overrides 包含非法边类型: {new_etype!r}")
+                    raise FailClosedError(
+                        ERR_INVALID_INPUT,
+                        f"edge_type_overrides 包含非法边类型: {new_etype!r}，仅允许 {sorted(ALLOWED_CLAIMED_EDGE_TYPES)}",
+                    )
                 conn.execute(
                     f"""
                     UPDATE epistemic_edges

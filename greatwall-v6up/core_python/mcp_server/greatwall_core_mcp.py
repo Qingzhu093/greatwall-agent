@@ -21,6 +21,8 @@ from mcp_server.control_plane_service import (  # noqa: E402
     sync_session_pressure,
 )
 from mcp_server.db_schema import (  # noqa: E402
+    ALLOWED_READ_DEPTHS,
+    ALLOWED_SUPPORT_SCOPES,
     ERR_INVALID_INPUT,
     FailClosedError,
     open_rw_connection,
@@ -28,6 +30,7 @@ from mcp_server.db_schema import (  # noqa: E402
     rw_immediate_tx,
 )
 from mcp_server.mcp_core_helpers import record_fact_edge  # noqa: E402
+from mcp_server.mcp_schema_docs import enrich_tool_definitions  # noqa: E402
 from mcp_server.tools_governance import (  # noqa: E402
     tool_check_stage2_closure_gate,
     tool_dispatch_stagnation_five_lanes,
@@ -260,16 +263,29 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "description": "[library_surveyor] 将外部文献或标准定理/算子卡以独立摘要入库外藏 [R###]。",
         "inputSchema": _schema(
             {
-                "ref_id": {"type": "string"},
-                "question_id": {"type": "string"},
-                "title": {"type": "string"},
-                "abstract_md": {"type": "string"},
-                "exact_preconditions_md": {"type": "string"},
-                "formulas_or_operators_md": {"type": "string"},
-                "read_depth": {"type": "string", "enum": ["full_text", "specified_sections", "abstract_only"]},
-                "support_scope": {"type": "string"},
-                "source_citation": {"type": "string"},
-                "fulfilled_request_ids": {"type": ["array", "null"], "items": {"type": "string"}, "default": None},
+                "ref_id": {"type": "string", "description": "外藏卡片编号（如 R001、R002）。"},
+                "question_id": {"type": "string", "description": "所属子题编号（如 Q1、Q2 或 ALL）。"},
+                "title": {"type": "string", "description": "文献或标准定理卡片标题。"},
+                "abstract_md": {
+                    "type": "string",
+                    "minLength": 60,
+                    "maxLength": 1500,
+                    "description": "独立高密度摘要（60–1500 字符，推荐 120–500 字符）。",
+                },
+                "exact_preconditions_md": {"type": "string", "description": "严格适用前提与边界条件（必填）。"},
+                "formulas_or_operators_md": {"type": "string", "description": "核心数学公式、定理表达式或算子定义（必填）。"},
+                "read_depth": {
+                    "type": "string",
+                    "enum": sorted(ALLOWED_READ_DEPTHS),
+                    "description": "阅读深度英文枚举：full_text | specified_sections | abstract_only。",
+                },
+                "support_scope": {
+                    "type": "string",
+                    "enum": sorted(ALLOWED_SUPPORT_SCOPES),
+                    "description": "支持度分类英文枚举（严禁填中文）：常用 DIRECT_PROOF_OR_EXACT_MEASUREMENT | CONDITIONALLY_VERIFIED | NEGATIVE_REFUTATION | HEURISTIC_CORRELATION | BACKGROUND_REFERENCE。",
+                },
+                "source_citation": {"type": "string", "description": "文献出处或标准教材定理来源。"},
+                "fulfilled_request_ids": {"type": ["array", "null"], "items": {"type": "string"}, "default": None, "description": "核销的 request_id 列表，主动建卡传 null 或 []。"},
             },
             ["ref_id", "question_id", "title", "abstract_md", "exact_preconditions_md", "formulas_or_operators_md", "read_depth", "support_scope", "source_citation"],
         ),
@@ -688,6 +704,9 @@ def serve_stdio() -> int:
         resp = handle_jsonrpc_message(msg)
         if resp is not None:
             _write_message(stdout_buf, resp, framing or "ndjson")
+
+
+TOOL_DEFINITIONS[:] = enrich_tool_definitions(TOOL_DEFINITIONS)
 
 
 if __name__ == "__main__":
