@@ -809,6 +809,28 @@ def evaluate(artifact, spec, tier="official"):
         self.assertEqual(row["status"], "REVISION_REQUESTED")
         mem.close()
 
+    def test_10_readonly_snapshot_no_side_effect_and_empty_goal_rejected(self) -> None:
+        # 1) 对从未初始化的新工作区调用只读 schedule_snapshot 绝不可创建数据目录或空库
+        fresh_ws = Path(self._tmp.name) / "never_initialized_ws"
+        fresh_ws.mkdir(parents=True, exist_ok=True)
+        probe_paths = db.resolve_storage_paths(str(fresh_ws), create_dirs=False)
+        self.assertFalse(probe_paths["data_dir"].exists())
+
+        snap_res = mcp.dispatch_control_call("control_plane/schedule_snapshot", {"workspace_root": str(fresh_ws)})
+        self.assertTrue(snap_res["ok"], snap_res)
+        self.assertFalse(snap_res["data"]["initialized"])
+        self.assertFalse(snap_res["data"]["parse0_signed"])
+        self.assertFalse(probe_paths["data_dir"].exists(), "只读 status/snapshot 严禁在磁盘上创建空目录或空库")
+        self.assertFalse(probe_paths["db_path"].exists())
+
+        # 2) init_parse0 传入空白 goal_and_completion_md 必须被拒
+        bad_init = mcp.dispatch_control_call(
+            "control_plane/init_parse0",
+            {"workspace_root": str(fresh_ws), "goal_and_completion_md": "   ", "subquestions": ["Q1"]},
+        )
+        self.assertFalse(bad_init["ok"])
+        self.assertEqual(bad_init["error_code"], db.ERR_INVALID_INPUT)
+
 
 if __name__ == "__main__":
     unittest.main()

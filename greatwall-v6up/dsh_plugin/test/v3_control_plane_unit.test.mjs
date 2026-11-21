@@ -29,6 +29,7 @@ import {
   runPreSpawnBriefingWithCompanion,
 } from '../lib/pair_lifecycle.js'
 import { GreatwallOrchestrator, selectDispatchableExplorers } from '../lib/orchestrator.js'
+import { TelemetryCollector } from '../lib/telemetry.js'
 import { pickController } from '../lib/console_routes.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -576,6 +577,120 @@ test('12. orchestrator 连续快照失败进入 error 退出，绝不假报 CLOS
     assert.ok(events.some((e) => e.kind === 'orchestrator_snapshot_error'))
     assert.ok(states.includes('error'))
     assert.ok(!stages.includes('CLOSED_VERIFIED'), '快照报错绝不可伪造 CLOSED_VERIFIED')
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('13. getControlStatus 暴露 kernelAlive 与 lastError，绝不假健康', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_v3_health_'))
+  const dataDir = path.join(tmpRoot, 'data')
+  try {
+    const orch = new GreatwallOrchestrator({
+      ctx: {},
+      bridge: {
+        async control() {
+          throw new Error('python kernel crashed (EPIPE)')
+        },
+      },
+      corePythonRoot: CORE_PYTHON_ROOT,
+      workspaceRoot: tmpRoot,
+      dataDir,
+    })
+    const st = await orch.getControlStatus()
+    assert.equal(st.kernelAlive, false)
+    assert.match(String(st.lastError), /EPIPE/)
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('14. pause 后再 start 复用原循环不双开 + _waitWakeOrTimeout 无泄漏', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_v3_pause_'))
+  const dataDir = path.join(tmpRoot, 'data')
+  try {
+    const orch = new GreatwallOrchestrator({
+      ctx: {},
+      bridge: {
+        async control(method) {
+          if (method === 'control_plane/schedule_snapshot') {
+            return { ok: true, data: { initialized: true, parse0_signed: true, stage: 'STAGE2_EVOLVE', closure_state: { status: 'OPEN' } } }
+          }
+          return { ok: true, data: {} }
+        },
+      },
+      corePythonRoot: CORE_PYTHON_ROOT,
+      workspaceRoot: tmpRoot,
+      dataDir,
+    })
+
+    // 1) 连续 20 次超时等待后 _wakeResolvers 必须为 0（零泄漏）
+    for (let i = 0; i < 20; i += 1) {
+      await orch._waitWakeOrTimeout(1)
+    }
+    assert.equal(orch._wakeResolvers.size, 0, '超时后必须清理 _wakeResolvers 避免长跑内存泄漏')
+
+    // 2) start -> pause -> start 绝不可启动第二条事件池
+    let loopsStarted = 0
+    let releaseLoop = null
+    orch._runAsyncEventPool = async () => {
+      loopsStarted += 1
+      await new Promise((resolve) => {
+        releaseLoop = resolve
+      })
+    }
+    const r1 = await orch.startBackground()
+    assert.equal(r1.started, true)
+    assert.equal(r1.alreadyRunning, false)
+    assert.equal(loopsStarted, 1)
+
+    orch.pauseBackground()
+    assert.equal(orch._poolState, 'paused')
+
+    const r2 = await orch.startBackground()
+    assert.equal(r2.started, true)
+    assert.equal(r2.alreadyRunning, true)
+    assert.equal(r2.resumed, true)
+    assert.equal(orch._poolState, 'running')
+    assert.equal(loopsStarted, 1, 'pause 后再 start 必须复用原循环，严禁起第二条并发循环')
+
+    releaseLoop?.()
+    await orch.stopBackground('TEST_DONE')
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('15. 未签 Parse 0 禁止 start 空转 + TelemetryCollector 跨重建保留 countersByRole', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_v3_nop0_'))
+  const dataDir = path.join(tmpRoot, 'data')
+  try {
+    const orch = new GreatwallOrchestrator({
+      ctx: {},
+      bridge: {
+        async control(method) {
+          if (method === 'control_plane/schedule_snapshot') {
+            return { ok: true, data: { initialized: false, parse0_signed: false, stage: 'STAGE1_PARSE0', closure_state: { status: 'OPEN' } } }
+          }
+          return { ok: true, data: {} }
+        },
+      },
+      corePythonRoot: CORE_PYTHON_ROOT,
+      workspaceRoot: tmpRoot,
+      dataDir,
+    })
+    const res = await orch.startBackground()
+    assert.equal(res.started, false)
+    assert.equal(res.blocked, 'NEED_PARSE0_SIGNATURE')
+    assert.equal(orch._poolState, 'idle')
+
+    // TelemetryCollector 跨重建必须保留 countersByRole
+    const t1 = new TelemetryCollector({ workspaceRoot: tmpRoot, dataDir })
+    t1.recordSessionStart({ sessionId: 's1', role: 'explorer' })
+    t1.recordSessionStart({ sessionId: 's2', role: 'lineage_companion' })
+    const t2 = new TelemetryCollector({ workspaceRoot: tmpRoot, dataDir })
+    assert.equal(t2.getSummary().countersByRole.explorer?.total, 1)
+    assert.equal(t2.getSummary().countersByRole.lineage_companion?.total, 1)
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true })
   }

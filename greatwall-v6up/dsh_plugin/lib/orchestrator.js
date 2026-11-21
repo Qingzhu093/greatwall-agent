@@ -89,7 +89,9 @@ export class GreatwallOrchestrator {
     this._poolState = 'idle'
     this._loopAbortController = null
     this._backgroundTask = null
-    this._wakeResolvers = []
+    /** @type {Set<() => void>} */
+    this._wakeResolvers = new Set()
+    this._lastError = null
     this._runningExplorers = new Map()
     this._runningGov = new Map()
     /** 单节点同会话伴随暂停保活句柄表（严格按 node_id 绑定，绝不跨代复用） */
@@ -150,31 +152,80 @@ export class GreatwallOrchestrator {
   }
 
   _wakeLoop() {
-    for (const r of this._wakeResolvers.splice(0)) {
+    for (const r of [...this._wakeResolvers]) {
+      this._wakeResolvers.delete(r)
       try { r() } catch {}
     }
   }
 
   _waitWakeOrTimeout(ms) {
     return new Promise((resolve) => {
-      const t = setTimeout(() => resolve(), ms)
-      this._wakeResolvers.push(() => {
+      const done = () => {
+        this._wakeResolvers.delete(done)
         clearTimeout(t)
         resolve()
-      })
+      }
+      const t = setTimeout(done, ms)
+      this._wakeResolvers.add(done)
     })
   }
 
   async startBackground({ maxConcurrentWorkers = null, agentOptions = {} } = {}) {
-    if (this._poolState === 'running' && this._backgroundTask) {
-      return { started: true, alreadyRunning: true, status: await this.getControlStatus() }
+    // 幂等保护：若后台循环仍在存活，running 直接返回，paused 则恢复原循环，严禁起第二条并发循环！
+    if (this._backgroundTask) {
+      if (this._poolState === 'paused') {
+        this.resumeBackground()
+        return { started: true, alreadyRunning: true, resumed: true, status: await this.getControlStatus() }
+      }
+      if (this._poolState === 'running') {
+        return { started: true, alreadyRunning: true, status: await this.getControlStatus() }
+      }
     }
+
+    // 启动前置门禁：核验内核可达且已签署 Parse 0，杜绝未签契约静默空转刷盘
+    let preSnapRes = null
+    try {
+      preSnapRes = await this.bridge.control('control_plane/schedule_snapshot', {
+        workspace_root: this.workspaceRoot,
+        ...(maxConcurrentWorkers ? { max_concurrent_workers: maxConcurrentWorkers } : {}),
+      })
+    } catch (err) {
+      this._lastError = String(err?.message || err)
+      return {
+        started: false,
+        alreadyRunning: false,
+        blocked: 'KERNEL_UNAVAILABLE',
+        error: this._lastError,
+        status: await this.getControlStatus(),
+      }
+    }
+    if (!preSnapRes?.ok || !preSnapRes?.data) {
+      this._lastError = String(preSnapRes?.error || 'schedule_snapshot 返回失败')
+      return {
+        started: false,
+        alreadyRunning: false,
+        blocked: 'KERNEL_UNAVAILABLE',
+        error: this._lastError,
+        status: await this.getControlStatus(),
+      }
+    }
+    if (!preSnapRes.data.parse0_signed) {
+      return {
+        started: false,
+        alreadyRunning: false,
+        blocked: 'NEED_PARSE0_SIGNATURE',
+        error: '尚未签署 Parse 0 启动契约，请先调用 init（或传入非空 goal_and_completion_md）后再启动事件池。',
+        status: await this.getControlStatus(),
+      }
+    }
+
     if (agentOptions && Object.keys(agentOptions).length > 0) {
       this.defaultAgentOptions = { ...this.defaultAgentOptions, ...agentOptions }
     }
     if (!this._loopAbortController || this._loopAbortController.signal.aborted) {
       this._loopAbortController = new AbortController()
     }
+    this._lastError = null
     this._poolState = 'running'
     this._stage3Done = false
     this.telemetry.setOrchestratorState('running')
@@ -183,7 +234,8 @@ export class GreatwallOrchestrator {
     this._backgroundTask = this._runAsyncEventPool({ maxConcurrentWorkers })
       .catch((err) => {
         if (err?.code !== 'GREATWALL_RUN_ABORTED') {
-          this.telemetry.recordEvent('orchestrator_error', { error: String(err?.message || err) })
+          this._lastError = String(err?.message || err)
+          this.telemetry.recordEvent('orchestrator_error', { error: this._lastError })
         }
       })
       .finally(() => {
@@ -312,10 +364,19 @@ export class GreatwallOrchestrator {
 
   async getControlStatus() {
     let snapData = null
+    let kernelAlive = false
+    let statusError = this._lastError || null
     try {
       const res = await this.bridge.control('control_plane/schedule_snapshot', { workspace_root: this.workspaceRoot })
-      snapData = res?.data || null
-    } catch {}
+      if (res?.ok && res?.data) {
+        snapData = res.data
+        kernelAlive = true
+      } else {
+        statusError = String(res?.error || 'schedule_snapshot 返回失败')
+      }
+    } catch (err) {
+      statusError = String(err?.message || err)
+    }
     const liveList = [...this.liveSessions.entries()].map(([sid, s]) => ({
       sessionId: sid,
       role: s.role,
@@ -326,6 +387,9 @@ export class GreatwallOrchestrator {
     }))
     return {
       poolState: this._poolState,
+      kernelAlive,
+      lastError: statusError,
+      initialized: snapData ? Boolean(snapData.initialized ?? true) : false,
       stage: snapData?.stage || this.telemetry.state.stage,
       closureStatus: snapData?.closure_state?.status || 'OPEN',
       humanStopActive: Boolean(snapData?.human_stop_active),
@@ -472,6 +536,7 @@ export class GreatwallOrchestrator {
           error: errMsg,
         })
         if (snapshotErrorStreak >= 3) {
+          this._lastError = errMsg
           this._poolState = 'error'
           this.telemetry.setOrchestratorState('error', this.telemetry.state.stage || 'ERROR')
           break
@@ -673,12 +738,18 @@ export class GreatwallOrchestrator {
         continue
       }
 
-      // Stage 2: 1) PRE_SPAWN 同节点伴随写看板并挂起保活
+      // Stage 2: 1) PRE_SPAWN 同节点伴随写看板并挂起保活（受 slot_cap 约束，避免多起空转保活伴随）
+      const effSlotCap = Math.max(1, Number(maxConcurrentWorkers || snap.slot_cap || 6))
+      const runningBriefings = [...this._runningGov.keys()].filter((k) => k.startsWith('brief:')).length
+      const readyWaitingCount = (snap.explorers_ready_to_run || []).filter((n) => !this._runningExplorers.has(n.node_id)).length
+      let availBriefSlots = Math.max(0, effSlotCap - this._runningExplorers.size - runningBriefings - readyWaitingCount)
       for (const node of snap.explorers_needing_briefing || []) {
+        if (availBriefSlots <= 0) break
         if (this._launchGovTask(`brief:${node.node_id}`, () =>
           runPreSpawnBriefingWithCompanion(this, node, { signal: sig }),
         )) {
           dispatchedSomething = true
+          availBriefSlots -= 1
         }
       }
 

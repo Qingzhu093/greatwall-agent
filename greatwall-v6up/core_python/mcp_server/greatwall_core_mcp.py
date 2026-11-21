@@ -27,6 +27,7 @@ from .control_plane_service import (  # noqa: E402
     schedule_control_plane_snapshot,
     stage_blind_review_sandbox,
     sync_session_pressure,
+    uninitialized_schedule_snapshot,
 )
 from .db_schema import (  # noqa: E402
     ERR_INVALID_INPUT,
@@ -557,6 +558,19 @@ def dispatch_control_call(method: str, params: dict[str, Any] | None) -> dict[st
     eff_ws = str(p.pop("workspace_root", "") or os.environ.get("GREATWALL_WORKSPACE_ROOT", "")).strip()
     conn = None
     try:
+        # 纯只读探测与启动恢复：若尚未初始化数据库，严禁无故创建目录与 300KB 空库
+        if method in ("control_plane/schedule_snapshot", "control_plane/recover_heavy_jobs"):
+            probe_paths = resolve_storage_paths(eff_ws, create_dirs=False)
+            if not probe_paths["db_path"].is_file():
+                if method == "control_plane/schedule_snapshot":
+                    return {
+                        "ok": True,
+                        "data": uninitialized_schedule_snapshot(
+                            max_concurrent_workers=p.get("max_concurrent_workers")
+                        ),
+                    }
+                return {"ok": True, "data": {"recovered_jobs": []}}
+
         paths = resolve_storage_paths(eff_ws)
         conn = open_rw_connection(paths["db_path"], init_schema=True)
         if method in ("control_plane/init_parse0", "control_plane/init_epoch"):

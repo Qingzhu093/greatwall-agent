@@ -38,11 +38,15 @@ export class TelemetryCollector {
     this.workspaceRoot = workspaceRoot
     this.filePath = resolveTelemetryFilePath({ dataDir, workspaceRoot })
     let persistedSessions = {}
+    let persistedCounters = {}
     try {
       if (fs.existsSync(this.filePath)) {
         const prev = JSON.parse(fs.readFileSync(this.filePath, 'utf8'))
         if (prev?.sessions && typeof prev.sessions === 'object') {
           persistedSessions = prev.sessions
+        }
+        if (prev?.countersByRole && typeof prev.countersByRole === 'object') {
+          persistedCounters = prev.countersByRole
         }
       }
     } catch {}
@@ -56,7 +60,7 @@ export class TelemetryCollector {
       activeExplorers: [],
       activeGovernance: [],
       interventions: [],
-      countersByRole: {},
+      countersByRole: persistedCounters,
       sessions: persistedSessions,
       recentEvents: [],
     }

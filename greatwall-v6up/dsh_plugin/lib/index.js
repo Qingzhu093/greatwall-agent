@@ -311,12 +311,15 @@ export function apply(ctx, config = {}) {
         }
         if (act === 'start') {
           if (goalText || (Array.isArray(args.subquestions) && args.subquestions.length) || (Array.isArray(args.required_questions) && args.required_questions.length)) {
-            await ctrl.initParse0(initPayload)
+            const initRes = await ctrl.initParse0(initPayload)
+            if (!initRes?.ok) {
+              return { ok: false, action: act, init: initRes, status: await ctrl.orchestrator.getControlStatus() }
+            }
           }
           const startRes = await ctrl.orchestrator.startBackground({
             maxConcurrentWorkers: args.max_concurrent_workers ? Number(args.max_concurrent_workers) : null,
           })
-          return { ok: true, action: act, ...startRes }
+          return { ok: Boolean(startRes?.started), action: act, ...startRes }
         }
         if (act === 'pause') {
           return { ok: true, action: act, ...ctrl.orchestrator.pauseBackground() }

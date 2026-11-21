@@ -132,8 +132,8 @@ def compute_workspace_hash(workspace_root: str) -> str:
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
 
 
-def resolve_storage_paths(workspace_root: str = "") -> dict[str, Path]:
-    """解析并准备 `$PLUGIN_DATA/workspaces/<ws_hash>/` 全套物理隔离受控目录。"""
+def resolve_storage_paths(workspace_root: str = "", *, create_dirs: bool = True) -> dict[str, Path]:
+    """解析并按需准备 `$PLUGIN_DATA/workspaces/<ws_hash>/` 全套物理隔离受控目录。"""
     base_data = (
         os.environ.get("GREATWALL_PLUGIN_DATA_DIR")
         or os.environ.get("PLUGIN_DATA")
@@ -150,17 +150,18 @@ def resolve_storage_paths(workspace_root: str = "") -> dict[str, Path]:
     instrument_snapshots_dir = data_dir / "instrument_snapshots"
     skills_dir = data_dir / "skills"
 
-    for d in (
-        data_dir,
-        eval_artifacts_dir,
-        job_inputs_dir,
-        snapshots_dir,
-        hidden_calibrations_dir,
-        blind_sandboxes_dir,
-        instrument_snapshots_dir,
-        skills_dir,
-    ):
-        d.mkdir(parents=True, exist_ok=True)
+    if create_dirs:
+        for d in (
+            data_dir,
+            eval_artifacts_dir,
+            job_inputs_dir,
+            snapshots_dir,
+            hidden_calibrations_dir,
+            blind_sandboxes_dir,
+            instrument_snapshots_dir,
+            skills_dir,
+        ):
+            d.mkdir(parents=True, exist_ok=True)
 
     return {
         "data_dir": data_dir,

@@ -78,6 +78,9 @@ def init_parse0_contract(
     human_signed_at: str | None = None,
 ) -> dict[str, Any]:
     """写入或更新 active Parse 0 六项启动契约表单（单写者控制面调用）。"""
+    clean_goal = str(goal_and_completion_md or "").strip()
+    if not clean_goal:
+        raise FailClosedError(ERR_INVALID_INPUT, "Parse 0 第 1 项 goal_and_completion_md 不可为空")
     qs: list[str] = []
     for q in (subquestions or ["Q1"]):
         val = (q.get("question_id") or q.get("id") or "") if isinstance(q, dict) else q
@@ -85,7 +88,7 @@ def init_parse0_contract(
         if s and s not in qs:
             qs.append(s)
     if not qs:
-        qs = ["Q1"]
+        raise FailClosedError(ERR_INVALID_INPUT, "Parse 0 第 2 项 subquestions 至少须包含 1 个非空子题标识")
     order_list = [str(q).strip() for q in (question_order or []) if str(q).strip()]
     now = utc_now_iso()
     signed_ts = str(human_signed_at or now)
@@ -1021,6 +1024,7 @@ def schedule_control_plane_snapshot(
     stop_new_dispatch = bool(human_stop_active or closure_gate.get("closure_allowed"))
 
     return {
+        "initialized": True,
         "stage": stage,
         "parse0_signed": has_parse0_signed,
         "goal_and_completion_md": goal_md,
@@ -1050,6 +1054,62 @@ def schedule_control_plane_snapshot(
         "stage3_revision_pending": stage3_revision_pending,
         "stage3_final_audit_pending": stage3_final_audit_pending,
         "stage3_supervisory_sign_pending": stage3_supervisory_sign_pending,
+    }
+
+
+def uninitialized_schedule_snapshot(max_concurrent_workers: int | None = None) -> dict[str, Any]:
+    """工作区尚未建库时返回的纯只读空快照（零写盘、零建目录、零建库）。"""
+    cfg = load_runtime_config()
+    hard_cap = int(cfg.get("max_concurrent_workers_hard_cap", 10))
+    wanted = int(max_concurrent_workers or cfg.get("max_concurrent_workers", 6))
+    slot_cap = max(1, min(hard_cap, wanted))
+    return {
+        "initialized": False,
+        "stage": "STAGE1_PARSE0",
+        "parse0_signed": False,
+        "goal_and_completion_md": "",
+        "required_questions": [],
+        "question_order": [],
+        "question_order_status": {},
+        "questions_needing_branch": [],
+        "external_literature_count": 0,
+        "slot_cap": slot_cap,
+        "triage_locked_branches": [],
+        "family_concentration_alerts": [],
+        "ambiguous_spec_alerts": [],
+        "unhealthy_instruments": [],
+        "pending_surveys": [],
+        "open_works_tickets": [],
+        "pending_revalidation": [],
+        "awaiting_triage": [],
+        "pending_reviews": [],
+        "pending_handoff_nodes": [],
+        "explorers_needing_briefing": [],
+        "explorers_ready_to_run": [],
+        "blocked_by_requires_nodes": [],
+        "stagnation_triggered": False,
+        "human_stop_active": False,
+        "closure_state": {"status": "OPEN"},
+        "closure_gate": {
+            "mode": "FULL",
+            "closure_allowed": False,
+            "gate_code": "GATE_BLOCKED_NO_CONTRACT",
+            "required_questions": [],
+            "full_goal_l3_counts": {},
+            "total_l3_counts": {},
+            "blocking_questions_missing_full_goal": [],
+            "min_commitment_window_sec": 0,
+            "elapsed_sec": 0.0,
+            "commitment_window_satisfied": True,
+            "budget_exhausted": False,
+            "budget_usage": {"used_handoffs": 0, "used_official_evals": 0, "limits": {}},
+            "human_stop_requested_at": None,
+            "pending_reviews": [],
+            "pending_revalidation": [],
+        },
+        "stage3_revision_pending": False,
+        "stage3_final_audit_pending": False,
+        "stage3_supervisory_sign_pending": False,
     }
 
 
