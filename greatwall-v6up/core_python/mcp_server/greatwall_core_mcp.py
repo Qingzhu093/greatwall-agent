@@ -584,7 +584,7 @@ def dispatch_control_call(method: str, params: dict[str, Any] | None) -> dict[st
                 total_budget=p.get("total_budget"),
                 min_commitment_window_sec=int(p.get("min_commitment_window_sec", 0) or 0),
                 delivery_spec_md=str(p.get("delivery_spec_md") or ""),
-                stage=str(p.get("stage", "STAGE1_PARSE0")),
+                stage=p.get("stage") if p.get("stage") else None,
                 epoch_id=int(p.get("epoch_id", 1)),
                 human_signed_at=p.get("human_signed_at"),
             )

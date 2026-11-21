@@ -695,3 +695,35 @@ test('15. 未签 Parse 0 禁止 start 空转 + TelemetryCollector 跨重建保�
     fs.rmSync(tmpRoot, { recursive: true, force: true })
   }
 })
+
+test('16. _launchGovTask 失败进入冷却且不立刻 _wakeLoop()，防紧循环空转', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_v3_govcool_'))
+  const dataDir = path.join(tmpRoot, 'data')
+  try {
+    const orch = new GreatwallOrchestrator({
+      ctx: {},
+      bridge: { async control() { return { ok: true, data: {} } } },
+      corePythonRoot: CORE_PYTHON_ROOT,
+      workspaceRoot: tmpRoot,
+      dataDir,
+    })
+    let wakes = 0
+    orch._wakeLoop = () => { wakes += 1 }
+    let calls = 0
+    const launched1 = orch._launchGovTask('works:queue', async () => {
+      calls += 1
+      throw new Error('instant spawn error')
+    })
+    assert.equal(launched1, true)
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal(calls, 1)
+    assert.equal(wakes, 0, '治理任务失败时不应该立刻 _wakeLoop() 触发紧循环')
+
+    // 冷却期内再次尝试拉起同一 taskKey 必须被跳过
+    const launched2 = orch._launchGovTask('works:queue', async () => { calls += 1 })
+    assert.equal(launched2, false)
+    assert.equal(calls, 1)
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})

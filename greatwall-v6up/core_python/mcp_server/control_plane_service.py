@@ -73,11 +73,11 @@ def init_parse0_contract(
     total_budget: dict[str, Any] | None = None,
     min_commitment_window_sec: int = 0,
     delivery_spec_md: str = "",
-    stage: str = "STAGE1_PARSE0",
+    stage: str | None = None,
     epoch_id: int = 1,
     human_signed_at: str | None = None,
 ) -> dict[str, Any]:
-    """写入或更新 active Parse 0 六项启动契约表单（单写者控制面调用）。"""
+    """写入或更新 active Parse 0 六项启动契约表单（单写者控制面调用；更新已有契约时默认保留当前 stage 不倒退）。"""
     clean_goal = str(goal_and_completion_md or "").strip()
     if not clean_goal:
         raise FailClosedError(ERR_INVALID_INPUT, "Parse 0 第 1 项 goal_and_completion_md 不可为空")
@@ -92,11 +92,13 @@ def init_parse0_contract(
     order_list = [str(q).strip() for q in (question_order or []) if str(q).strip()]
     now = utc_now_iso()
     signed_ts = str(human_signed_at or now)
-    eff_stage = stage if stage in ("STAGE1_PARSE0", "STAGE2_EVOLVE", "STAGE3_CONSOLIDATE", "CLOSED_VERIFIED") else "STAGE1_PARSE0"
+    explicit_stage = stage if stage in ("STAGE1_PARSE0", "STAGE2_EVOLVE", "STAGE3_CONSOLIDATE", "CLOSED_VERIFIED") else None
+    insert_stage = explicit_stage or "STAGE1_PARSE0"
+    stage_update_sql = "stage = excluded.stage," if explicit_stage is not None else ""
 
     with rw_immediate_tx(conn):
         conn.execute(
-            """
+            f"""
             INSERT INTO parse0_contract(
                 contract_id, goal_and_completion_md, subquestions_json, question_order_json,
                 initial_instruments_json, seed_families_json, total_budget_json,
@@ -113,7 +115,7 @@ def init_parse0_contract(
                 min_commitment_window_sec = excluded.min_commitment_window_sec,
                 delivery_spec_md = excluded.delivery_spec_md,
                 human_signed_at = excluded.human_signed_at,
-                stage = excluded.stage,
+                {stage_update_sql}
                 epoch_id = excluded.epoch_id,
                 updated_at = excluded.updated_at
             """,
@@ -127,7 +129,7 @@ def init_parse0_contract(
                 max(0, int(min_commitment_window_sec or 0)),
                 str(delivery_spec_md or ""),
                 signed_ts,
-                eff_stage,
+                insert_stage,
                 int(epoch_id or 1),
                 now,
                 now,
@@ -140,6 +142,8 @@ def init_parse0_contract(
             """,
             (now,),
         )
+        cur_row = conn.execute("SELECT stage FROM parse0_contract WHERE contract_id = 'active'").fetchone()
+        eff_stage = str(cur_row["stage"]) if cur_row else insert_stage
 
     return {
         "contract_id": "active",

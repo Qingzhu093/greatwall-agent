@@ -123,7 +123,7 @@ export function apply(ctx, config = {}) {
         totalBudget = {},
         minCommitmentWindowSec = 0,
         deliverySpecMd = '',
-        stage = 'STAGE1_PARSE0',
+        stage = null,
         epochId = 1,
       } = {}) {
         return bridge.control('control_plane/init_parse0', {
@@ -136,7 +136,7 @@ export function apply(ctx, config = {}) {
           total_budget: totalBudget,
           min_commitment_window_sec: minCommitmentWindowSec,
           delivery_spec_md: deliverySpecMd,
-          stage,
+          ...(stage ? { stage } : {}),
           epoch_id: epochId,
         })
       },
@@ -147,7 +147,7 @@ export function apply(ctx, config = {}) {
           questionOrder: optsCompat.questionOrder || [],
           minCommitmentWindowSec: optsCompat.minCommitmentWindowSec || 0,
           deliverySpecMd: optsCompat.deliverySpecMd || '',
-          stage: optsCompat.stage || 'STAGE1_PARSE0',
+          stage: optsCompat.stage || null,
           epochId: optsCompat.epochId || 1,
         })
       },
@@ -310,10 +310,19 @@ export function apply(ctx, config = {}) {
           return { ok: Boolean(initRes?.ok), action: act, init: initRes, status: await ctrl.orchestrator.getControlStatus() }
         }
         if (act === 'start') {
-          if (goalText || (Array.isArray(args.subquestions) && args.subquestions.length) || (Array.isArray(args.required_questions) && args.required_questions.length)) {
-            const initRes = await ctrl.initParse0(initPayload)
-            if (!initRes?.ok) {
-              return { ok: false, action: act, init: initRes, status: await ctrl.orchestrator.getControlStatus() }
+          const hasInlineInit = Boolean(
+            goalText ||
+              (Array.isArray(args.subquestions) && args.subquestions.length) ||
+              (Array.isArray(args.required_questions) && args.required_questions.length),
+          )
+          // start 只在尚未启动且未签署 Parse 0 的首次冷启动时顺手立项；运行中或已签过契约时绝不借 start 悄悄覆写契约（中途修订请显式调 init）
+          if (hasInlineInit && !ctrl.orchestrator._backgroundTask) {
+            const preSnap = await ctrl.scheduleSnapshot()
+            if (preSnap?.ok && !preSnap?.data?.parse0_signed) {
+              const initRes = await ctrl.initParse0(initPayload)
+              if (!initRes?.ok) {
+                return { ok: false, action: act, init: initRes, status: await ctrl.orchestrator.getControlStatus() }
+              }
             }
           }
           const startRes = await ctrl.orchestrator.startBackground({

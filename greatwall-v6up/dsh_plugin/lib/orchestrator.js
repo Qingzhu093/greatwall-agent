@@ -94,6 +94,7 @@ export class GreatwallOrchestrator {
     this._lastError = null
     this._runningExplorers = new Map()
     this._runningGov = new Map()
+    this._govCooldownUntil = new Map()
     /** 单节点同会话伴随暂停保活句柄表（严格按 node_id 绑定，绝不跨代复用） */
     this._nodeCompanionSessions = new Map()
     this._pendingSalvageNodes = new Map()
@@ -412,17 +413,25 @@ export class GreatwallOrchestrator {
 
   _launchGovTask(taskKey, runner) {
     if (this._runningGov.has(taskKey)) return false
+    const cooldownUntil = this._govCooldownUntil.get(taskKey) || 0
+    if (cooldownUntil > Date.now()) return false
+    let failed = false
     const p = Promise.resolve()
       .then(runner)
       .catch((err) => {
         if (err?.code !== 'GREATWALL_RUN_ABORTED') {
+          failed = true
+          this._govCooldownUntil.set(taskKey, Date.now() + 3000)
           this.telemetry.recordEvent('gov_task_error', { taskKey, error: String(err?.message || err) })
         }
       })
       .finally(() => {
         this._runningGov.delete(taskKey)
         this._syncSlotsToTelemetry()
-        this._wakeLoop()
+        if (!failed) {
+          this._govCooldownUntil.delete(taskKey)
+          this._wakeLoop()
+        }
       })
     this._runningGov.set(taskKey, p)
     this._syncSlotsToTelemetry()

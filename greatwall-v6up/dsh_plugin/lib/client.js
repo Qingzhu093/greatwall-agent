@@ -179,6 +179,8 @@ window.__ModuleLoader__.load({
 			const ambiguousAlerts = snap.ambiguous_spec_alerts || st.ambiguousSpecAlerts || [];
 			const closureStatus = snap.closure_state?.status || st.closureStatus || "OPEN";
 			const poolState = st.poolState || st.state || "idle";
+			const kernelAlive = st.kernelAlive !== false;
+			const lastError = st.lastError || "";
 			const knownWorkspaces = payload?.knownWorkspaces || [];
 
 			return jsxs("div", {
@@ -192,6 +194,11 @@ window.__ModuleLoader__.load({
 								children: [
 									jsx("strong", { children: "长城 V6-Up v3.0" }),
 									jsx("span", { className: stateBadgeClass(poolState), children: poolState }),
+									jsx("span", {
+										className: kernelAlive ? "gw-console-badge gw-badge-run" : "gw-console-badge gw-badge-err",
+										title: kernelAlive ? "Python 控制面内核在线" : (lastError || "Python 控制面内核不可达"),
+										children: kernelAlive ? "内核在线" : "内核离线"
+									}),
 									jsx("span", { className: "gw-muted", children: `${st.stage || "STAGE1_PARSE0"} · ${closureStatus}` })
 								]
 							}),
@@ -212,6 +219,11 @@ window.__ModuleLoader__.load({
 						className: "gw-scroll",
 						children: [
 							notice && jsx("div", { className: "gw-log-line", children: notice }),
+							(!kernelAlive || lastError) && jsx("div", {
+								className: "gw-log-line",
+								style: { borderColor: "rgba(220,38,38,.45)", color: "#dc2626" },
+								children: `🔴 内核异常：${lastError || "Python 控制面未响应"}`
+							}),
 							ambiguousAlerts.length > 0 && jsx("div", {
 								className: "gw-log-line",
 								style: { borderColor: "rgba(220,38,38,.45)", color: "#dc2626" },

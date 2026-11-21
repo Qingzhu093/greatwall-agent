@@ -831,6 +831,22 @@ def evaluate(artifact, spec, tier="official"):
         self.assertFalse(bad_init["ok"])
         self.assertEqual(bad_init["error_code"], db.ERR_INVALID_INPUT)
 
+        # 3) Stage 2 人在环路修订 Parse 0（更新目标/预算，不传 stage）必须成功且保留 STAGE2_EVOLVE 不倒退
+        upd = mcp.dispatch_control_call(
+            "control_plane/init_parse0",
+            {
+                "workspace_root": str(self.ws),
+                "goal_and_completion_md": "# Goal (Revised)\n人类中途补充口径说明并扩容预算。",
+                "subquestions": ["Q1"],
+                "total_budget": {"max_total_handoffs": 50},
+            },
+        )
+        self.assertTrue(upd["ok"], upd)
+        self.assertEqual(upd["data"]["stage"], "STAGE2_EVOLVE")
+        snap_after = cp.schedule_control_plane_snapshot(self.conn)
+        self.assertEqual(snap_after["stage"], "STAGE2_EVOLVE")
+        self.assertIn("人类中途补充口径说明", snap_after["goal_and_completion_md"])
+
 
 if __name__ == "__main__":
     unittest.main()
