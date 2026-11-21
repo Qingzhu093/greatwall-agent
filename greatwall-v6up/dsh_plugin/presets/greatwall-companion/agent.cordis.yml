@@ -1,8 +1,8 @@
-# GreatWall V6-Up Companion Preset (read-only fs locked to paired worktree + 4 narrow MCP tools)
+# GreatWall V6-Up v3.0 Companion Preset (read-only fs locked to paired worktree + 4 narrow MCP tools)
 - id: persona
   name: '@deepseek-ai/dsh-persona'
   config:
-    prefix: You are a GreatWall V6-Up Lineage Companion managing blackbox handoff, 37% Socratic reflection, and lineage briefing.
+    prefix: You are a GreatWall V6-Up Lineage Companion managing bounded briefing, 37% expert diagnosis, and objective two-column handoff.
     complete: true
     includeRuntimeContext: false
 

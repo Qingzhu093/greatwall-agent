@@ -1,70 +1,34 @@
-"""V6-Up (v2.2) supervisory_committee（监察委员会）4 个超然只读零公文窄工具。"""
+"""长城 V6-Up (v3.0) supervisory_committee（监察委员会）4 个超然只读/合规窄工具。"""
+
 from __future__ import annotations
 
 import json
 import os
-import re
-import shutil
 import sqlite3
-import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
 
-from evaluators.isolated_runner import (
-    run_stage_b_revaluation,
-    sha256_file,
-)
 from .control_plane_service import (
-    backup_retained_candidate_snapshot,
     check_stage2_closure_gate_data,
-    export_stage3_deliverables,
-    get_question_dependency_status,
-    restore_retained_candidate_snapshot,
+    compute_delivery_dir_sha256,
+    compute_family_concentration_alerts,
 )
 from .db_schema import (
-    ALLOWED_CLAIMED_EDGE_TYPES,
-    ALLOWED_READ_DEPTHS,
-    ALLOWED_SUPPORT_SCOPES,
+    ALLOWED_COMPLIANCE_STAGES,
+    ALLOWED_COMPLIANCE_STATUSES,
     ERR_AUTH,
-    ERR_CONFLICT,
     ERR_INVALID_INPUT,
-    ERR_INVARIANT,
     ERR_LOCKED,
-    ERR_NOT_FOUND,
     FailClosedError,
-    propagate_dependency_recheck,
-    resolve_storage_paths,
     rw_immediate_tx,
     utc_now_iso,
 )
 from .mcp_core_helpers import (
-    VALID_FORK_MODES,
-    VALID_STAGNATION_LANES,
-    build_tool_receipt,
-    check_mechanism_similarity,
-    compute_adversarial_qp,
-    compute_bb_epsilon,
-    core_python_root,
-    enforce_role_tool_permission,
-    load_runtime_config,
-    record_fact_edge,
-    validate_baseline_isolation_ast,
-)
-from .governance_common import (
     _SQL_WRITE_FORBIDDEN_RE,
-    _audit_node_unread_citations,
-    _collect_proposer_sessions,
-    _extract_referenced_cards_for_blind_review,
-    _next_id,
-    _next_ledger_id,
-    _parse_proposer_sessions,
-    _require_reviewer_session,
+    build_tool_receipt,
+    enforce_role_tool_permission,
 )
-
-# ==============================================================================
-# 角色 7：supervisory_committee（4 个超然只读零公文窄工具）
-# ==============================================================================
 
 
 def tool_get_supervisory_audit_snapshot(
@@ -72,42 +36,45 @@ def tool_get_supervisory_audit_snapshot(
     caller_role: str,
     session_id: str,
 ) -> dict[str, Any]:
+    """纯查 SQLite (<50ms) 返回全局流程审计快照：Parse 0、仪器健康、口径红灯、学派聚拢、最短投入时间与两步终局状态。"""
     enforce_role_tool_permission(conn, caller_role, "get_supervisory_audit_snapshot", session_id=session_id)
-    hooks = [dict(r) for r in conn.execute("SELECT question_id, fidelity_max_error_pct, eval_epoch_version FROM domain_hooks_by_question").fetchall()]
-    ep = conn.execute("SELECT consecutive_non_l1_handoffs, required_questions_json FROM epoch_config WHERE config_id = 'active'").fetchone()
-    non_l1 = int(ep["consecutive_non_l1_handoffs"]) if ep else 0
 
-    all_nodes = conn.execute("SELECT node_id FROM lineage_nodes").fetchall()
-    unread_nodes: list[dict[str, Any]] = []
-    for nr in all_nodes:
-        nid = str(nr["node_id"])
-        rec = _audit_node_unread_citations(conn, nid)
-        if rec["unread_claimed_refs"]:
-            unread_nodes.append({"node_id": nid, "unread_refs": rec["unread_claimed_refs"]})
-
-    unauth_attempts = [
+    p0 = conn.execute("SELECT * FROM parse0_contract WHERE contract_id = 'active'").fetchone()
+    closure_row = conn.execute("SELECT * FROM project_closure_state WHERE id = 1").fetchone()
+    unhealthy = [
         dict(r)
         for r in conn.execute(
-            "SELECT src_id, dst_id, metadata_json, created_at FROM epistemic_edges WHERE edge_track = 'FACT_LOG' AND edge_type = 'UNAUTHORIZED_TOOL_ATTEMPT' ORDER BY created_at DESC LIMIT 20"
+            "SELECT instrument_id, version, question_id, instrument_role, consecutive_error_count FROM instruments WHERE is_active = 1 AND health_status = 'UNHEALTHY'"
         ).fetchall()
     ]
-    reval_backlog = int(
-        conn.execute("SELECT COUNT(*) AS cnt FROM pending_revalidation_queue WHERE status = 'PENDING'").fetchone()["cnt"] or 0
-    )
-    gate = check_stage2_closure_gate_data(conn)
+    ambiguous_alerts = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT alert_id, stage, notes, created_at FROM compliance_alerts WHERE status = 'ALERT_AMBIGUOUS_SPEC' ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+    ]
+    recent_checks = [
+        dict(r)
+        for r in conn.execute("SELECT * FROM compliance_alerts ORDER BY created_at DESC LIMIT 15").fetchall()
+    ]
+    conc_alerts = compute_family_concentration_alerts(conn)
+    gate_full = check_stage2_closure_gate_data(conn, mode="FULL", human_aborted=False)
 
     return build_tool_receipt(
         conn=conn,
         tool_name="get_supervisory_audit_snapshot",
         question_id="ALL",
-        next_step_guidance="审计快照就绪。严禁在磁盘写任何 *_AUDIT.md 文件，请直接调用 check_stage2_closure_gate 与 record_compliance_check 写 SQLite。",
+        next_step_guidance="纯只读审计快照已就绪；请严格遵循流程正义与零 .md 落盘原则调用 record_compliance_check 写库。",
         data={
-            "hooks_fidelity": hooks,
-            "unread_citation_nodes": unread_nodes,
-            "unauthorized_tool_attempts": unauth_attempts,
-            "consecutive_non_l1_handoffs": non_l1,
-            "pending_revalidation_backlog": reval_backlog,
-            "closure_gate_summary": gate,
+            "parse0_signed": bool(p0 and str(p0["human_signed_at"] or "").strip()),
+            "stage": str(p0["stage"]) if p0 else "STAGE1_PARSE0",
+            "consecutive_non_l1_handoffs": int(p0["consecutive_non_l1_handoffs"] or 0) if p0 else 0,
+            "unhealthy_instruments": unhealthy,
+            "ambiguous_spec_alerts": ambiguous_alerts,
+            "family_concentration_alerts": conc_alerts,
+            "project_closure_state": dict(closure_row) if closure_row else {},
+            "closure_gate_full": gate_full,
+            "recent_compliance_alerts": recent_checks,
         },
     )
 
@@ -116,14 +83,16 @@ def tool_check_stage2_closure_gate(
     conn: sqlite3.Connection,
     caller_role: str,
     session_id: str,
+    mode: str = "FULL",
+    human_aborted: bool = False,
 ) -> dict[str, Any]:
+    """CDC 双段式终局门禁校验（FULL / PARTIAL_ON_BUDGET / PARTIAL_ON_HUMAN_STOP）。"""
     enforce_role_tool_permission(conn, caller_role, "check_stage2_closure_gate", session_id=session_id)
-    gate = check_stage2_closure_gate_data(conn)
-    guidance = (
-        "全卷所有必答子题均已具备 >=1 条 L3_VERIFIED 黄金结论且无待重评积压，可调 record_compliance_check(status='PASSED') 放行 Stage 3！"
-        if gate["closure_allowed"]
-        else f"HARD LOCK ({gate['gate_code']}): 必答子题 {gate['blocking_questions_zero_l3']} 尚无 L3_VERIFIED！请立即调用 record_compliance_check(status='BLOCKED') 并严禁宣布结题！"
-    )
+    gate = check_stage2_closure_gate_data(conn, mode=mode, human_aborted=bool(human_aborted))
+    if not gate["closure_allowed"]:
+        guidance = f"终局门禁暂未放行 ({gate['gate_code']})；严禁未满最短投入时间或伪造 human_aborted 提前收工。"
+    else:
+        guidance = f"终局门禁已放行 ({gate['gate_code']})，可通知 library_surveyor 导出 Stage 3 五件套。"
     return build_tool_receipt(
         conn=conn,
         tool_name="check_stage2_closure_gate",
@@ -139,61 +108,105 @@ def tool_record_compliance_check(
     session_id: str,
     stage: str,
     status: str,
-    blocking_questions_zero_l3: list[str],
-    unread_citation_nodes: list[str],
-    notes: str,
+    blocking_questions: list[str] | None = None,
+    notes: str = "",
+    workspace_root: str = "",
 ) -> dict[str, Any]:
+    """写入 SQLite `compliance_alerts`（零 .md 落盘；CLOSURE_GATE(PASSED) 强校验绑定导出版本与磁盘实时哈希防审 A 放 B / 磁盘篡改）。"""
     enforce_role_tool_permission(conn, caller_role, "record_compliance_check", session_id=session_id)
-    st_u = (stage or "").strip().upper()
-    stat_u = (status or "").strip().upper()
-    if st_u not in ("STAGE1_GATE", "STAGE2_HEARTBEAT", "STAGE2_CLOSURE_GATE", "STAGE3_FINAL_AUDIT"):
-        raise FailClosedError(
-            ERR_INVALID_INPUT,
-            f"非法 stage: {stage!r}，仅允许 ['STAGE1_GATE', 'STAGE2_HEARTBEAT', 'STAGE2_CLOSURE_GATE', 'STAGE3_FINAL_AUDIT']",
-        )
-    if stat_u not in ("PASSED", "ALERT", "BLOCKED"):
-        raise FailClosedError(
-            ERR_INVALID_INPUT,
-            f"非法 status: {status!r}，仅允许 ['PASSED', 'ALERT', 'BLOCKED']",
-        )
+    st_u = str(stage or "").strip().upper()
+    stat_u = str(status or "").strip().upper()
+    if st_u not in ALLOWED_COMPLIANCE_STAGES:
+        raise FailClosedError(ERR_INVALID_INPUT, f"非法 stage={stage!r}，仅允许 {sorted(ALLOWED_COMPLIANCE_STAGES)}")
+    if stat_u not in ALLOWED_COMPLIANCE_STATUSES:
+        raise FailClosedError(ERR_INVALID_INPUT, f"非法 status={status!r}，仅允许 {sorted(ALLOWED_COMPLIANCE_STATUSES)}")
 
-    if st_u == "STAGE2_CLOSURE_GATE" and stat_u == "PASSED":
-        gate = check_stage2_closure_gate_data(conn)
-        if not gate["closure_allowed"]:
+    now = utc_now_iso()
+    p0 = conn.execute("SELECT * FROM parse0_contract WHERE contract_id = 'active'").fetchone()
+
+    if st_u == "PARSE0_GATE" and stat_u == "PASSED":
+        if p0 is None or not str(p0["human_signed_at"] or "").strip() or not str(p0["goal_and_completion_md"] or "").strip():
+            raise FailClosedError(ERR_LOCKED, "PARSE0_GATE 阻断：尚未签署包含非空目标与完成判据的 Parse 0 六项启动表单")
+        with rw_immediate_tx(conn):
+            conn.execute(
+                "UPDATE parse0_contract SET stage = 'STAGE2_EVOLVE', updated_at = ? WHERE contract_id = 'active'",
+                (now,),
+            )
+
+    elif st_u == "CLOSURE_GATE" and stat_u == "PASSED":
+        closure = conn.execute("SELECT * FROM project_closure_state WHERE id = 1").fetchone()
+        if closure is None or str(closure["status"]) != "DELIVERY_EXPORTED":
             raise FailClosedError(
                 ERR_LOCKED,
-                f"结题硬锁拦截 (P9/P27)：存在 0 L3 子题 {gate['blocking_questions_zero_l3']}，严禁签发 PASSED！",
+                f"CLOSURE_GATE 硬拦截：当前 project_closure_state={closure['status'] if closure else None!r}，必须先导出五件套至 DELIVERY_EXPORTED",
+            )
+        latest_did = str(closure["latest_delivery_id"] or "")
+        latest_sha = str(closure["latest_delivery_sha256"] or "")
+        aud_did = str(closure["verifier_audited_delivery_id"] or "")
+        aud_sha = str(closure["verifier_audited_delivery_sha256"] or "")
+        aud_pass = int(closure["verifier_final_audit_passed"] or 0)
+        if not (aud_pass == 1 and latest_did and aud_did == latest_did and aud_sha == latest_sha):
+            raise FailClosedError(
+                ERR_LOCKED,
+                f"CLOSURE_GATE 版本绑定硬拦截（防审 A 放 B）：盲审终核记录 (passed={aud_pass}, id={aud_did!r}, sha={aud_sha[:10]!r}) "
+                f"与当前最新导出版本 (id={latest_did!r}, sha={latest_sha[:10]!r}) 不匹配！请先由 library_verifier 完成 STAGE3_FINAL_AUDIT:{latest_did}。",
+            )
+        # 实时重算磁盘 final_delivery/ 整包 SHA-256，防终核后磁盘文件被篡改或缺失
+        if workspace_root:
+            delivery_dir = Path(os.path.realpath(workspace_root)) / "final_delivery"
+            if not delivery_dir.is_dir():
+                raise FailClosedError(ERR_LOCKED, f"CLOSURE_GATE 硬拦截：交付目录 {delivery_dir} 不存在！")
+            live_sha = compute_delivery_dir_sha256(delivery_dir)
+            if live_sha != latest_sha:
+                raise FailClosedError(
+                    ERR_LOCKED,
+                    f"CLOSURE_GATE 磁盘完整性硬拦截（交付包内容已变化）：磁盘实时 SHA-256 ({live_sha[:12]}) != 审定绑定 SHA-256 ({latest_sha[:12]})，必须重新导出并重走终核！",
+                )
+        with rw_immediate_tx(conn):
+            conn.execute(
+                """
+                UPDATE project_closure_state
+                SET status = 'CLOSED_VERIFIED', supervisory_signed_at = ?, updated_at = ?
+                WHERE id = 1
+                """,
+                (now, now),
+            )
+            conn.execute(
+                "UPDATE parse0_contract SET stage = 'CLOSED_VERIFIED', updated_at = ? WHERE contract_id = 'active'",
+                (now,),
             )
 
     alert_id = f"ca_{uuid.uuid4().hex[:10]}"
-    now = utc_now_iso()
     with rw_immediate_tx(conn):
         conn.execute(
             """
-            INSERT INTO compliance_alerts(
-                alert_id, stage, status, blocking_questions_zero_l3_json, unread_citation_nodes_json, notes, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO compliance_alerts(alert_id, stage, status, blocking_questions_json, notes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 alert_id,
                 st_u,
                 stat_u,
-                json.dumps(blocking_questions_zero_l3 or [], ensure_ascii=False),
-                json.dumps(unread_citation_nodes or [], ensure_ascii=False),
-                (notes or "").strip(),
+                json.dumps([str(q) for q in (blocking_questions or [])], ensure_ascii=False),
+                str(notes or "").strip(),
                 now,
             ),
         )
-        if st_u == "STAGE1_GATE" and stat_u == "PASSED":
-            conn.execute("UPDATE epoch_config SET stage = 'STAGE2_EVOLVE', updated_at = ? WHERE config_id = 'active'", (now,))
-        elif st_u == "STAGE3_FINAL_AUDIT" and stat_u == "PASSED":
-            conn.execute("UPDATE epoch_config SET stage = 'CLOSED', updated_at = ? WHERE config_id = 'active'", (now,))
 
+    guidance = (
+        "已写入 ALERT_AMBIGUOUS_SPEC 红灯告警留待人类核查；无人值守总线继续按原已签口径运行不停机。"
+        if stat_u == "ALERT_AMBIGUOUS_SPEC"
+        else (
+            "联合终核版本匹配校验通过，项目已正式晋升为 CLOSED_VERIFIED！"
+            if (st_u == "CLOSURE_GATE" and stat_u == "PASSED")
+            else f"合规记录 {alert_id} ({st_u}={stat_u}) 已写入 SQLite。"
+        )
+    )
     return build_tool_receipt(
         conn=conn,
         tool_name="record_compliance_check",
         question_id="ALL",
-        next_step_guidance="合规核验已写入 SQLite compliance_alerts（零磁盘 .md 公文）。请直接输出 1 行状态并结束会话。",
+        next_step_guidance=guidance,
         data={"alert_id": alert_id, "stage": st_u, "status": stat_u},
     )
 
@@ -206,35 +219,36 @@ def tool_register_saved_graph_query(
     description: str,
     sql_select: str,
 ) -> dict[str, Any]:
+    """单条只读 SELECT + EXPLAIN QUERY PLAN 预检后注册共享只读图视图。"""
     enforce_role_tool_permission(conn, caller_role, "register_saved_graph_query", session_id=session_id)
-    qname = (query_name or "").strip()
-    sql = (sql_select or "").strip().rstrip(";")
-    if not qname or not sql:
+    qn = str(query_name or "").strip()
+    sql = str(sql_select or "").strip()
+    if not qn or not sql:
         raise FailClosedError(ERR_INVALID_INPUT, "query_name 与 sql_select 不能为空")
-    if ";" in sql or _SQL_WRITE_FORBIDDEN_RE.search(sql) or not re.match(r"^\s*SELECT\b", sql, re.IGNORECASE):
+    if _SQL_WRITE_FORBIDDEN_RE.search(sql) or ";" in sql.rstrip(";") or not sql.upper().startswith("SELECT"):
         raise FailClosedError(ERR_AUTH, "仅允许单条只读 SELECT 语句，严禁写子句或多语句注入")
 
     try:
-        conn.execute(f"EXPLAIN QUERY PLAN {sql}", {"branch_id": "test", "question_id": "Q1"}).fetchall()
-    except sqlite3.Error as exc:
+        conn.execute(f"EXPLAIN QUERY PLAN {sql}").fetchall()
+    except sqlite3.DatabaseError as exc:
         raise FailClosedError(ERR_INVALID_INPUT, f"SQL EXPLAIN QUERY PLAN 预检失败: {exc}")
 
     now = utc_now_iso()
     with rw_immediate_tx(conn):
         conn.execute(
             """
-            INSERT INTO saved_graph_queries(query_name, author_role, author_session_id, description, sql_select, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO saved_graph_queries(query_name, description, sql_select, created_at)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(query_name) DO UPDATE SET
                 description = excluded.description,
                 sql_select = excluded.sql_select
             """,
-            (qname, caller_role, session_id, description.strip(), sql, now),
+            (qn, str(description or "").strip(), sql, now),
         )
     return build_tool_receipt(
         conn=conn,
         tool_name="register_saved_graph_query",
         question_id="ALL",
-        next_step_guidance=f"A 档只读 SQL 视图 {qname!r} 已通过 EXPLAIN QUERY PLAN 预检并注册。",
-        data={"query_name": qname},
+        next_step_guidance=f"只读图查询视图 {qn!r} 已通过 EXPLAIN 校验并注册。",
+        data={"query_name": qn},
     )

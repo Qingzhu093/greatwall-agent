@@ -1,12 +1,11 @@
 /**
- * 长城 V6-Up (v2.2) 独立会话托管宿主机（AgentSessionHost）：
+ * 长城 V6-Up (v3.0) 独立会话托管宿主机（AgentSessionHost）：
  *
- * 职责范围：
- * 1. 基于 5 套专用 Preset 创建同工作区独立会话（`meta.cwd = workspaceRoot`，严禁伪造 subagent）；
- * 2. 发布后自动调 `workspaceRegistry.attachSession()` 归入左栏主工作区 + 规范中文标题；
- * 3. 短事务结案自动调 `archiveSession()` 从左侧栏隐藏 + 写入 `greatwall/settled` 只读事件；
- * 4. 监听 `agent/created` 支持 DSH 原生冷恢复 (`agents.resume()`) 同步重挂窄 MCP 工具与沙箱 Guard；
- * 5. 提供 `spawnAndRunAgent` 与 `continueAliveAgent` 执行流封装及 `turn/end` 异常终态探测。
+ * 核心能力：
+ * 1. 基于 6 套专用 Preset 创建同工作区独立会话；`library_verifier` 挂载独立空白盲审沙箱 `sandboxAbsPath`；
+ * 2. 平台感知原生工具挂载强断言 (`win32->pwsh`, 非 `win32->bash`，覆盖 `explorer`、`works_engineer`、`library_verifier`)；
+ * 3. `setSessionReadonly(sessionId, flag)` 支持 70% 两步清醒交接期间将在线探索者瞬时锁为只读文本收官态；
+ * 4. 完整支持单节点伴随会话保活 (`keepAliveAfterIdle`)、冷恢复自动重挂窄工具与沙箱 Guard、短事务归档。
  * @module dsh-greatwall-v6up/agent_session_host
  */
 import crypto from 'node:crypto'
@@ -15,8 +14,9 @@ import {
   CANONICAL_ROLES,
   ROLE_EFFORT_MAP,
   ROLE_MCP_TOOLS,
-  ROLE_NATIVE_ALLOW_TOOLS,
   formatNodeSessionTitle,
+  resolvePlatformAllowedTools,
+  resolvePlatformShellTool,
 } from './prompts.js'
 import { ROLE_TO_PRESET, registerPresetsOnRegistry } from './presets.js'
 import { installRoleSandboxGuard } from './read_isolated_sandbox.js'
@@ -81,18 +81,43 @@ export function extractLastAssistantText(surfaceSnap) {
   return ''
 }
 
+/**
+ * 平台感知原生工具挂载强断言（纯函数，兼供单测校验）。
+ * @param {string} role
+ * @param {Iterable<string>} mountedToolNames
+ * @param {string} [platform]
+ */
+export function assertRequiredNativeTools(role, mountedToolNames, platform = process.platform) {
+  const mounted = new Set(mountedToolNames || [])
+  const expectedShell = resolvePlatformShellTool(platform)
+  const missing = []
+
+  if (role === 'explorer' || role === 'works_engineer') {
+    for (const req of ['read', 'write', expectedShell]) {
+      if (!mounted.has(req)) missing.push(req)
+    }
+  } else if (role === 'library_verifier') {
+    for (const req of ['read', expectedShell]) {
+      if (!mounted.has(req)) missing.push(req)
+    }
+    if (mounted.has('write') || mounted.has('edit')) {
+      throw new Error(`角色 library_verifier 严禁挂载写工具 (write/edit)，当前已挂载: ${[...mounted].join(', ')}`)
+    }
+  } else if (role === 'logistics_coordinator' || role === 'supervisory_committee') {
+    const forbidden = ['read', 'write', 'edit', 'pwsh', 'bash', 'web_search', 'web_fetch'].filter((n) => mounted.has(n))
+    if (forbidden.length > 0) {
+      throw new Error(`纯 DB 治理角色 ${role} 严禁挂载原生工具: ${forbidden.join(', ')}`)
+    }
+  }
+
+  if (missing.length > 0) {
+    throw new Error(
+      `角色 ${role} (platform=${platform}) 缺少关键原生工具: ${missing.join(', ')}（当前仅有: ${[...mounted].join(', ')}）`,
+    )
+  }
+}
+
 export class AgentSessionHost {
-  /**
-   * @param {object} opts
-   * @param {object} opts.ctx
-   * @param {import('./mcp_bridge.js').GreatwallMcpBridge} opts.bridge
-   * @param {string} opts.workspaceRoot
-   * @param {Record<string, string>} opts.rolePrompts
-   * @param {string[]} [opts.protectedDirs]
-   * @param {object} [opts.defaultAgentOptions]
-   * @param {boolean} [opts.autoArchiveShortTx=true]
-   * @param {import('./telemetry.js').TelemetryCollector} opts.telemetry
-   */
   constructor({
     ctx,
     bridge,
@@ -114,6 +139,8 @@ export class AgentSessionHost {
 
     /** @type {Map<string, any>} */
     this.liveSessions = new Map()
+    /** @type {Map<string, boolean>} */
+    this._sessionReadonlyFlags = new Map()
     /** @type {Set<string>} */
     this._setupHandledAgentIds = new Set()
     /** @type {Array<object> | null} */
@@ -122,6 +149,16 @@ export class AgentSessionHost {
     this._latestGovernanceSessions = new Map()
 
     this._resumeListenerDisposer = this._installResumeAutoRemountListener()
+  }
+
+  /** 动态切换指定在线会话的只读保护标志（用于 70% 探索者最后一轮亲笔遗嘱只读收官）。 */
+  setSessionReadonly(sessionId, isReadonly) {
+    if (!sessionId) return
+    this._sessionReadonlyFlags.set(sessionId, Boolean(isReadonly))
+  }
+
+  isSessionReadonly(sessionId) {
+    return Boolean(this._sessionReadonlyFlags.get(sessionId))
   }
 
   _installResumeAutoRemountListener() {
@@ -140,6 +177,7 @@ export class AgentSessionHost {
           role: ident.role,
           nodeId: ident.nodeId || '',
           cwd: ident.worktreeAbsPath || this.workspaceRoot,
+          sandboxAbsPath: ident.sandboxAbsPath || '',
           toolSchemas: cachedSchemas,
           readonly: settled || Boolean(ident.readonly),
           taskContextText: settled
@@ -199,9 +237,22 @@ export class AgentSessionHost {
   mountCapabilitiesOnAgent(
     agentCtx,
     agent,
-    { role, nodeId = '', cwd = '', toolSchemas = [], taskContextText = '', readonly = false, cleanupFns = [], turnSignals = [], onNativeThresholdHit = null },
+    {
+      role,
+      nodeId = '',
+      cwd = '',
+      sandboxAbsPath = '',
+      toolSchemas = [],
+      taskContextText = '',
+      readonly = false,
+      cleanupFns = [],
+      turnSignals = [],
+      onNativeThresholdHit = null,
+    },
   ) {
-    const allowNative = readonly ? ['read', 'glob', 'grep'] : (ROLE_NATIVE_ALLOW_TOOLS[role] || [])
+    const allowNative = readonly
+      ? (role === 'logistics_coordinator' || role === 'supervisory_committee' ? [] : ['read', 'glob', 'grep'])
+      : resolvePlatformAllowedTools(role, process.platform)
     const mcpToolNames = readonly ? [] : (ROLE_MCP_TOOLS[role] || [])
 
     if (typeof agentCtx.tools?.presentAs === 'function') {
@@ -223,16 +274,20 @@ export class AgentSessionHost {
       }
     }
 
-    const effCwd = (role === 'explorer' || role === 'lineage_companion') && cwd ? path.resolve(cwd) : this.workspaceRoot
+    const effWorktree = (role === 'explorer' || role === 'lineage_companion') && cwd ? path.resolve(cwd) : this.workspaceRoot
+    const effSandbox = role === 'library_verifier' && sandboxAbsPath ? path.resolve(sandboxAbsPath) : ''
+    this._sessionReadonlyFlags.set(agent.id, Boolean(readonly))
+
     cleanupFns.push(
       installRoleSandboxGuard(agentCtx, {
         role,
         sessionId: agent.id,
         nodeId,
         workspaceRoot: this.workspaceRoot,
-        worktreeAbsPath: effCwd,
+        worktreeAbsPath: effWorktree,
+        sandboxAbsPath: effSandbox,
         protectedDirs: this.protectedDirs,
-        readonly,
+        readonly: () => Boolean(readonly) || this.isSessionReadonly(agent.id),
         bridge: this.bridge,
       }),
     )
@@ -381,6 +436,7 @@ export class AgentSessionHost {
     branchId = '',
     questionId = '',
     cwd = '',
+    sandboxAbsPath = '',
     taskContextText = '',
     agentOptions = {},
     keepAliveAfterIdle = false,
@@ -406,10 +462,17 @@ export class AgentSessionHost {
 
     const effSid = sessionId || `gw_${role}_${crypto.randomUUID().slice(0, 8)}`
     const effWorktree = (role === 'explorer' || role === 'lineage_companion') && cwd ? path.resolve(cwd) : this.workspaceRoot
+    const effSandbox = role === 'library_verifier' && sandboxAbsPath ? path.resolve(sandboxAbsPath) : ''
+    const metaCwd = role === 'library_verifier' && effSandbox
+      ? effSandbox
+      : ((role === 'explorer' || role === 'lineage_companion') ? effWorktree : this.workspaceRoot)
+
     const sessionTitle = uiLabel || formatNodeSessionTitle(role, { questionId, branchId, nodeId })
     const turnSignals = []
     const nativeThresholds = []
     const cleanupFns = []
+    let liveHandleRef = null
+    let thresholdCancelled = false
 
     const mergedAgentOptions = { ...this.defaultAgentOptions, ...agentOptions }
     const effEffort = await this._resolveSafeReasoningEffort(
@@ -434,10 +497,10 @@ export class AgentSessionHost {
         resolved = await agentPresetsSvc.resolve(targetPreset)
       }
       if (!resolved) {
-        throw new Error(`角色 ${role} 所需的 Agent Preset "${targetPreset}" 无法在 agentPresets 中解析，禁止无原生工具裸奔启动。`)
+        throw new Error(`角色 ${role} 所需的 Agent Preset "${targetPreset}" 无法在 agentPresets 中解析，禁止裸奔启动。`)
       }
       if (resolved.broken) {
-        throw new Error(`角色 ${role} 所需的 Agent Preset "${targetPreset}" 损坏 (${resolved.broken})，请检查 DSH Desktop/Cordis 插件声明后重试。`)
+        throw new Error(`角色 ${role} 所需的 Agent Preset "${targetPreset}" 损坏 (${resolved.broken})，请检查 Cordis 插件声明。`)
       }
       resolvedPresetId = targetPreset
     }
@@ -445,7 +508,7 @@ export class AgentSessionHost {
     const createOpts = {
       sessionId: effSid,
       meta: {
-        cwd: this.workspaceRoot,
+        cwd: metaCwd,
         ...(resolvedPresetId ? { agentPreset: resolvedPresetId } : {}),
       },
       agentOptions: mergedAgentOptions,
@@ -459,24 +522,31 @@ export class AgentSessionHost {
           role,
           nodeId,
           cwd: effWorktree,
+          sandboxAbsPath: effSandbox,
           toolSchemas,
           taskContextText,
           cleanupFns,
           turnSignals,
-          onNativeThresholdHit: (ev) => nativeThresholds.push(ev),
+          onNativeThresholdHit: (ev) => {
+            nativeThresholds.push(ev)
+            // 纯原生工具长回合跨过 37% / 70% 时主动安全收束当前 Turn，防止一路冲过头
+            if (ev?.trigger === 'REFLECT_37' || ev?.trigger === 'HANDOFF_70') {
+              thresholdCancelled = true
+              try {
+                liveHandleRef?.agent?.cancel?.({ kind: 'greatwall_threshold' })
+              } catch {}
+            }
+          },
         })
-        if (typeof agentPresetsSvc?.register === 'function' && (role === 'works_engineer' || role === 'explorer')) {
-          const mountedNames = new Set((agentCtx.tools?.schemas?.(agent) || []).map((s) => s.name))
-          const missing = ['read', 'write'].filter((n) => !mountedNames.has(n))
-          if (!mountedNames.has('pwsh') && !mountedNames.has('bash')) missing.push('pwsh|bash')
-          if (missing.length > 0) {
-            throw new Error(`角色 ${role} 挂载 Preset "${resolvedPresetId}" 后仍缺少关键原生工具: ${missing.join(', ')}（当前仅有: ${[...mountedNames].join(', ')}）`)
-          }
+        if (typeof agentPresetsSvc?.register === 'function') {
+          const mountedNames = (agentCtx.tools?.schemas?.(agent) || []).map((s) => s.name)
+          assertRequiredNativeTools(role, mountedNames, process.platform)
         }
       },
     }
 
     const handle = await this.ctx.agents.create(createOpts)
+    liveHandleRef = handle
     this.telemetry.recordSessionStart({
       sessionId: effSid,
       role,
@@ -484,6 +554,7 @@ export class AgentSessionHost {
       nodeId,
       branchId,
       worktreeAbsPath: effWorktree,
+      sandboxAbsPath: effSandbox,
       workspaceRoot: this.workspaceRoot,
       shortTransaction,
       title: sessionTitle,
@@ -505,6 +576,7 @@ export class AgentSessionHost {
       if (disposed) return
       disposed = true
       this.liveSessions.delete(effSid)
+      this._sessionReadonlyFlags.delete(effSid)
       this._setupHandledAgentIds.delete(effSid)
       const sessionRef = handle?.agent?.session
       if (shouldArchive) {
@@ -533,6 +605,13 @@ export class AgentSessionHost {
       questionId,
       uiLabel: sessionTitle,
       startedAt: Date.now(),
+      turnSignals,
+      nativeThresholds,
+      consumeThresholdCancel: () => {
+        const hit = thresholdCancelled
+        thresholdCancelled = false
+        return hit
+      },
       handleDispose: disposeAll,
     })
 
@@ -563,7 +642,10 @@ export class AgentSessionHost {
     }
 
     const turnEndReason = await this.inspectLastTurnEndReason(effSid, handle?.agent?.session)
-    const isAbnormalEnd = turnEndReason && (turnEndReason.kind === 'error' || turnEndReason.kind === 'aborted')
+    const isAbnormalEnd = Boolean(
+      !thresholdCancelled && turnEndReason && (turnEndReason.kind === 'error' || turnEndReason.kind === 'aborted'),
+    )
+    thresholdCancelled = false
 
     if (role === 'explorer' && nodeId) {
       await syncLivePressureToDb(this.ctx, handle.agent, this.bridge, this.workspaceRoot, nodeId)
@@ -622,13 +704,16 @@ export class AgentSessionHost {
       await syncLivePressureToDb(this.ctx, entry.handle.agent, this.bridge, this.workspaceRoot, entry.nodeId)
     }
     const turnEndReason = await this.inspectLastTurnEndReason(sessionId, entry.handle?.agent?.session)
+    const wasThresholdCancel = Boolean(entry.consumeThresholdCancel?.())
     const blackbox = entry.role === 'explorer' ? await buildBlackboxTrajectorySummary(this.ctx, sessionId, 4800, entry.handle?.agent?.session) : ''
     const lastAssistantText = await this._readLastAssistantText(sessionId, entry.handle?.agent?.session)
     return {
       blackboxSummary: blackbox,
       lastAssistantText,
+      turnSignals: entry.turnSignals || [],
+      nativeThresholds: entry.nativeThresholds || [],
       turnEndReason,
-      isAbnormalEnd: Boolean(turnEndReason && (turnEndReason.kind === 'error' || turnEndReason.kind === 'aborted')),
+      isAbnormalEnd: Boolean(!wasThresholdCancel && turnEndReason && (turnEndReason.kind === 'error' || turnEndReason.kind === 'aborted')),
     }
   }
 
@@ -640,5 +725,6 @@ export class AgentSessionHost {
     if (entries.length > 0) {
       await Promise.allSettled(entries.map((entry) => entry.handleDispose('disposed')))
     }
+    this._sessionReadonlyFlags.clear()
   }
 }

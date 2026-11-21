@@ -1,8 +1,8 @@
 /**
- * 长城 V6-Up 实时轻量遥测导出器：`epoch_telemetry_summary.json`
+ * 长城 V6-Up (v3.0) 实时轻量遥测导出器：`epoch_telemetry_summary.json`
  *
  * 在关键状态跳变、节点启停与错误时原子刷新 `$PLUGIN_DATA/workspaces/<ws_hash>/epoch_telemetry_summary.json`，
- * 彻底告别事后人工解压数十个 `.jsonl.zstd` 法医排查，实现 `greatwall_orchestrate(action="status")` 秒级诊断。
+ * 实现 `greatwall_orchestrate(action="status")` 秒级诊断与冷恢复身份查询。
  * @module dsh-greatwall-v6up/telemetry
  */
 import crypto from 'node:crypto'
@@ -25,16 +25,15 @@ export function resolveTelemetryFilePath({ dataDir = '', workspaceRoot }) {
   const wsHash = computeWorkspaceHash(workspaceRoot)
   const base = dataDir
     ? path.resolve(dataDir)
-    : path.join(process.env.PLUGIN_DATA || path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'greatwall-v6up'))
+    : path.join(
+        process.env.GREATWALL_PLUGIN_DATA_DIR ||
+          process.env.PLUGIN_DATA ||
+          path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'greatwall-v6up'),
+      )
   return path.join(base, 'workspaces', wsHash, 'epoch_telemetry_summary.json')
 }
 
 export class TelemetryCollector {
-  /**
-   * @param {object} opts
-   * @param {string} opts.workspaceRoot
-   * @param {string} [opts.dataDir]
-   */
   constructor({ workspaceRoot, dataDir = '' }) {
     this.workspaceRoot = workspaceRoot
     this.filePath = resolveTelemetryFilePath({ dataDir, workspaceRoot })
@@ -48,7 +47,7 @@ export class TelemetryCollector {
       }
     } catch {}
     this.state = {
-      schemaVersion: '2.2.0',
+      schemaVersion: '3.0.0',
       workspaceRoot,
       updatedAt: new Date().toISOString(),
       orchestratorState: 'idle',
@@ -91,6 +90,7 @@ export class TelemetryCollector {
     nodeId = '',
     branchId = '',
     worktreeAbsPath = '',
+    sandboxAbsPath = '',
     workspaceRoot = '',
     shortTransaction = true,
     title = '',
@@ -102,6 +102,7 @@ export class TelemetryCollector {
       nodeId,
       branchId,
       worktreeAbsPath,
+      sandboxAbsPath,
       workspaceRoot: workspaceRoot || this.workspaceRoot,
       shortTransaction: Boolean(shortTransaction),
       readonly: false,
@@ -185,6 +186,7 @@ export class TelemetryCollector {
 
   getSummary() {
     return {
+      schemaVersion: this.state.schemaVersion,
       telemetryFile: this.filePath,
       orchestratorState: this.state.orchestratorState,
       stage: this.state.stage,

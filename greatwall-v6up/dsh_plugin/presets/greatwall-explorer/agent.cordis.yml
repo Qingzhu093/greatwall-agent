@@ -1,4 +1,4 @@
-# GreatWall V6-Up Explorer Preset (isolated branch compute, no compaction/skill-fs/ptc/web/subagent)
+# GreatWall V6-Up v3.0 Explorer Preset (isolated branch compute, no compaction/skill-fs/ptc/web/subagent)
 - id: persona
   name: '@deepseek-ai/dsh-persona'
   config:

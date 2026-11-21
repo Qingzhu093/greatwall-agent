@@ -1,8 +1,8 @@
-# GreatWall V6-Up Governance & Survey Preset (fs-ro + search + web, further constrained per role via tools.restrict & guard)
+# GreatWall V6-Up v3.0 Library Surveyor Preset (read-only fs + search + web)
 - id: persona
   name: '@deepseek-ai/dsh-persona'
   config:
-    prefix: You are a GreatWall V6-Up Governance or Library Survey node strictly following narrow role authorization.
+    prefix: You are a GreatWall V6-Up Library Surveyor managing external literature cards and Stage 3 delivery synthesis.
     complete: true
     includeRuntimeContext: false
 

@@ -1,9 +1,9 @@
 /**
- * 长城 V6-Up (v2.2) 右侧栏「长城控制台」服务端鉴权 HTTP 路由：
+ * 长城 V6-Up (v3.0) 右侧栏「长城控制台」服务端鉴权 HTTP 路由：
  *
  * 通过 DSH 原生 `ctx.connection.fetch.register(...)`（处于 Connection 鉴权围栏内）暴露：
- * - GET  /api/greatwall.status  : 获取活跃或磁盘历史工作区的实时编排状态、子题 L3 进度与节点遥测；
- * - POST /api/greatwall.control : 在 UI 面板直接执行 pause / resume / stop / intervene 节点定向纠偏。
+ * - GET  /api/greatwall.status  : 获取活跃或磁盘历史工作区的实时编排状态、子题 L3 进度、红灯告警与节点遥测；
+ * - POST /api/greatwall.control : 在 UI 面板直接执行 pause / resume / stop / human_stop / intervene 节点定向纠偏。
  * @module dsh-greatwall-v6up/console_routes
  */
 import fs from 'node:fs'
@@ -50,11 +50,20 @@ function resolveSessionCwd(ctx, sessionId) {
   }
 }
 
-function pickController({ activeControllersByWs, reqWorkspaceRoot, sessionCwd }) {
-  const candidates = [reqWorkspaceRoot, sessionCwd].filter(Boolean).map((p) => path.resolve(p).toLowerCase())
-  for (const key of candidates) {
-    const found = activeControllersByWs.get(key)
-    if (found) return found
+export function pickController({ activeControllersByWs, reqWorkspaceRoot = '', sessionCwd = '', allowFallback = true }) {
+  const explicit = String(reqWorkspaceRoot || '').trim()
+  if (explicit) {
+    const foundExplicit = activeControllersByWs.get(path.resolve(explicit).toLowerCase())
+    if (foundExplicit) return foundExplicit
+    // 写控制操作（stop / human_stop / pause / intervene）显式指定工作区不匹配时严禁回退误杀隔壁工作区！
+    if (!allowFallback) return null
+  }
+  if (sessionCwd) {
+    const foundCwd = activeControllersByWs.get(path.resolve(sessionCwd).toLowerCase())
+    if (foundCwd) return foundCwd
+  }
+  if (!allowFallback) {
+    return activeControllersByWs.size === 1 ? activeControllersByWs.values().next().value : null
   }
   if (activeControllersByWs.size === 1) {
     return activeControllersByWs.values().next().value
@@ -179,12 +188,15 @@ export function registerGreatwallConsoleRoutes(ctx, { activeControllersByWs, dat
             activeControllersByWs,
             reqWorkspaceRoot: reqWs,
             sessionCwd,
+            allowFallback: false,
           })
           if (!ctrl) {
             return Response.json(
               {
                 ok: false,
-                error: '当前暂无运行中的长城编排控制器。请先在主控对话中调用 greatwall_orchestrate(action="start", ...) 启动任务。',
+                error: reqWs
+                  ? `未找到目标工作区 (${reqWs}) 对应的活跃长城控制器，已拒绝回退以防误操作其他工作区。`
+                  : '当前暂无运行中的长城编排控制器。请先在主控对话中调用 greatwall_orchestrate(action="start", ...) 启动任务。',
               },
               { status: 409 },
             )
@@ -198,6 +210,13 @@ export function registerGreatwallConsoleRoutes(ctx, { activeControllersByWs, dat
           }
           if (action === 'stop') {
             return Response.json({ ok: true, action, ...(await ctrl.orchestrator.stopBackground('UI_CONSOLE_STOP')) })
+          }
+          if (action === 'human_stop') {
+            return Response.json({
+              ok: true,
+              action,
+              ...(await ctrl.orchestrator.humanStop(String(body?.note || body?.directive || 'UI_CONSOLE_HUMAN_STOP'))),
+            })
           }
           if (action === 'intervene') {
             const res = await ctrl.orchestrator.intervene({

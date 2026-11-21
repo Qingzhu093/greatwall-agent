@@ -1,27 +1,26 @@
-"""V6-Up (v2.2) explorer（探索者）5 个窄工具及安全隔离评测原语。"""
+"""长城 V6-Up (v3.0) explorer（一线科研探索者）5 个单一职责窄工具。"""
+
 from __future__ import annotations
 
 import json
 import os
-import re
+import shutil
 import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any
 
-from evaluators.isolated_runner import (
-    run_isolated_evaluation,
-    sha256_canonical_json,
+from ..evaluators.isolated_runner import (
+    compute_eval_cache_key,
+    compute_recursive_dir_sha256,
+    compute_spec_sha256,
+    run_isolated_instrument,
     sha256_file,
 )
 
-from .control_plane_service import (
-    backup_retained_candidate_snapshot,
-    extract_sanitized_code_diff_md,
-    safe_resolve_in_worktree,
-    scan_worktree_tools_manifest,
-)
+from .control_plane_service import execute_heavy_async_job, safe_resolve_in_worktree
 from .db_schema import (
+    ALLOWED_INSTRUMENT_TIERS,
     ERR_AUTH,
     ERR_INVALID_INPUT,
     ERR_LOCKED,
@@ -33,56 +32,104 @@ from .db_schema import (
     utc_now_iso,
 )
 from .mcp_core_helpers import (
-    VALID_VERDICT_3STATE,
+    _SQL_WRITE_FORBIDDEN_RE,
     build_tool_receipt,
-    compute_clock_warnings_and_guidance,
+    compute_clock_signal,
     core_python_root,
     enforce_role_tool_permission,
     load_runtime_config,
-    record_claim_edge,
+    next_prefixed_id,
+    record_declared_refs,
     record_fact_edge,
-    resolve_claimed_refs_list,
-    sample_holiday_candidates_for_reflect37,
+)
+
+_FORBIDDEN_TENANT_TABLES = (
+    "review_queue",
+    "compliance_alerts",
+    "parse0_contract",
+    "project_closure_state",
+    "works_engineering_queue",
 )
 
 
-_SQL_WRITE_FORBIDDEN_RE = re.compile(
-    r"\b(?:INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|ATTACH|DETACH|PRAGMA|VACUUM|REINDEX)\b",
-    re.IGNORECASE,
-)
-
-
-def _next_obs_id(conn: sqlite3.Connection) -> str:
-    rows = conn.execute("SELECT obs_id FROM observations WHERE obs_id LIKE 'Obs-%'").fetchall()
-    max_num = 0
-    for r in rows:
-        tail = str(r["obs_id"])[4:]
-        if tail.isdigit():
-            max_num = max(max_num, int(tail))
-    idx = max(max_num + 1, len(rows) + 1)
-    while True:
-        cand = f"Obs-{idx:03d}"
-        if conn.execute("SELECT 1 FROM observations WHERE obs_id = ?", (cand,)).fetchone() is None:
-            return cand
-        idx += 1
-
-
-def _next_ticket_id(conn: sqlite3.Connection) -> str:
-    row = conn.execute("SELECT COUNT(*) AS cnt FROM works_engineering_queue").fetchone()
-    idx = int(row["cnt"] or 0) + 1
-    return f"wt_{idx:03d}_{uuid.uuid4().hex[:6]}"
-
-
-def _resolve_hook_path(workspace_root: str, rel_path: str) -> Path:
-    """与工造司 register_question_domain_hook 完全一致的跨工作区/内置仓路径解析。"""
+def _resolve_instrument_file(workspace_root: str, rel_path: str) -> Path:
     ws = Path(os.path.realpath(workspace_root))
-    cand1 = Path(os.path.realpath(ws / rel_path))
-    if cand1.is_file():
-        return cand1
-    cand2 = Path(os.path.realpath(core_python_root() / rel_path))
-    if cand2.is_file():
-        return cand2
-    raise FailClosedError(ERR_NOT_FOUND, f"找不到子题验证钩子 {rel_path!r}（已检查工作区与 core_python）")
+    p1 = Path(os.path.realpath(ws / rel_path))
+    if p1.is_file():
+        return p1
+    p2 = Path(os.path.realpath(core_python_root() / rel_path))
+    if p2.is_file():
+        return p2
+    raise FailClosedError(ERR_NOT_FOUND, f"找不到仪器脚本 {rel_path!r}")
+
+
+def _materialize_cached_obs_for_node(
+    conn: sqlite3.Connection,
+    *,
+    cached: sqlite3.Row,
+    question_id: str,
+    branch_id: str,
+    node_id: str,
+    tier: str,
+    linguistic_prediction: str,
+    declared_refs: list[Any],
+    session_id: str,
+    cfg: dict[str, Any],
+    now: str,
+) -> tuple[str, str | None]:
+    """命中四元缓存时确保返回属于本节点的正式收据：
+    - 同节点复用：直接返回原 obs_id；
+    - 跨节点/跨分支复用：零重跑容器，为本节点签发一条独立归属的 Obs-###（revalidated_from_obs_id 指向原收据，cache_key 留空）。
+    """
+    src_obs_id = str(cached["obs_id"])
+    if str(cached["node_id"]) == str(node_id):
+        return src_obs_id, None
+
+    new_obs_id = next_prefixed_id(conn, "observations", "obs_id", "Obs-")
+    reuse_prefix = f"[CACHE_REUSED_FROM {src_obs_id}] "
+    base_details = str(cached["details_text"] or "")
+    merged_details = base_details if base_details.startswith("[CACHE_REUSED_FROM ") else (reuse_prefix + base_details)
+    with rw_immediate_tx(conn):
+        conn.execute(
+            """
+            INSERT INTO observations(
+                obs_id, question_id, branch_id, node_id, instrument_id, instrument_version, tier,
+                candidate_entry_sha256, tools_dir_sha256, spec_sha256, instrument_sha256, cache_key,
+                stage_a_artifact_path, revalidated_from_obs_id, obs_status, tracks_json,
+                details_text, linguistic_prediction, spec_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_obs_id,
+                question_id,
+                branch_id,
+                node_id,
+                str(cached["instrument_id"]),
+                int(cached["instrument_version"]),
+                tier,
+                str(cached["candidate_entry_sha256"]),
+                str(cached["tools_dir_sha256"]),
+                str(cached["spec_sha256"]),
+                str(cached["instrument_sha256"]),
+                cached["stage_a_artifact_path"],
+                src_obs_id,
+                str(cached["obs_status"]),
+                str(cached["tracks_json"] or "{}"),
+                merged_details,
+                linguistic_prediction,
+                str(cached["spec_json"] or "{}"),
+                now,
+                now,
+            ),
+        )
+        record_declared_refs(
+            conn,
+            source_id=new_obs_id,
+            declared_refs=declared_refs,
+            session_id=session_id,
+            default_edge_type=str(cfg.get("default_declared_ref_edge_type", "MOTIVATING_REF")),
+        )
+    return new_obs_id, src_obs_id
 
 
 def tool_run_isolated_eval(
@@ -92,285 +139,466 @@ def tool_run_isolated_eval(
     session_id: str,
     node_id: str,
     question_id: str,
-    candidate_rel_path: str,
+    instrument_id: str,
+    tier: str,
+    artifact_rel_path: str,
     linguistic_prediction: str,
-    declared_refs: list[Any] | None = None,
-    evaluator_spec: dict[str, Any] | None = None,
+    declared_refs: list[str] | None = None,
+    job_id: str | None = None,
 ) -> dict[str, Any]:
+    """统一三档仪器调用：probe（诊断不记 Obs）/ official（受控凭证）/ heavy（冻结现场异步幂等取回）。"""
     enforce_role_tool_permission(conn, caller_role, "run_isolated_eval", session_id=session_id, node_id=node_id)
 
-    pred = (linguistic_prediction or "").strip()
-    if len(pred) < 5:
+    tier_l = str(tier or "").strip().lower()
+    if tier_l not in ALLOWED_INSTRUMENT_TIERS:
         raise FailClosedError(
             ERR_INVALID_INPUT,
-            "run_isolated_eval 必须在运行前提交明确的事前预测 linguistic_prediction（预期趋势、量级或待推翻假设）",
+            f"非法 tier={tier!r}，仅允许 {sorted(ALLOWED_INSTRUMENT_TIERS)}",
         )
 
     node = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ?", (node_id,)).fetchone()
     if node is None:
         raise FailClosedError(ERR_NOT_FOUND, f"节点 {node_id!r} 不存在")
-    if str(node["node_status"]) != "EXPLORING":
+    if str(node["question_id"]) != str(question_id):
+        raise FailClosedError(ERR_INVALID_INPUT, f"节点 {node_id!r} 属于 {node['question_id']!r} 而非 {question_id!r}")
+
+    cfg = load_runtime_config()
+    clock_sig = compute_clock_signal(int(node["pressure_tokens"] or 0), int(node["first_reflection_unlocked"] or 0), cfg)
+
+    # 1. 重型作业凭 job_id 幂等取回/执行（按入队冻结快照与原仪器版本运行，仅扣费一次）
+    if tier_l == "heavy" and job_id and str(job_id).strip():
+        jres = execute_heavy_async_job(conn, workspace_root=workspace_root, job_id=str(job_id).strip())
+        return build_tool_receipt(
+            conn=conn,
+            tool_name="run_isolated_eval",
+            question_id=question_id,
+            node_id=node_id,
+            next_step_guidance=(
+                f"重型作业 {job_id} 已按入队冻结现场完成，产出 {jres.get('obs_id')}（状态 {jres.get('obs_status')}，预算仅扣 1 次）。"
+            ),
+            data={**jres, "tier": "heavy", "clock_signal": clock_sig},
+        )
+
+    pred = str(linguistic_prediction or "").strip()
+    if tier_l in ("official", "heavy") and len(pred) < 5:
+        raise FailClosedError(ERR_INVALID_INPUT, "正式/重型实验调用前必须提供 >= 5 字可证伪的事前预测 linguistic_prediction")
+
+    inst = conn.execute(
+        """
+        SELECT * FROM instruments
+        WHERE instrument_id = ? AND is_active = 1
+        ORDER BY version DESC LIMIT 1
+        """,
+        (instrument_id,),
+    ).fetchone()
+    if inst is None:
+        raise FailClosedError(ERR_NOT_FOUND, f"找不到活跃仪器 {instrument_id!r}，请核对已注册仪器清单")
+    if str(inst["question_id"]) not in (str(question_id), "ALL"):
+        raise FailClosedError(ERR_INVALID_INPUT, f"仪器 {instrument_id!r} 归属 {inst['question_id']!r}，不可跨题调用")
+    if tier_l == "official" and str(inst["health_status"]) == "UNHEALTHY":
         raise FailClosedError(
             ERR_LOCKED,
-            f"节点 {node_id!r} 当前状态为 {node['node_status']}，非 EXPLORING 态禁止提交新实验",
-        )
-    if str(node["question_id"]) != question_id:
-        raise FailClosedError(
-            ERR_AUTH,
-            f"子题边界违例：节点 {node_id!r} 绑定子题 {node['question_id']!r}，禁止越界运行 {question_id!r}",
+            f"仪器 {instrument_id!r} (v{inst['version']}) 因连续报错已熔断置 UNHEALTHY 并报修工造司（非你算法问题），请暂改用其他仪器或推进推导。",
         )
 
     worktree_abs = str(node["worktree_abs_path"])
-    cand_file = safe_resolve_in_worktree(worktree_abs, candidate_rel_path)
-    if not cand_file.is_file():
-        raise FailClosedError(ERR_NOT_FOUND, f"候选脚本不存在: {candidate_rel_path!r}")
-
-    cfg = load_runtime_config()
-    hook_row = conn.execute(
-        "SELECT * FROM domain_hooks_by_question WHERE question_id = ?",
-        (question_id,),
-    ).fetchone()
-
-    ep = conn.execute("SELECT epoch_id, contracts_json FROM epoch_config WHERE config_id = 'active'").fetchone()
-    epoch_id = int(ep["epoch_id"]) if ep else 1
-    contracts = json.loads(ep["contracts_json"]) if ep and ep["contracts_json"] else {}
-    q_contract = contracts.get(question_id) if isinstance(contracts, dict) else {}
-    if not isinstance(q_contract, dict):
-        q_contract = {}
-
-    if hook_row is not None:
-        max_err = float(cfg.get("simulator_fidelity_max_error_pct", 5.0))
-        if float(hook_row["fidelity_max_error_pct"]) >= max_err:
-            raise FailClosedError(
-                ERR_LOCKED,
-                f"子题 {question_id} 仿真器保真误差 {hook_row['fidelity_max_error_pct']}% >= {max_err}%，Stage 2 评测已熔断",
-            )
-        hook_abs = str(_resolve_hook_path(workspace_root, str(hook_row["hook_rel_path"])))
-        hook_sha = str(hook_row["hook_sha256"])
-        eval_epoch_ver = int(hook_row["eval_epoch_version"])
-    elif q_contract.get("allow_generic_eval") is True:
-        hook_abs = ""
-        hook_sha = "generic"
-        eval_epoch_ver = 1
-    else:
+    art_abs = safe_resolve_in_worktree(worktree_abs, artifact_rel_path)
+    if not art_abs.exists():
         raise FailClosedError(
-            ERR_LOCKED,
-            f"子题 {question_id} 尚未在 domain_hooks_by_question 注册独立验证钩子（P10 门禁阻断裸跑）",
+            ERR_NOT_FOUND,
+            f"在分支工作树 {worktree_abs} 下找不到相对路径 {artifact_rel_path!r}（artifact_rel_path 必须相对于分支工作树根目录）",
         )
 
-    base_spec = dict(q_contract.get("evaluator_spec") or {})
-    if isinstance(evaluator_spec, dict):
-        base_spec.update(evaluator_spec)
-    # 自动注入工造/Parse 0 注册的公开样例契约，消灭开局盲猜 public_input 导致的连环 no_cases 失败
-    if not base_spec.get("public_input"):
-        hook_pub_raw = hook_row["public_input_sample_json"] if hook_row is not None and "public_input_sample_json" in hook_row.keys() else "{}"
-        hook_pub = json.loads(hook_pub_raw or "{}")
-        contract_pub = q_contract.get("public_input_sample")
-        if isinstance(hook_pub, dict) and hook_pub:
-            base_spec["public_input"] = hook_pub
-        elif isinstance(contract_pub, dict) and contract_pub:
-            base_spec["public_input"] = contract_pub
-    if hook_abs:
-        base_spec["domain_hook_path"] = hook_abs
+    inst_abs = _resolve_instrument_file(workspace_root, str(inst["instrument_rel_path"]))
+    spec = json.loads(inst["default_spec_json"] or "{}")
+    if not isinstance(spec, dict):
+        spec = {}
+    spec["tier"] = tier_l
+    spec["question_id"] = question_id
+    spec["instrument_id"] = instrument_id
+    spec["instrument_version"] = int(inst["version"])
 
-    cand_hash = sha256_file(cand_file)
-    spec_for_hash = {k: v for k, v in base_spec.items() if k != "domain_hook_path"}
-    spec_hash = sha256_canonical_json(spec_for_hash)
+    cand_sha = sha256_file(art_abs) if art_abs.is_file() else ""
+    tools_sha = compute_recursive_dir_sha256(Path(worktree_abs) / "tools")
+    spec_sha = compute_spec_sha256(spec, tier_l)
+    inst_sha = str(inst["instrument_sha256"])
+    cache_key = compute_eval_cache_key(
+        candidate_entry_sha256=cand_sha,
+        tools_dir_sha256=tools_sha,
+        spec_sha256=spec_sha,
+        instrument_sha256=inst_sha,
+    )
 
-    # 三元复合幂等键检查：(candidate_hash, spec_hash, domain_hook_sha256)
-    cached = conn.execute(
-        """
-        SELECT * FROM observations
-        WHERE node_id = ? AND candidate_hash = ? AND spec_hash = ? AND domain_hook_sha256 = ?
-          AND obs_status IN ('VALID', 'MEASURED_NON_IMPROVEMENT', 'EXECUTION_ERROR')
-        ORDER BY created_at DESC LIMIT 1
-        """,
-        (node_id, cand_hash, spec_hash, hook_sha),
-    ).fetchone()
-    if cached is not None:
-        warnings, guidance, signal = compute_clock_warnings_and_guidance(
-            conn, node_id, new_score=cached["comparable_rank_score"]
+    now = utc_now_iso()
+    paths = resolve_storage_paths(workspace_root)
+
+    # 2. heavy 首次入队：冻结候选 + tools/ 快照、原仪器版本与规格至 async_eval_jobs（仅扣费 1 次）
+    if tier_l == "heavy":
+        cached = conn.execute(
+            """
+            SELECT * FROM observations
+            WHERE cache_key = ? AND tier = 'heavy'
+              AND obs_status IN ('VALID_PASS','MEASURED_REJECTION','VALID_UNDECIDED','CANDIDATE_ERROR')
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (cache_key,),
+        ).fetchone()
+        if cached is not None:
+            eff_obs_id, reused_from = _materialize_cached_obs_for_node(
+                conn,
+                cached=cached,
+                question_id=question_id,
+                branch_id=str(node["branch_id"]),
+                node_id=node_id,
+                tier="heavy",
+                linguistic_prediction=pred,
+                declared_refs=declared_refs,
+                session_id=session_id,
+                cfg=cfg,
+                now=now,
+            )
+            return build_tool_receipt(
+                conn=conn,
+                tool_name="run_isolated_eval",
+                question_id=question_id,
+                node_id=node_id,
+                next_step_guidance=(
+                    f"命中四元复合缓存（复用 {reused_from}），已零算力签发本节点重型收据 {eff_obs_id}。"
+                    if reused_from
+                    else f"命中四元复合缓存，直接返回历史重型收据 {eff_obs_id}（零额外开销）。"
+                ),
+                data={
+                    "cache_hit": True,
+                    "tier": "heavy",
+                    "obs_id": eff_obs_id,
+                    "reused_from_obs_id": reused_from,
+                    "obs_status": str(cached["obs_status"]),
+                    "tracks": json.loads(cached["tracks_json"] or "{}"),
+                    "details": str(cached["details_text"] or ""),
+                    "instrument_id": instrument_id,
+                    "instrument_version": int(cached["instrument_version"]),
+                    "clock_signal": clock_sig,
+                },
+            )
+
+        new_job_id = f"job_{uuid.uuid4().hex[:10]}"
+        freeze_dir = paths["job_inputs_dir"] / new_job_id
+        freeze_dir.mkdir(parents=True, exist_ok=True)
+        frozen_art = freeze_dir / art_abs.name
+        if art_abs.is_file():
+            shutil.copy2(art_abs, frozen_art)
+        else:
+            shutil.copytree(art_abs, frozen_art, dirs_exist_ok=True)
+        src_tools = Path(worktree_abs) / "tools"
+        if src_tools.is_dir():
+            shutil.copytree(
+                src_tools,
+                freeze_dir / "tools",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+                dirs_exist_ok=True,
+            )
+        # 同步物理冻结当前版本仪器源码，彻底杜绝同路径原地升版串版本！
+        frozen_inst = freeze_dir / f"frozen_instrument_v{int(inst['version'])}.py"
+        if inst_abs.is_file():
+            shutil.copy2(inst_abs, frozen_inst)
+
+        with rw_immediate_tx(conn):
+            conn.execute(
+                """
+                INSERT INTO async_eval_jobs(
+                    job_id, obs_id, question_id, branch_id, node_id, instrument_id, instrument_version,
+                    artifact_snapshot_path, frozen_instrument_path, spec_snapshot_json, cache_key, linguistic_prediction,
+                    declared_refs_json, status, budget_charged, created_at, updated_at
+                ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', 1, ?, ?)
+                """,
+                (
+                    new_job_id,
+                    question_id,
+                    str(node["branch_id"]),
+                    node_id,
+                    instrument_id,
+                    int(inst["version"]),
+                    str(frozen_art),
+                    str(frozen_inst) if frozen_inst.is_file() else None,
+                    json.dumps(spec, ensure_ascii=False),
+                    cache_key,
+                    pred,
+                    json.dumps(declared_refs or [], ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+        return build_tool_receipt(
+            conn=conn,
+            tool_name="run_isolated_eval",
+            question_id=question_id,
+            node_id=node_id,
+            next_step_guidance=f"重型作业 {new_job_id} 已入队并冻结候选快照与仪器 v{inst['version']}（预算已计 1 次）；稍后可凭 job_id='{new_job_id}' 幂等取回结果。",
+            data={
+                "tier": "heavy",
+                "job_id": new_job_id,
+                "status": "QUEUED",
+                "instrument_id": instrument_id,
+                "instrument_version": int(inst["version"]),
+                "budget_charged": 1,
+                "cache_key": cache_key,
+                "clock_signal": clock_sig,
+            },
+        )
+
+    # 3. probe 档：只写 probe_diagnostic_logs，绝不污染 observations
+    if tier_l == "probe":
+        res = run_isolated_instrument(
+            instrument_path=inst_abs,
+            instrument_role=str(inst["instrument_role"]),
+            artifact_path=art_abs,
+            spec=spec,
+            tier="probe",
+            artifact_schema=str(inst["artifact_schema"]),
+            worktree_root=worktree_abs,
+            persist_stage_a_path=None,
+        )
+        probe_id = next_prefixed_id(conn, "probe_diagnostic_logs", "probe_id", "probe_")
+        with rw_immediate_tx(conn):
+            conn.execute(
+                """
+                INSERT INTO probe_diagnostic_logs(probe_id, node_id, question_id, instrument_id, instrument_version, status, tracks_json, details_text, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    probe_id,
+                    node_id,
+                    question_id,
+                    instrument_id,
+                    int(inst["version"]),
+                    str(res["status"]),
+                    json.dumps(res.get("tracks") or {}, ensure_ascii=False),
+                    str(res.get("details") or ""),
+                    now,
+                ),
+            )
+            if res["status"] == "INSTRUMENT_ERROR":
+                _handle_instrument_error_ticket(conn, question_id, instrument_id, int(inst["version"]), str(res["details"]), now, cfg)
+
+        guidance = (
+            "平台仪器故障已自动报修工造司，非你算法问题（不扣修补配额、不记负结果）。"
+            if res["status"] in ("INSTRUMENT_ERROR", "INFRA_ERROR")
+            else f"probe 快速诊断完成 ({probe_id})，仅记录诊断日志不污染正式观测账。"
         )
         return build_tool_receipt(
             conn=conn,
             tool_name="run_isolated_eval",
-            node_id=node_id,
             question_id=question_id,
-            warnings=[*warnings, "[_idempotent_hit] 命中三元复合幂等缓存，未重复运行 Stage A"],
+            node_id=node_id,
             next_step_guidance=guidance,
             data={
-                "obs_id": cached["obs_id"],
-                "idempotent_hit": True,
-                "obs_status": cached["obs_status"],
-                "passed": bool(cached["passed"]),
-                "metrics": json.loads(cached["metrics_json"] or "{}"),
-                "details": cached["details_text"],
-                "stage_a_artifact_path": cached["stage_a_artifact_path"],
-                "clock_signal": signal,
+                "tier": "probe",
+                "probe_id": probe_id,
+                "status": res["status"],
+                "verdict": res["verdict"],
+                "tracks": res.get("tracks") or {},
+                "details": str(res.get("details") or ""),
+                "instrument_id": instrument_id,
+                "instrument_version": int(inst["version"]),
+                "clock_signal": clock_sig,
             },
         )
 
-    # 校验声明引用（先检查解锁态 + 外键存在性）
-    resolved_refs = resolve_claimed_refs_list(conn, list(declared_refs or []))
-    unlocked = int(node["first_reflection_unlocked"] or 0) == 1
-    if not unlocked:
-        for r in resolved_refs:
-            if r["ref_kind"] in ("l3_verified", "l2_failure_record", "lineage_node"):
-                raise FailClosedError(
-                    ERR_LOCKED,
-                    f"0-37% 净室独思期尚未解锁内藏 L3/L2 或谱系 DAG，禁止提前引用 {r['dst_id']!r}",
-                )
+    # 4. official 档：四元缓存检查（INSTRUMENT_ERROR / INFRA_ERROR 绝对穿透不命中）
+    cached = conn.execute(
+        """
+        SELECT * FROM observations
+        WHERE cache_key = ? AND tier = 'official'
+          AND obs_status IN ('VALID_PASS','MEASURED_REJECTION','VALID_UNDECIDED','CANDIDATE_ERROR')
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        (cache_key,),
+    ).fetchone()
+    if cached is not None:
+        eff_obs_id, reused_from = _materialize_cached_obs_for_node(
+            conn,
+            cached=cached,
+            question_id=question_id,
+            branch_id=str(node["branch_id"]),
+            node_id=node_id,
+            tier="official",
+            linguistic_prediction=pred,
+            declared_refs=declared_refs,
+            session_id=session_id,
+            cfg=cfg,
+            now=now,
+        )
+        return build_tool_receipt(
+            conn=conn,
+            tool_name="run_isolated_eval",
+            question_id=question_id,
+            node_id=node_id,
+            next_step_guidance=(
+                f"命中四元复合缓存（复用 {reused_from}），已零算力签发本节点正式收据 {eff_obs_id}（状态 {cached['obs_status']}）。"
+                if reused_from
+                else f"命中四元复合缓存，直接返回正式收据 {eff_obs_id}（状态 {cached['obs_status']}）。"
+            ),
+            data={
+                "cache_hit": True,
+                "tier": "official",
+                "obs_id": eff_obs_id,
+                "reused_from_obs_id": reused_from,
+                "obs_status": str(cached["obs_status"]),
+                "status": "CANDIDATE_ERROR" if cached["obs_status"] == "CANDIDATE_ERROR" else "OK",
+                "verdict": "PASS" if cached["obs_status"] == "VALID_PASS" else ("FAIL" if cached["obs_status"] == "MEASURED_REJECTION" else "UNDECIDED"),
+                "tracks": json.loads(cached["tracks_json"] or "{}"),
+                "details": str(cached["details_text"] or ""),
+                "instrument_id": instrument_id,
+                "instrument_version": int(cached["instrument_version"]),
+                "cache_key": cache_key,
+                "clock_signal": clock_sig,
+            },
+        )
 
-    run_claim_id = f"rc_{uuid.uuid4().hex[:12]}"
-    paths = resolve_storage_paths(workspace_root)
-    stage_a_file = Path(paths["eval_artifacts_dir"]) / run_claim_id / "stage_a_output.json"
-
-    eval_res = run_isolated_evaluation(
-        candidate_path=str(cand_file),
-        domain="generic" if not hook_abs else question_id,
-        evaluator_spec=base_spec,
-        output_dir=str(paths["outputs_dir"]),
-        stage_a_output_path=str(stage_a_file),
+    obs_id = next_prefixed_id(conn, "observations", "obs_id", "Obs-")
+    stage_a_persist = str(paths["eval_artifacts_dir"] / obs_id / "stage_a_output.json")
+    res = run_isolated_instrument(
+        instrument_path=inst_abs,
+        instrument_role=str(inst["instrument_role"]),
+        artifact_path=art_abs,
+        spec=spec,
+        tier="official",
+        artifact_schema=str(inst["artifact_schema"]),
         worktree_root=worktree_abs,
+        persist_stage_a_path=stage_a_persist,
     )
+    obs_status = str(res["obs_status"])
+    # 故障穿透：任何错误态（CANDIDATE_ERROR / INSTRUMENT_ERROR / INFRA_ERROR）绝不写 cache_key 进永久缓存！
+    stored_cache_key = cache_key if res["status"] == "OK" else ""
 
-    obs_status = str(eval_res["obs_status"])
-    passed = 1 if eval_res.get("passed") else 0
-    metrics = eval_res.get("metrics") or {}
-    details = str(eval_res.get("details") or "")
-    rank_score = eval_res.get("comparable_rank_score")
-    now = utc_now_iso()
-
-    auto_pain_ticket: str | None = None
-    retained_snapshot_path = str(node["retained_snapshot_abs_path"] or "")
-
+    circuit_broken = False
     with rw_immediate_tx(conn):
-        obs_id = _next_obs_id(conn)
         conn.execute(
             """
             INSERT INTO observations(
-                obs_id, epoch_id, question_id, branch_id, node_id, run_claim_id,
-                candidate_hash, spec_hash, domain_hook_sha256, eval_epoch_version,
-                stage_a_artifact_path, obs_status, passed, metrics_json, details_text,
-                linguistic_prediction, validity_reason, comparable_rank_score,
-                evaluator_spec_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                obs_id, question_id, branch_id, node_id, instrument_id, instrument_version, tier,
+                candidate_entry_sha256, tools_dir_sha256, spec_sha256, instrument_sha256, cache_key,
+                stage_a_artifact_path, obs_status, tracks_json, details_text, linguistic_prediction,
+                spec_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'official', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 obs_id,
-                epoch_id,
                 question_id,
                 str(node["branch_id"]),
                 node_id,
-                run_claim_id,
-                cand_hash,
-                spec_hash,
-                hook_sha,
-                eval_epoch_ver,
-                str(eval_res.get("stage_a_artifact_path") or ""),
+                instrument_id,
+                int(inst["version"]),
+                cand_sha,
+                tools_sha,
+                spec_sha,
+                inst_sha,
+                stored_cache_key,
+                stage_a_persist if Path(stage_a_persist).is_file() else None,
                 obs_status,
-                passed,
-                json.dumps(metrics, ensure_ascii=False),
-                details,
+                json.dumps(res.get("tracks") or {}, ensure_ascii=False),
+                str(res.get("details") or ""),
                 pred,
-                str(eval_res.get("failure_category") or ""),
-                rank_score,
-                json.dumps(base_spec, ensure_ascii=False),
+                json.dumps(spec, ensure_ascii=False),
                 now,
                 now,
             ),
         )
-
-        for ref in resolved_refs:
-            record_claim_edge(
-                conn,
-                src_id=obs_id,
-                dst_id=ref["dst_id"],
-                edge_type=ref["edge_type"],
-                metadata={"node_id": node_id, "question_id": question_id},
-            )
-        record_fact_edge(
+        # 声明引用默认以 MOTIVATING_REF 写入（防全军连坐）
+        record_declared_refs(
             conn,
-            src_id=node_id,
-            dst_id="tool:run_isolated_eval",
-            edge_type="USED_TOOL",
-            metadata={"obs_id": obs_id, "session_id": session_id, "obs_status": obs_status},
+            source_id=obs_id,
+            declared_refs=declared_refs,
+            session_id=session_id,
+            default_edge_type=str(cfg.get("default_declared_ref_edge_type", "MOTIVATING_REF")),
         )
-
-        consec_err = int(node["consecutive_exec_errors"] or 0)
-        retained_cid = str(node["retained_candidate_id"] or "")
-        if obs_status == "VALID" and passed == 1:
-            consec_err = 0
-            retained_cid = cand_hash
-            retained_snapshot_path = backup_retained_candidate_snapshot(
-                paths, str(node["branch_id"]), node_id, worktree_abs, candidate_rel_path
+        if res["status"] == "INSTRUMENT_ERROR":
+            circuit_broken = _handle_instrument_error_ticket(
+                conn, question_id, instrument_id, int(inst["version"]), str(res["details"]), now, cfg
             )
-        elif obs_status == "EXECUTION_ERROR":
-            consec_err += 1
-            if consec_err >= 2:
-                auto_pain_ticket = _next_ticket_id(conn)
-                conn.execute(
-                    """
-                    INSERT INTO works_engineering_queue(
-                        ticket_id, question_id, node_id, source_type, description_md, status, created_at, updated_at
-                    ) VALUES (?, ?, ?, 'AUTO_CONSECUTIVE_ERRORS', ?, 'OPEN', ?, ?)
-                    """,
-                    (
-                        auto_pain_ticket,
-                        question_id,
-                        node_id,
-                        f"节点 {node_id} 连续 {consec_err} 次 EXECUTION_ERROR (最新 {obs_id}: {eval_res.get('failure_category')})，请排查环境/钩子瓶颈",
-                        now,
-                        now,
-                    ),
-                )
-        else:
-            consec_err = 0
+        elif res["status"] in ("OK", "CANDIDATE_ERROR"):
+            conn.execute(
+                "UPDATE instruments SET consecutive_error_count = 0, updated_at = ? WHERE instrument_id = ? AND version = ?",
+                (now, instrument_id, int(inst["version"])),
+            )
 
-        conn.execute(
-            """
-            UPDATE lineage_nodes
-            SET eval_count = eval_count + 1,
-                consecutive_exec_errors = ?,
-                retained_candidate_id = ?,
-                retained_snapshot_abs_path = ?,
-                updated_at = ?
-            WHERE node_id = ?
-            """,
-            (consec_err, retained_cid, retained_snapshot_path, now, node_id),
+    if res["status"] in ("INSTRUMENT_ERROR", "INFRA_ERROR"):
+        guidance = (
+            "平台仪器/基础设施故障已自动报修工造司，非你算法问题（零处罚、不扣修补配额、不进缓存）。"
+            + (" 该仪器已触发连续3次故障熔断。" if circuit_broken else "")
         )
-
-    warnings, guidance, signal = compute_clock_warnings_and_guidance(
-        conn, node_id, new_score=rank_score if obs_status == "VALID" else None
-    )
-    if auto_pain_ticket:
-        warnings.append(
-            f"[AUTO_PAIN_TICKET:{auto_pain_ticket}] 连续 EXECUTION_ERROR >= 2，已自动排入工造司痛点队列，建议回退 Retained Candidate 修复而非换向"
-        )
+    elif clock_sig["trigger"] == "HANDOFF_70":
+        guidance = f"已产出 {obs_id} ({obs_status})。水位已达 >=70%，请立即停止改码并在最后 1 轮只读回合亲笔总结成果与《科研遗嘱》！"
+    elif clock_sig["trigger"] == "REFLECT_37":
+        guidance = f"已产出 {obs_id} ({obs_status})。水位已跨 37%，回合间隙将切入伴随元反思并解锁内藏 L3/L2！"
+    else:
+        guidance = f"正式观测 {obs_id} 已入库（status={res['status']}, verdict={res['verdict']}, obs_status={obs_status}，绑定 {instrument_id} v{inst['version']}）。"
 
     return build_tool_receipt(
         conn=conn,
         tool_name="run_isolated_eval",
-        node_id=node_id,
         question_id=question_id,
-        warnings=warnings,
+        node_id=node_id,
         next_step_guidance=guidance,
         data={
+            "cache_hit": False,
+            "tier": "official",
             "obs_id": obs_id,
-            "idempotent_hit": False,
             "obs_status": obs_status,
-            "passed": bool(passed),
-            "metrics": metrics,
-            "details": details,
-            "comparable_rank_score": rank_score,
-            "failure_category": str(eval_res.get("failure_category") or ""),
-            "stage_a_artifact_path": str(eval_res.get("stage_a_artifact_path") or ""),
-            "retained_candidate_id": retained_cid,
-            "retained_snapshot_abs_path": retained_snapshot_path,
-            "auto_pain_ticket": auto_pain_ticket,
-            "clock_signal": signal,
+            "status": res["status"],
+            "verdict": res["verdict"],
+            "tracks": res.get("tracks") or {},
+            "details": str(res.get("details") or ""),
+            "instrument_id": instrument_id,
+            "instrument_version": int(inst["version"]),
+            "cache_key": stored_cache_key,
+            "instrument_circuit_broken": circuit_broken,
+            "clock_signal": clock_sig,
         },
     )
+
+
+def _handle_instrument_error_ticket(
+    conn: sqlite3.Connection,
+    question_id: str,
+    instrument_id: str,
+    version: int,
+    details: str,
+    now: str,
+    cfg: dict[str, Any],
+) -> bool:
+    """递增仪器连续出错计数，达阈值自动置 UNHEALTHY 熔断，并自动入队工造司故障工单。"""
+    threshold = int(cfg.get("instrument_unhealthy_consecutive_error_threshold", 3))
+    row = conn.execute(
+        "SELECT consecutive_error_count FROM instruments WHERE instrument_id = ? AND version = ?",
+        (instrument_id, version),
+    ).fetchone()
+    new_cnt = int(row["consecutive_error_count"] or 0) + 1 if row else 1
+    broken = new_cnt >= threshold
+    conn.execute(
+        """
+        UPDATE instruments
+        SET consecutive_error_count = ?, health_status = ?, updated_at = ?
+        WHERE instrument_id = ? AND version = ?
+        """,
+        (new_cnt, "UNHEALTHY" if broken else "HEALTHY", now, instrument_id, version),
+    )
+    tid = f"tkt_{uuid.uuid4().hex[:10]}"
+    conn.execute(
+        """
+        INSERT INTO works_engineering_queue(ticket_id, question_id, ticket_type, instrument_id, payload_json, status, created_at, updated_at)
+        VALUES (?, ?, 'INSTRUMENT_ERROR', ?, ?, 'OPEN', ?, ?)
+        """,
+        (
+            tid,
+            question_id,
+            instrument_id,
+            json.dumps({"version": version, "consecutive_error_count": new_cnt, "circuit_broken": broken, "details": details[:800]}, ensure_ascii=False),
+            now,
+            now,
+        ),
+    )
+    return broken
 
 
 def tool_query_library_catalog(
@@ -382,46 +610,47 @@ def tool_query_library_catalog(
     scope: str = "ALL",
     keyword: str = "",
 ) -> dict[str, Any]:
+    """一级目录卡按需检索（0-37% 物理锁定内藏，仅返 EXTERNAL_R；37% 解锁后全馆两翼开放）。"""
     enforce_role_tool_permission(conn, caller_role, "query_library_catalog", session_id=session_id, node_id=node_id)
     node = conn.execute("SELECT first_reflection_unlocked FROM lineage_nodes WHERE node_id = ?", (node_id,)).fetchone()
     if node is None:
         raise FailClosedError(ERR_NOT_FOUND, f"节点 {node_id!r} 不存在")
     unlocked = int(node["first_reflection_unlocked"] or 0) == 1
 
-    scope_u = (scope or "ALL").strip().upper()
+    scope_u = str(scope or "ALL").strip().upper()
     if scope_u not in ("EXTERNAL_R", "INTERNAL_L3", "INTERNAL_L2", "ALL"):
         raise FailClosedError(
             ERR_INVALID_INPUT,
-            f"非法 scope: {scope!r}，仅允许 ['ALL', 'EXTERNAL_R', 'INTERNAL_L2', 'INTERNAL_L3']",
+            f"非法 scope={scope!r}，仅允许 ['ALL', 'EXTERNAL_R', 'INTERNAL_L2', 'INTERNAL_L3']",
         )
 
+    fts_q = sanitize_fts5_query(keyword)
     cards: list[dict[str, Any]] = []
-    kw = (keyword or "").strip()
+    warnings: list[str] = []
 
     # 左翼外藏 [R###] 从 0% 起全程开放
     if scope_u in ("EXTERNAL_R", "ALL"):
-        fts = sanitize_fts5_query(kw, ["title", "abstract_md", "exact_preconditions_md"]) if kw else None
-        if fts:
+        if fts_q:
             rows = conn.execute(
                 """
-                SELECT e.ref_id, e.question_id, e.title, e.abstract_md, e.exact_preconditions_md, e.read_depth, e.support_scope
-                FROM external_literature_fts f
-                JOIN external_literature_cards e ON f.ref_id = e.ref_id
+                SELECT c.ref_id, c.question_id, c.title, c.abstract_md, c.read_depth, c.support_scope, c.is_unverified_external
+                FROM external_literature_cards c
+                JOIN external_literature_fts f ON f.rowid = c.rowid
                 WHERE external_literature_fts MATCH ?
-                  AND (e.question_id = ? OR e.question_id = 'GLOBAL')
-                LIMIT 15
+                  AND (? = 'ALL' OR c.question_id = ? OR c.question_id = 'ALL')
+                ORDER BY c.ref_id
                 """,
-                (fts, question_id),
+                (fts_q, question_id, question_id),
             ).fetchall()
         else:
             rows = conn.execute(
                 """
-                SELECT ref_id, question_id, title, abstract_md, exact_preconditions_md, read_depth, support_scope
+                SELECT ref_id, question_id, title, abstract_md, read_depth, support_scope, is_unverified_external
                 FROM external_literature_cards
-                WHERE (question_id = ? OR question_id = 'GLOBAL')
-                ORDER BY created_at DESC LIMIT 15
+                WHERE ? = 'ALL' OR question_id = ? OR question_id = 'ALL'
+                ORDER BY ref_id
                 """,
-                (question_id,),
+                (question_id, question_id),
             ).fetchall()
         for r in rows:
             cards.append(
@@ -430,90 +659,70 @@ def tool_query_library_catalog(
                     "wing": "EXTERNAL_R",
                     "question_id": str(r["question_id"]),
                     "title": str(r["title"]),
-                    "abstract_md": str(r["abstract_md"]),
-                    "preconditions": str(r["exact_preconditions_md"]),
+                    "abstract_preview": str(r["abstract_md"])[:350],
                     "read_depth": str(r["read_depth"]),
                     "support_scope": str(r["support_scope"]),
+                    "is_unverified_external": bool(r["is_unverified_external"]),
                 }
             )
 
-    # 右翼内藏 L3/L2 在 first_reflection_unlocked == 1 后开放
-    if unlocked and scope_u in ("INTERNAL_L3", "INTERNAL_L2", "ALL"):
-        types_want = []
-        if scope_u in ("INTERNAL_L3", "ALL"):
-            types_want.append("L3_VERIFIED")
-        if scope_u in ("INTERNAL_L2", "ALL"):
-            types_want.append("L2_FAILURE_RECORD")
-        placeholders = ",".join("?" for _ in types_want)
-        fts_int = sanitize_fts5_query(kw, ["title", "abstract_md", "exact_verified_scope_md", "exact_refuted_scope_md"]) if kw else None
-        if fts_int:
-            rows = conn.execute(
-                f"""
-                SELECT l.entry_id, l.question_id, l.ledger_type, l.title, l.abstract_md,
-                       l.exact_verified_scope_md, l.exact_refuted_scope_md, l.ledger_status
-                FROM internal_ledger_fts f
-                JOIN internal_research_ledger l ON f.entry_id = l.entry_id
-                WHERE internal_ledger_fts MATCH ?
-                  AND l.ledger_type IN ({placeholders})
-                  AND l.ledger_status = 'active'
-                  AND (l.question_id = ? OR ? = 'ALL')
-                LIMIT 15
-                """,
-                (fts_int, *types_want, question_id, question_id),
-            ).fetchall()
+    # 右翼内藏 L3 / L2：0-37% 物理锁死
+    if scope_u in ("INTERNAL_L3", "INTERNAL_L2", "ALL"):
+        if not unlocked:
+            if scope_u in ("INTERNAL_L3", "INTERNAL_L2"):
+                raise FailClosedError(ERR_LOCKED, "0-37% 净室独思期物理锁定内藏 L3/L2，完成 37% 伴随元反思后立即可读")
+            warnings.append("当前处于 0-37% 独思净室期，本次仅返回左翼外藏 [R###]；完成 37% 元反思后将解锁 L3/L2。")
         else:
-            rows = conn.execute(
-                f"""
-                SELECT entry_id, question_id, ledger_type, title, abstract_md,
-                       exact_verified_scope_md, exact_refuted_scope_md, ledger_status
-                FROM internal_research_ledger
-                WHERE ledger_type IN ({placeholders})
-                  AND ledger_status = 'active'
-                  AND (question_id = ? OR ? = 'ALL')
-                ORDER BY created_at DESC LIMIT 15
-                """,
-                (*types_want, question_id, question_id),
-            ).fetchall()
-        for r in rows:
-            ltype = str(r["ledger_type"])
-            cards.append(
-                {
-                    "entry_id": str(r["entry_id"]),
-                    "wing": "INTERNAL_L3" if ltype == "L3_VERIFIED" else "INTERNAL_L2",
-                    "question_id": str(r["question_id"]),
-                    "title": str(r["title"]),
-                    "abstract_md": str(r["abstract_md"]),
-                    "scope_summary": str(
-                        r["exact_verified_scope_md"] if ltype == "L3_VERIFIED" else r["exact_refuted_scope_md"]
-                    ),
-                }
-            )
-
-    with rw_immediate_tx(conn):
-        record_fact_edge(
-            conn,
-            src_id=node_id,
-            dst_id=f"catalog:{scope_u}:{question_id}",
-            edge_type="RETRIEVED",
-            metadata={"session_id": session_id, "keyword": kw, "unlocked": unlocked, "returned": len(cards)},
-        )
-
-    if not unlocked:
-        guidance = (
-            "0-37% 期间仅返回外藏 [R###] 基础文献/算子卡；看中卡片请调 get_library_entry 拉取详情，缺外部资料可调 request_literature_survey。内藏 L3/L2 将在 37% 反思后当场解锁。"
-        )
-    else:
-        guidance = (
-            "已返回全馆匹配目录卡（外藏 [R###] + 内藏 L3/L2）。看中条目请按 entry_id 调 get_library_entry 并确保在引用前真实阅读（计入 FACT_LOG）。"
-        )
+            ltypes = ("L3_VERIFIED",) if scope_u == "INTERNAL_L3" else (("L2_FAILURE_RECORD",) if scope_u == "INTERNAL_L2" else ("L3_VERIFIED", "L2_FAILURE_RECORD"))
+            ph = ",".join("?" for _ in ltypes)
+            if fts_q:
+                rows = conn.execute(
+                    f"""
+                    SELECT l.entry_id, l.question_id, l.ledger_type, l.l3_entry_kind, l.goal_coverage, l.l2_category, l.title, l.abstract_md
+                    FROM internal_research_ledger l
+                    JOIN internal_research_fts f ON f.rowid = l.rowid
+                    WHERE internal_research_fts MATCH ?
+                      AND l.is_active = 1
+                      AND l.ledger_type IN ({ph})
+                      AND (? = 'ALL' OR l.question_id = ?)
+                    ORDER BY l.entry_id
+                    """,
+                    (fts_q, *ltypes, question_id, question_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f"""
+                    SELECT entry_id, question_id, ledger_type, l3_entry_kind, goal_coverage, l2_category, title, abstract_md
+                    FROM internal_research_ledger
+                    WHERE is_active = 1
+                      AND ledger_type IN ({ph})
+                      AND (? = 'ALL' OR question_id = ?)
+                    ORDER BY entry_id
+                    """,
+                    (*ltypes, question_id, question_id),
+                ).fetchall()
+            for r in rows:
+                cards.append(
+                    {
+                        "entry_id": str(r["entry_id"]),
+                        "wing": str(r["ledger_type"]),
+                        "question_id": str(r["question_id"]),
+                        "l3_entry_kind": r["l3_entry_kind"],
+                        "goal_coverage": r["goal_coverage"],
+                        "l2_category": r["l2_category"],
+                        "title": str(r["title"]),
+                        "abstract_preview": str(r["abstract_md"])[:350],
+                    }
+                )
 
     return build_tool_receipt(
         conn=conn,
         tool_name="query_library_catalog",
-        node_id=node_id,
         question_id=question_id,
-        next_step_guidance=guidance,
-        data={"unlocked_internal": unlocked, "cards": cards, "count": len(cards)},
+        node_id=node_id,
+        warnings=warnings,
+        next_step_guidance=f"共检索到 {len(cards)} 张目录卡；选定 1-2 张高相关卡片调用 get_library_entry 拉取全文。",
+        data={"unlocked": unlocked, "cards": cards},
     )
 
 
@@ -524,6 +733,7 @@ def tool_get_library_entry(
     node_id: str,
     entry_id: str,
 ) -> dict[str, Any]:
+    """二级详卡按 ID 拉取，并静默写入参考性 `FACT_LOG(READ)` 边。"""
     enforce_role_tool_permission(conn, caller_role, "get_library_entry", session_id=session_id, node_id=node_id)
     node = conn.execute("SELECT question_id, first_reflection_unlocked FROM lineage_nodes WHERE node_id = ?", (node_id,)).fetchone()
     if node is None:
@@ -533,35 +743,29 @@ def tool_get_library_entry(
     ext = conn.execute("SELECT * FROM external_literature_cards WHERE ref_id = ?", (entry_id,)).fetchone()
     if ext is not None:
         with rw_immediate_tx(conn):
-            record_fact_edge(conn, src_id=node_id, dst_id=str(ext["ref_id"]), edge_type="READ", metadata={"session_id": session_id})
+            record_fact_edge(conn, source_id=node_id, target_id=entry_id, edge_type="READ", session_id=session_id)
         return build_tool_receipt(
             conn=conn,
             tool_name="get_library_entry",
-            node_id=node_id,
             question_id=str(node["question_id"]),
-            next_step_guidance="已登记 FACT_LOG 阅读凭证，你现在可以在 run_isolated_eval 的 declared_refs 中合法引用该条目 ID。",
+            node_id=node_id,
+            next_step_guidance=f"已拉取外藏参考卡 {entry_id}（注意：未复验外部参考摘要，须在推导/计算中自行核验适用前提）。",
             data={"wing": "EXTERNAL_R", "entry": dict(ext)},
         )
 
-    intl = conn.execute("SELECT * FROM internal_research_ledger WHERE entry_id = ?", (entry_id,)).fetchone()
-    if intl is not None:
+    led = conn.execute("SELECT * FROM internal_research_ledger WHERE entry_id = ?", (entry_id,)).fetchone()
+    if led is not None:
         if not unlocked:
-            raise FailClosedError(
-                ERR_LOCKED,
-                f"0-37% 净室独思期暂锁内藏账本，禁止读取 {entry_id!r}；完成首测与 37% 反思后当场解锁",
-            )
+            raise FailClosedError(ERR_LOCKED, f"0-37% 独思期物理锁定内藏条目 {entry_id!r}，完成 37% 反思后开放")
         with rw_immediate_tx(conn):
-            record_fact_edge(conn, src_id=node_id, dst_id=str(intl["entry_id"]), edge_type="READ", metadata={"session_id": session_id})
-        d = dict(intl)
-        # 盲态保护：绝不向他者暴露原作者方法学派身份
-        d.pop("method_family_id", None)
+            record_fact_edge(conn, source_id=node_id, target_id=entry_id, edge_type="READ", session_id=session_id)
         return build_tool_receipt(
             conn=conn,
             tool_name="get_library_entry",
-            node_id=node_id,
             question_id=str(node["question_id"]),
-            next_step_guidance="已登记 FACT_LOG 阅读凭证，你现在可以在 run_isolated_eval 的 declared_refs 中合法引用该内藏条目 ID。",
-            data={"wing": str(d["ledger_type"]), "entry": d},
+            node_id=node_id,
+            next_step_guidance=f"已拉取内藏 {led['ledger_type']} 条目 {entry_id} 并静默记录参考 READ 轨迹。",
+            data={"wing": str(led["ledger_type"]), "entry": dict(led)},
         )
 
     raise FailClosedError(ERR_NOT_FOUND, f"图书馆条目 {entry_id!r} 不存在")
@@ -576,29 +780,27 @@ def tool_request_literature_survey(
     topic_query: str,
     reason: str,
 ) -> dict[str, Any]:
+    """委托图书馆外藏采编补充外部文献/标准定理卡。"""
     enforce_role_tool_permission(conn, caller_role, "request_literature_survey", session_id=session_id, node_id=node_id)
-    if not (topic_query or "").strip() or not (reason or "").strip():
+    if not str(topic_query or "").strip() or not str(reason or "").strip():
         raise FailClosedError(ERR_INVALID_INPUT, "topic_query 与 reason 均不能为空")
-    req_id = f"sr_{uuid.uuid4().hex[:10]}"
+    req_id = next_prefixed_id(conn, "survey_requests", "req_id", "sreq_")
     now = utc_now_iso()
     with rw_immediate_tx(conn):
         conn.execute(
             """
-            INSERT INTO survey_requests(request_id, node_id, question_id, topic_query, reason, status, created_at, updated_at)
+            INSERT INTO survey_requests(req_id, question_id, node_id, topic_query, reason, status, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?)
             """,
-            (req_id, node_id, question_id, topic_query.strip(), reason.strip(), now, now),
-        )
-        record_fact_edge(
-            conn, src_id=node_id, dst_id=f"survey:{req_id}", edge_type="USED_TOOL", metadata={"topic": topic_query}
+            (req_id, question_id, node_id, topic_query.strip(), reason.strip(), now, now),
         )
     return build_tool_receipt(
         conn=conn,
         tool_name="request_literature_survey",
-        node_id=node_id,
         question_id=question_id,
-        next_step_guidance="委托查新单已入队，控制面将唤醒 library_surveyor 采编新 [R###] 卡片，你可继续推进本地实验。",
-        data={"request_id": req_id, "status": "PENDING"},
+        node_id=node_id,
+        next_step_guidance=f"查新请求 {req_id} 已入队，后台采编馆员完成后将自动入库 [R###]。",
+        data={"req_id": req_id, "status": "PENDING"},
     )
 
 
@@ -609,118 +811,97 @@ def tool_read_lineage_graph(
     node_id: str,
     branch_id: str,
     target_node_id: str | None = None,
+    view: str = "nodes",
     saved_query_name: str | None = None,
 ) -> dict[str, Any]:
+    """37% 解锁后翻阅本门派私有谱系 DAG 或 `lineage_dead_ends` 全表（强隔离他脉与盲审表）。"""
     enforce_role_tool_permission(conn, caller_role, "read_lineage_graph", session_id=session_id, node_id=node_id)
     node = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ?", (node_id,)).fetchone()
     if node is None:
         raise FailClosedError(ERR_NOT_FOUND, f"节点 {node_id!r} 不存在")
-    if str(node["branch_id"]) != branch_id:
-        raise FailClosedError(ERR_AUTH, f"分支声明不匹配：节点 {node_id!r} 属 {node['branch_id']!r} 而非 {branch_id!r}")
-    if int(node["first_reflection_unlocked"] or 0) == 0:
-        raise FailClosedError(ERR_LOCKED, "0-37% 净室独思期暂锁本脉深层谱系 DAG，完成 37% 短反思后立即开放")
+    if str(node["branch_id"]) != str(branch_id):
+        raise FailClosedError(
+            ERR_AUTH,
+            f"门派物理隔离拦截：节点 {node_id!r} 隶属分支 {node['branch_id']!r}，严禁跨分支偷读 {branch_id!r}！",
+        )
+    if int(node["first_reflection_unlocked"] or 0) != 1:
+        raise FailClosedError(ERR_LOCKED, "0-37% 净室独思期暂锁本脉深层谱系 DAG 与 dead_ends，完成 37% 反思后立即开放")
 
-    qid = str(node["question_id"])
-    payload: dict[str, Any] = {}
+    if saved_query_name:
+        sq = conn.execute("SELECT sql_select, description FROM saved_graph_queries WHERE query_name = ?", (saved_query_name,)).fetchone()
+        if sq is None:
+            raise FailClosedError(ERR_NOT_FOUND, f"已保存查询视图 {saved_query_name!r} 不存在")
+        sql = str(sq["sql_select"]).strip()
+        if _SQL_WRITE_FORBIDDEN_RE.search(sql) or ";" in sql.rstrip(";"):
+            raise FailClosedError(ERR_AUTH, "非法非只读 SQL 视图")
+        sql_l = sql.lower()
+        for forbidden_tbl in _FORBIDDEN_TENANT_TABLES:
+            if forbidden_tbl in sql_l:
+                raise FailClosedError(ERR_AUTH, f"租户隔离阻断：探索者禁止执行涉及受保护表 {forbidden_tbl!r} 的 SQL 视图")
+        rows = [dict(r) for r in conn.execute(sql).fetchall()]
+        return build_tool_receipt(
+            conn=conn,
+            tool_name="read_lineage_graph",
+            question_id=str(node["question_id"]),
+            node_id=node_id,
+            next_step_guidance=f"已执行只读视图 {saved_query_name!r}，返回 {len(rows)} 行。",
+            data={"saved_query_name": saved_query_name, "rows": rows},
+        )
+
+    view_l = str(view or "nodes").strip().lower()
+    if view_l not in ("nodes", "dead_ends"):
+        raise FailClosedError(ERR_INVALID_INPUT, f"非法 view={view!r}，仅允许 'nodes' 或 'dead_ends'")
+
+    if view_l == "dead_ends":
+        de_rows = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM lineage_dead_ends WHERE branch_id = ? ORDER BY created_at ASC",
+                (branch_id,),
+            ).fetchall()
+        ]
+        return build_tool_receipt(
+            conn=conn,
+            tool_name="read_lineage_graph",
+            question_id=str(node["question_id"]),
+            node_id=node_id,
+            next_step_guidance=f"已拉取本脉 {branch_id} 全部 {len(de_rows)} 条历史死胡同排除记录。",
+            data={"view": "dead_ends", "branch_id": branch_id, "dead_ends": de_rows},
+        )
 
     if target_node_id:
         tgt = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ?", (target_node_id,)).fetchone()
         if tgt is None:
             raise FailClosedError(ERR_NOT_FOUND, f"目标谱系节点 {target_node_id!r} 不存在")
-        if str(tgt["branch_id"]) != branch_id:
-            # 允许查直接祖先链节点，禁止查他门派兄弟/敌脉私有节点
-            anc_rows = conn.execute(
-                """
-                WITH RECURSIVE anc AS (
-                    SELECT node_id, parent_node_id FROM lineage_nodes WHERE node_id = ?
-                    UNION ALL
-                    SELECT p.node_id, p.parent_node_id FROM lineage_nodes p JOIN anc ON anc.parent_node_id = p.node_id
-                )
-                SELECT node_id FROM anc
-                """,
-                (node_id,),
-            ).fetchall()
-            anc_ids = {str(r["node_id"]) for r in anc_rows}
-            if str(target_node_id) not in anc_ids:
-                raise FailClosedError(
-                    ERR_AUTH,
-                    f"跨门派隔离阻断：禁止 {branch_id!r} 偷窥他脉节点 {target_node_id!r} 的私有谱系手记",
-                )
-        obs = conn.execute(
-            "SELECT obs_id, obs_status, passed, metrics_json, details_text, linguistic_prediction FROM observations WHERE node_id = ? ORDER BY created_at ASC",
-            (target_node_id,),
-        ).fetchall()
-        payload["target_node"] = {
-            "node_id": str(tgt["node_id"]),
-            "branch_id": str(tgt["branch_id"]),
-            "generation": int(tgt["generation"]),
-            "column_a_facts_md": str(tgt["column_a_facts_md"]),
-            "column_b_hypothesis_md": str(tgt["column_b_hypothesis_md"]),
-            "will_md": str(tgt["will_md"]),
-            "observations": [dict(o) for o in obs],
-        }
-
-    elif saved_query_name:
-        qrow = conn.execute(
-            "SELECT * FROM saved_graph_queries WHERE query_name = ?",
-            (saved_query_name,),
-        ).fetchone()
-        if qrow is None:
-            raise FailClosedError(ERR_NOT_FOUND, f"已保存查询视图 {saved_query_name!r} 不存在")
-        sql = str(qrow["sql_select"]).strip()
-        if _SQL_WRITE_FORBIDDEN_RE.search(sql) or not re.match(r"^\s*SELECT\b", sql, re.IGNORECASE):
-            raise FailClosedError(ERR_AUTH, "非法非只读 SQL 视图")
-        sql_l = sql.lower()
-        # 拍板 5：面向探索者强校验租户隔离 —— 禁查盲审表/合规私密表，若涉私有节点/观测表必须显式绑定 :branch_id 参数
-        if any(tbl in sql_l for tbl in ("review_queue", "compliance_alerts", "works_engineering_queue")):
-            raise FailClosedError(ERR_AUTH, "租户隔离阻断：探索者禁止执行涉及盲审/合规内部表的 SQL 视图")
-        touches_private = ("lineage_nodes" in sql_l) or ("observations" in sql_l)
-        if touches_private and ":branch_id" not in sql:
-            raise FailClosedError(
-                ERR_AUTH,
-                "租户隔离阻断：涉及 lineage_nodes 或 observations 的共享视图面向探索者时必须强制包含 `:branch_id` 参数过滤",
-            )
-        rows = conn.execute(sql, {"branch_id": branch_id, "question_id": qid}).fetchall()
-        with rw_immediate_tx(conn):
-            conn.execute(
-                "UPDATE saved_graph_queries SET usage_count = usage_count + 1 WHERE query_name = ?",
-                (saved_query_name,),
-            )
-        payload["saved_query_rows"] = [dict(r) for r in rows[:50]]
-
-    else:
-        anc_rows = conn.execute(
-            """
-            WITH RECURSIVE anc(node_id, parent_node_id, branch_id, generation, triage_level, column_a_facts_md, will_md, lvl) AS (
-                SELECT node_id, parent_node_id, branch_id, generation, triage_level, column_a_facts_md, will_md, 0
-                FROM lineage_nodes WHERE node_id = ?
-                UNION ALL
-                SELECT p.node_id, p.parent_node_id, p.branch_id, p.generation, p.triage_level, p.column_a_facts_md, p.will_md, anc.lvl + 1
-                FROM lineage_nodes p JOIN anc ON anc.parent_node_id = p.node_id
-            )
-            SELECT node_id, generation, triage_level, substr(column_a_facts_md, 1, 280) AS col_a_preview, will_md
-            FROM anc ORDER BY generation ASC
-            """,
-            (node_id,),
-        ).fetchall()
-        payload["ancestors"] = [dict(r) for r in anc_rows]
-
-    with rw_immediate_tx(conn):
-        record_fact_edge(
-            conn,
-            src_id=node_id,
-            dst_id=f"dag:{target_node_id or saved_query_name or branch_id}",
-            edge_type="READ",
-            metadata={"session_id": session_id},
+        if str(tgt["branch_id"]) != str(branch_id):
+            raise FailClosedError(ERR_AUTH, f"门派物理隔离拦截：目标节点 {target_node_id!r} 不属于本分支 {branch_id!r}")
+        return build_tool_receipt(
+            conn=conn,
+            tool_name="read_lineage_graph",
+            question_id=str(node["question_id"]),
+            node_id=node_id,
+            next_step_guidance=f"已读取本脉祖先节点 {target_node_id} 完整记录。",
+            data={"view": "nodes", "node": dict(tgt)},
         )
 
+    nodes = [
+        dict(r)
+        for r in conn.execute(
+            """
+            SELECT node_id, generation, node_status, evidence_grade, mechanism_summary,
+                   column_a_facts_md, will_md, created_at
+            FROM lineage_nodes
+            WHERE branch_id = ?
+            ORDER BY generation ASC, created_at ASC
+            """,
+            (branch_id,),
+        ).fetchall()
+    ]
     return build_tool_receipt(
         conn=conn,
         tool_name="read_lineage_graph",
+        question_id=str(node["question_id"]),
         node_id=node_id,
-        question_id=qid,
-        next_step_guidance="已拉取本脉谱系 DAG 祖先上下文。如需细看某代完整手记与指标，请传入 target_node_id。",
-        data=payload,
+        next_step_guidance=f"已读取本脉 {branch_id} 共 {len(nodes)} 代谱系节点摘要。",
+        data={"view": "nodes", "branch_id": branch_id, "nodes": nodes},
     )
-
-

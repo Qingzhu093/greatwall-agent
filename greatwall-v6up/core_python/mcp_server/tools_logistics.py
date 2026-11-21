@@ -1,70 +1,58 @@
-"""V6-Up (v2.2) logistics_coordinator（后勤调度总管）5 个窄工具实现。"""
+"""长城 V6-Up (v3.0) logistics_coordinator（后勤调度总管）5 个单一职责窄工具。"""
+
 from __future__ import annotations
 
 import json
 import os
-import re
-import shutil
 import sqlite3
-import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
 
-from evaluators.isolated_runner import (
-    run_stage_b_revaluation,
-    sha256_file,
-)
 from .control_plane_service import (
     backup_retained_candidate_snapshot,
-    check_stage2_closure_gate_data,
-    export_stage3_deliverables,
-    get_question_dependency_status,
+    check_branch_requires_satisfied,
+    compute_family_concentration_alerts,
+    get_question_order_status,
     restore_retained_candidate_snapshot,
 )
 from .db_schema import (
-    ALLOWED_CLAIMED_EDGE_TYPES,
-    ALLOWED_READ_DEPTHS,
-    ALLOWED_SUPPORT_SCOPES,
-    ERR_AUTH,
+    ALLOWED_FORK_MODES,
+    ALLOWED_STAGNATION_LANES,
+    ALLOWED_TRIAGE_ACTIONS,
+    ALLOWED_TRIAGE_LEVELS,
     ERR_CONFLICT,
     ERR_INVALID_INPUT,
     ERR_INVARIANT,
     ERR_LOCKED,
     ERR_NOT_FOUND,
     FailClosedError,
-    propagate_dependency_recheck,
-    resolve_storage_paths,
     rw_immediate_tx,
     utc_now_iso,
 )
 from .mcp_core_helpers import (
-    VALID_FORK_MODES,
-    VALID_STAGNATION_LANES,
     build_tool_receipt,
-    check_mechanism_similarity,
-    compute_adversarial_qp,
-    compute_bb_epsilon,
-    core_python_root,
     enforce_role_tool_permission,
     load_runtime_config,
-    record_fact_edge,
-    validate_baseline_isolation_ast,
-)
-from .governance_common import (
-    _SQL_WRITE_FORBIDDEN_RE,
-    _audit_node_unread_citations,
-    _collect_proposer_sessions,
-    _extract_referenced_cards_for_blind_review,
-    _next_id,
-    _next_ledger_id,
-    _parse_proposer_sessions,
-    _require_reviewer_session,
+    next_prefixed_id,
 )
 
-# ==============================================================================
-# 角色 3：logistics_coordinator（5 个窄工具）
-# ==============================================================================
+
+def _validate_deterministic_requires(requires: list[str] | None) -> list[str]:
+    """分支级确定性 requires 校验：仅允许 `L3-###` 或 `OBS:<instrument_id>:PASS`。"""
+    out: list[str] = []
+    for raw in requires or []:
+        req = str(raw or "").strip()
+        if not req:
+            continue
+        if req.startswith("L3-") or (req.startswith("OBS:") and req.endswith(":PASS") and len(req) > len("OBS::PASS")):
+            out.append(req)
+        else:
+            raise FailClosedError(
+                ERR_INVALID_INPUT,
+                f"非法 requires 条目 {req!r}：仅支持系统可确定性查库的 'L3-###' 或 'OBS:<instrument_id>:PASS'",
+            )
+    return out
 
 
 def tool_get_logistics_dashboard(
@@ -73,128 +61,111 @@ def tool_get_logistics_dashboard(
     session_id: str,
     question_id: str = "ALL",
 ) -> dict[str, Any]:
+    """纯查 SQLite (<50ms) 返回全卷或指定子题的方法族谱、分支占比、待分诊页、Ready Queue 与聚拢告警。"""
     enforce_role_tool_permission(conn, caller_role, "get_logistics_dashboard", session_id=session_id)
-    cfg = load_runtime_config()
-    q_filter = (question_id or "ALL").strip()
-    ep = conn.execute("SELECT * FROM epoch_config WHERE config_id = 'active'").fetchone()
-    non_l1 = int(ep["consecutive_non_l1_handoffs"]) if ep else 0
-    stag_thresh = int(cfg.get("stagnation_consecutive_non_l1_handoffs", 8))
+    qf = str(question_id or "ALL").strip()
 
-    if q_filter.upper() == "ALL":
-        fams = [dict(r) for r in conn.execute("SELECT * FROM method_families ORDER BY question_id, created_at").fetchall()]
+    p0 = conn.execute("SELECT * FROM parse0_contract WHERE contract_id = 'active'").fetchone()
+    order_status = get_question_order_status(conn)
+    conc_alerts = compute_family_concentration_alerts(conn)
+    if qf.upper() != "ALL":
+        conc_alerts = [a for a in conc_alerts if a["question_id"] == qf]
+
+    if qf.upper() == "ALL":
+        families = [dict(r) for r in conn.execute("SELECT * FROM method_families ORDER BY question_id, family_id").fetchall()]
         triage_nodes = [
             dict(r)
             for r in conn.execute(
-                "SELECT * FROM lineage_nodes WHERE node_status = 'AWAITING_TRIAGE' ORDER BY updated_at ASC"
+                """
+                SELECT node_id, question_id, branch_id, family_id, generation, mechanism_summary,
+                       evidence_grade, candidate_rel_path, bound_obs_ids_json, revise_count,
+                       inplace_repair_count, premise_revoked, column_a_facts_md, will_md
+                FROM lineage_nodes
+                WHERE node_status = 'AWAITING_TRIAGE'
+                ORDER BY updated_at ASC
+                """
             ).fetchall()
         ]
         ready_queue = [
             dict(r)
             for r in conn.execute(
-                "SELECT node_id, question_id, branch_id, family_id, reopen_condition, will_md, updated_at FROM lineage_nodes WHERE node_status = 'BLOCKED_L4B' ORDER BY updated_at ASC"
+                "SELECT node_id, question_id, branch_id, family_id, reopen_condition, requires_json FROM lineage_nodes WHERE node_status = 'BLOCKED_L4B' ORDER BY updated_at ASC"
             ).fetchall()
         ]
-        exploring = [
+        active_branches = [
             dict(r)
             for r in conn.execute(
-                "SELECT node_id, question_id, branch_id, family_id, pressure_tokens, eval_count FROM lineage_nodes WHERE node_status = 'EXPLORING'"
+                "SELECT DISTINCT question_id, branch_id, family_id, node_status, lane_assignment FROM lineage_nodes WHERE node_status IN ('EXPLORING','ACTIVE_REVISING','AWAITING_TRIAGE','PENDING_REVIEW')"
             ).fetchall()
         ]
     else:
-        fams = [
-            dict(r)
-            for r in conn.execute(
-                "SELECT * FROM method_families WHERE question_id = ? ORDER BY created_at", (q_filter,)
-            ).fetchall()
-        ]
+        families = [dict(r) for r in conn.execute("SELECT * FROM method_families WHERE question_id = ? ORDER BY family_id", (qf,)).fetchall()]
         triage_nodes = [
             dict(r)
             for r in conn.execute(
-                "SELECT * FROM lineage_nodes WHERE question_id = ? AND node_status = 'AWAITING_TRIAGE' ORDER BY updated_at ASC",
-                (q_filter,),
+                """
+                SELECT node_id, question_id, branch_id, family_id, generation, mechanism_summary,
+                       evidence_grade, candidate_rel_path, bound_obs_ids_json, revise_count,
+                       inplace_repair_count, premise_revoked, column_a_facts_md, will_md
+                FROM lineage_nodes
+                WHERE node_status = 'AWAITING_TRIAGE' AND question_id = ?
+                ORDER BY updated_at ASC
+                """,
+                (qf,),
             ).fetchall()
         ]
         ready_queue = [
             dict(r)
             for r in conn.execute(
-                "SELECT node_id, question_id, branch_id, family_id, reopen_condition, will_md, updated_at FROM lineage_nodes WHERE question_id = ? AND node_status = 'BLOCKED_L4B' ORDER BY updated_at ASC",
-                (q_filter,),
+                "SELECT node_id, question_id, branch_id, family_id, reopen_condition, requires_json FROM lineage_nodes WHERE node_status = 'BLOCKED_L4B' AND question_id = ? ORDER BY updated_at ASC",
+                (qf,),
             ).fetchall()
         ]
-        exploring = [
+        active_branches = [
             dict(r)
             for r in conn.execute(
-                "SELECT node_id, question_id, branch_id, family_id, pressure_tokens, eval_count FROM lineage_nodes WHERE question_id = ? AND node_status = 'EXPLORING'",
-                (q_filter,),
+                "SELECT DISTINCT question_id, branch_id, family_id, node_status, lane_assignment FROM lineage_nodes WHERE question_id = ? AND node_status IN ('EXPLORING','ACTIVE_REVISING','AWAITING_TRIAGE','PENDING_REVIEW')",
+                (qf,),
             ).fetchall()
         ]
 
+    # 附加每个待分诊节点的关联观测摘要，方便后勤辨别 CANDIDATE_ERROR vs 科学否定（并忽略 INSTRUMENT_ERROR）
     for tn in triage_nodes:
-        obs = conn.execute(
-            "SELECT obs_id, obs_status, passed, comparable_rank_score, metrics_json, details_text FROM observations WHERE node_id = ?",
+        obs_rows = conn.execute(
+            "SELECT obs_id, instrument_id, instrument_version, obs_status, tracks_json FROM observations WHERE node_id = ? ORDER BY created_at ASC",
             (tn["node_id"],),
         ).fetchall()
-        tn["observations"] = [dict(o) for o in obs]
-
-    req_qs = json.loads(ep["required_questions_json"]) if ep and ep["required_questions_json"] else []
-    contracts = json.loads(ep["contracts_json"]) if ep and ep["contracts_json"] else {}
-    dep_status = get_question_dependency_status(conn, contracts=contracts, required_questions=req_qs)
-    for rq in ready_queue:
-        rq_dep = dep_status.get(str(rq["question_id"]), {})
-        rq["depends_on_questions"] = rq_dep.get("depends_on_questions", [])
-        rq["unmet_dependencies"] = rq_dep.get("unmet_dependencies", [])
-        rq["dependency_unlocked"] = rq_dep.get("unlocked", True)
-
-    recent_l3 = [
-        dict(r)
-        for r in conn.execute(
-            "SELECT entry_id, question_id, title, exact_verified_scope_md, created_at FROM internal_research_ledger WHERE ledger_type = 'L3_VERIFIED' AND ledger_status = 'active' ORDER BY created_at DESC LIMIT 8"
-        ).fetchall()
-    ]
-    hooks = [
-        dict(r)
-        for r in conn.execute(
-            "SELECT question_id, eval_epoch_version, fidelity_max_error_pct, public_input_sample_json, updated_at FROM domain_hooks_by_question"
-        ).fetchall()
-    ]
-
-    all_blocked = (len(exploring) == 0 and len(triage_nodes) == 0 and len(ready_queue) > 0)
-    stag_triggered = non_l1 >= stag_thresh or all_blocked
+        tn["observations"] = [
+            {
+                "obs_id": str(o["obs_id"]),
+                "instrument_id": str(o["instrument_id"]),
+                "instrument_version": int(o["instrument_version"]),
+                "obs_status": str(o["obs_status"]),
+                "tracks": json.loads(o["tracks_json"] or "{}"),
+            }
+            for o in obs_rows
+        ]
 
     guidance = (
-        f"当前有 {len(triage_nodes)} 个 AWAITING_TRIAGE 节点待调 triage_node；"
-        + ("停滞看门狗已触发，请调 dispatch_stagnation_five_lanes 分配 5 互斥车道！" if stag_triggered else "可对照 goal_md、question_dependencies、Ready Queue 与最新 L3/钩子决定是否 fork_branch。")
+        f"发现 {len(conc_alerts)} 条无豁免学派聚拢告警 (>50%)，请立即执行 fork_branch(fork_mode='orthogonal') 正交分流！"
+        if conc_alerts
+        else f"当前待分诊 {len(triage_nodes)} 节点、Ready Queue {len(ready_queue)} 条、已登记学派 {len(families)} 个。"
     )
     return build_tool_receipt(
         conn=conn,
         tool_name="get_logistics_dashboard",
-        question_id=q_filter,
+        question_id=qf,
         next_step_guidance=guidance,
         data={
-            "epoch_config": {
-                "epoch_id": int(ep["epoch_id"]) if ep else 1,
-                "stage": str(ep["stage"]) if ep else "STAGE1_PARSE0",
-                "goal_md": str(ep["goal_md"] or "") if ep else "",
-                "required_questions": req_qs,
-                "contracts_json": contracts,
-            },
-            "question_dependencies": dep_status,
-            "method_families": fams,
-            "awaiting_triage_nodes": triage_nodes,
-            "active_exploring_nodes": exploring,
-            "ready_queue_blocked_l4b": ready_queue,
-            "recent_verified_l3_unlocks": recent_l3,
-            "domain_hooks": hooks,
-            "stagnation": {
-                "consecutive_non_l1_handoffs": non_l1,
-                "threshold": stag_thresh,
-                "triggered": stag_triggered,
-            },
-            "slot_budget": {
-                "configured_max": int(cfg.get("max_concurrent_workers", 6)),
-                "hard_cap": int(cfg.get("max_concurrent_workers_hard_cap", 10)),
-                "currently_running": len(exploring),
-            },
+            "parse0_goal_md": str(p0["goal_and_completion_md"]) if p0 else "",
+            "required_questions": json.loads(p0["subquestions_json"]) if p0 else [],
+            "question_order_status": order_status,
+            "consecutive_non_l1_handoffs": int(p0["consecutive_non_l1_handoffs"] or 0) if p0 else 0,
+            "method_families": families,
+            "active_branches": active_branches,
+            "family_concentration_alerts": conc_alerts,
+            "awaiting_triage": triage_nodes,
+            "ready_queue": ready_queue,
         },
     )
 
@@ -207,73 +178,63 @@ def tool_register_method_family(
     family_id: str,
     mechanism_signature: str,
     orthogonal_contrast: str,
-    depends_on_questions: list[str] | None = None,
 ) -> dict[str, Any]:
+    """登记底层数学/物理思想学派（按需登记，不强卡固定条数）。"""
     enforce_role_tool_permission(conn, caller_role, "register_method_family", session_id=session_id)
-    if not family_id.strip() or not mechanism_signature.strip():
-        raise FailClosedError(ERR_INVALID_INPUT, "family_id 与 mechanism_signature 不能为空")
+    fid = str(family_id or "").strip()
+    sig = str(mechanism_signature or "").strip()
+    contrast = str(orthogonal_contrast or "").strip()
+    if not fid or not sig or not contrast:
+        raise FailClosedError(ERR_INVALID_INPUT, "family_id、mechanism_signature 与 orthogonal_contrast 均不能为空")
 
-    ep = conn.execute("SELECT epoch_id, contracts_json FROM epoch_config WHERE config_id = 'active'").fetchone()
-    epoch_id = int(ep["epoch_id"]) if ep else 1
-    contracts = json.loads(ep["contracts_json"]) if ep and ep["contracts_json"] else {}
-    q_c = contracts.get(question_id, {}) if isinstance(contracts, dict) else {}
-    c_deps = q_c.get("depends_on_questions") if isinstance(q_c, dict) else []
-    merged_deps = sorted({
-        *(str(d).strip() for d in (depends_on_questions or []) if str(d).strip() and str(d).strip() != question_id),
-        *(str(d).strip() for d in (c_deps or []) if str(d).strip() and str(d).strip() != question_id),
-    })
-
-    existing = conn.execute(
-        "SELECT family_id, mechanism_signature FROM method_families WHERE epoch_id = ? AND question_id = ?",
-        (epoch_id, question_id),
-    ).fetchall()
-    for ex in existing:
-        if str(ex["family_id"]) == family_id:
-            raise FailClosedError(ERR_CONFLICT, f"方法学派 {family_id!r} 在 {question_id} 已存在")
-        sim = check_mechanism_similarity(mechanism_signature, str(ex["mechanism_signature"]))
-        if sim >= 0.88:
-            raise FailClosedError(
-                ERR_CONFLICT,
-                f"学派机制撞车：与既有学派 {ex['family_id']!r} 高度相似 (sim={sim:.2f})，请登记正交机理",
-            )
+    exists = conn.execute("SELECT 1 FROM method_families WHERE family_id = ?", (fid,)).fetchone()
+    if exists is not None:
+        raise FailClosedError(ERR_CONFLICT, f"方法学派 {fid!r} 已存在")
 
     now = utc_now_iso()
     with rw_immediate_tx(conn):
         conn.execute(
             """
-            INSERT INTO method_families(epoch_id, question_id, family_id, mechanism_signature, orthogonal_contrast, family_status, depends_on_questions_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 'EXPLORING', ?, ?, ?)
+            INSERT INTO method_families(family_id, question_id, mechanism_signature, orthogonal_contrast, family_status, created_at)
+            VALUES (?, ?, ?, ?, 'ACTIVE', ?)
             """,
-            (
-                epoch_id,
-                question_id,
-                family_id.strip(),
-                mechanism_signature.strip(),
-                (orthogonal_contrast or "").strip(),
-                json.dumps(merged_deps, ensure_ascii=False),
-                now,
-                now,
-            ),
+            (fid, question_id, sig, contrast, now),
         )
-    count = len(existing) + 1
-    cfg = load_runtime_config()
-    min_fam = int(cfg.get("min_initial_method_families_per_question", 2))
-    guidance = (
-        f"子题 {question_id} 已登记 {count} 个学派（开局最低要求 {min_fam} 个）。"
-        + ("请再登记至少 1 个互斥学派后调 fork_branch 并发派单。" if count < min_fam else "已达多学派互斥条件，可调 fork_branch 派发并发分支。")
-    )
+
     return build_tool_receipt(
         conn=conn,
         tool_name="register_method_family",
         question_id=question_id,
-        next_step_guidance=guidance,
-        data={
-            "question_id": question_id,
-            "family_id": family_id,
-            "depends_on_questions": merged_deps,
-            "total_families_for_question": count,
-        },
+        next_step_guidance=f"方法学派 {fid} 已建档，可调用 fork_branch 开启探索分支。",
+        data={"question_id": question_id, "family_id": fid, "family_status": "ACTIVE"},
     )
+
+
+def _has_verifiable_carrier(conn: sqlite3.Connection, node: sqlite3.Row) -> tuple[bool, str]:
+    """按科学主张形态核验可核验载体完整性（数值 Obs / 形式化凭证 / 反例脚本 / >=60字自包含推导四轨并行，废除单一 passed=1 死锁！）。"""
+    obs_ids = json.loads(node["bound_obs_ids_json"] or "[]")
+    if obs_ids:
+        ph = ",".join("?" for _ in obs_ids)
+        valid_obs = conn.execute(
+            f"""
+            SELECT obs_id, obs_status FROM observations
+            WHERE obs_id IN ({ph}) AND obs_status IN ('VALID_PASS', 'VALID_UNDECIDED', 'MEASURED_REJECTION')
+            """,
+            tuple(obs_ids),
+        ).fetchall()
+        if valid_obs:
+            return True, f"绑定有效观测收据 {len(valid_obs)} 条"
+
+    cand_rel = str(node["candidate_rel_path"] or "").strip()
+    wt_abs = str(node["worktree_abs_path"] or "").strip()
+    if cand_rel and wt_abs and (Path(wt_abs) / cand_rel).is_file():
+        return True, f"具备实体可核验产物文件 {cand_rel}"
+
+    col_a = str(node["column_a_facts_md"] or "").strip()
+    if len(col_a) >= 60:
+        return True, f"具备自包含解析推导 A 栏正文 ({len(col_a)} 字)"
+
+    return False, "缺少可核验载体（需至少齐备其一：有效 official/heavy [Obs###]、实体脚本/反例/证明文件、或 >=60 字自包含 A 栏推导）"
 
 
 def tool_triage_node(
@@ -282,281 +243,317 @@ def tool_triage_node(
     caller_role: str,
     session_id: str,
     node_id: str,
+    assigned_family_id: str,
     triage_level: str,
     action: str,
     rationale: str,
     barrier_proof_md: str | None = None,
     reopen_condition: str | None = None,
 ) -> dict[str, Any]:
+    """后勤四级认知分诊（强制归类 assigned_family_id、按主张核验载体、快照托管与工程错误绝不污染 L2）。"""
     enforce_role_tool_permission(conn, caller_role, "triage_node", session_id=session_id, node_id=node_id)
+
     node = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ?", (node_id,)).fetchone()
     if node is None:
         raise FailClosedError(ERR_NOT_FOUND, f"节点 {node_id!r} 不存在")
     if str(node["node_status"]) != "AWAITING_TRIAGE":
         raise FailClosedError(ERR_LOCKED, f"节点 {node_id!r} 状态为 {node['node_status']}，仅 AWAITING_TRIAGE 可调 triage_node")
 
-    tl = (triage_level or "").strip().upper()
-    act = (action or "").strip().upper()
-    valid_pairs = {
-        ("ROUTINE_CONTINUATION", "CONTINUE"),
-        ("LEVEL_1", "SUBMIT_BLIND_REVIEW"),
-        ("LEVEL_2", "INPLACE_REPAIR"),
-        ("LEVEL_3", "SPAWN_PROTECTED"),
-        ("LEVEL_4A", "SEAL_BARRIER"),
-        ("LEVEL_4B", "PAUSE_TO_READY_QUEUE"),
-    }
-    if (tl, act) not in valid_pairs:
-        raise FailClosedError(
-            ERR_INVALID_INPUT,
-            f"非法的 (triage_level, action) 组合: ({triage_level!r}, {action!r})，仅允许 {sorted(valid_pairs)}",
-        )
-    if not (rationale or "").strip():
+    lvl = str(triage_level or "").strip().upper()
+    act = str(action or "").strip().upper()
+    if lvl not in ALLOWED_TRIAGE_LEVELS:
+        raise FailClosedError(ERR_INVALID_INPUT, f"非法 triage_level={triage_level!r}，仅允许 {sorted(ALLOWED_TRIAGE_LEVELS)}")
+    if act not in ALLOWED_TRIAGE_ACTIONS:
+        raise FailClosedError(ERR_INVALID_INPUT, f"非法 action={action!r}，仅允许 {sorted(ALLOWED_TRIAGE_ACTIONS)}")
+    if not str(rationale or "").strip():
         raise FailClosedError(ERR_INVALID_INPUT, "triage_node 必须提供清晰的 rationale")
 
     qid = str(node["question_id"])
     bid = str(node["branch_id"])
-    fid = str(node["family_id"])
-    wt_abs = str(node["worktree_abs_path"])
-    now = utc_now_iso()
+    fid = str(assigned_family_id or node["family_id"] or "").strip()
+    if not fid:
+        raise FailClosedError(ERR_INVALID_INPUT, "assigned_family_id 不能为空（后勤须依据 mechanism_summary 确定性归类）")
+    fam = conn.execute("SELECT 1 FROM method_families WHERE family_id = ? AND question_id = ?", (fid, qid)).fetchone()
+    if fam is None:
+        raise FailClosedError(ERR_NOT_FOUND, f"方法学派 {fid!r} 尚未在子题 {qid} 登记，请先调 register_method_family")
+
     cfg = load_runtime_config()
     max_repairs = int(cfg.get("level2_max_inplace_repairs", 3))
+    now = utc_now_iso()
 
-    obs_rows = conn.execute(
-        "SELECT * FROM observations WHERE node_id = ? ORDER BY created_at DESC",
-        (node_id,),
-    ).fetchall()
-    valid_passed = [r for r in obs_rows if str(r["obs_status"]) == "VALID" and int(r["passed"]) == 1]
+    # 若运行中分支前置 L3 已被撤回 (premise_revoked == 1)，自然交接时转 LEVEL_4B 暂停
+    if int(node["premise_revoked"] or 0) == 1 and lvl not in ("LEVEL_4A", "LEVEL_4B"):
+        lvl = "LEVEL_4B"
+        act = "PAUSE_TO_READY_QUEUE"
+        reopen_condition = reopen_condition or "前置依赖 L3 已被撤回重审，待上游 L3 恢复或切换新前提后重启"
 
-    created_review_id: str | None = None
-    created_l2_id: str | None = None
-    spawned_node_id: str | None = None
-    restored_files: list[str] = []
-
-    with rw_immediate_tx(conn):
-        if tl == "LEVEL_1":
-            if not valid_passed:
-                raise FailClosedError(
-                    ERR_INVARIANT,
-                    f"LEVEL_1 送审拦截：节点 {node_id!r} 不存在任何 VALID 且 passed=1 的观测收据",
-                )
-            snap_path = str(node["retained_snapshot_abs_path"] or "")
-            if not snap_path:
-                # 兜底尝试从最新 passed candidate_rel 或工作树备份
-                paths = resolve_storage_paths(workspace_root)
-                py_files = [
-                    p for p in Path(wt_abs).rglob("*.py")
-                    if "__pycache__" not in p.parts and "tools" not in p.relative_to(Path(wt_abs)).parts
-                ] if Path(wt_abs).is_dir() else []
-                if py_files:
-                    snap_path = backup_retained_candidate_snapshot(
-                        paths, bid, node_id, wt_abs, py_files[0].relative_to(Path(wt_abs)).as_posix()
-                    )
-
-            created_review_id = _next_id(conn, "review_queue", "review_id", "rev_", 3)
-            bound_obs_ids = [str(r["obs_id"]) for r in obs_rows]
-            proposer_sessions_val = _collect_proposer_sessions(conn, node_id, session_id or bid)
+    if lvl == "LEVEL_1" or act == "SUBMIT_BLIND_REVIEW":
+        ok_carrier, carrier_note = _has_verifiable_carrier(conn, node)
+        if not ok_carrier:
+            raise FailClosedError(ERR_INVARIANT, f"LEVEL_1 送审准入拦截：{carrier_note}")
+        snap_path = backup_retained_candidate_snapshot(
+            workspace_root=workspace_root,
+            branch_id=bid,
+            worktree_abs_path=str(node["worktree_abs_path"]),
+            candidate_rel_path=node["candidate_rel_path"],
+        )
+        rev_id = next_prefixed_id(conn, "review_queue", "review_id", "rev_")
+        with rw_immediate_tx(conn):
+            conn.execute(
+                """
+                UPDATE lineage_nodes
+                SET family_id = ?, node_status = 'PENDING_REVIEW', retained_snapshot_abs_path = ?, updated_at = ?
+                WHERE node_id = ?
+                """,
+                (fid, snap_path, now, node_id),
+            )
             conn.execute(
                 """
                 INSERT INTO review_queue(
-                    review_id, source_node_id, question_id, source_type, proposer_session_id,
+                    review_id, question_id, source_node_id, source_type, proposer_session_id,
                     review_status, manuscript_title, column_a_snapshot_md, column_b_snapshot_md,
-                    sanitized_code_diff_md, bound_obs_ids_json, created_at
-                ) VALUES (?, ?, ?, 'LEVEL1_MANUSCRIPT', ?, 'STAGE1_BLIND', ?, ?, ?, ?, ?, ?)
+                    bound_obs_ids_json, artifact_rel_path, sanitized_code_diff_md, created_at, updated_at
+                ) VALUES (?, ?, ?, 'LEVEL1_MANUSCRIPT', ?, 'STAGE1_BLIND', ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    created_review_id,
-                    node_id,
+                    rev_id,
                     qid,
-                    proposer_sessions_val,
-                    f"{qid} {fid} 突破手稿",
-                    str(node["column_a_facts_md"]),
-                    str(node["column_b_hypothesis_md"]),
-                    str(node["sanitized_code_diff_md"]),
-                    json.dumps(bound_obs_ids, ensure_ascii=False),
+                    node_id,
+                    session_id or f"logistics_{node_id}",
+                    str(node["mechanism_summary"] or f"{qid} Candidate Manuscript"),
+                    str(node["column_a_facts_md"] or ""),
+                    str(node["column_b_hypothesis_md"] or ""),
+                    str(node["bound_obs_ids_json"] or "[]"),
+                    node["candidate_rel_path"],
+                    str(node["sanitized_code_diff_md"] or ""),
+                    now,
                     now,
                 ),
             )
-            conn.execute(
-                "UPDATE lineage_nodes SET node_status = 'CLOSED', triage_level = ?, retained_snapshot_abs_path = ?, updated_at = ? WHERE node_id = ?",
-                (tl, snap_path, now, node_id),
-            )
+            conn.execute("UPDATE parse0_contract SET consecutive_non_l1_handoffs = 0, updated_at = ? WHERE contract_id = 'active'", (now,))
+        return build_tool_receipt(
+            conn=conn,
+            tool_name="triage_node",
+            question_id=qid,
+            node_id=node_id,
+            next_step_guidance=f"已备份物理快照并冻结分支为 PENDING_REVIEW，生成盲审单 {rev_id}（{carrier_note}）。",
+            data={"node_id": node_id, "triage_level": "LEVEL_1", "created_review_id": rev_id, "retained_snapshot_abs_path": snap_path},
+        )
 
-        elif tl == "LEVEL_2":
-            restored_files = restore_retained_candidate_snapshot(wt_abs, str(node["retained_snapshot_abs_path"] or ""))
-            rep_count = int(node["inplace_repair_count"] or 0) + 1
-            conn.execute("UPDATE epoch_config SET consecutive_non_l1_handoffs = consecutive_non_l1_handoffs + 1, updated_at = ? WHERE config_id = 'active'", (now,))
-            if rep_count >= max_repairs:
-                # 满 3 次自动写内藏 L2_FAILURE_RECORD 并结束本代，退回祖先
-                created_l2_id = _next_ledger_id(conn, "L2_FAILURE_RECORD")
-                hook_sha = str(obs_rows[0]["domain_hook_sha256"]) if obs_rows else ""
-                conn.execute(
-                    """
-                    INSERT INTO internal_research_ledger(
-                        entry_id, question_id, ledger_type, source_type, method_family_id,
-                        title, abstract_md, exact_refuted_scope_md, body_proof_or_code_md,
-                        bound_obs_ids_json, domain_hook_sha256, created_at
-                    ) VALUES (?, ?, 'L2_FAILURE_RECORD', 'L2_REPAIR_EXHAUSTED', ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        created_l2_id,
-                        qid,
-                        fid,
-                        f"[{qid}] {fid} 环境/运行修补超限 ({rep_count} 次)",
-                        f"分支 {bid} 在 {qid} 连续触发 EXECUTION_ERROR 且原地修补达 {rep_count} 次上限，已由事务自动沉淀至 L2 失败雷达警示后来者。",
-                        str(rationale).strip(),
-                        str(node["column_a_facts_md"]),
-                        json.dumps([str(r["obs_id"]) for r in obs_rows], ensure_ascii=False),
-                        hook_sha,
-                        now,
-                    ),
-                )
-                conn.execute(
-                    "UPDATE lineage_nodes SET node_status = 'CLOSED', triage_level = ?, inplace_repair_count = ?, updated_at = ? WHERE node_id = ?",
-                    (tl, rep_count, now, node_id),
-                )
-            else:
-                # 回滚快照后允许下代继续同向修补
-                conn.execute(
-                    "UPDATE lineage_nodes SET node_status = 'CLOSED', triage_level = ?, inplace_repair_count = ?, updated_at = ? WHERE node_id = ?",
-                    (tl, rep_count, now, node_id),
-                )
-                spawned_node_id = _next_id(conn, "lineage_nodes", "node_id", f"node_{qid.lower()}_", 3)
-                conn.execute(
-                    """
-                    INSERT INTO lineage_nodes(
-                        node_id, epoch_id, question_id, branch_id, family_id, parent_node_id,
-                        generation, node_status, triage_level, worktree_abs_path,
-                        retained_candidate_id, retained_snapshot_abs_path, inplace_repair_count,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'EXPLORING', 'LEVEL_2_REPAIR', ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        spawned_node_id,
-                        int(node["epoch_id"]),
-                        qid,
-                        bid,
-                        fid,
-                        node_id,
-                        int(node["generation"]) + 1,
-                        wt_abs,
-                        str(node["retained_candidate_id"] or ""),
-                        str(node["retained_snapshot_abs_path"] or ""),
-                        rep_count,
-                        now,
-                        now,
-                    ),
-                )
-
-        elif tl == "LEVEL_4A":
-            if not (barrier_proof_md or "").strip() or len(barrier_proof_md.strip()) < 15:
-                raise FailClosedError(
-                    ERR_INVARIANT,
-                    "LEVEL_4A 必须提交硬反例与结构阻碍证明 barrier_proof_md（无严密反证禁止轻言放弃）",
-                )
-            if not obs_rows:
-                raise FailClosedError(ERR_INVARIANT, "LEVEL_4A 阻碍证明必须绑定至少 1 条实测 [Obs###]")
-            created_l2_id = _next_ledger_id(conn, "L2_FAILURE_RECORD")
-            hook_sha = str(obs_rows[0]["domain_hook_sha256"])
+    if lvl == "LEVEL_4A" or act == "SEAL_BARRIER":
+        bp = str(barrier_proof_md or "").strip()
+        if len(bp) < 15:
+            raise FailClosedError(ERR_INVALID_INPUT, "LEVEL_4A 严密证伪/结构阻碍证明必须提供 >= 15 字的 barrier_proof_md")
+        snap_path = backup_retained_candidate_snapshot(
+            workspace_root=workspace_root,
+            branch_id=bid,
+            worktree_abs_path=str(node["worktree_abs_path"]),
+            candidate_rel_path=node["candidate_rel_path"],
+        )
+        rev_id = next_prefixed_id(conn, "review_queue", "review_id", "rev_")
+        col_a_combined = (str(node["column_a_facts_md"] or "") + "\n\n### 结构阻碍 / 反例证明\n" + bp).strip()
+        with rw_immediate_tx(conn):
             conn.execute(
                 """
-                INSERT INTO internal_research_ledger(
-                    entry_id, question_id, ledger_type, source_type, method_family_id,
-                    title, abstract_md, exact_refuted_scope_md, body_proof_or_code_md,
-                    bound_obs_ids_json, domain_hook_sha256, created_at
-                ) VALUES (?, ?, 'L2_FAILURE_RECORD', 'L4A_BARRIER_PROOF', ?, ?, ?, ?, ?, ?, ?, ?)
+                UPDATE lineage_nodes
+                SET family_id = ?, node_status = 'PENDING_REVIEW', retained_snapshot_abs_path = ?, updated_at = ?
+                WHERE node_id = ?
+                """,
+                (fid, snap_path, now, node_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO review_queue(
+                    review_id, question_id, source_node_id, source_type, proposer_session_id,
+                    review_status, manuscript_title, column_a_snapshot_md, column_b_snapshot_md,
+                    bound_obs_ids_json, artifact_rel_path, sanitized_code_diff_md, created_at, updated_at
+                ) VALUES (?, ?, ?, 'LEVEL4A_BARRIER', ?, 'STAGE1_BLIND', ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    created_l2_id,
+                    rev_id,
                     qid,
-                    fid,
-                    f"[{qid}] {fid} 结构阻碍证明 (Level 4a)",
-                    f"分支 {bid} 在 {qid} 证实路径不可行边界：{barrier_proof_md.strip()}",
-                    barrier_proof_md.strip(),
-                    str(node["column_a_facts_md"]),
-                    json.dumps([str(r["obs_id"]) for r in obs_rows], ensure_ascii=False),
-                    hook_sha,
+                    node_id,
+                    session_id or f"logistics_{node_id}",
+                    f"[Barrier/Counterexample] {node['mechanism_summary'] or qid}",
+                    col_a_combined,
+                    str(node["column_b_hypothesis_md"] or ""),
+                    str(node["bound_obs_ids_json"] or "[]"),
+                    node["candidate_rel_path"],
+                    str(node["sanitized_code_diff_md"] or ""),
+                    now,
                     now,
                 ),
             )
-            conn.execute("UPDATE epoch_config SET consecutive_non_l1_handoffs = consecutive_non_l1_handoffs + 1, updated_at = ? WHERE config_id = 'active'", (now,))
-            conn.execute(
-                "UPDATE lineage_nodes SET node_status = 'CLOSED', triage_level = ?, updated_at = ? WHERE node_id = ?",
-                (tl, now, node_id),
-            )
+            conn.execute("UPDATE parse0_contract SET consecutive_non_l1_handoffs = consecutive_non_l1_handoffs + 1, updated_at = ? WHERE contract_id = 'active'", (now,))
+        return build_tool_receipt(
+            conn=conn,
+            tool_name="triage_node",
+            question_id=qid,
+            node_id=node_id,
+            next_step_guidance=f"LEVEL_4A 阻碍/反例证明已冻结为 PENDING_REVIEW 并送盲审 {rev_id}（判 REVISE 可返工，终判确证后才 SEALED）。",
+            data={"node_id": node_id, "triage_level": "LEVEL_4A", "created_review_id": rev_id, "node_status": "PENDING_REVIEW"},
+        )
 
-        elif tl == "LEVEL_4B":
-            if not (reopen_condition or "").strip():
-                raise FailClosedError(ERR_INVALID_INPUT, "LEVEL_4B 条件阻塞必须明确填写 reopen_condition 以供 Ready Queue 唤醒")
-            conn.execute("UPDATE epoch_config SET consecutive_non_l1_handoffs = consecutive_non_l1_handoffs + 1, updated_at = ? WHERE config_id = 'active'", (now,))
+    if lvl == "LEVEL_4B" or act == "PAUSE_TO_READY_QUEUE":
+        rc = str(reopen_condition or "").strip()
+        if not rc:
+            raise FailClosedError(ERR_INVALID_INPUT, "LEVEL_4B 条件阻塞必须填写 reopen_condition 以供 Ready Queue 唤醒")
+        with rw_immediate_tx(conn):
             conn.execute(
-                "UPDATE lineage_nodes SET node_status = 'BLOCKED_L4B', triage_level = ?, reopen_condition = ?, updated_at = ? WHERE node_id = ?",
-                (tl, reopen_condition.strip(), now, node_id),
+                "UPDATE lineage_nodes SET family_id = ?, node_status = 'BLOCKED_L4B', reopen_condition = ?, updated_at = ? WHERE node_id = ?",
+                (fid, rc, now, node_id),
             )
+            conn.execute("UPDATE parse0_contract SET consecutive_non_l1_handoffs = consecutive_non_l1_handoffs + 1, updated_at = ? WHERE contract_id = 'active'", (now,))
+        return build_tool_receipt(
+            conn=conn,
+            tool_name="triage_node",
+            question_id=qid,
+            node_id=node_id,
+            next_step_guidance=f"分支 {bid} 已挂入 Ready Queue (BLOCKED_L4B)，已允许 Auditor 按需打捞残骸局部引理。",
+            data={"node_id": node_id, "triage_level": "LEVEL_4B", "node_status": "BLOCKED_L4B", "reopen_condition": rc},
+        )
 
-        else:
-            # ROUTINE_CONTINUATION 或 LEVEL_3 特异保护
-            conn.execute("UPDATE epoch_config SET consecutive_non_l1_handoffs = consecutive_non_l1_handoffs + 1, updated_at = ? WHERE config_id = 'active'", (now,))
+    if lvl == "LEVEL_2" or act == "INPLACE_REPAIR":
+        cur_repairs = int(node["inplace_repair_count"] or 0)
+        # 若此前有物理快照先恢复工作区
+        if node["retained_snapshot_abs_path"]:
+            restore_retained_candidate_snapshot(str(node["retained_snapshot_abs_path"]), str(node["worktree_abs_path"]))
+
+        next_node_id = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
+        exhausted = cur_repairs >= max_repairs
+        with rw_immediate_tx(conn):
             conn.execute(
-                "UPDATE lineage_nodes SET node_status = 'CLOSED', triage_level = ?, updated_at = ? WHERE node_id = ?",
-                (tl, now, node_id),
+                "UPDATE lineage_nodes SET family_id = ?, node_status = 'CLOSED', updated_at = ? WHERE node_id = ?",
+                (fid, now, node_id),
             )
-            spawned_node_id = _next_id(conn, "lineage_nodes", "node_id", f"node_{qid.lower()}_", 3)
+            if exhausted:
+                # 满 3 次原地修补失败：仅记入本脉 lineage_dead_ends(IMPL_FAILURE)，绝对严禁污染中央图书馆 L2！
+                de_id = f"de_{uuid.uuid4().hex[:10]}"
+                conn.execute(
+                    """
+                    INSERT INTO lineage_dead_ends(dead_end_id, question_id, branch_id, node_id, category, scope_condition_md, failure_mechanism_md, bound_obs_id, created_at)
+                    VALUES (?, ?, ?, ?, 'IMPL_FAILURE', ?, ?, NULL, ?)
+                    """,
+                    (de_id, qid, bid, node_id, f"LEVEL_2 原地修补满 {max_repairs} 次失败", str(rationale).strip(), now),
+                )
             conn.execute(
                 """
                 INSERT INTO lineage_nodes(
-                    node_id, epoch_id, question_id, branch_id, family_id, parent_node_id,
-                    generation, node_status, triage_level, stagnation_lane, worktree_abs_path,
-                    retained_candidate_id, retained_snapshot_abs_path, inplace_repair_count,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'EXPLORING', ?, ?, ?, ?, ?, 0, ?, ?)
+                    node_id, question_id, branch_id, family_id, parent_node_id, generation, node_status,
+                    worktree_abs_path, retained_snapshot_abs_path, requires_json, revise_count,
+                    inplace_repair_count, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'EXPLORING', ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    spawned_node_id,
-                    int(node["epoch_id"]),
+                    next_node_id,
                     qid,
                     bid,
                     fid,
                     node_id,
                     int(node["generation"]) + 1,
-                    "LEVEL_3_PROTECTED" if tl == "LEVEL_3" else "",
-                    str(node["stagnation_lane"] or ""),
-                    wt_abs,
-                    str(node["retained_candidate_id"] or ""),
-                    str(node["retained_snapshot_abs_path"] or ""),
+                    str(node["worktree_abs_path"]),
+                    node["retained_snapshot_abs_path"],
+                    str(node["requires_json"] or "[]"),
+                    int(node["revise_count"] or 0),
+                    0 if exhausted else cur_repairs + 1,
                     now,
                     now,
                 ),
             )
-
-        record_fact_edge(
-            conn,
-            src_id=node_id,
-            dst_id=f"triage:{tl}:{act}",
-            edge_type="USED_TOOL",
-            metadata={"review_id": created_review_id, "l2_id": created_l2_id, "spawned_node_id": spawned_node_id},
+            conn.execute("UPDATE parse0_contract SET consecutive_non_l1_handoffs = consecutive_non_l1_handoffs + 1, updated_at = ? WHERE contract_id = 'active'", (now,))
+        return build_tool_receipt(
+            conn=conn,
+            tool_name="triage_node",
+            question_id=qid,
+            node_id=next_node_id,
+            next_step_guidance=(
+                f"原地修补满 {max_repairs} 次已写入本脉 lineage_dead_ends(IMPL_FAILURE)（未污染图书馆 L2）并回退重启 {next_node_id}。"
+                if exhausted
+                else f"已启动第 {cur_repairs + 1}/{max_repairs} 次 LEVEL_2 原地修补节点 {next_node_id}。"
+            ),
+            data={"closed_node_id": node_id, "next_node_id": next_node_id, "repair_exhausted": exhausted},
         )
 
-    guidance = (
-        f"分诊 {tl}/{act} 已原子落库。"
-        + (f" 已创建盲审单 {created_review_id}，等待 library_verifier 审理。" if created_review_id else "")
-        + (f" 已自动生成内藏失败雷达 {created_l2_id}。" if created_l2_id else "")
-        + (f" 已派生下代探索节点 {spawned_node_id}，待伴随助手合成看板后启动。" if spawned_node_id else "")
+    if lvl == "LEVEL_3" or act == "SPAWN_PROTECTED":
+        prot_bid = f"b_{qid.lower()}_prot_{uuid.uuid4().hex[:6]}"
+        prot_wt = Path(os.path.realpath(workspace_root)) / "worktrees" / prot_bid
+        prot_wt.mkdir(parents=True, exist_ok=True)
+        snap_path = backup_retained_candidate_snapshot(
+            workspace_root=workspace_root,
+            branch_id=bid,
+            worktree_abs_path=str(node["worktree_abs_path"]),
+            candidate_rel_path=node["candidate_rel_path"],
+        )
+        restore_retained_candidate_snapshot(snap_path, str(prot_wt))
+        prot_nid = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
+        with rw_immediate_tx(conn):
+            conn.execute(
+                "UPDATE lineage_nodes SET family_id = ?, node_status = 'CLOSED', retained_snapshot_abs_path = ?, updated_at = ? WHERE node_id = ?",
+                (fid, snap_path, now, node_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO lineage_nodes(
+                    node_id, question_id, branch_id, family_id, parent_node_id, generation, node_status,
+                    worktree_abs_path, retained_snapshot_abs_path, requires_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 1, 'EXPLORING', ?, ?, ?, ?, ?)
+                """,
+                (prot_nid, qid, prot_bid, fid, node_id, str(prot_wt), snap_path, str(node["requires_json"] or "[]"), now, now),
+            )
+        return build_tool_receipt(
+            conn=conn,
+            tool_name="triage_node",
+            question_id=qid,
+            node_id=prot_nid,
+            next_step_guidance=f"已为反常/特异突破单开受保护支线 {prot_bid} ({prot_nid})。",
+            data={"closed_node_id": node_id, "protected_branch_id": prot_bid, "next_node_id": prot_nid},
+        )
+
+    # ROUTINE_CONTINUATION / CONTINUE
+    snap_path = backup_retained_candidate_snapshot(
+        workspace_root=workspace_root,
+        branch_id=bid,
+        worktree_abs_path=str(node["worktree_abs_path"]),
+        candidate_rel_path=node["candidate_rel_path"],
     )
+    next_node_id = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
+    with rw_immediate_tx(conn):
+        conn.execute(
+            "UPDATE lineage_nodes SET family_id = ?, node_status = 'CLOSED', retained_snapshot_abs_path = ?, updated_at = ? WHERE node_id = ?",
+            (fid, snap_path, now, node_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO lineage_nodes(
+                node_id, question_id, branch_id, family_id, parent_node_id, generation, node_status,
+                worktree_abs_path, retained_snapshot_abs_path, requires_json, revise_count,
+                inplace_repair_count, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'EXPLORING', ?, ?, ?, ?, 0, ?, ?)
+            """,
+            (
+                next_node_id,
+                qid,
+                bid,
+                fid,
+                node_id,
+                int(node["generation"]) + 1,
+                str(node["worktree_abs_path"]),
+                snap_path,
+                str(node["requires_json"] or "[]"),
+                int(node["revise_count"] or 0),
+                now,
+                now,
+            ),
+        )
+        conn.execute("UPDATE parse0_contract SET consecutive_non_l1_handoffs = consecutive_non_l1_handoffs + 1, updated_at = ? WHERE contract_id = 'active'", (now,))
+
     return build_tool_receipt(
         conn=conn,
         tool_name="triage_node",
-        node_id=spawned_node_id or node_id,
         question_id=qid,
-        next_step_guidance=guidance,
-        data={
-            "triaged_node_id": node_id,
-            "triage_level": tl,
-            "action": act,
-            "created_review_id": created_review_id,
-            "created_l2_id": created_l2_id,
-            "spawned_node_id": spawned_node_id,
-            "restored_snapshot_files": restored_files,
-        },
+        node_id=next_node_id,
+        next_step_guidance=f"已刷新物理快照并创建下一代节点 {next_node_id}（等待伴随重写行前看板）。",
+        data={"closed_node_id": node_id, "next_node_id": next_node_id, "retained_snapshot_abs_path": snap_path},
     )
 
 
@@ -569,139 +566,132 @@ def tool_fork_branch(
     parent_node_id: str | None = None,
     fork_mode: str = "orthogonal",
     target_family_id: str = "",
+    requires: list[str] | None = None,
+    new_mechanism_note: str | None = None,
     source_l3_id: str | None = None,
 ) -> dict[str, Any]:
+    """开启新探索分支（分支级确定性 requires、WHERE branch_id != :self 查重、跨脉授粉双 L3 门槛）。"""
     enforce_role_tool_permission(conn, caller_role, "fork_branch", session_id=session_id)
-    if fork_mode not in VALID_FORK_MODES:
-        raise FailClosedError(ERR_INVALID_INPUT, f"非法 fork_mode={fork_mode!r}，仅允许 {sorted(VALID_FORK_MODES)}")
-    if not target_family_id.strip():
+    mode_l = str(fork_mode or "").strip().lower()
+    if mode_l not in ALLOWED_FORK_MODES:
+        raise FailClosedError(ERR_INVALID_INPUT, f"非法 fork_mode={fork_mode!r}，仅允许 {sorted(ALLOWED_FORK_MODES)}")
+
+    fid = str(target_family_id or "").strip()
+    if not fid:
         raise FailClosedError(ERR_INVALID_INPUT, "target_family_id 不能为空")
+    fam = conn.execute("SELECT * FROM method_families WHERE family_id = ? AND question_id = ?", (fid, question_id)).fetchone()
+    if fam is None:
+        raise FailClosedError(ERR_NOT_FOUND, f"方法学派 {fid!r} 尚未在子题 {question_id} 登记")
 
-    ep = conn.execute("SELECT epoch_id, contracts_json, required_questions_json FROM epoch_config WHERE config_id = 'active'").fetchone()
-    epoch_id = int(ep["epoch_id"]) if ep else 1
-    contracts = json.loads(ep["contracts_json"]) if ep and ep["contracts_json"] else {}
-    req_qs = json.loads(ep["required_questions_json"]) if ep and ep["required_questions_json"] else []
-
-    dep_status = get_question_dependency_status(conn, contracts=contracts, required_questions=req_qs)
-    q_dep = dep_status.get(question_id, {})
-    if not q_dep.get("unlocked", True):
+    if str(fam["family_status"]) == "BLOCKED" and not str(new_mechanism_note or "").strip():
         raise FailClosedError(
             ERR_LOCKED,
-            f"子题前置依赖未满足 (depends_on_questions={q_dep.get('depends_on_questions')}): 尚缺前置子题 {q_dep.get('unmet_dependencies')} 的 active L3_VERIFIED 结论，暂缓派发！",
+            f"学派 {fid!r} 当前处于 BLOCKED 状态（阻塞引理：{fam['blocking_lemma']}），重开必须提供实质绕开方案 new_mechanism_note",
         )
 
-    fam = conn.execute(
-        "SELECT * FROM method_families WHERE epoch_id = ? AND question_id = ? AND family_id = ?",
-        (epoch_id, question_id, target_family_id),
-    ).fetchone()
-    if fam is None:
-        raise FailClosedError(ERR_NOT_FOUND, f"方法学派 {target_family_id!r} 尚未在子题 {question_id} 登记")
-
-    parent_row = None
-    self_branch_id = ""
+    parent_branch_id = ""
+    parent_family_id = ""
     if parent_node_id:
-        parent_row = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ?", (parent_node_id,)).fetchone()
-        if parent_row is None:
+        pnode = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ?", (parent_node_id,)).fetchone()
+        if pnode is None:
             raise FailClosedError(ERR_NOT_FOUND, f"父节点 {parent_node_id!r} 不存在")
-        self_branch_id = str(parent_row["branch_id"])
+        parent_branch_id = str(pnode["branch_id"])
+        parent_family_id = str(pnode["family_id"] or "")
 
-    # 根治 P19：查重强加 WHERE branch_id != :self（绝不把当前分支自身当成兄弟撞车）
-    sibling_nodes = conn.execute(
-        """
-        SELECT DISTINCT branch_id, family_id FROM lineage_nodes
-        WHERE question_id = ? AND branch_id != ? AND node_status IN ('EXPLORING', 'AWAITING_TRIAGE')
-        """,
-        (question_id, self_branch_id),
-    ).fetchall()
-    if fork_mode == "orthogonal" and any(str(s["family_id"]) == target_family_id for s in sibling_nodes):
-        raise FailClosedError(
-            ERR_CONFLICT,
-            f"正交派生撞车拦截：已有其他活跃分支正在探索 {target_family_id!r}（已排除自身分支 {self_branch_id!r}）",
-        )
+    # orthogonal 查重：强加 WHERE branch_id != :self（绝不因自身分支而误报重复）
+    if mode_l == "orthogonal" and parent_branch_id and parent_family_id == fid:
+        siblings = conn.execute(
+            """
+            SELECT DISTINCT branch_id FROM lineage_nodes
+            WHERE question_id = ? AND family_id = ? AND branch_id != ?
+              AND node_status IN ('EXPLORING', 'ACTIVE_REVISING', 'AWAITING_TRIAGE', 'PENDING_REVIEW')
+            """,
+            (question_id, fid, parent_branch_id),
+        ).fetchall()
+        if siblings:
+            raise FailClosedError(
+                ERR_CONFLICT,
+                f"orthogonal 分流必须切向不同或欠探索学派：学派 {fid!r} 已有活跃兄弟分支 {[r['branch_id'] for r in siblings]}",
+            )
 
-    if fork_mode == "cross_pollinate":
-        if not source_l3_id:
+    if mode_l == "cross_pollinate":
+        if not str(source_l3_id or "").strip():
             raise FailClosedError(ERR_INVALID_INPUT, "cross_pollinate 分叉必须指定已证实的 source_l3_id")
-        l3 = conn.execute(
-            "SELECT entry_id FROM internal_research_ledger WHERE entry_id = ? AND ledger_type = 'L3_VERIFIED' AND ledger_status = 'active'",
+        src_l3 = conn.execute(
+            "SELECT entry_id, question_id FROM internal_research_ledger WHERE entry_id = ? AND ledger_type = 'L3_VERIFIED' AND is_active = 1",
             (source_l3_id,),
         ).fetchone()
-        if l3 is None:
-            raise FailClosedError(ERR_NOT_FOUND, f"交叉授粉引理 {source_l3_id!r} 不存在或未通过盲审 L3")
+        if src_l3 is None:
+            raise FailClosedError(ERR_NOT_FOUND, f"交叉授粉引理 {source_l3_id!r} 不存在或非活跃 L3")
+        # 延迟交叉授粉双 L3 门槛：双方学派各自至少已有 >= 1 条 L3
+        target_fam_l3 = conn.execute(
+            """
+            SELECT COUNT(*) AS cnt FROM internal_research_ledger l
+            JOIN review_queue r ON r.review_id = l.verified_review_id
+            JOIN lineage_nodes n ON n.node_id = r.source_node_id
+            WHERE l.ledger_type = 'L3_VERIFIED' AND l.is_active = 1 AND n.family_id = ?
+            """,
+            (fid,),
+        ).fetchone()["cnt"]
+        if int(target_fam_l3 or 0) < 1:
+            raise FailClosedError(
+                ERR_LOCKED,
+                f"延迟交叉授粉门禁：目标学派 {fid!r} 尚未拥有 >= 1 条独立已审 L3（须双方学派各有 >=1 L3 后方可嫁接）",
+            )
 
-    branch_idx = int(
-        conn.execute("SELECT COUNT(DISTINCT branch_id) AS cnt FROM lineage_nodes WHERE question_id = ?", (question_id,)).fetchone()["cnt"]
-        or 0
-    ) + 1
-    new_branch_id = f"b_{question_id.lower()}_{re.sub(r'[^a-zA-Z0-9]+', '_', target_family_id)[:18]}_{branch_idx}"
+    clean_reqs = _validate_deterministic_requires(requires)
+    sat, unmet = check_branch_requires_satisfied(conn, clean_reqs)
 
-    ws = Path(os.path.realpath(workspace_root))
-    wt_dir = ws / "worktrees" / new_branch_id
-    (wt_dir / "src").mkdir(parents=True, exist_ok=True)
-    (wt_dir / "tools").mkdir(parents=True, exist_ok=True)
-
-    # lateral 继承父快照物理代码，orthogonal 净室起跑（排除敏感文件）
-    if fork_mode in ("lateral", "cross_pollinate") and parent_row is not None:
-        src_snap = str(parent_row["retained_snapshot_abs_path"] or parent_row["worktree_abs_path"] or "")
-        if src_snap and Path(src_snap).is_dir():
-            for item in Path(src_snap).rglob("*"):
-                if item.is_file() and item.name != "_snapshot_meta.json" and "__pycache__" not in item.parts:
-                    rel = item.relative_to(Path(src_snap))
-                    dest = wt_dir / rel
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(item, dest)
-
+    new_bid = f"b_{question_id.lower()}_{fid[:12]}_{uuid.uuid4().hex[:5]}"
+    new_nid = f"node_{question_id.lower()}_{uuid.uuid4().hex[:8]}"
+    wt_dir = Path(os.path.realpath(workspace_root)) / "worktrees" / new_bid
+    wt_dir.mkdir(parents=True, exist_ok=True)
     now = utc_now_iso()
-    parent_brief = ""
-    if fork_mode == "cross_pollinate" and source_l3_id:
-        parent_brief = f"### 交叉授粉嫁接提示\n来自 Stage 2 横向提名：引入已验证原语 {source_l3_id} 解决瓶颈。\n"
 
     with rw_immediate_tx(conn):
-        new_node_id = _next_id(conn, "lineage_nodes", "node_id", f"node_{question_id.lower()}_", 3)
-        if parent_row is not None and str(parent_row["node_status"]) == "BLOCKED_L4B":
-            conn.execute("UPDATE lineage_nodes SET node_status = 'CLOSED', updated_at = ? WHERE node_id = ?", (now, parent_node_id))
+        if str(fam["family_status"]) == "BLOCKED" and str(new_mechanism_note or "").strip():
+            conn.execute("UPDATE method_families SET family_status = 'ACTIVE' WHERE family_id = ?", (fid,))
         conn.execute(
             """
             INSERT INTO lineage_nodes(
-                node_id, epoch_id, question_id, branch_id, family_id, parent_node_id,
-                generation, node_status, worktree_abs_path, will_md, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'EXPLORING', ?, ?, ?, ?)
+                node_id, question_id, branch_id, family_id, parent_node_id, generation, node_status,
+                worktree_abs_path, mechanism_summary, requires_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 1, 'EXPLORING', ?, ?, ?, ?, ?)
             """,
             (
-                new_node_id,
-                epoch_id,
+                new_nid,
                 question_id,
-                new_branch_id,
-                target_family_id,
+                new_bid,
+                fid,
                 parent_node_id,
-                1 if parent_row is None else int(parent_row["generation"]) + 1,
                 str(wt_dir),
-                parent_brief,
+                str(new_mechanism_note or "")[:99],
+                json.dumps(clean_reqs, ensure_ascii=False),
                 now,
                 now,
             ),
-        )
-        record_fact_edge(
-            conn,
-            src_id=new_node_id,
-            dst_id=f"fork:{fork_mode}:{target_family_id}",
-            edge_type="USED_TOOL",
-            metadata={"parent_node_id": parent_node_id, "source_l3_id": source_l3_id},
         )
 
     return build_tool_receipt(
         conn=conn,
         tool_name="fork_branch",
-        node_id=new_node_id,
         question_id=question_id,
-        next_step_guidance=f"已开辟新分支 {new_branch_id}（工作树 {wt_dir}）与探索节点 {new_node_id}，伴随助手可调 save_lineage_briefing 准备看板。",
+        node_id=new_nid,
+        next_step_guidance=(
+            f"新分支 {new_bid} ({new_nid}) 已建立（前置 requires 未满足项 {unmet}，仅暂锁本分支不影响同题兄弟分支）。"
+            if not sat
+            else f"新分支 {new_bid} ({new_nid}) 已就绪，将由伴随助手写行前看板并立即启动探索。"
+        ),
         data={
-            "node_id": new_node_id,
-            "branch_id": new_branch_id,
             "question_id": question_id,
-            "family_id": target_family_id,
-            "fork_mode": fork_mode,
+            "branch_id": new_bid,
+            "node_id": new_nid,
+            "family_id": fid,
+            "fork_mode": mode_l,
             "worktree_abs_path": str(wt_dir),
+            "requires": clean_reqs,
+            "requires_satisfied": sat,
+            "unmet_requires": unmet,
         },
     )
 
@@ -711,47 +701,52 @@ def tool_dispatch_stagnation_five_lanes(
     caller_role: str,
     session_id: str,
     question_id: str,
-    lane_assignments: list[dict[str, str]],
+    lane_assignments: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    """全局停滞或 >50% 聚拢告警时将活跃分支打散编入五互斥车道并重置停滞计数。"""
     enforce_role_tool_permission(conn, caller_role, "dispatch_stagnation_five_lanes", session_id=session_id)
     if not isinstance(lane_assignments, list) or not lane_assignments:
         raise FailClosedError(ERR_INVALID_INPUT, "lane_assignments 不能为空")
 
     seen_branches: set[str] = set()
+    applied: list[dict[str, str]] = []
     now = utc_now_iso()
-    updated: list[dict[str, str]] = []
+
     with rw_immediate_tx(conn):
         for item in lane_assignments:
+            if not isinstance(item, dict):
+                raise FailClosedError(ERR_INVALID_INPUT, "lane_assignments 元素必须为对象")
             bid = str(item.get("branch_id") or "").strip()
             lane = str(item.get("lane") or "").strip().upper()
             directive = str(item.get("directive") or "").strip()
-            if not bid or lane not in VALID_STAGNATION_LANES or not directive:
+            if not bid or lane not in ALLOWED_STAGNATION_LANES:
                 raise FailClosedError(
                     ERR_INVALID_INPUT,
-                    f"车道分配项格式非法: {item!r}（lane 仅限 {sorted(VALID_STAGNATION_LANES)}）",
+                    f"非法车道分配 branch_id={bid!r}, lane={lane!r}（仅允许 {sorted(ALLOWED_STAGNATION_LANES)}）",
                 )
             if bid in seen_branches:
                 raise FailClosedError(ERR_CONFLICT, f"同一分支 {bid!r} 不可重复分配车道")
             seen_branches.add(bid)
-            cur = conn.execute(
-                """
-                UPDATE lineage_nodes
-                SET stagnation_lane = ?, will_md = CASE WHEN will_md = '' THEN ? ELSE will_md || char(10) || ? END, updated_at = ?
-                WHERE branch_id = ? AND question_id = ? AND node_status IN ('EXPLORING', 'BLOCKED_L4B')
-                """,
-                (lane, f"[Stagnation-{lane}] {directive}", f"[Stagnation-{lane}] {directive}", now, bid, question_id),
-            )
-            if cur.rowcount == 0:
+
+            exists = conn.execute(
+                "SELECT 1 FROM lineage_nodes WHERE question_id = ? AND branch_id = ? AND node_status IN ('EXPLORING','ACTIVE_REVISING','BLOCKED_L4B','AWAITING_TRIAGE') LIMIT 1",
+                (question_id, bid),
+            ).fetchone()
+            if exists is None:
                 raise FailClosedError(ERR_NOT_FOUND, f"子题 {question_id} 下无活跃或阻塞分支 {bid!r}")
-            updated.append({"branch_id": bid, "lane": lane, "directive": directive})
-        conn.execute("UPDATE epoch_config SET consecutive_non_l1_handoffs = 0, updated_at = ? WHERE config_id = 'active'", (now,))
+
+            conn.execute(
+                "UPDATE lineage_nodes SET lane_assignment = ?, updated_at = ? WHERE question_id = ? AND branch_id = ? AND node_status IN ('EXPLORING','ACTIVE_REVISING','BLOCKED_L4B','AWAITING_TRIAGE')",
+                (f"{lane}: {directive}" if directive else lane, now, question_id, bid),
+            )
+            applied.append({"branch_id": bid, "lane": lane, "directive": directive})
+
+        conn.execute("UPDATE parse0_contract SET consecutive_non_l1_handoffs = 0, updated_at = ? WHERE contract_id = 'active'", (now,))
 
     return build_tool_receipt(
         conn=conn,
         tool_name="dispatch_stagnation_five_lanes",
         question_id=question_id,
-        next_step_guidance="五车道重编已落库并重置停滞计数，控制面将按新方向唤醒对应探索双人组。",
-        data={"question_id": question_id, "assigned": updated},
+        next_step_guidance=f"已将 {len(applied)} 条分支编入五车道并重置停滞计数。",
+        data={"question_id": question_id, "applied_lanes": applied},
     )
-
-

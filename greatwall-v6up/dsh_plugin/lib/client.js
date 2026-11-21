@@ -172,7 +172,13 @@ window.__ModuleLoader__.load({
 			const sessionsMap = tState.sessions || {};
 			const allSessions = Object.values(sessionsMap).sort((a, b) => String(b.startedAt || "").localeCompare(String(a.startedAt || "")));
 			const runningExplorers = st.runningExplorers || [];
-			const qIds = Object.keys(snap.question_dependencies || snap.l3_count_by_question || { Q1: 0 });
+			const orderStatus = snap.question_order_status || {};
+			const qIds = Array.isArray(snap.required_questions) && snap.required_questions.length
+				? snap.required_questions
+				: Object.keys(orderStatus).length ? Object.keys(orderStatus) : ["Q1"];
+			const ambiguousAlerts = snap.ambiguous_spec_alerts || st.ambiguousSpecAlerts || [];
+			const closureStatus = snap.closure_state?.status || st.closureStatus || "OPEN";
+			const poolState = st.poolState || st.state || "idle";
 			const knownWorkspaces = payload?.knownWorkspaces || [];
 
 			return jsxs("div", {
@@ -184,19 +190,20 @@ window.__ModuleLoader__.load({
 							jsxs("div", {
 								className: "gw-console-title-wrap",
 								children: [
-									jsx("strong", { children: "长城 V6-Up 驾驶舱" }),
-									jsx("span", { className: stateBadgeClass(st.state || "idle"), children: st.state || "idle" }),
-									jsx("span", { className: "gw-muted", children: st.stage || "STAGE1" })
+									jsx("strong", { children: "长城 V6-Up v3.0" }),
+									jsx("span", { className: stateBadgeClass(poolState), children: poolState }),
+									jsx("span", { className: "gw-muted", children: `${st.stage || "STAGE1_PARSE0"} · ${closureStatus}` })
 								]
 							}),
 							jsxs("div", {
 								className: "gw-console-actions",
 								children: [
 									jsx("button", { type: "button", className: "gw-btn", disabled: busy, onClick: () => void fetchStatus(), children: "刷新" }),
-									st.state === "running"
+									poolState === "running"
 										? jsx("button", { type: "button", className: "gw-btn", disabled: busy, onClick: () => void sendControl("pause"), children: "暂停" })
-										: jsx("button", { type: "button", className: "gw-btn gw-btn-primary", disabled: busy || st.state !== "paused", onClick: () => void sendControl("resume"), children: "恢复" }),
-									jsx("button", { type: "button", className: "gw-btn gw-btn-danger", disabled: busy || st.state === "idle" || st.state === "stopped", onClick: () => void sendControl("stop"), children: "停止" })
+										: jsx("button", { type: "button", className: "gw-btn gw-btn-primary", disabled: busy || poolState !== "paused", onClick: () => void sendControl("resume"), children: "恢复" }),
+									jsx("button", { type: "button", className: "gw-btn gw-btn-danger", disabled: busy || poolState === "idle" || poolState === "stopped", onClick: () => void sendControl("human_stop", { note: "UI_HUMAN_STOP" }), title: "写入不可伪造的人类叫停真源，触发 PARTIAL_ON_HUMAN_STOP 收口汇总", children: "叫停结项" }),
+									jsx("button", { type: "button", className: "gw-btn gw-btn-danger", disabled: busy || poolState === "idle" || poolState === "stopped", onClick: () => void sendControl("stop"), children: "强停" })
 								]
 							})
 						]
@@ -205,6 +212,11 @@ window.__ModuleLoader__.load({
 						className: "gw-scroll",
 						children: [
 							notice && jsx("div", { className: "gw-log-line", children: notice }),
+							ambiguousAlerts.length > 0 && jsx("div", {
+								className: "gw-log-line",
+								style: { borderColor: "rgba(220,38,38,.45)", color: "#dc2626" },
+								children: `🔴 ALERT_AMBIGUOUS_SPEC (${ambiguousAlerts.length})：${ambiguousAlerts[0]?.notes || "存在口径歧义告警（系统按原口径继续不停机）"}`
+							}),
 							knownWorkspaces.length > 0 && jsxs("div", {
 								className: "gw-form-row",
 								children: [
@@ -224,17 +236,17 @@ window.__ModuleLoader__.load({
 									jsxs("div", {
 										className: "gw-card-title",
 										children: [
-											jsx("span", { children: "子题进展 & 依赖锁" }),
-											jsx("span", { className: "gw-muted", children: `待审:${snap.pending_reviews ?? 0} | 盲审队列:${snap.awaiting_triage_count ?? 0}` })
+											jsx("span", { children: "子题进展 & 两步终核状态" }),
+											jsx("span", { className: "gw-muted", children: `待盲审:${(snap.pending_reviews || []).length} | 待分诊:${(snap.awaiting_triage || []).length}` })
 										]
 									}),
 									jsxs("div", {
 										className: "gw-q-grid",
 										children: qIds.map((qid) => {
-											const dep = snap.question_dependencies?.[qid] || {};
-											const l3c = Number(snap.l3_count_by_question?.[qid] ?? 0);
+											const info = orderStatus[qid] || {};
+											const l3c = Number(info.full_goal_l3_count ?? info.l3_count ?? 0);
 											const needsBranch = (snap.questions_needing_branch || []).includes(qid);
-											const blocked = dep.unlocked === false;
+											const blocked = info.unlocked === false;
 											return jsxs("div", {
 												className: "gw-q-item",
 												onClick: () => { setTargetType("question"); setTargetId(qid); },
@@ -247,11 +259,10 @@ window.__ModuleLoader__.load({
 															jsx("strong", { children: qid }),
 															jsx("span", {
 																className: blocked ? "gw-badge-pause gw-console-badge" : (l3c > 0 ? "gw-badge-run gw-console-badge" : "gw-console-badge"),
-																children: blocked ? "依赖锁" : (l3c > 0 ? `L3×${l3c}` : (needsBranch ? "待派枝" : "探索中"))
+																children: blocked ? "顺序待解锁" : (l3c > 0 ? `L3×${l3c}` : (needsBranch ? "待派枝" : "探索中"))
 															})
 														]
-													}),
-													dep.depends_on?.length > 0 && jsx("span", { className: "gw-muted", children: "前置: " + dep.depends_on.join(",") })
+													})
 												]
 											}, qid);
 										})

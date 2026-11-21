@@ -1,139 +1,160 @@
-"""全量 31 个 MCP 工具 JSON Schema 字段说明、枚举约束与结构补全模块。
-
-将各工具的中文参数说明、共享通用字段规范及从 `db_schema.py` 派生的枚举列表统一注入
-`TOOL_DEFINITIONS`，避免模型因 Schema 缺失 `enum`/`description`/`maxLength` 产生幻觉传参。
-"""
+"""长城 V6-Up (v3.0) 全量 31 个 MCP 工具 JSON Schema 字段说明、枚举与内嵌结构表（100% 同源 db_schema.py）。"""
 
 from __future__ import annotations
 
 from copy import deepcopy
 from typing import Any
 
-from mcp_server.db_schema import (
+from .db_schema import (
     ALLOWED_CLAIMED_EDGE_TYPES,
+    ALLOWED_COMPANION_MODES,
+    ALLOWED_COMPLIANCE_STAGES,
+    ALLOWED_COMPLIANCE_STATUSES,
+    ALLOWED_DEAD_END_CATEGORIES,
+    ALLOWED_DELIVERY_MODES,
+    ALLOWED_EVIDENCE_GRADES,
+    ALLOWED_FINAL_VERDICTS,
+    ALLOWED_FORK_MODES,
+    ALLOWED_GOAL_COVERAGES,
+    ALLOWED_INSTRUMENT_ROLES,
+    ALLOWED_INSTRUMENT_TIERS,
+    ALLOWED_L3_ENTRY_KINDS,
     ALLOWED_READ_DEPTHS,
+    ALLOWED_STAGE1_VERDICTS,
+    ALLOWED_STAGNATION_LANES,
     ALLOWED_SUPPORT_SCOPES,
+    ALLOWED_TRIAGE_ACTIONS,
+    ALLOWED_TRIAGE_LEVELS,
+    ALLOWED_VERDICT_3STATE,
 )
 
-# 跨工具复用的通用字段默认说明
-_COMMON_PROP_DESCRIPTIONS: dict[str, str] = {
-    "node_id": "探索节点唯一 ID（例如 node_q1_01）。",
-    "branch_id": "探索分支唯一 ID（例如 br_q1_fam01_01）。",
+_COMMON_DESCRIPTIONS: dict[str, str] = {
+    "node_id": "探索节点唯一 ID（例如 node_p1_n2）。",
+    "branch_id": "探索分支唯一 ID（例如 b_q1_famA）。",
     "question_id": "所属子题编号（例如 Q1、Q2，或全卷查询时的 ALL）。",
-    "review_id": "盲审工单 ID（例如 rev_001，或 Stage 3 比较器模式 STAGE3_COMPARATOR）。",
-    "obs_id": "观测实测记录 ID（例如 Obs001）。",
-    "title": "条目标题（需概括核心物理/数学机制与适用结论）。",
+    "review_id": "盲审工单 ID（例如 rev_001，或终核模式 STAGE3_FINAL_AUDIT:<delivery_id>）。",
+    "obs_id": "正式观测收据 ID（例如 Obs-001）。",
+    "instrument_id": "科研仪器唯一 ID（例如 inst_q1_geom）。",
+    "title": "条目标题（需概括核心数学/物理机制与适用结论）。",
 }
 
-# 各工具专属属性覆盖补丁（按工具名索引）
 _TOOL_PROP_PATCHES: dict[str, dict[str, dict[str, Any]]] = {
     "run_isolated_eval": {
-        "candidate_rel_path": {"description": "待测候选 Python 脚本相对工作区路径（例如 scripts/q1_solver.py）。"},
-        "linguistic_prediction": {
-            "minLength": 5,
-            "description": "执行前必须写明的可证伪自然语言事前预测（至少 5 字，严禁空洞占位）。",
+        "tier": {
+            "enum": sorted(ALLOWED_INSTRUMENT_TIERS),
+            "description": "三档同码调用档位：probe（公开快速诊断，不记 Obs）| official（受控正式收据 [Obs###]）| heavy（重型排队，冻结快照幂等取回）。",
         },
-        "declared_refs": {
-            "description": "本实验显式依赖的外部/内部条目引用 ID 数组（如 [\"R001\", \"L3-001\"]，无引用传 []）。",
-        },
+        "artifact_rel_path": {"description": "待测候选产物路径，严格相对于当前分支 worktree_abs_path 根目录（例如 proofs/jung_counterexample.py）。"},
+        "linguistic_prediction": {"description": "调用 official/heavy 前必填（>=5 字）的可证伪事前自然语言预测。"},
+        "declared_refs": {"description": "本实验显式引用的外藏/内藏条目 ID 列表（默认记为 MOTIVATING_REF，不触发连坐撤回）。"},
+        "job_id": {"description": "可选：仅 tier='heavy' 幂等取回已排队重型作业时传入先前返回的 job_id，首次提交传 null。"},
     },
     "query_library_catalog": {
         "scope": {
             "enum": ["EXTERNAL_R", "INTERNAL_L3", "INTERNAL_L2", "ALL"],
-            "description": "检索翼范围：0-37% 未解锁前仅能使用 EXTERNAL_R；37% 解锁后可使用 EXTERNAL_R | INTERNAL_L3 | INTERNAL_L2 | ALL。",
+            "description": "检索范围：0-37% 未解锁前仅能使用 EXTERNAL_R；37% 元反思解锁后开放 EXTERNAL_R | INTERNAL_L3 | INTERNAL_L2 | ALL。",
         },
-        "keyword": {"description": "FTS5 关键词过滤词（支持中英文术语；留空 \"\" 返回该范围全部可用卡片）。"},
+        "keyword": {"description": "FTS5 中英文关键词过滤词（留空 '' 返回该范围全部目录卡）。"},
     },
     "get_library_entry": {
-        "entry_id": {"description": "欲精读的文献或引理卡片 ID（如 R001、L3-001、L2-001），调用自动记录 READ 边。"},
+        "entry_id": {"description": "目标文献或引理条目 ID（如 R006、L3-001、L2-001），调用静默记录参考 READ 边。"},
     },
     "request_literature_survey": {
-        "topic_query": {"description": "委托采编检索的具体数学物理机制、定理名称或关键词。"},
-        "reason": {"description": "说明当前建模瓶颈及需要该文献/定理卡片解决的具体问题。"},
+        "topic_query": {"description": "委托外藏采编检索的数学定理、物理机制或关键词。"},
+        "reason": {"description": "当前研究瓶颈及需要该外部参考卡片解决的具体问题。"},
     },
     "read_lineage_graph": {
-        "target_node_id": {"description": "可选：指定只查看某一历史谱系节点详情（不传或 null 返回当前门派全局视图）。"},
-        "saved_query_name": {"description": "可选：监察委预注册的只读 SQL 视图名称（受租户盲审表隔离保护）。"},
+        "target_node_id": {"description": "可选：仅查看本分支指定祖先节点详情（不传或 null 返回本分支谱系摘要）。"},
+        "view": {
+            "enum": ["nodes", "dead_ends"],
+            "description": "查询视图：nodes（本脉历代 DAG 页）| dead_ends（本脉只增不改的全量历史死胡同表）。",
+        },
+        "saved_query_name": {"description": "可选：监察委预注册的只读 SQL 视图名（受租户与盲审表隔离保护）。"},
     },
     "get_companion_context": {
         "mode": {
-            "enum": ["PRE_SPAWN", "REFLECT_37", "HANDOFF_70"],
-            "description": "伴随上下文模式：PRE_SPAWN（行前看板）| REFLECT_37（37% 触发元反思题包）| HANDOFF_70（70% 或崩溃打捞交接包）。",
+            "enum": sorted(ALLOWED_COMPANION_MODES),
+            "description": "伴随阶段模式：PRE_SPAWN（仅旧看板与上代手记）| REFLECT_37（含本脉 dead_ends、L3/L2 目录与夜科学题）| HANDOFF_70 | CRASH_RECOVERY。",
         },
     },
     "save_lineage_briefing": {
-        "sec1_mechanism": {"description": "第1段：当前假设的核心物理/数学机制（与其余4段合计总长 <= 2200 字）。"},
-        "sec2_verified_baseline": {"description": "第2段：已实测确认的基线现象、[Obs###] 与边界范围。"},
-        "sec3_bottleneck": {"description": "第3段：当前尚未突破的数学或数值瓶颈。"},
-        "sec4_dead_ends": {"description": "第4段：已证伪路线与 L2 失败边界，防止后继重复踩坑。"},
-        "sec5_immediate_will": {"description": "第5段：下一小步立即待验证的可执行改动遗愿。"},
+        "sec1_mechanism": {"description": "段1（稳定精炼）：核心底层机理与不变量（五段合计硬限 <= 2200 字，分段配比仅为软参考）。"},
+        "sec2_verified_baseline": {"description": "段2（合并覆写）：已证实前提、最新快照及活跃 REVISE 审稿异议。"},
+        "sec3_bottleneck": {"description": "段3（覆盖刷新）：当前尚未突破的核心矛盾。"},
+        "sec4_dead_ends": {"description": "段4（Top-K 下沉）：当前直接相关死胡同精选 + lineage_dead_ends 全表条数索引。"},
+        "sec5_immediate_will": {"description": "段5（整体替换）：刚退场这一代的新《科研遗嘱》（最小鉴别实验与翻转条件）。"},
     },
     "record_reflection_and_unlock_pull": {
-        "selected_categories": {
-            "description": "选题分类列表，必须包含第 7 类 \"Attractor Tasks\"。",
-        },
-        "holiday_prompt_id": {
-            "minimum": 1,
-            "maximum": 28,
-            "description": "随机抽中的夜科学反思题编号（1–28 整数；29 号专供监察委）。",
-        },
+        "selected_categories": {"description": "元反思分类列表，必须包含第 7 类 Attractor Tasks。"},
+        "holiday_prompt_id": {"minimum": 1, "maximum": 28, "description": "抽中的夜科学启发题编号（1–28 整数）。"},
         "turns": {
             "minItems": 1,
             "maxItems": 2,
             "items": {
                 "type": "object",
                 "properties": {
-                    "question": {"type": "string", "description": "提问内容。"},
-                    "answer": {"type": "string", "description": "探索者基于实测的反思回答（<=300 字）。"},
+                    "question": {"type": "string", "maxLength": 300, "description": "伴随外部专家诊断追问（<=300字）。"},
+                    "answer": {"type": "string", "maxLength": 300, "description": "探索者反思回答（<=300字）。"},
                 },
                 "required": ["question", "answer"],
             },
-            "description": "1 至 2 轮精简问答列表，每轮均须含 non-empty question 与 answer。",
+            "description": "1 至 2 轮精简问答，每轮 <= 300 字。",
         },
         "verdict_3state": {
-            "enum": ["SUFFICIENT_EVIDENCE", "MINIMAL_EXPERIMENT_NEXT", "NEED_CONTROL_GROUP"],
-            "description": "元反思三态结论枚举：SUFFICIENT_EVIDENCE | MINIMAL_EXPERIMENT_NEXT | NEED_CONTROL_GROUP。",
+            "enum": sorted(ALLOWED_VERDICT_3STATE),
+            "description": "三态元反思决断枚举。",
         },
     },
     "submit_node_handoff": {
-        "column_a_facts_md": {"description": "A 栏（严格实证事实）：仅记录可回溯至 [Obs###] 与源码路径的实测数据与现象。"},
-        "column_b_hypothesis_md": {"description": "B 栏（机制假说）：与 A 栏严格分离的理论推演与因果假说。"},
-        "will_md": {"description": "接力遗愿：为下一代或后勤分诊留下的清晰后续实验建议。"},
-        "obs_ids": {"description": "绑定的真实 [Obs###] ID 列表；正常交接至少 1 条（零实测崩溃传 [] 且设 is_zero_eval_crash=true）。"},
-        "candidate_rel_path": {"description": "可选：交接关联的最新候选脚本相对路径（无则 null）。"},
-        "is_zero_eval_crash": {"description": "仅当探索者未跑通任何一次 run_isolated_eval 即异常崩溃打捞时设为 true。"},
-        "tool_pain_point": {"description": "可选：若发现验证钩子缺陷或基线痛点，简要说明以便派工造司修复。"},
+        "mechanism_summary": {"maxLength": 99, "description": "必填 <100 字纯底层核心数学/物理机制摘要（严禁写指标分数或结果）。"},
+        "evidence_grade": {
+            "enum": sorted(ALLOWED_EVIDENCE_GRADES),
+            "description": "证据形态分级：NONE | ARTIFACT_ONLY（纯推导/反例脚本）| MEASURED（绑定真实 official/heavy [Obs###]）。",
+        },
+        "column_a_facts_md": {"description": "A 栏（客观实证事实与推导资产，供 Stage 1 盲审；A+B+will 总长 <= 2000 字）。"},
+        "column_b_hypothesis_md": {"description": "B 栏（机理猜想与反常线索，Stage 1 物理屏蔽）。"},
+        "will_md": {"description": "核对后的下代《科研遗嘱》。"},
+        "obs_ids": {"description": "绑定的正式 official/heavy [Obs###] ID 列表（严禁把 probe 日志混入；纯推导可传 []）。"},
+        "dead_ends": {
+            "items": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "enum": sorted(ALLOWED_DEAD_END_CATEGORIES), "description": "失败归因分类。"},
+                    "scope_condition_md": {"type": "string", "description": "失效条件与边界范围。"},
+                    "failure_mechanism_md": {"type": "string", "description": "精确失灵机理。"},
+                    "bound_obs_id": {"type": ["string", "null"], "description": "关联 [Obs###] 或 null。"},
+                },
+                "required": ["category", "scope_condition_md", "failure_mechanism_md"],
+            },
+            "description": "本代新排除边界数组，只追加写入 lineage_dead_ends 表（严禁把 INSTRUMENT_ERROR 记为候选失败）。",
+        },
+        "candidate_rel_path": {"description": "可选：本代主产物/脚本相对分支 worktree 路径。"},
+        "is_empty_crash": {"description": "仅当探索者一字未产即意外崩溃时设为 true（记入 scratch_log）；非空产物一律 false 写正式 DAG。"},
+        "tool_pain_point": {"description": "可选：工具/仪器痛点说明（自动入队工造司）。"},
     },
     "get_logistics_dashboard": {
-        "question_id": {"description": "子题编号（如 Q1）或 ALL（查看全卷子题依赖、学派、待分诊节点及停滞计数）。"},
+        "question_id": {"description": "子题编号或 ALL。"},
     },
     "register_method_family": {
-        "family_id": {"description": "方法学派唯一英文标识（如 fam_q1_spectral）。"},
-        "mechanism_signature": {"description": "该学派的核心机理与数学建模路线签名。"},
-        "orthogonal_contrast": {"description": "说明本学派与已有学派在机制或近似假设上的正交差异。"},
-        "depends_on_questions": {"description": "可选：前置依赖子题编号列表（如 [\"Q1\"]）；前置子题未获至少 1 条 L3 前不可派生探索。"},
+        "family_id": {"description": "底层方法学派唯一英文标识（如 fam_q1_jung_extremal）。"},
+        "mechanism_signature": {"description": "底层思想与数理机理签名。"},
+        "orthogonal_contrast": {"description": "说明与已有学派在原理层面的正交区别。"},
     },
     "triage_node": {
-        "triage_level": {
-            "enum": ["ROUTINE_CONTINUATION", "LEVEL_1", "LEVEL_2", "LEVEL_3", "LEVEL_4A", "LEVEL_4B"],
-            "description": "分诊级别枚举：ROUTINE_CONTINUATION | LEVEL_1(送盲审) | LEVEL_2(局部修补) | LEVEL_3(跨脉派生) | LEVEL_4A(死路封存L2) | LEVEL_4B(条件暂停)。",
-        },
-        "action": {
-            "enum": ["CONTINUE", "SUBMIT_BLIND_REVIEW", "INPLACE_REPAIR", "SPAWN_PROTECTED", "SEAL_BARRIER", "PAUSE_TO_READY_QUEUE"],
-            "description": "裁决动作枚举：CONTINUE | SUBMIT_BLIND_REVIEW | INPLACE_REPAIR | SPAWN_PROTECTED | SEAL_BARRIER | PAUSE_TO_READY_QUEUE。",
-        },
-        "rationale": {"description": "结合实测 rank_score、依赖与停滞计数给出的清晰裁决理由（必填）。"},
-        "barrier_proof_md": {"description": "当 triage_level=LEVEL_4A / SEAL_BARRIER 时必填（>=15字），写明被证伪物理/数学边界。"},
-        "reopen_condition": {"description": "当 triage_level=LEVEL_4B / PAUSE_TO_READY_QUEUE 时必填，说明重入就绪队列的解锁条件。"},
+        "assigned_family_id": {"description": "后勤依据 mechanism_summary 归类确定的学派 family_id。"},
+        "triage_level": {"enum": sorted(ALLOWED_TRIAGE_LEVELS), "description": "分诊级别枚举。"},
+        "action": {"enum": sorted(ALLOWED_TRIAGE_ACTIONS), "description": "分诊动作枚举。"},
+        "rationale": {"description": "清晰的分诊裁决理由。"},
+        "barrier_proof_md": {"description": "LEVEL_4A / SEAL_BARRIER 时必填（>=15 字）：严密反例或结构阻碍证明。"},
+        "reopen_condition": {"description": "LEVEL_4B / PAUSE_TO_READY_QUEUE 时必填：重入队列解锁条件。"},
     },
     "fork_branch": {
-        "parent_node_id": {"description": "父节点 ID（Stage 1 初始开启首枝探索分支时传 null）。"},
-        "fork_mode": {
-            "enum": ["orthogonal", "lateral", "cross_pollinate"],
-            "description": "派生模式枚举：orthogonal（首脉或正交新学派）| lateral（同脉横向变体）| cross_pollinate（跨子题借用 L3 引理）。",
-        },
-        "target_family_id": {"description": "目标学派 family_id（须已通过 register_method_family 在该子题登记）。"},
-        "source_l3_id": {"description": "仅 fork_mode=\"cross_pollinate\" 时必填：借用的已验证 L3 引理 ID（如 L3-001）。"},
+        "parent_node_id": {"description": "父节点 ID（开局首枝可传 null）。"},
+        "fork_mode": {"enum": sorted(ALLOWED_FORK_MODES), "description": "派生模式：orthogonal | lateral | cross_pollinate。"},
+        "target_family_id": {"description": "目标学派 family_id。"},
+        "requires": {"description": "分支级确定性前置列表（仅限 L3-### 或 OBS:<instrument_id>:PASS，只锁本分支）。"},
+        "new_mechanism_note": {"description": "可选：学派处于 BLOCKED 时重开必填的实质绕开方案说明。"},
+        "source_l3_id": {"description": "仅 cross_pollinate 必填：借用的活跃 L3 ID（需双方学派各有 >=1 L3）。"},
     },
     "dispatch_stagnation_five_lanes": {
         "lane_assignments": {
@@ -141,52 +162,38 @@ _TOOL_PROP_PATCHES: dict[str, dict[str, dict[str, Any]]] = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "branch_id": {"type": "string", "description": "待重排分支 ID。"},
-                    "lane": {"type": "string", "description": "五车道类型（如 ORTHOGONAL_EXPLORE / ABLATION / LITERATURE_SURVEY / REPAIR / ARCHIVE）。"},
-                    "directive": {"type": "string", "description": "该车道下一步指令。"},
+                    "branch_id": {"type": "string", "description": "分支 ID。"},
+                    "lane": {"type": "string", "enum": sorted(ALLOWED_STAGNATION_LANES), "description": "五互斥车道枚举。"},
+                    "directive": {"type": "string", "description": "车道行动指令。"},
                 },
-                "required": ["branch_id", "lane"],
+                "required": ["branch_id", "lane", "directive"],
             },
-            "description": "停滞重排五车道分配数组，每项须指定不重复的 branch_id 与 lane。",
+            "description": "停滞或 >50% 聚拢告警时的五车道重排清单。",
         },
     },
     "get_survey_requests": {
-        "question_id": {"description": "过滤子题 ID（如 Q1）或 ALL（在 Stage 3 时同时返回全卷 L3/L2/R 综合包）。"},
+        "question_id": {"description": "过滤子题 ID 或 ALL（Stage 3 附带全量已审 L3 综合包）。"},
     },
     "publish_external_literature_card": {
-        "ref_id": {"description": "外藏卡片唯一编号（规范格式：R001、R002...；重复 ref_id 将拒绝或需递增编号）。"},
-        "question_id": {"description": "主要关联的子题 ID（如 Q1、Q2 或 ALL）。"},
+        "ref_id": {"description": "外藏参考卡唯一编号（如 R001、R006）。"},
         "abstract_md": {
             "minLength": 60,
             "maxLength": 1500,
-            "description": "独立高密度摘要（必须 60–1500 字符；推荐 120–500 字符，严禁 [:120] 伪摘要与冗余长篇推导）。",
+            "description": "独立高密度外部参考摘要（服务端硬限 60–1500 字符，推荐 120–300 字符）。",
         },
-        "exact_preconditions_md": {"description": "严格适用前提、物理边界或数学假设条件列表（必填，不能为空）。"},
-        "formulas_or_operators_md": {"description": "核心方程、定理表达式或算子定义（离线标准定理亦须公式完整）。"},
-        "read_depth": {
-            "enum": sorted(ALLOWED_READ_DEPTHS),
-            "description": "诚实阅读深度英文枚举：full_text（全文/完备定理推导）| specified_sections（指定章节）| abstract_only（仅摘要）。",
-        },
-        "support_scope": {
-            "enum": sorted(ALLOWED_SUPPORT_SCOPES),
-            "description": (
-                "支持度分类英文枚举（严禁填写中文解释或自定义词）：常用 "
-                "DIRECT_PROOF_OR_EXACT_MEASUREMENT | CONDITIONALLY_VERIFIED | "
-                "NEGATIVE_REFUTATION | HEURISTIC_CORRELATION | BACKGROUND_REFERENCE。"
-            ),
-        },
-        "source_citation": {"description": "标准出处引用（文献作者/书名/章节/DOI 或公认标准教材定理名称）。"},
-        "fulfilled_request_ids": {
-            "description": "可选：本次精准核销的 request_id 数组（来自 get_survey_requests）；Stage 1 主动建卡或无指定工单时传 null 或 []。",
-        },
+        "exact_preconditions_md": {"description": "严格适用前提与边界假设。"},
+        "formulas_or_operators_md": {"description": "核心数学公式、定理表达式或算子定义。"},
+        "read_depth": {"enum": sorted(ALLOWED_READ_DEPTHS), "description": "诚实阅读深度英文枚举。"},
+        "support_scope": {"enum": sorted(ALLOWED_SUPPORT_SCOPES), "description": "严格 5 选 1 支持度分类英文枚举（严禁填中文）。"},
+        "source_citation": {"description": "标准文献或教材出处。"},
+        "fulfilled_request_ids": {"description": "可选：精准核销的 survey_requests.req_id 列表。"},
     },
     "export_stage3_final_delivery": {
-        "formal_paper_md": {
-            "minLength": 50,
-            "description": "正式学术论文全文 Markdown（需结构完整、数据对齐 [Obs###] 与 L3，严禁空壳成文）。",
-        },
-        "selected_l3_ids_by_question": {"description": "各子题最终入选的 L3_VERIFIED 映射字典，例如 {\"Q1\": [\"L3-001\"], \"Q2\": [\"L3-002\"]}。"},
-        "reproduction_candidate_nodes": {"description": "各子题代表性可复现探索节点 ID 列表（如 [\"node_q1_01\"]）。"},
+        "delivery_mode": {"enum": sorted(ALLOWED_DELIVERY_MODES), "description": "终局交付模式：FULL | PARTIAL_ON_BUDGET | PARTIAL_ON_HUMAN_STOP。"},
+        "formal_paper_md": {"minLength": 50, "description": "正式研究报告全文 Markdown（严禁混入未审稿或夸大 L3 边界）。"},
+        "selected_l3_ids_by_question": {"description": "各子题入选的活跃 L3 ID 映射字典。"},
+        "remaining_gaps_by_question": {"description": "各子题精确剩余断点（Remaining Gaps）映射字典。"},
+        "reproduction_candidate_nodes": {"description": "可复现节点 ID 列表。"},
     },
     "submit_stage1_blind_ledger": {
         "ledger_items": {
@@ -194,98 +201,88 @@ _TOOL_PROP_PATCHES: dict[str, dict[str, dict[str, Any]]] = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "claim": {"type": "string", "description": "待核验核心宣称。"},
-                    "evidence_location_and_quote": {"type": "string", "description": "对应 [Obs###] / 代码 / 引用原文定位及精确摘录。"},
-                    "verified": {"type": "boolean", "description": "是否被证据真实支撑。"},
+                    "claim": {"type": "string", "description": "核心宣称。"},
+                    "evidence_location_and_quote": {"type": "string", "description": "精确原文定位、代码行或沙箱实跑输出摘录（缺证填 No direct evidence found）。"},
+                    "sandbox_check_cmd_or_note": {"type": ["string", "null"], "description": "可选：盲审沙箱执行的验证命令与输出摘要。"},
+                    "is_verified": {"type": "boolean", "description": "是否通过核验。"},
                 },
                 "required": ["claim", "evidence_location_and_quote"],
             },
-            "description": "Stage 1 不可逆独立证据核查账本（非空数组）。",
+            "description": "Stage 1 不可逆独立 Evidence Ledger 列表。",
         },
-        "stage1_verdict": {
-            "enum": ["PASS", "REJECT"],
-            "description": "Stage 1 盲态初判英文枚举：PASS | REJECT（落库后数据库触发器锁定不可改）。",
-        },
-        "reject_failure_reason": {"description": "当 stage1_verdict=\"REJECT\" 时必填：明确拒稿根本原因。"},
-        "exact_refuted_scope_md": {"description": "当 stage1_verdict=\"REJECT\" 时必填：准确界定被证伪或未支撑的边界范围。"},
+        "stage1_verdict": {"enum": sorted(ALLOWED_STAGE1_VERDICTS), "description": "Stage 1 裁决枚举：PASS | REVISE | REFUTED。"},
+        "revision_or_refutation_reason": {"description": "判 REVISE 或 REFUTED 时必填的明确原因或返工要求。"},
+        "exact_refuted_scope_md": {"description": "判 REFUTED 时必填的精确被证伪范围。"},
     },
     "submit_stage2_unblind_verdict": {
-        "final_verdict": {
-            "enum": ["PASS", "PASS_WITH_NARROWED_SCOPE", "REJECT"],
-            "description": "Stage 2 终审英文枚举：PASS | PASS_WITH_NARROWED_SCOPE | REJECT。",
-        },
-        "abstract_md": {
-            "minLength": 40,
-            "description": "独立高密度终审摘要（必须 >= 40 字符，严禁空洞占位）。",
-        },
-        "exact_verified_scope_md": {"description": "PASS 或 PASS_WITH_NARROWED_SCOPE 时必填：明确已证实有效边界。"},
-        "exact_refuted_scope_md": {"description": "REJECT（或窄化剔除场景）时必填：明确被否定/未达标边界。"},
-        "cross_draft_comparison_notes": {"description": "跨稿件/同题其他候选对比评审说明。"},
-        "cross_pollinate_nomination": {"description": "可选：推荐用于其他子题交叉授粉的结构化说明对象或 null。"},
+        "final_verdict": {"enum": sorted(ALLOWED_FINAL_VERDICTS), "description": "Stage 2 终审三态枚举：ACCEPT | ACCEPT_NARROWED | REVISE | REFUTED。"},
+        "l3_entry_kind": {"enum": [*sorted(ALLOWED_L3_ENTRY_KINDS), None], "description": "ACCEPT* 必填：POS_THEOREM | NEG_COUNTEREXAMPLE | BARRIER_PROOF。"},
+        "goal_coverage": {"enum": [*sorted(ALLOWED_GOAL_COVERAGES), None], "description": "ACCEPT* 必填：FULL_GOAL | PARTIAL_OR_LEMMA | EQUIVALENT_REDUCTION（缩窄/等价归约严禁标 FULL_GOAL）。"},
+        "is_equivalent_reduction": {"description": "是否为问题等价归约（若为 true 严禁标 FULL_GOAL）。"},
+        "abstract_md": {"description": "独立高密度终审摘要（ACCEPT* 必填 >= 40 字）。"},
+        "exact_verified_scope_md": {"description": "ACCEPT* 必填：严格已证实成立范围。"},
+        "exact_refuted_scope_md": {"description": "REFUTED 必填（ACCEPT_NARROWED 可选）：精确失灵/证伪范围。"},
+        "revision_requests": {"description": "REVISE 必填：退回原分支的具体返工项列表。"},
+        "cross_draft_comparison_notes": {"description": "跨稿件横向对比说明。"},
+        "cross_pollinate_nomination": {"description": "可选：交叉授粉提名对象或 null。"},
         "edge_type_overrides": {
-            "description": f"可选：按 ref_id 覆盖宣称引用边类型字典，合法值为 {sorted(ALLOWED_CLAIMED_EDGE_TYPES)}；无覆盖传 null。",
+            "description": f"可选：按引用 ID 升级承重前提边类型，合法值 {sorted(ALLOWED_CLAIMED_EDGE_TYPES)}。",
         },
     },
     "propose_salvaged_lemma": {
-        "source_node_id": {"description": "被提议局部规律打捞的源探索节点 ID。"},
-        "abstract_md": {"description": "打捞引理的独立摘要（阐述局部机制及有效范围）。"},
-        "column_a_self_contained_proof_md": {"description": "A 栏自洽实证证明/数值规律（需独立可核查）。"},
-        "column_b_scope_notes_md": {"description": "B 栏精确边界与失效区说明（不可越界推广）。"},
-        "bound_obs_ids": {"minItems": 1, "description": "必须绑定至少 1 条真实存在的 [Obs###] ID 列表。"},
+        "source_node_id": {"description": "已闭或阻塞源节点 ID（严禁对 ACTIVE_REVISING 返工分支打捞）。"},
+        "abstract_md": {"description": "打捞引理独立摘要。"},
+        "column_a_self_contained_proof_md": {"description": "剥离原上下文后的自包含证明/实证正文。"},
+        "column_b_scope_notes_md": {"description": "精确适用边界与限制条件。"},
+        "bound_obs_ids": {"description": "关联正式 [Obs###] 列表（纯解析引理可传 []）。"},
     },
     "get_works_engineering_queue": {
-        "question_id": {"description": "过滤子题 ID 或 ALL（查看未处理的 tool_pain_point 与待局部重评队列）。"},
+        "question_id": {"description": "子题编号或 ALL（返回仪器健康、故障工单与 pending_revalidation 队列）。"},
     },
-    "register_question_domain_hook": {
-        "hook_rel_path": {"description": "验证钩子相对工作区路径（如 evaluators/hook_q1.py），需提供 evaluate_candidate(art, spec)。"},
-        "baseline_rel_path": {"description": "对应基准真值脚本相对路径（如 baselines/Q1/baseline.py）。"},
-        "fidelity_max_error_pct": {"description": "与基准脚本对比允许的最大保真度相对误差百分比（非负浮点数，如 1.0）。"},
-        "plugin_protocol_version": {"description": "钩子协议版本字符串，默认 v1。"},
-        "public_input_sample": {"description": "可选：向探索者公开的标准输入样例 JSON 对象或 null。"},
+    "register_question_instrument": {
+        "instrument_role": {"enum": sorted(ALLOWED_INSTRUMENT_ROLES), "description": "仪器角色枚举：VERDICT | PROBE | ENV。"},
+        "instrument_rel_path": {"description": "仪器 Python 脚本相对工作区路径，须导出 evaluate(artifact, spec, tier)。"},
+        "calibration_suite_rel_path": {"description": "校准集 JSON 相对路径（VERDICT 必填且 100% 通过自声明预期；PROBE/ENV 可传 null）。"},
+        "artifact_schema": {"description": "自声明待测 artifact 形态（如 python_run / raw_file / counterexample_json / lean4）。"},
+        "plugin_protocol_version": {"description": "仪器协议版本，默认 v3。"},
+        "default_spec": {"description": "可选：仪器默认配置规格字典（可含 public_input）。"},
     },
-    "upgrade_hook_with_rqgm_gate": {
-        "new_hook_rel_path": {"description": "升版后的新验证钩子相对路径。"},
-        "gt_success_count": {"description": "RQGM 真值正样本通过数（整数）。"},
-        "gt_failure_count": {"description": "RQGM 真值正样本失败数（整数）。"},
-        "adv_pool_reject_rate": {"description": "对抗样本池总体拒识率 r_P（0..1，可为空）。"},
-        "adv_pool_positive_rate": {"description": "对抗样本池真阳性率 p_+（0..1，可为空）。"},
-        "adv_pool_negative_rate": {"description": "对抗样本池假阳性率 p_-（0..1，可为空）。"},
+    "upgrade_instrument_with_calibration": {
+        "new_instrument_rel_path": {"description": "新版仪器脚本相对路径。"},
+        "calibration_suite_rel_path": {"description": "独立校准集 JSON 相对路径（100% 匹配所有用例自声明预期即直接升版）。"},
     },
     "recompute_stage_b_only": {
-        "obs_id": {"description": "需要仅重算 Stage B 评分与通过状态的持久化观测记录 ID（不重复执行 Stage A）。"},
+        "obs_id": {"description": "需按新版仪器免重跑 Stage A 重评的旧观测 ID（保留旧收据，成功生成新版新收据，缺字段标 INCOMPATIBLE）。"},
     },
     "update_skill_ledger": {
-        "skill_id": {"pattern": "^[a-z0-9_]+$", "description": "技能唯一标识（严格匹配 ^[a-z0-9_]+$，禁止大写/空格/连字符）。"},
-        "applicable_scope": {"description": "技能适用工程场景与约束条件说明。"},
-        "version": {"minimum": 1, "description": "技能版本号（正整数，如 1、2）。"},
-        "raw_success_count": {"minimum": 0, "description": "累计实测成功次数。"},
-        "raw_failure_count": {"minimum": 0, "description": "累计实测失败次数。"},
-        "verified_artifact_rel_path": {"description": "已通过 No-File 校验的非空技能产物相对路径。"},
-        "rollback_pointer": {"description": "回滚指针或前序稳定版本标识（如 v0 / git sha）。"},
+        "skill_id": {"pattern": "^[a-z0-9_]+$", "description": "技能唯一 ID（严格匹配 ^[a-z0-9_]+$）。"},
+        "applicable_scope": {"description": "适用范围说明。"},
+        "version": {"minimum": 1, "description": "版本号（正整数）。"},
+        "raw_success_count": {"minimum": 0, "description": "原始成功次数。"},
+        "raw_failure_count": {"minimum": 0, "description": "原始失败次数。"},
+        "verified_artifact_rel_path": {"description": "经 No-File 校验的非空产物相对路径。"},
+        "rollback_pointer": {"description": "回滚指针或前序版本标识。"},
+    },
+    "check_stage2_closure_gate": {
+        "mode": {"enum": sorted(ALLOWED_DELIVERY_MODES), "description": "结题模式：FULL | PARTIAL_ON_BUDGET | PARTIAL_ON_HUMAN_STOP。"},
+        "human_aborted": {"description": "是否按人类紧急叫停路径核验（服务端强校验控制面真实写入的 human_stop_requested_at，严禁伪造）。"},
     },
     "record_compliance_check": {
-        "stage": {
-            "enum": ["STAGE1_GATE", "STAGE2_HEARTBEAT", "STAGE2_CLOSURE_GATE", "STAGE3_FINAL_AUDIT"],
-            "description": "审计检查点枚举：STAGE1_GATE | STAGE2_HEARTBEAT | STAGE2_CLOSURE_GATE | STAGE3_FINAL_AUDIT。",
-        },
-        "status": {
-            "enum": ["PASSED", "ALERT", "BLOCKED"],
-            "description": "合规状态枚举：PASSED | ALERT | BLOCKED。",
-        },
-        "blocking_questions_zero_l3": {"description": "当前仍处于 0 L3 阻塞状态的子题编号列表（无则传 []）。"},
-        "unread_citation_nodes": {"description": "声明引用但缺少 READ 暴露边的高风险节点 ID 列表（无则传 []）。"},
-        "notes": {"description": "本次合规检查的简明对账备注。"},
+        "stage": {"enum": sorted(ALLOWED_COMPLIANCE_STAGES), "description": "合规审计阶段枚举。"},
+        "status": {"enum": sorted(ALLOWED_COMPLIANCE_STATUSES), "description": "合规状态枚举（口径歧义用 ALERT_AMBIGUOUS_SPEC 后台亮红灯不停机）。"},
+        "blocking_questions": {"description": "阻塞子题编号列表（无则 []）。"},
+        "notes": {"description": "简明审计备注（零 .md 落盘）。"},
     },
     "register_saved_graph_query": {
-        "query_name": {"description": "只读图查询视图名称（供探索者 read_lineage_graph 复用）。"},
-        "description": {"description": "说明该视图返回的图谱指标或查询用途。"},
-        "sql_select": {"description": "单条合法只读 SELECT SQL 语句（严禁写操作或分号多语句）。"},
+        "query_name": {"description": "只读图查询视图名称。"},
+        "description": {"description": "视图用途说明。"},
+        "sql_select": {"description": "单条合法只读 SELECT SQL 语句。"},
     },
 }
 
 
 def enrich_tool_definitions(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """为 31 个 MCP 工具 JSON Schema 统一注入字段说明、枚举与内嵌数组结构。"""
+    """为全量 31 个 MCP 工具 JSON Schema 统一注入中文说明、枚举与内嵌数组结构。"""
     enriched: list[dict[str, Any]] = []
     for tool in tools:
         t = deepcopy(tool)
@@ -294,14 +291,14 @@ def enrich_tool_definitions(tools: list[dict[str, Any]]) -> list[dict[str, Any]]
         if isinstance(schema, dict):
             props = schema.get("properties")
             if isinstance(props, dict):
-                tool_patches = _TOOL_PROP_PATCHES.get(name, {})
-                for prop_name, prop_def in props.items():
-                    if not isinstance(prop_def, dict):
+                patches = _TOOL_PROP_PATCHES.get(name, {})
+                for pname, pdef in props.items():
+                    if not isinstance(pdef, dict):
                         continue
-                    if prop_name in _COMMON_PROP_DESCRIPTIONS and "description" not in prop_def:
-                        prop_def["description"] = _COMMON_PROP_DESCRIPTIONS[prop_name]
-                    patch = tool_patches.get(prop_name)
+                    if pname in _COMMON_DESCRIPTIONS and "description" not in pdef:
+                        pdef["description"] = _COMMON_DESCRIPTIONS[pname]
+                    patch = patches.get(pname)
                     if patch:
-                        prop_def.update(patch)
+                        pdef.update(patch)
         enriched.append(t)
     return enriched

@@ -1,51 +1,47 @@
 ---
 name: greatwall-research-loop
-description: 长城 Agent V6-Up (v2.2) DSH 外部无状态编排控制面 × Python 31 窄工具 MCP 内核“一委三部”科研攻关核心规程。
+description: 长城 Agent V6-Up (v3.0) DSH 极薄事件总线 × Python 31 窄工具 MCP 内核“一委三部 + 科研仪器科 + 双隔离沙箱”通用自主科学发现规程。
 ---
 
-# 长城 Agent V6-Up (`dsh-greatwall-v6up` v2.2) “一委三部”科研攻关核心规程
+# 长城 Agent V6-Up (`dsh-greatwall-v6up` v3.0) 通用自主科研核心规程
 
 > **主控入口与防越权红线（强制执行）**：
-> 1. **主控会话唯一合法调度入口**是 **`greatwall_orchestrate`（`action: "start" | "status" | "pause" | "resume" | "stop" | "intervene"`）**，后台异步事件池启动后会在 1 秒内立即返回，人类可直接点击左侧栏工作区下各节点独立会话对话、或通过 `intervene` 下发纠偏指令；
-> 2. **严禁主控直连 SQLite `greatwall.db`**（不得用 `sqlite3` / `pwsh` 手写 SQL 改写谱系、学派或门禁状态）；
-> 3. **严禁主控读写 `worktrees/` 求解代码或篡改 `evaluators/` 验证钩子/容差**（所有代码研发与钩子升级均由独立无状态工作节点与工造司完成）；
-> 4. **严禁使用原生 `subagent` 工具自行派发子代理**（所有角色统一由插件基于独立 Preset 与同工作区会话调度）。
-
-> **架构铁律**：全系统采用 **DSH (`0.2.2-rc.3`) `ctx.agents.create()` 同工作区独立会话 × Python 31 单一职责窄工具 MCP + SQLite WAL 底座**，彻底取消 `dsh-subagent` 限制、取消中心化常驻 `ROOT` 官僚、取消一切过程 `.md` 公文落盘（工作区零 `HANDOFF.md` / `*_AUDIT.md` / `*_CLOSURE.md` / `REFLECTION_*.md`）。
-
----
-
-## 一、7 大独立无状态角色与极简数据底座（3 真相 + 2 视图）
-
-1. **三个唯一真相（只存 SQLite WAL + 分支 Git Worktree）**：
-   - **真相 ① `observations`**：按子题隔离评估产出收据（`VALID / EXECUTION_ERROR / MEASURED_NON_IMPROVEMENT / INCONCLUSIVE / PENDING_REVALIDATION / INVALIDATED`），绑定 `(question_id, domain_hook_sha256, stage_a_artifact_path)`；
-   - **真相 ② `lineage_nodes`（原 `L1` 直接合一）**：各门派私有实验记录本（`<2000` 字 A/B 双栏手记、遗嘱、`sanitized_code_diff_md`、`worktree_abs_path` 与 `Retained Candidate` 物理快照路径），严禁跨门派读取；零实测崩溃节点记入 `scratch_log_json` 不污染主谱系与看板；
-   - **真相 ③ 中央图书馆物理分两翼**：
-     - 左翼外藏 `external_literature_cards` (`[R###]`)：由 `library_surveyor` 写入，`0%` 起全程开放 Pull；
-     - 右翼内藏 `internal_research_ledger` (`L3_VERIFIED` 黄金账本 + `L2_FAILURE_RECORD` 失败雷达)：由零磁盘工具的 `library_verifier` 通过两阶段盲审唯一入 `L3`，在 Stage 1/2 `REJECT`、Level 2 修补满 3 次或 Level 4a 阻碍证明时同事务自动入 `L2`。
-2. **两个派生视图**：
-   - **视图 ① 谱系状态看板 (`Briefing`, `<= 2200` 字)**：由 `lineage_companion` 在探索者出生前按五段定额预算（`200 / 400 / 350 / 650 / 400`）增量合成，严禁 `[:2000]` 硬切片；
-   - **视图 ② 图书馆两级目录卡**：`query_library_catalog` $\to$ `get_library_entry`（`0–37%` 自动屏蔽内藏、`37%` 解锁后开放全馆）。
-3. **7 大无状态角色工具分工（严格执行 31 个唯一授权窄工具）**：
-   - `explorer` (5 MCP + 本分支 `read/write/edit/glob/grep/pwsh` 受 OS 读隔离 + Guard 约束)：`run_isolated_eval`, `query_library_catalog`, `get_library_entry`, `request_literature_survey`, `read_lineage_graph`；
-   - `lineage_companion` (4 MCP + 只读工作树)：`get_companion_context`, `save_lineage_briefing`, `record_reflection_and_unlock_pull`, `submit_node_handoff`（独占 DAG 单写权）；
-   - `logistics_coordinator` (5 MCP，零科研代码写权)：`get_logistics_dashboard`, `register_method_family`, `triage_node`, `fork_branch`, `dispatch_stagnation_five_lanes`；
-   - `library_surveyor` (3 MCP + 网络/PDF/读工具)：`get_survey_requests`, `publish_external_literature_card`, `export_stage3_final_delivery`；
-   - `library_verifier` (5 MCP，**物理零磁盘、零网络、零终端工具**)：`get_blind_manuscript`, `submit_stage1_blind_ledger`, `get_unblinded_manuscript_and_peers`, `submit_stage2_unblind_verdict`, `propose_salvaged_lemma`；
-   - `works_engineer` (5 MCP + 评估器工作区)：`get_works_engineering_queue`, `register_question_domain_hook`, `upgrade_hook_with_rqgm_gate`, `recompute_stage_b_only`, `update_skill_ledger`；
-   - `supervisory_committee` (4 MCP，超然只读零公文)：`get_supervisory_audit_snapshot`, `check_stage2_closure_gate`, `record_compliance_check`, `register_saved_graph_query`。
+> 1. **主控会话唯一合法调度入口**是 **`greatwall_orchestrate`（`action: "init" | "start" | "status" | "pause" | "resume" | "stop" | "human_stop" | "intervene"`）**，后台事件池非阻塞运行；
+> 2. **严禁主控直连 SQLite `greatwall.db`**（不得用 `sqlite3` / Shell 篡改谱系、学派、盲审或终局状态）；
+> 3. **严禁主控代改研究 `worktrees/` 代码或越权覆盖校准集与仪器版本**；
+> 4. **严禁使用原生 `subagent` 工具自行派单**（所有角色由外部事件总线以独立无状态短会话或单节点保活伴随调度）。
+> 5. **工作区磁盘零过程公文**：严禁任何角色在工作区写出 `HANDOFF.md` / `*_AUDIT.md` / `*_CLOSURE.md` 等审批文件，一切流转只写 SQLite（仅 Stage 3 终局由服务端导出 `<workspace>/final_delivery/` 五件套）。
 
 ---
 
-## 二、500,000 Token 真实时钟与回合间隙顺序反思
+## 一、“3 真相 + 2 视图”与 7 角色沙箱平权矩阵
 
-- **统一计算公式**：`pressure_pct = pressure_tokens / 500000`（`37% = 185,000` 且 `eval_count >= 1`；`70% = 350,000`）。
-- **回合间隙 `37%` 顺序反思**：`run_isolated_eval` 先返回成绩单并标记回合收敛（`concludesTurn`），控制面于回合间隙暂停探索者、抽取黑匣子轨迹与夜科学 `1–28` 随机 `1–2` 题候选推送给 `lineage_companion(REFLECT_37)` 完成 `<= 2` 轮（每轮 `<= 300` 字）问答并调 `record_reflection_and_unlock_pull` 当场置位 `first_reflection_unlocked = 1`，随后放行探索者继续 `37%–70%` 攻坚。
+1. **三真相（SQLite WAL，物理隔离于 `$PLUGIN_DATA/workspaces/<ws_hash>/`）**：
+   - **真相 ① `observations`**：仅 `official` / `heavy` 档写入的科学收据（`VALID_PASS / MEASURED_REJECTION / VALID_UNDECIDED / CANDIDATE_ERROR / INSTRUMENT_ERROR / INFRA_ERROR / PENDING_REVALIDATION / SUPERSEDED_REVALIDATED / INCOMPATIBLE`），永久绑定 `(instrument_id, instrument_version)`；高频 `probe` 仅写 `probe_diagnostic_logs`；
+   - **真相 ② `lineage_nodes` + `lineage_dead_ends`**：各门派私有实验记录本（由一对一 `lineage_companion` 独占单写；历代全部排除边界永久只追加写入 `lineage_dead_ends`，跨门派物理不可见）；
+   - **真相 ③ 中央图书馆物理分两翼**：左翼外藏 `external_literature_cards` (`[R###]`，未复验参考先验，0% 开放) + 右翼内藏 `internal_research_ledger`（`L3_VERIFIED` 含 `POS_THEOREM / NEG_COUNTEREXAMPLE / BARRIER_PROOF` 与 `goal_coverage`；`L2_FAILURE_RECORD` 仅存 `REFUTED / UNRESOLVED_OBJECTION`，工程故障绝不入库）。
+2. **两视图**：
+   - **视图 ① `lineage_briefings`（`<= 2200` 字定额滚动重压缩看板）**：$\text{Rewrite}_{\le 2200}(\text{旧看板}, \text{最新手记})$；
+   - **视图 ② 图书馆两级目录卡**：`query_library_catalog` $\to$ `get_library_entry`。
+3. **双隔离沙箱平权**：
+   - 探索者（本分支 Worktree）、工造司（`evaluators/` & `skills/`）与盲审官（每次现建独立空白沙箱 `blind_sandbox_<review_id>/`）均按 OS 开放真实平台 Shell（`win32 -> pwsh`, `非win32 -> bash`）；`logistics_coordinator` 与 `supervisory_committee` 物理 `0` 原生工具。
 
 ---
 
-## 三、四阶段科研流水线与结题硬锁
+## 二、500k 物理时钟与单节点四幕节律
 
-- **Stage 1（`Parse 0` 基建）**：`works_engineer` 为每一子题 `Q1..Qn`（含纯理论与仿真）注册 `evaluators/hooks/hook_<question_id>.py` 与隔离 `baselines/baseline_<question_id>.py`（误差 `< 5.0%`）；`library_surveyor` 补充 `[R###]`；`logistics_coordinator` 登记每题 `>= 2` 互斥学派并在 `max_concurrent_workers = 6`（硬上限 `10`）下公平派单；`supervisory_committee` 核签 `STAGE1_GATE`。
-- **Stage 2（并行演化）**：探索者-伴随双人组按统一时间轴推进；`triage_node` 驱动四级分诊与 `Retained Candidate` 物理快照保存/恢复；`library_verifier` 两阶段纯 DB 盲审及异会话 `Auditor` 打捞；`works_engineer` 执行 `RQGM`（真值锚点实跑优先）与 `DEPENDS_ON` 局部同事务重评（零跨题连坐）。
-- **Stage 3（收官交付 — 死守 `L3_VERIFIED >= 1` 硬锁）**：`check_stage2_closure_gate()` 全题通过后，`library_verifier` 任 `Comparator` 择优各题 `L3_VERIFIED` -> `library_surveyor` 任 `Formal Writer` 调 `export_stage3_final_delivery` 导出 `<workspace>/final_delivery/` 五件套 -> `library_verifier` + `supervisory_committee` 逐行核对收据后正式结项。
+- **单一真时钟**：`pressure_pct = pressure_tokens / 500000`（`0.37` = 185k 触发反思，**无 `eval_count` 前置门槛**；`0.70` = 350k 触发两步清醒交接）。
+- **单节点伴随暂停续传**：同一探索节点内复用同一个 `lineage_companion` 会话依次承接 `PRE_SPAWN -> REFLECT_37 -> HANDOFF_70`，节点完结即随探索者销毁（绝不跨代常驻；断线崩溃支持冷启动抢救 `CRASH_RECOVERY`）。
+- **70% 两步交接**：先给清醒探索者最后一轮只读纯文本收官回合亲笔总结并立《科研遗嘱》，退场后由伴随核对客观 Diff 与 `[Obs###]` 独占单写 `submit_node_handoff`。
+
+---
+
+## 三、三阶段生命周期与核心制度
+
+- **Stage 1 (Parse 0)**：人类签发六项启动表单写入 `parse0_contract`（允许 0 `VERDICT` 判定器开局与空 `question_order`）；采编预建 `[R###]`；后勤按提示开枝；监察委核签 `PARSE0_GATE`。
+- **Stage 2 (无人值守演化)**：
+  - 仪器科统一 `evaluate(artifact, spec, tier)` 三档四态，**判不了绝不判负**（`INSTRUMENT_ERROR/INFRA_ERROR` 零处罚、不进缓存、连续 3 次自动熔断 `UNHEALTHY`），`VERDICT` 注册与升版走独立校准集 100% 回归；
+  - 后勤实行分支级 `requires`、无豁免 `branch_count >= 2 && share > 0.50` 聚拢正交打散、`AWAITING_TRIAGE` 禁抢跑硬锁、四轨可核验准入与五车道停滞复苏；
+  - 盲审官在独立空白沙箱跑证执行两阶段盲审与三态裁决（`ACCEPT* / REVISE(共用<=2轮) / REFUTED`），默认引用边为 `MOTIVATING_REF`；
+  - 监察委遇口径歧义亮 `ALERT_AMBIGUOUS_SPEC` 红灯且维持原口径不停摆。
+- **Stage 3 (双段门禁与两步联合核签)**：满足 `FULL`（全题 `FULL_GOAL` L3）或满最短投入时间 `PARTIAL_ON_BUDGET` 或人类控制面真实 `human_stop_requested_at` 触发 `PARTIAL_ON_HUMAN_STOP` $\to$ 采编导出五件套生成 `(delivery_id, delivery_sha256)` 置 `DELIVERY_EXPORTED` $\to$ `library_verifier(STAGE3_FINAL_AUDIT:<delivery_id>)` 核对不夸大边界且复现一致 $\to$ `supervisory_committee` 绑定版本核签 `CLOSURE_GATE(PASSED)` 晋升 `CLOSED_VERIFIED`。

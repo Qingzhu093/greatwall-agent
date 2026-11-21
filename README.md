@@ -1,9 +1,9 @@
 # 长城科研共同体 V6-Up (v3.0) · GreatWall Agent
 
 > 面向长周期、高并发、无人值守通用 **AI for Science**（科学计算、物理仿真、数学推导与形式化发现）的 **DeepSeek Harness (`0.2.2-rc.3`) × Python Single-Writer 控制面 × 双隔离沙箱** 多智能体科研协同系统。  
-> **当前版本状态（2026-11-21 第四轮复盘后）**：
+> **当前版本状态（2026-11-21 · v3.0.0 重构落地）**：
 > - **顶层架构与知识库（v3.0 已定版）**：已完成去竞赛过拟合大重构与全套工程契约闭环（见 [`PROJECT.md`](PROJECT.md)、[`04` 顶层专报](docs/architecture/04_长城%20Agent%20V6-Up：面向长周期自主科学发现的多智能体系统架构白皮书（v3.0）.md)、[`09` 工程交接说明书](docs/architecture/09长城%20Agent%20V6-Up（v3.0）零前提工程架构与系统开发总说明书.md) 及 [`docs/agent_kb/`](docs/agent_kb/00_INDEX_Agent知识库总导航与必读映射.md)）。
-> - **代码实现底座（[`greatwall-v6up/`](greatwall-v6up/)）**：当前代码停留在 `3dfa211`（v2.2 基线 + 第 4 轮应急门禁修复），**待按 [`09` 说明书](docs/architecture/09长城%20Agent%20V6-Up（v3.0）零前提工程架构与系统开发总说明书.md) 进入 P0–P4 的 v3.0 重构落地**。系统仍处实验验证期，暂不建议外部直接下载用于生产。
+> - **代码实现底座（[`greatwall-v6up/`](greatwall-v6up/)）**：已严格依照 [`09` 说明书](docs/architecture/09长城%20Agent%20V6-Up（v3.0）零前提工程架构与系统开发总说明书.md) 完成 **v3.0.0 全量升级（P0 静态契约 + P1 隔离仪器容器与 17 组 SQLite 表 + P2 31 窄工具控制面 + P3 DSH 6 套 Preset/双隔离沙箱/单节点伴随续传与两步联合终核）**，全套 Python 与 Node 快速单元测试已通过；最终端到端 SDK 实测与审阅由独立评审流程跟进。
 
 ---
 
@@ -47,21 +47,21 @@ flowchart LR
 .
 ├── README.md                  # 项目总览与状态说明（本文档）
 ├── PROJECT.md                 # V6-Up v3.0 顶层架构与目录总入口
-├── greatwall-v6up/            # 【工程代码仓】（当前为 v2.2 基线，待按 09 说明书推进 P0–P4 升级至 v3.0）
-│   ├── core_python/           # Python Single-Writer 控制面、MCP Server、隔离评测器与角色模板
-│   │   ├── agents/            # 7 大角色运行态提示词契约 (.md)
-│   │   ├── evaluators/        # 物理隔离评测执行器 (isolated_runner.py)
-│   │   ├── mcp_server/        # 模块化 MCP 工具、SQLite WAL Schema、参数校验与服务实现
+├── greatwall-v6up/            # 【工程代码仓】（v3.0.0：已完成 P0–P3 全面升级）
+│   ├── core_python/           # Python Single-Writer 控制面、MCP Server、隔离仪器容器与角色模板
+│   │   ├── agents/            # 7 大角色运行态提示词契约 (.md，与 agent_kb/05 逐字一致)
+│   │   ├── evaluators/        # 统一三档四态隔离容器 (base_instrument.py / isolated_runner.py / examples/)
+│   │   ├── mcp_server/        # 31 个单一职责窄工具、17 组 SQLite WAL Schema、3 条硬触发器与服务实现
 │   │   ├── prompts/           # 29 条夜科学元反思提示库 (holiday_prompts.yaml)
 │   │   ├── skills/            # 主控科研 SOP (SKILL.md) 与技能台账 (SKILL_LEDGER.json)
-│   │   └── config.json        # 运行时核心参数表
+│   │   └── config.json        # 运行时核心参数表（逐字段对齐 04 §6.1）
 │   ├── dsh_plugin/            # DeepSeek Harness (0.2.2-rc.3) 插件本体
-│   │   ├── lib/               # 编排器、会话宿主、Preset 注册、沙箱、遥测与右侧栏控制台
-│   │   ├── presets/           # 子角色 Preset 定义文件
-│   │   ├── test/              # DSH SDK E2E 与 Hard Gates 测试 (.test.mjs)
+│   │   ├── lib/               # 编排器、会话宿主、6 套 Preset 注册、双隔离沙箱、遥测与右侧栏控制台
+│   │   ├── presets/           # 6 套子角色 Preset 定义文件
+│   │   ├── test/              # Node 纯模块级控制面与双隔离沙箱单元测试 (.test.mjs)
 │   │   ├── cordis.patch.yml   # DSH Bundle 补丁与 @deepseek-ai/dsh-agent-preset 声明
-│   │   └── package.json       # 插件清单与 dsh.client 入口声明
-│   └── tests/                 # Python 契约、触发器、沙箱与 Round 4 门禁单测 (test_*.py)
+│   │   └── package.json       # 插件清单 (v3.0.0) 与 dsh.client 入口声明
+│   └── tests/                 # Python P0/P1/P2 契约、隔离容器、触发器与 31 工具门禁单测 (test_*.py)
 └── docs/                      # 【顶层定稿、知识库与多轮实机审计档案】
     ├── architecture/          # 第一性手稿、13 篇论文融合专报 (04)、演进思辨 (05) 与 v3.0 工程交接说明书 (09)
     ├── agent_kb/              # v3.0 全套 7 份中层实施与 Prompt 零缩水直抄知识库 (00–06)
@@ -96,17 +96,15 @@ flowchart LR
 }
 ```
 
-### 3. 当前基线（`3dfa211`）自动化自检
-在仓库根目录使用 PowerShell 7 (`pwsh`) 或对应 Shell 运行现有测试套件（待后续 P0–P4 改造同步扩充 v3.0 测试）：
+### 3. v3.0.0 快速自动化自检（零 SDK 卡死）
+在仓库根目录使用 PowerShell 7 (`pwsh`) 或对应 Shell 运行全套 Python + Node 单元测试：
 
 ```powershell
-# 1. 运行 Python 控制面与门禁单元测试 (4 套 test_*.py)
+# 1. 运行 Python P0/P1/P2/P3 契约、隔离容器、31 窄工具门禁与审阅回归单测 (4 套 26 项)
 python -m unittest discover -s "./greatwall-v6up/tests" -p "test_*.py" -v
 
-# 2. 运行 DSH SDK E2E 与 Round 4 Hard Gates 测试 (2 套 .test.mjs)
-node --test --test-reporter=spec --test-force-exit --test-timeout=20000 `
-  "./greatwall-v6up/dsh_plugin/test/dsh_orchestrator_e2e.test.mjs" `
-  "./greatwall-v6up/dsh_plugin/test/round4_hard_gates.test.mjs"
+# 2. 运行 DSH 插件 Node 纯模块级控制面与双隔离沙箱单测 (9 项)
+node --test --test-reporter=spec --test-timeout=15000 "./greatwall-v6up/dsh_plugin/test/v3_control_plane_unit.test.mjs"
 ```
 
 ---

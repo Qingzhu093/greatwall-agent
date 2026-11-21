@@ -1,25 +1,23 @@
-# dsh-greatwall-v6up (v2.2.0 代码基线 · 待按 v3.0 说明书升级)
+# dsh-greatwall-v6up (v3.0.0)
 
-> **架构同步提示（2026-11-21）**：仓库顶层设计文档与 [`docs/agent_kb/`](../../docs/agent_kb/00_INDEX_Agent知识库总导航与必读映射.md) 已定稿为 **V6-Up v3.0**；当前 `dsh_plugin/` 源码仍对应 **v2.2 (`3dfa211`) 基线实现**，后续将按 [`09` 工程交接说明书](../../docs/architecture/09长城%20Agent%20V6-Up（v3.0）零前提工程架构与系统开发总说明书.md) 的 P0–P4 计划改造（新增盲审隔离沙箱、平台感知 Shell 断言、无 `eval_count` 锁 37% 触发及学派聚拢分流）。
+长城科研共同体 **GreatWall Agent V6-Up (v3.0)** 的 DeepSeek Harness (`0.2.2-rc.3`) 官方 Cordis 插件包。
 
-长城科研共同体 **V6-Up (v2.2)** 面向 DeepSeek Harness (`0.2.2-rc.3`) 的官方插件本体，遵循**双层解耦与单写并发控制面**架构：
+## 核心架构特性（v3.0）
 
-## 核心架构
-1. **上层 DSH 异步事件池编排器 (`lib/orchestrator.js`, `lib/agent_session_host.js`, `lib/pair_lifecycle.js`)**：
-   - 基于 DSH 原生 `ctx.agents.create()` 管理 **7 大标准角色**（`explorer`, `lineage_companion`, `logistics_coordinator`, `library_surveyor`, `library_verifier`, `works_engineer`, `supervisory_committee`）；
-   - 通过 `cordis.patch.yml` 声明式 `@deepseek-ai/dsh-agent-preset` + 运行时 `agentPresets.register()` 兜底注册 **5 套专用预设**（`greatwall-explorer` / `verifier` / `companion` / `works` / `governance`），并在 `setup` 内以 `tools.restrict()` + `tools.register()` 将 31 个 Python MCP 窄工具按角色精确切分为 3–5 个；
-   - 保留桌面主控预设原能力不受限，子角色全部在同工作区归档、支持 UI 直接追问纠偏与冷恢复自动重挂。
-2. **500,000 Token 真实水位时钟 & 回合间隙控制流 (`lib/clock_and_turn_gap.js`)**：
-   - 结合 `sessionProjections(['contextPressure'])`、`tokenMeter.measure()` 与 `agent/pre-step` + `tools/result` 追帧监听，原子同步至 SQLite `lineage_nodes.pressure_tokens`；
-   - 到达 `37%`（且首测完成）或 `70%` 时触发 `exec.concludeTurn()`，交由 `lineage_companion` 完成 `<=2` 轮反思对话并提炼**去思维链黑匣子摘要**独家写库。
-3. **方案 A 混合读写隔离沙箱 (`lib/read_isolated_sandbox.js`)**：
-   - 使用 `fs.realpathSync()` 解析最深祖先路径，免疫符号链接与 `..` 绕过；严密保护隔离 `$PLUGIN_DATA`（含 `greatwall.db`）、`evaluators/anchors/`、兄弟分支 worktree 与 `pwsh` 跨目录 / `$env:` / `sqlite3` 探测。
-4. **右侧栏「长城控制台」(`lib/client.js`, `lib/console_routes.js`) & 轻量遥测 (`lib/telemetry.js`)**：
-   - 通过 DSH Connection 鉴权路由 `/api/greatwall.status` 与 `/api/greatwall.control` 为右侧栏提供子题依赖锁、节点 `500k` 压力条、一键暂停/恢复/停止与人工定向 `intervene` 纠偏。
-5. **底层 Single-Writer Python MCP 控制面 (`../core_python/mcp_server/greatwall_core_mcp.py`)**：
-   - 持久化 stdio JSON-RPC 2.0 进程独占 SQLite WAL 写入与数据库触发器硬锁。
+- **6 套职责极净预设（`cordis.patch.yml` + `lib/presets.js`）**：
+  - `greatwall-explorer`：读写 fs + search + 平台 Shell（锁在分支 `worktree`）
+  - `greatwall-verifier`：只读 fs + search + 平台 Shell（锁在现建独立空白盲审沙箱，物理禁写/禁外网/禁 DB）
+  - `greatwall-companion`：只读 fs + search（单节点同会话暂停续传）
+  - `greatwall-works`：读写 fs + search + 平台 Shell（锁在 `evaluators/` 与 `skills/`，严禁修改 `worktrees/`）
+  - `greatwall-surveyor`：只读 fs + search + web（外藏文献与 Stage 3 五件套导出）
+  - `greatwall-db-only`：物理 0 原生工具（专供 `logistics_coordinator` 与 `supervisory_committee` 纯 SQLite 状态机驱动）
+- **Single-Writer Python MCP 桥（`lib/mcp_bridge.js`）**：常驻单进程 `python -u -m core_python.mcp_server.greatwall_core_mcp`，支持常规 60s / 重计算与校准 300s 分级 RPC 超时。
+- **双隔离沙箱与动态只读保护（`lib/read_isolated_sandbox.js`）**：探索 Worktree + 盲审空白沙箱 + 70% 探索者最后一轮亲笔遗嘱只读瞬时锁。
+- **单节点同会话伴随暂停续传与 70% 两步清醒交接（`lib/pair_lifecycle.js`）**：废除 `eval_count >= 1` 反思门槛，支持纯数学推导与多学科通用科研。
+- **两步联合终核与人类叫停真源（`lib/orchestrator.js` + `lib/console_routes.js`）**：`export_stage3_final_delivery` 绑定 `(delivery_id, delivery_sha256)`，支持 UI/MCP `human_stop` 写入控制面真源 `human_stop_requested_at`。
 
-## 在 DeepSeek Harness 桌面端中调控课题
-本插件通过软链挂载至 `~/.dsh/profiles/desktop` 后，主对话会话自动拥有入口工具 `greatwall_orchestrate` 与技能卡 `greatwall-research-loop`：
-1. 初始化或异步启动：`greatwall_orchestrate(action="start", workspace_root="<项目绝对路径>", goal_md="...", required_questions=["Q1", "Q2"])`（非阻塞 ~1s 返回，免受 600s 墙钟误杀）；
-2. 实时状态与纠偏：`greatwall_orchestrate(action="status" | "pause" | "resume" | "stop" | "intervene", workspace_root="...")` 或直接打开右侧栏 **「长城控制台」** Tab 可视化操作。
+## 快速自检（纯模块单元测试）
+
+```bash
+node --test --test-reporter=spec --test-timeout=15000 ./test/v3_control_plane_unit.test.mjs
+```

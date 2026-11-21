@@ -1,15 +1,12 @@
 /**
- * DSH 原生 TokenMeter 500k 物理时钟与 `concludeTurn()` 回合间隙控制流（v2.2）。
+ * DSH 原生 TokenMeter 500k 物理时钟与 `concludeTurn()` 回合间隙控制流（v3.0）。
  *
- * 100% 使用本机核准的 DSH `0.2.2-rc.3` 原生 API：
- * - 优先从 `ctx.sessionProjections.snapshot(agent.session, ['contextPressure'])` 读取 `projectedTokens ?? pressureTokens`
- * - 降级调用 `ctx.tokenMeter.measure(agent.session).totalTokens`（绝不虚构不存在的方法）
- * - 以 Single-Writer 控制面原子同步回 `lineage_nodes.pressure_tokens`（500,000 分母）
- * - 在 `agentCtx.tools.register` 注册的 MCP 工具体内调用 `exec.concludeTurn()`：
- *   当 `explorer` 的 `run_isolated_eval` 返回 `clock_signal.trigger` (`REFLECT_37` / `HANDOFF_70`)
- *   或当收官工具（`record_reflection_and_unlock_pull`, `submit_node_handoff`, `submit_stage1_blind_ledger(REJECT)`,
- *   `submit_stage2_unblind_verdict`, `export_stage3_final_delivery`, `record_compliance_check`）成功落库时，
- *   立即让当前 Turn 干净完结（`whenIdle()` 返回），由外层编排器在回合间隙顺序唤醒下一角色！
+ * 核心升级（对齐 09 §5.2 & agent_kb/05）：
+ * 1. 彻底废除 `evalCount >= 1` 反思锁：`pct >= 0.37 && !unlocked` 立即触发 `REFLECT_37`，
+ *    保障纯数学推导与零仪器探索节点同样准时获得 37% 诊断反思与内藏解锁；
+ * 2. `pct >= 0.70` 触发 `HANDOFF_70`，进入探索者只读亲笔遗嘱 + 伴随单写交接两步闭环；
+ * 3. `submit_stage1_blind_ledger` 在 `REVISE` 或 `REFUTED` 时立刻 `exec.concludeTurn()`，
+ *    `PASS` 时保留回合继续解盲执行 Stage 2。
  * @module dsh-greatwall-v6up/clock_and_turn_gap
  */
 import { TURN_CONCLUDING_TOOLS } from './prompts.js'
@@ -18,6 +15,7 @@ import { TURN_CONCLUDING_TOOLS } from './prompts.js'
  * 采样指定 Agent Session 当前上下文 Token 压力水位。
  * @param {object} ctx DSH Cordis Context
  * @param {object} agent DSH Live Agent（含 `agent.session`）
+ * @param {number} [defaultWindow=500000]
  * @returns {{ pressureTokens: number, contextWindow: number, source: string }}
  */
 export function sampleAgentContextPressure(ctx, agent, defaultWindow = 500_000) {
@@ -30,7 +28,6 @@ export function sampleAgentContextPressure(ctx, agent, defaultWindow = 500_000) 
     return { pressureTokens, contextWindow, source }
   }
 
-  // 1. 首选真实 DSH 0.2.2-rc.3 sessionProjections(['contextPressure'])
   try {
     const snap = ctx?.sessionProjections?.snapshot?.(session, ['contextPressure'])
     const cp = snap?.values?.contextPressure
@@ -46,7 +43,6 @@ export function sampleAgentContextPressure(ctx, agent, defaultWindow = 500_000) 
     }
   } catch {}
 
-  // 2. Step 0 或尚未累积 contextPressure 时回退 tokenMeter.measure(session)
   if (pressureTokens === 0 && typeof ctx?.tokenMeter?.measure === 'function') {
     try {
       const m = ctx.tokenMeter.measure(session)
@@ -62,12 +58,30 @@ export function sampleAgentContextPressure(ctx, agent, defaultWindow = 500_000) 
 }
 
 /**
+ * 纯函数计算当前上下文水位触发器（v3.0：无 `evalCount >= 1` 限制！）。
+ * @param {{ pressureTokens: number, contextWindow?: number, firstReflectionUnlocked?: boolean, reflectPct?: number, handoffPct?: number }} params
+ * @returns {{ pressurePct: number, trigger: 'HANDOFF_70' | 'REFLECT_37' | null }}
+ */
+export function evaluateContextClockTrigger({
+  pressureTokens,
+  contextWindow = 500_000,
+  firstReflectionUnlocked = false,
+  reflectPct = 0.37,
+  handoffPct = 0.70,
+}) {
+  const denom = Math.max(1, Number(contextWindow) || 500_000)
+  const pct = Math.max(0, Number(pressureTokens) || 0) / denom
+  if (pct >= handoffPct) {
+    return { pressurePct: pct, trigger: 'HANDOFF_70' }
+  }
+  if (pct >= reflectPct && !firstReflectionUnlocked) {
+    return { pressurePct: pct, trigger: 'REFLECT_37' }
+  }
+  return { pressurePct: pct, trigger: null }
+}
+
+/**
  * 将当前压力水位同步到 Python SQLite 单一真相时钟字段。
- * @param {object} ctx
- * @param {object} agent
- * @param {import('./mcp_bridge.js').GreatwallMcpBridge} bridge
- * @param {string} workspaceRoot
- * @param {string} nodeId
  */
 export async function syncLivePressureToDb(ctx, agent, bridge, workspaceRoot, nodeId) {
   if (!nodeId || !bridge) return null
@@ -84,9 +98,8 @@ export async function syncLivePressureToDb(ctx, agent, bridge, workspaceRoot, no
 }
 
 /**
- * 消除探索者连调几十次原生工具 (`read`/`edit`/`pwsh` 等) 期间 500k 时钟冻结的盲区：
- * 将 `syncLivePressureToDb` 与 37% / 70% 水位检查同时挂载到 `agent/pre-step` 与全部工具的 `tools/result`！
- * @param {object} params
+ * 实时追帧观测器：在探索者连续调用原生工具（`read`/`edit`/`pwsh`）期间同步 500k 时钟，
+ * 并在纯推导/零仪器场景下照常准时触发 37% 反思与 70% 交接。
  */
 export function installLiveClockObservers({
   rootCtx,
@@ -107,24 +120,27 @@ export function installLiveClockObservers({
   const checkAndSync = async (sourceHook) => {
     const syncRes = await syncLivePressureToDb(rootCtx, agent, bridge, workspaceRoot, nodeId)
     const sample = sampleAgentContextPressure(rootCtx, agent)
-    const pct = sample.pressureTokens / Math.max(1, sample.contextWindow || 500_000)
     const rowData = syncRes?.data ?? syncRes ?? {}
-    const evalCount = Number(rowData.eval_count ?? 0)
     const unlocked = Boolean(rowData.first_reflection_unlocked)
 
-    if (pct >= 0.70 && lastTriggerEmitted !== 'HANDOFF_70') {
+    const { pressurePct, trigger } = evaluateContextClockTrigger({
+      pressureTokens: sample.pressureTokens,
+      contextWindow: sample.contextWindow || 500_000,
+      firstReflectionUnlocked: unlocked,
+    })
+
+    if (trigger === 'HANDOFF_70' && lastTriggerEmitted !== 'HANDOFF_70') {
       lastTriggerEmitted = 'HANDOFF_70'
-      onNativeThresholdHit?.({ trigger: 'HANDOFF_70', pressurePct: pct, sourceHook, evalCount })
-    } else if (pct >= 0.37 && !unlocked && evalCount >= 1 && !lastTriggerEmitted) {
+      onNativeThresholdHit?.({ trigger: 'HANDOFF_70', pressurePct, sourceHook })
+    } else if (trigger === 'REFLECT_37' && !lastTriggerEmitted) {
       lastTriggerEmitted = 'REFLECT_37'
-      onNativeThresholdHit?.({ trigger: 'REFLECT_37', pressurePct: pct, sourceHook, evalCount })
+      onNativeThresholdHit?.({ trigger: 'REFLECT_37', pressurePct, sourceHook })
     }
   }
 
   try {
     const dResult = agentCtx.on('tools/result', (exec) => {
       const tname = String(exec?.name || '')
-      // `run_isolated_eval` 已在自身执行体做同步与 concludeTurn，其余原生工具与检索工具走这里实时追帧
       if (tname && tname !== 'run_isolated_eval') {
         void checkAndSync(`tools/result:${tname}`)
       }
@@ -150,11 +166,26 @@ export function installLiveClockObservers({
 }
 
 /**
- * 为指定角色的 DSH Agent 注册其专属 3–5 个 MCP 窄工具，并内嵌：
- * - 调用前自动同步最新 Token 压力（仅 `explorer` 带 `nodeId` 时）
- * - `tools.register` 严格输出 Schema + text 渲染
- * - Turn 间隙 `exec.concludeTurn()` 精准状态切换事件通知
- * @param {object} params
+ * 判断某个窄工具成功返回后是否应当在当前 Turn 边界优雅收尾 (`exec.concludeTurn()`)。
+ * @param {string} toolName
+ * @param {any} res
+ */
+export function shouldConcludeTurnAfterTool(toolName, res) {
+  if (!res?.ok) return false
+  if (toolName === 'run_isolated_eval') {
+    const trigger = res?.data?.clock_signal?.trigger
+    return trigger === 'REFLECT_37' || trigger === 'HANDOFF_70'
+  }
+  if (!TURN_CONCLUDING_TOOLS.has(toolName)) return false
+  if (toolName === 'submit_stage1_blind_ledger') {
+    const v = String(res?.data?.stage1_verdict || '').toUpperCase()
+    return v === 'REVISE' || v === 'REFUTED'
+  }
+  return true
+}
+
+/**
+ * 为指定角色的 DSH Agent 注册其专属 3–5 个 MCP 窄工具。
  */
 export function registerScopedMcpTools({
   rootCtx,
@@ -187,7 +218,6 @@ export function registerScopedMcpTools({
         },
       },
       async execute(args, exec) {
-        // 探索者每次发起评估/查询前同步最新 DSH Token 水位，确保 SQLite 时钟严格与 LLM Context 一致
         if (role === 'explorer' && nodeId) {
           await syncLivePressureToDb(rootCtx, agent, bridge, workspaceRoot, nodeId)
         }
@@ -198,9 +228,7 @@ export function registerScopedMcpTools({
           sessionId: agent.id,
         })
 
-        // 捕捉 Turn 间隙信号，在安全边界调用 exec.concludeTurn()
         if (role === 'explorer' && toolName === 'run_isolated_eval' && res?.ok) {
-          // 再次采样本轮刚产生的消耗并同步
           if (nodeId) {
             await syncLivePressureToDb(rootCtx, agent, bridge, workspaceRoot, nodeId)
           }
@@ -211,16 +239,10 @@ export function registerScopedMcpTools({
               onTurnSignal({ role, nodeId, sessionId: agent.id, toolName, trigger, receipt: res })
             }
           }
-        } else if (res?.ok && TURN_CONCLUDING_TOOLS.has(toolName)) {
-          // Stage 1 PASS 不直接结题（紧接着要调 Stage 2），只有 REJECT 短路或非 submit_stage1_blind_ledger 才结束
-          const shouldConclude =
-            toolName !== 'submit_stage1_blind_ledger' ||
-            String(res?.data?.stage1_verdict || '').toUpperCase() === 'REJECT'
-          if (shouldConclude) {
-            exec.concludeTurn()
-            if (typeof onTurnSignal === 'function') {
-              onTurnSignal({ role, nodeId, sessionId: agent.id, toolName, trigger: 'ROLE_TASK_DONE', receipt: res })
-            }
+        } else if (shouldConcludeTurnAfterTool(toolName, res)) {
+          exec.concludeTurn()
+          if (typeof onTurnSignal === 'function') {
+            onTurnSignal({ role, nodeId, sessionId: agent.id, toolName, trigger: 'ROLE_TASK_DONE', receipt: res })
           }
         }
 

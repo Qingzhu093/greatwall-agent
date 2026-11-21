@@ -1,28 +1,48 @@
 /**
- * 方案 A 混合读写隔离沙箱与双保险 Guard（v2.2 零过程 .md 公文 + 物理跨脉盲视）。
+ * 长城 V6-Up (v3.0) 双隔离读写沙箱与同步 Guard（探索 Worktree + 独立空白盲审沙箱 + 动态只读态）。
  *
- * 结合 DSH 0.2.2-rc.3 原生 `agentCtx.tools.guard` / `tools/pre-execute`：
- * 1. `resolveCanonicalTarget`: 使用 `fs.realpathSync` 逐层解析最深存在祖先并拼接剩余段，
- *    彻底免疫 `..`、大小写、Windows 8.3 短名及符号链接/目录联结绕过；
- * 2. 保护边界：
- *    - 严禁非特权角色读写外部 `$PLUGIN_DATA`（含 `greatwall.db`）、`evaluators/anchors`、
- *      任何 `_hidden*` 文件及兄弟分支 Worktree（不在自己 `worktreeAbsPath` 内的其他 `worktrees/*`）；
- *    - 严禁 7 大角色用写文件或 Shell 重定向写入过程公文（`HANDOFF*.md`, `*_AUDIT.md`, `*_CLOSURE.md`, `REVIEW*.md`）；
- * 3. Exploration-Safe `pwsh` / `bash` Shell Guard：
- *    - 拦截命令字符串中的跨目录绝对路径、上跳 `..\\`/`../`、`$env:GREATWALL_*`、`greatwall.db`、
- *      `anchors`、`_hidden`、以及跨 worktree 访问；仅在本人 `worktreeAbsPath` 内放行科研计算执行！
- * 4. 可控环境 Env 隔离（供 `dsh` / 子进程清洗泄露路径）与可选只读/ACL 状态记录。
+ * 严格落实 09 第四/五章沙箱边界：
+ * 1. `resolveCanonicalTarget`: `fs.realpathSync` 逐层解析最深存在祖先并规范化路径，防 `..` / 大小写 / 符号链接绕过；
+ * 2. 探索者 (`explorer`)：锁在本人 `worktreeAbsPath`，支持动态 `isReadonly()` 回调（70% 亲笔遗嘱回合瞬时锁写与 Shell）；
+ * 3. 盲审官 (`library_verifier`)：锁在独立现建空白盲审沙箱 `blind_sandbox_<review_id>/`，开放只读 fs + 平台 Shell，
+ *    物理禁写、禁外网、禁读 `greatwall.db` / `_hidden_calibrations` / 原 `worktrees/` / B 栏假设；
+ * 4. 科研仪器科 (`works_engineer`)：仅允许读写工作区内 `evaluators/`、`skills/` 与配置，**严禁修改 `worktrees/`**；
+ * 5. 纯 DB 角色 (`logistics_coordinator`、`supervisory_committee`)：物理 0 原生工具，Guard 二次兜底拦截任何磁盘与 Shell；
+ * 6. 全局禁写过程性 `.md` 公文（`HANDOFF*.md`, `*_AUDIT.md`, `*_CLOSURE.md`, `REVIEW*.md`）。
  * @module dsh-greatwall-v6up/read_isolated_sandbox
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { ROLE_MCP_TOOLS } from './prompts.js'
-
-const ALL_31_MCP_TOOLS = new Set(Object.values(ROLE_MCP_TOOLS).flat())
+import { ALL_31_MCP_TOOLS } from './prompts.js'
 
 export const PROCESS_MD_FORBIDDEN_RE = /(?:^|[\\/])(?:HANDOFF[^\\/]*|REVIEW[^\\/]*|SUPERVISORY[^\\/]*|LINEAGE_BRIEFING[^\\/]*|.*_(?:AUDIT|CLOSURE|HANDOFF|BRIEFING|VERDICT|REPORT))\.md$/i
 
-export const PROTECTED_TOKEN_RE = /(?:greatwall\.db(?:-wal|-shm)?|greatwall-v6up[\\/]workspaces|_hidden[a-z0-9_]*|evaluators[\\/]anchors|anchors[\\/]Q\d+|final_delivery|GREATWALL_DATA_DIR|GREATWALL_DB_PATH)/i
+export const PROTECTED_TOKEN_RE = /(?:greatwall\.db(?:-wal|-shm)?|greatwall-v6up[\\/]workspaces|_hidden_calibrations|_hidden[a-z0-9_]*|eval_artifacts|blind_sandboxes|final_delivery|GREATWALL_DATA_DIR|GREATWALL_DB_PATH|GREATWALL_PLUGIN_DATA_DIR|PLUGIN_DATA)/i
+
+export const VERIFIER_NETWORK_CMD_RE = /\b(?:curl|wget|Invoke-WebRequest|Invoke-RestMethod|iwr|irm|Start-BitsTransfer|nslookup|dig|nc|ncat|telnet|ssh|scp|ftp|urllib|requests|httpx|aiohttp|http\.client|socket\.create_connection)\b/i
+
+export const READONLY_BLOCKED_MCP_TOOLS = new Set([
+  'run_isolated_eval',
+  'request_literature_survey',
+  'save_lineage_briefing',
+  'record_reflection_and_unlock_pull',
+  'submit_node_handoff',
+  'register_method_family',
+  'triage_node',
+  'fork_branch',
+  'dispatch_stagnation_five_lanes',
+  'publish_external_literature_card',
+  'export_stage3_final_delivery',
+  'submit_stage1_blind_ledger',
+  'submit_stage2_unblind_verdict',
+  'propose_salvaged_lemma',
+  'register_question_instrument',
+  'upgrade_instrument_with_calibration',
+  'recompute_stage_b_only',
+  'update_skill_ledger',
+  'record_compliance_check',
+  'register_saved_graph_query',
+])
 
 export const WRITE_TOOL_NAMES = new Set([
   'write',
@@ -39,8 +59,10 @@ export const PATH_ARG_KEYS = ['file_path', 'path', 'target_file', 'file', 'dir',
 
 export const SHELL_TOOL_NAMES = new Set(['pwsh', 'bash', 'shell', 'run_command'])
 
+const SHELL_WRITE_RE = /(?:>|>>|\bOut-File\b|\bSet-Content\b|\bAdd-Content\b|\bNew-Item\b|\bRemove-Item\b|\bMove-Item\b|\bCopy-Item\b|\btee\b|\brm\s|\bmv\s|\bcp\s|\btouch\s|\bmkdir\s)/i
+
 /**
- * 同步规范化（含最深存在祖先 realpathSync + 小写 Windows 归一化）。
+ * 同步规范化（含最深存在祖先 realpathSync + Windows 小写归一化）。
  * @param {string} targetPath
  * @param {string} [baseDir]
  */
@@ -89,186 +111,246 @@ export function extractPathValues(args) {
 }
 
 /**
- * 对 Shell 命令字符串执行逃逸与跨界访问静态审查。
+ * 对 Shell 命令字符串执行逃逸、越权与外网静态审查。
  * @param {string} commandText
- * @param {{ role: string, worktreeCanon: string, workspaceCanon: string, protectedCanons: string[], readonly?: boolean }} opts
+ * @param {{ role: string, sandboxCanon: string, workspaceCanon: string, worktreesCanon?: string, protectedCanons?: string[], readonly?: boolean }} opts
  * @returns {string | null} 若命中违规则返回拒绝原因，否则 null
  */
 export function evaluateShellCommandGuard(commandText, opts) {
+  const role = String(opts.role || '')
   if (opts.readonly) {
-    return 'SANDBOX_VIOLATION: 该会话已结案进入只读保护态，禁止再执行任何 Shell 命令'
+    return 'SANDBOX_VIOLATION: 该会话已进入只读保护态（含 70% 遗嘱收官或结案归档），禁止再执行任何 Shell 命令'
   }
+  if (role === 'logistics_coordinator' || role === 'supervisory_committee' || role === 'lineage_companion' || role === 'library_surveyor') {
+    return `SANDBOX_VIOLATION: 角色 ${role} 无终端执行权限`
+  }
+
   const cmd = String(commandText ?? '')
   if (!cmd.trim()) return null
 
   if (PROTECTED_TOKEN_RE.test(cmd)) {
-    return 'SANDBOX_VIOLATION: Shell 命令严禁触及受保护数据库 (greatwall.db)、真值锚点 (anchors) 或隐藏资产'
+    return 'SANDBOX_VIOLATION: Shell 命令严禁触及受保护数据库 (greatwall.db)、隐藏校准集 (_hidden_calibrations) 或外部控制面资产'
   }
 
-  // 严禁写出过程 .md 公文
-  if (/\.(?:md)\b/i.test(cmd) && /(?:>|>>|Out-File|Set-Content|Add-Content|New-Item|tee)\b/i.test(cmd)) {
+  // 全局禁写过程 .md 公文
+  if (/\.(?:md)\b/i.test(cmd) && SHELL_WRITE_RE.test(cmd)) {
     if (PROCESS_MD_FORBIDDEN_RE.test(cmd) || /(?:HANDOFF|AUDIT|CLOSURE|BRIEFING)\.md/i.test(cmd)) {
       return 'NO_MD_DOSSIER_POLICY: 严禁使用 Shell 生成过程性 .md 公文，请调用对应 MCP 窄工具写库'
     }
   }
 
-  if (opts.role === 'explorer') {
-    // 禁止工作树上跳、家目录缩写或环境变量路径探测
+  // 探索者与盲审官：同属严格单目录隔离沙箱
+  if (role === 'explorer' || role === 'library_verifier') {
     if (/(?:^|[\s"'`(=,;\\\/])\.\.(?:[\\/]|$|['"`\s;,)])/.test(cmd)) {
-      return 'SANDBOX_VIOLATION: explorer 隔离区严禁使用上跳路径 (..)'
+      return `SANDBOX_VIOLATION: ${role} 隔离区严禁使用上跳路径 (..)`
     }
     if (/~[\\/]|HOME\b|\$(?:env:)?(?:USERPROFILE|HOME|APPDATA|LOCALAPPDATA|TEMP|TMP|GREATWALL_|PLUGIN_DATA|DSH_HOME)/i.test(cmd)) {
-      return 'SANDBOX_VIOLATION: explorer 严禁探测宿主敏感环境变量或用户主目录'
+      return `SANDBOX_VIOLATION: ${role} 严禁探测宿主敏感环境变量或用户主目录`
     }
     if (/\bsqlite3\b/i.test(cmd)) {
-      return 'SANDBOX_VIOLATION: explorer 严禁直接调用 sqlite3 探测数据库'
+      return `SANDBOX_VIOLATION: ${role} 严禁直接调用 sqlite3 探测数据库`
     }
-    // 检查兄弟 worktree 名称与受保护目录片段
+    if (role === 'library_verifier') {
+      if (VERIFIER_NETWORK_CMD_RE.test(cmd)) {
+        return 'SANDBOX_VIOLATION: library_verifier 盲审沙箱物理断网，严禁发起任何网络命令或 HTTP/Socket 请求'
+      }
+      if (/\bworktrees\b/i.test(cmd)) {
+        return 'SANDBOX_VIOLATION: library_verifier 严禁访问原探索分支 worktrees/ 目录'
+      }
+    }
     for (const prot of opts.protectedCanons || []) {
       const normalizedCmd = process.platform === 'win32' ? cmd.toLowerCase().replace(/\//g, '\\') : cmd
       const normalizedProt = process.platform === 'win32' ? prot.toLowerCase() : prot
       if (normalizedProt && normalizedCmd.includes(normalizedProt)) {
-        return `SANDBOX_VIOLATION: explorer 严禁在 Shell 中引用受保护外部目录 (${prot})`
+        return `SANDBOX_VIOLATION: ${role} 严禁在 Shell 中引用受保护外部目录 (${prot})`
       }
     }
-    // 扫描命令中出现的所有显式盘符/UNC绝对路径，必须全部位于本分支工作树或 Python 可执行路径白名单内
-    const winAbsRe = /(?:[a-zA-Z]:[\\/]|\\\\)[^\s"'`;|><&()]+/g
+    // 扫描显式绝对路径（Windows 盘符/UNC 与 POSIX 根路径），仅放行本沙箱内路径与常见解释器路径
+    const absRe = process.platform === 'win32'
+      ? /(?:[a-zA-Z]:[\\/]|\\\\)[^\s"'`;|><&()]+/g
+      : /(?:^|[\s"'`(=,;])(\/[^\s"'`;|><&()]+)/g
     let m
-    while ((m = winAbsRe.exec(cmd)) !== null) {
-      const rawHit = m[0]
+    while ((m = absRe.exec(cmd)) !== null) {
+      const rawHit = process.platform === 'win32' ? m[0] : m[1]
       const candidate = resolveCanonicalTarget(rawHit)
-      const inOwnTree = isInsideRoot(candidate, opts.worktreeCanon)
-      const isPythonOrTemp = /(?:python(?:\d+(?:\.\d+)*)?(?:\.exe)?|python3|uv(?:\.exe)?|\.venv)[\\/]?$/i.test(candidate) ||
-        /[\\/]python\d*[\\/]python\.exe$/i.test(candidate)
-      if (!inOwnTree && !isPythonOrTemp) {
-        return `SANDBOX_VIOLATION: explorer 命令越界引用工作树外路径 (${rawHit})`
+      const inOwnSandbox = isInsideRoot(candidate, opts.sandboxCanon)
+      const isRuntimeBin = /(?:python(?:\d+(?:\.\d+)*)?(?:\.exe)?|python3|uv(?:\.exe)?|lean(?:\.exe)?|node(?:\.exe)?|\.venv)[\\/]?$/i.test(candidate) ||
+        /[\\/](?:usr[\\/]bin|bin|python\d*)[\\/][^\\/]+$/i.test(candidate)
+      if (!inOwnSandbox && !isRuntimeBin) {
+        return `SANDBOX_VIOLATION: ${role} 命令越界引用沙箱外路径 (${rawHit})`
       }
+    }
+  } else if (role === 'works_engineer') {
+    // 工造司严禁修改或篡改探索者 worktrees/
+    if (/\bworktrees[\\/]/i.test(cmd) && SHELL_WRITE_RE.test(cmd)) {
+      return 'SANDBOX_VIOLATION: works_engineer 严禁修改探索者分支工作树 worktrees/'
     }
   }
+
   return null
 }
 
 /**
- * 在 DSH `setup(agentCtx, agent)` 或冷恢复 `agent/created` 内挂载方案 A 同步 Guard 与 `UNAUTHORIZED_TOOL_ATTEMPT` 审计记账。
- * @param {object} agentCtx
+ * 构建纯规则评估器（供运行时 Guard 与单元测试直接复用，无需 mock DSH 容器）。
  * @param {object} opts
  * @param {string} opts.role
- * @param {string} opts.sessionId
- * @param {string} [opts.nodeId]
  * @param {string} opts.workspaceRoot
  * @param {string} [opts.worktreeAbsPath]
+ * @param {string} [opts.sandboxAbsPath]
  * @param {string[]} [opts.protectedDirs]
- * @param {boolean} [opts.readonly=false]
- * @param {import('./mcp_bridge.js').GreatwallMcpBridge} [opts.bridge]
- * @returns {() => void}
+ * @param {boolean | (() => boolean)} [opts.readonly=false]
  */
-export function installRoleSandboxGuard(agentCtx, opts) {
+export function createSandboxCallEvaluator(opts) {
   const role = String(opts.role || '')
-  const readonly = Boolean(opts.readonly)
+  const getReadonly = typeof opts.readonly === 'function' ? opts.readonly : () => Boolean(opts.readonly)
   const wsCanon = resolveCanonicalTarget(opts.workspaceRoot || process.cwd())
-  const wtCanon = opts.worktreeAbsPath ? resolveCanonicalTarget(opts.worktreeAbsPath) : wsCanon
-  const problemPackCanon = resolveCanonicalTarget(path.join(opts.workspaceRoot || process.cwd(), 'problem_pack'))
-  const anchorsCanon = resolveCanonicalTarget(path.join(opts.workspaceRoot || process.cwd(), 'evaluators', 'anchors'))
+  const worktreesCanon = resolveCanonicalTarget(path.join(opts.workspaceRoot || process.cwd(), 'worktrees'))
+  const hiddenCalCanon = resolveCanonicalTarget(path.join(opts.workspaceRoot || process.cwd(), 'evaluators', '_hidden_calibrations'))
   const finalDeliveryCanon = resolveCanonicalTarget(path.join(opts.workspaceRoot || process.cwd(), 'final_delivery'))
 
+  const effectiveSandboxDir = role === 'library_verifier'
+    ? (opts.sandboxAbsPath || opts.worktreeAbsPath || '')
+    : ((role === 'explorer' || role === 'lineage_companion') && opts.worktreeAbsPath ? opts.worktreeAbsPath : opts.workspaceRoot)
+  const sandboxCanon = effectiveSandboxDir ? resolveCanonicalTarget(effectiveSandboxDir) : ''
+
   const autoProtected = [
-    anchorsCanon,
+    hiddenCalCanon,
     finalDeliveryCanon,
     ...(opts.protectedDirs || []).filter(Boolean),
   ]
+  if (role === 'library_verifier') {
+    autoProtected.push(worktreesCanon)
+  }
   const protectedCanons = [...new Set(autoProtected.map((d) => resolveCanonicalTarget(d)).filter(Boolean))]
+
+  /** @param {{ name?: string, arguments?: Record<string, any> }} exec */
+  return function evaluateToolCall(exec) {
+    const name = String(exec?.name || '')
+    const args = exec?.arguments || {}
+    const isReadonlyNow = Boolean(getReadonly())
+
+    const isWriteTool = WRITE_TOOL_NAMES.has(name) || name.includes('write') || name.includes('edit')
+    const isShellTool = SHELL_TOOL_NAMES.has(name) || typeof args?.command === 'string' || typeof args?.CommandLine === 'string'
+
+    // 只读态强门禁必须早于 MCP 放行：70% 亲笔遗嘱回合同步禁掉写文件、Shell 与任何写/评测 MCP 工具！
+    if (isReadonlyNow && (isWriteTool || isShellTool || READONLY_BLOCKED_MCP_TOOLS.has(name))) {
+      return `SANDBOX_VIOLATION: 该会话已处于只读态（70% 亲笔遗嘱或已归档），严禁调用写入、终端或状态变更工具 (${name})`
+    }
+
+    // 31 个 Python MCP 窄工具与控制面工具由 Python RBAC 管控，非只读冲突时放行
+    if (ALL_31_MCP_TOOLS.has(name) || name.startsWith('greatwall_')) {
+      return undefined
+    }
+
+    // 纯 DB 角色：物理 0 原生工具（Guard 二次兜底）
+    if (role === 'logistics_coordinator' || role === 'supervisory_committee') {
+      return `SANDBOX_VIOLATION: ${role} 为纯 DB 治理角色（0 原生工具），禁止调用原生工具 ${name}`
+    }
+
+    // 禁写过程 .md 公文 + 严禁只读角色修改磁盘
+    if (isWriteTool) {
+      if (role === 'library_surveyor' || role === 'lineage_companion' || role === 'library_verifier') {
+        return `SANDBOX_VIOLATION: ${role} 严禁修改磁盘文件 (${name})`
+      }
+      for (const pVal of extractPathValues(args)) {
+        if (PROCESS_MD_FORBIDDEN_RE.test(pVal)) {
+          return 'NO_MD_DOSSIER_POLICY: V6-Up v3.0 严禁在磁盘撰写过程性 .md 公文（如 HANDOFF.md / *_AUDIT.md / *_CLOSURE.md），请直接写 SQLite 窄工具！'
+        }
+      }
+    }
+
+    // 路径隔离检查
+    const baseForRel = effectiveSandboxDir || opts.workspaceRoot
+    const pathVals = extractPathValues(args)
+    for (const pVal of pathVals) {
+      const canon = resolveCanonicalTarget(pVal, baseForRel)
+      const isVerifierOwnSandbox = role === 'library_verifier' && Boolean(sandboxCanon) && isInsideRoot(canon, sandboxCanon)
+      if (PROTECTED_TOKEN_RE.test(pVal)) {
+        const isCalForWorks = role === 'works_engineer' && /_hidden_calibrations/i.test(pVal) && !/greatwall\.db/i.test(pVal)
+        const isDbOrHidden = /(?:greatwall\.db(?:-wal|-shm)?|_hidden_calibrations|GREATWALL_DATA_DIR|GREATWALL_DB_PATH|GREATWALL_PLUGIN_DATA_DIR)/i.test(pVal)
+        if (!isCalForWorks && !(isVerifierOwnSandbox && !isDbOrHidden)) {
+          return `SANDBOX_VIOLATION: 角色 ${role} 严禁访问受保护资产 (${pVal})`
+        }
+      }
+      if (role !== 'works_engineer') {
+        for (const prot of protectedCanons) {
+          if (isVerifierOwnSandbox) {
+            continue
+          }
+          if (isInsideRoot(canon, prot)) {
+            return `SANDBOX_VIOLATION: 禁止访问受保护外部数据区或隐藏资产 (${pVal})`
+          }
+        }
+      }
+
+      if (role === 'explorer' || role === 'lineage_companion') {
+        if (!sandboxCanon || !isInsideRoot(canon, sandboxCanon)) {
+          return `SANDBOX_VIOLATION: ${role} 仅限在配对隔离工作树 (${effectiveSandboxDir}) 内访问，禁止越界 ${pVal}`
+        }
+      } else if (role === 'library_verifier') {
+        if (!sandboxCanon || !isInsideRoot(canon, sandboxCanon)) {
+          return `SANDBOX_VIOLATION: library_verifier 仅限在独立空白盲审沙箱 (${effectiveSandboxDir}) 内只读跑证，禁止越界 ${pVal}`
+        }
+      } else if (role === 'works_engineer') {
+        if (!isInsideRoot(canon, wsCanon)) {
+          return `SANDBOX_VIOLATION: works_engineer 仅限在实验工作区内访问，禁止越界 ${pVal}`
+        }
+        if (isWriteTool && isInsideRoot(canon, worktreesCanon)) {
+          return `SANDBOX_VIOLATION: works_engineer 严禁修改探索者分支工作树 (${pVal})`
+        }
+      } else if (role === 'library_surveyor') {
+        if (!isInsideRoot(canon, wsCanon)) {
+          return `SANDBOX_VIOLATION: library_surveyor 仅限在实验工作区内只读访问，禁止越界 ${pVal}`
+        }
+      }
+    }
+
+    // Shell 命令审查
+    if (isShellTool) {
+      const cmdStr = String(args?.command ?? args?.CommandLine ?? args?.script ?? '')
+      const shellErr = evaluateShellCommandGuard(cmdStr, {
+        role,
+        readonly: isReadonlyNow,
+        sandboxCanon,
+        workspaceCanon: wsCanon,
+        worktreesCanon,
+        protectedCanons: role === 'library_verifier'
+          ? protectedCanons.filter((p) => !isInsideRoot(sandboxCanon, p))
+          : protectedCanons,
+      })
+      if (shellErr) return shellErr
+    }
+
+    return undefined
+  }
+}
+
+/**
+ * 在 DSH `setup(agentCtx, agent)` 或冷恢复 `agent/created` 内挂载双隔离同步 Guard。
+ * @param {object} agentCtx
+ * @param {object} opts
+ */
+export function installRoleSandboxGuard(agentCtx, opts) {
+  const role = String(opts.role || '')
+  const checkCall = createSandboxCallEvaluator(opts)
 
   const reportUnauthorized = (toolName, reason, args) => {
     if (!opts.bridge) return
     void opts.bridge
       .control('control_plane/fact_edge', {
         workspace_root: opts.workspaceRoot,
-        src_id: opts.nodeId || opts.sessionId || role,
-        dst_id: `guard:${toolName}`,
-        edge_type: 'UNAUTHORIZED_TOOL_ATTEMPT',
+        source_id: opts.nodeId || opts.sessionId || role,
+        target_id: `guard:${toolName}`,
+        edge_type: 'USED_TOOL',
+        session_id: opts.sessionId,
         metadata: {
+          unauthorized: true,
           role,
-          session_id: opts.sessionId,
           reason: String(reason).slice(0, 200),
           args_preview: JSON.stringify(args ?? {}).slice(0, 300),
         },
       })
       .catch(() => {})
-  }
-
-  /** @param {any} exec */
-  const checkCall = (exec) => {
-    const name = String(exec?.name || '')
-    const args = exec?.arguments || {}
-
-    if (readonly && (WRITE_TOOL_NAMES.has(name) || SHELL_TOOL_NAMES.has(name) || name.includes('write') || name.includes('edit'))) {
-      return 'SANDBOX_VIOLATION: 该短事务会话已结案进入只读态，严禁再执行写入或终端操作'
-    }
-
-    // 自有 31 个 MCP 窄工具直接由 Python 控制面执行第二道 RBAC，这里放行
-    if (ALL_31_MCP_TOOLS.has(name) || name.startsWith('greatwall_')) return undefined
-
-    // 禁写过程 .md 公文（全局适用 7 角色）且禁止只读角色直接写磁盘
-    if (WRITE_TOOL_NAMES.has(name) || name.includes('write') || name.includes('edit')) {
-      if (role === 'library_surveyor' || role === 'lineage_companion' || role === 'logistics_coordinator' || role === 'supervisory_committee') {
-        return `SANDBOX_VIOLATION: ${role} 严禁直接修改工作区文件`
-      }
-      for (const pVal of extractPathValues(args)) {
-        if (PROCESS_MD_FORBIDDEN_RE.test(pVal)) {
-          return 'NO_MD_DOSSIER_POLICY: V6-Up v2.2 严禁在磁盘撰写过程性 .md 公文（如 HANDOFF.md / *_AUDIT.md / *_CLOSURE.md），请直接写 SQLite 窄工具！'
-        }
-      }
-    }
-
-    // 路径隔离检查
-    const baseForRel = (role === 'explorer' || role === 'lineage_companion') && opts.worktreeAbsPath
-      ? opts.worktreeAbsPath
-      : opts.workspaceRoot
-    const pathVals = extractPathValues(args)
-    for (const pVal of pathVals) {
-      if (PROTECTED_TOKEN_RE.test(pVal)) {
-        return `SANDBOX_VIOLATION: 角色 ${role} 严禁访问受保护资产 (${pVal})`
-      }
-      const canon = resolveCanonicalTarget(pVal, baseForRel)
-      if (role !== 'works_engineer' && role !== 'supervisory_committee') {
-        for (const prot of protectedCanons) {
-          if (isInsideRoot(canon, prot)) {
-            return `SANDBOX_VIOLATION: 禁止读写受保护外部数据区或真值锚点 (${pVal})`
-          }
-        }
-      }
-      if (role === 'explorer' || role === 'lineage_companion') {
-        if (!isInsideRoot(canon, wtCanon)) {
-          return `SANDBOX_VIOLATION: ${role} 仅限在配对隔离工作树 (${opts.worktreeAbsPath}) 内访问，禁止越界 ${pVal}`
-        }
-      } else if (role === 'logistics_coordinator') {
-        // logistics_coordinator 仅可只读 problem_pack/ 与工作区根目录（严禁窥探 worktrees/ 与 evaluators/）
-        const inProblemPack = isInsideRoot(canon, problemPackCanon)
-        const isRootDir = canon === wsCanon
-        if (!inProblemPack && !isRootDir) {
-          return `SANDBOX_VIOLATION: logistics_coordinator 仅可只读 problem_pack/ 题面目录，禁止探视分支或评测代码 (${pVal})`
-        }
-      } else if (role === 'works_engineer' || role === 'library_surveyor') {
-        if (!isInsideRoot(canon, wsCanon)) {
-          return `SANDBOX_VIOLATION: ${role} 仅限在实验工作区内访问，禁止越界 ${pVal}`
-        }
-      }
-    }
-
-    // Shell 命令检查（DSH pwsh 的工作目录参数亦可覆盖，已在上面 pathVals 校验 args.cwd / args.workdir）
-    if (SHELL_TOOL_NAMES.has(name) || typeof args?.command === 'string' || typeof args?.CommandLine === 'string') {
-      const cmdStr = String(args?.command ?? args?.CommandLine ?? args?.script ?? '')
-      const shellErr = evaluateShellCommandGuard(cmdStr, {
-        role,
-        readonly,
-        worktreeCanon: wtCanon,
-        workspaceCanon: wsCanon,
-        protectedCanons,
-      })
-      if (shellErr) return shellErr
-    }
-
-    return undefined
   }
 
   const disposeGuard = agentCtx.tools.guard((exec) => {
