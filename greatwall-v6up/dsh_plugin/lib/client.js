@@ -179,7 +179,7 @@ window.__ModuleLoader__.load({
 			const ambiguousAlerts = snap.ambiguous_spec_alerts || st.ambiguousSpecAlerts || [];
 			const closureStatus = snap.closure_state?.status || st.closureStatus || "OPEN";
 			const poolState = st.poolState || st.state || "idle";
-			const kernelAlive = st.kernelAlive !== false;
+			const kernelAlive = st.kernelAlive === true;
 			const lastError = st.lastError || "";
 			const knownWorkspaces = payload?.knownWorkspaces || [];
 

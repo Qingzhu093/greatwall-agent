@@ -227,6 +227,7 @@ export class GreatwallOrchestrator {
       this._loopAbortController = new AbortController()
     }
     this._lastError = null
+    this._govCooldownUntil.clear()
     this._poolState = 'running'
     this._stage3Done = false
     this.telemetry.setOrchestratorState('running')
@@ -903,7 +904,8 @@ export class GreatwallOrchestrator {
         this._launchExplorerWorker(node, snap, sig)
       }
 
-      if (!dispatchedSomething && this._runningExplorers.size === 0 && this._runningGov.size === 0) {
+      const hasCoolingGov = [...this._govCooldownUntil.values()].some((until) => until > Date.now())
+      if (!dispatchedSomething && this._runningExplorers.size === 0 && this._runningGov.size === 0 && !hasCoolingGov) {
         idleStreak += 1
         if (idleStreak >= 3) break
       } else {
