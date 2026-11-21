@@ -2,8 +2,8 @@
 
 > 面向长周期、高并发、无人值守通用 **AI for Science**（科学计算、物理仿真、数学推导与形式化发现）的 **DeepSeek Harness (`0.2.2-rc.3`) × Python Single-Writer 控制面 × 双隔离沙箱** 多智能体科研协同系统。  
 > **当前版本状态（2026-11-21 第四轮复盘后）**：
-> - **顶层架构与知识库（v3.0 已定版）**：已完成去竞赛过拟合大重构与全套工程契约闭环（见 [`PROJECT.md`](PROJECT.md)、[`04` 顶层专报](docs/architecture/04_十三篇前沿论文深度解惑与V6Up架构融合专报.md)、[`09` 工程交接说明书](docs/architecture/09_V6Up_v2.2_实施侧工程交接与系统开发总说明书.md) 及 [`docs/agent_kb/`](docs/agent_kb/00_INDEX_Agent知识库总导航与必读映射.md)）。
-> - **代码实现底座（[`greatwall-v6up/`](greatwall-v6up/)）**：当前代码停留在 `3dfa211`（v2.2 基线 + 第 4 轮应急门禁修复），**待按 [`09` 说明书](docs/architecture/09_V6Up_v2.2_实施侧工程交接与系统开发总说明书.md) 进入 P0–P4 的 v3.0 重构落地**。系统仍处实验验证期，暂不建议外部直接下载用于生产。
+> - **顶层架构与知识库（v3.0 已定版）**：已完成去竞赛过拟合大重构与全套工程契约闭环（见 [`PROJECT.md`](PROJECT.md)、[`04` 顶层专报](docs/architecture/04_长城%20Agent%20V6-Up：面向长周期自主科学发现的多智能体系统架构白皮书（v3.0）.md)、[`09` 工程交接说明书](docs/architecture/09长城%20Agent%20V6-Up（v3.0）零前提工程架构与系统开发总说明书.md) 及 [`docs/agent_kb/`](docs/agent_kb/00_INDEX_Agent知识库总导航与必读映射.md)）。
+> - **代码实现底座（[`greatwall-v6up/`](greatwall-v6up/)）**：当前代码停留在 `3dfa211`（v2.2 基线 + 第 4 轮应急门禁修复），**待按 [`09` 说明书](docs/architecture/09长城%20Agent%20V6-Up（v3.0）零前提工程架构与系统开发总说明书.md) 进入 P0–P4 的 v3.0 重构落地**。系统仍处实验验证期，暂不建议外部直接下载用于生产。
 
 ---
 
@@ -115,8 +115,8 @@ node --test --test-reporter=spec --test-force-exit --test-timeout=20000 `
 
 - **全局总入口**：[`PROJECT.md`](PROJECT.md)
 - **第一性思想原点**：[`docs/architecture/手写project.md`](docs/architecture/手写project.md)
-- **顶层架构总纲（v3.0 定稿）**：[`docs/architecture/04_十三篇前沿论文深度解惑与V6Up架构融合专报.md`](docs/architecture/04_十三篇前沿论文深度解惑与V6Up架构融合专报.md)
-- **工程交接与 P0–P4 施工总说明书**：[`docs/architecture/09_V6Up_v2.2_实施侧工程交接与系统开发总说明书.md`](docs/architecture/09_V6Up_v2.2_实施侧工程交接与系统开发总说明书.md)
+- **顶层架构总纲（v3.0 定稿）**：[`docs/architecture/04_长城 Agent V6-Up：面向长周期自主科学发现的多智能体系统架构白皮书（v3.0）.md`](docs/architecture/04_长城%20Agent%20V6-Up：面向长周期自主科学发现的多智能体系统架构白皮书（v3.0）.md)
+- **工程交接与 P0–P4 施工总说明书**：[`docs/architecture/09长城 Agent V6-Up（v3.0）零前提工程架构与系统开发总说明书.md`](docs/architecture/09长城%20Agent%20V6-Up（v3.0）零前提工程架构与系统开发总说明书.md)
 - **Agent 制度与 Prompt 零缩水直抄知识库**：[`docs/agent_kb/00_INDEX_Agent知识库总导航与必读映射.md`](docs/agent_kb/00_INDEX_Agent知识库总导航与必读映射.md)
 - **演进思辨与第 4 轮复盘**：[`docs/architecture/05_V6Up架构演进思辨与文献取舍絮语集.md`](docs/architecture/05_V6Up架构演进思辨与文献取舍絮语集.md) · [`docs/round4_audit/`](docs/round4_audit/01_交顶层设计者_原文对照与架构讨论稿_对齐版.md)
 - **DSH 插件模块说明**：[`greatwall-v6up/dsh_plugin/README.md`](greatwall-v6up/dsh_plugin/README.md)

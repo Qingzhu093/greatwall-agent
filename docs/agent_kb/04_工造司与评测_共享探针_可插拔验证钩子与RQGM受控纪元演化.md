@@ -1,87 +1,90 @@
-# 知识卡 04：工造司重构为【科研仪器科】——统一三档仪器、四态隔离与校准升级（v3.0）
+# 知识卡 04：工造司（科研仪器科）——统一仪器、三档四态与校准集版本演进
 
-> **核心依据来源**：  
-> - [`../architecture/手写project.md`](../architecture/手写project.md)（L3, L166–170 透明模拟器、不压死早期萌芽、防作弊、不拿竞赛特例污染通用底座）  
-> - [`../round4_audit/01_交顶层设计者_原文对照与架构讨论稿_对齐版.md`](../round4_audit/01_交顶层设计者_原文对照与架构讨论稿_对齐版.md) & [`03_顶层设计深度审阅_原文溯源与决策对照_对齐版.md`](../round4_audit/03_顶层设计深度审阅_原文溯源与决策对照_对齐版.md) & [`第六轮审阅（针对第四轮测试）.md`](../round4_audit/第六轮审阅（针对第四轮测试）.md)（工造司大范围重构、废除全题强制基线/5%门禁/AST特例/平局保在位/计数回退、`Obs-031` 冤案复盘）  
-> - `Audit the Scaffold` [`2609.34924#L312-L329`](file:///D:/Documents/deepseek%20harness/论文研读/2609.34924_Audit_the_Scaffold_Not_the_Checkpoint_A_Stationarity_Dichotomy_for_Recursive_Self-Improvement_in_Agentic_Coding/2609.34924_AuditTheScaffold_%E4%B8%AD%E6%96%87%E7%BB%BC%E8%BF%B0.md#L312-L329)（工具扩张才是突破天花板的唯一杠杆 + **黄金补丁自测测试器揪出 23/50 测坏的科研诚实铁律**）  
-> - `RQGM` [`2606.26294_中文翻译.md#L76-L109`](file:///D:/Documents/deepseek%20harness/论文研读/2606.26294_The_Red_Queen_Godel_Machine_Co-Evolving_Agents_and_Their_Evaluators/2606.26294_RedQueenGodelMachine_%E4%B8%AD%E6%96%87%E7%BF%BB%E8%AF%91.md#L76-L109)（只在同一版本口径内比较、独立锚点门控、对抗池沉淀回归、保留全部产物按需重评、83%–90% 改进落在共享基建）  
-> - `AgentDiscover` [`evaluator.py#L197-L267`](file:///D:/Documents/deepseek%20harness/论文研读/2610.05334_AgentDiscover_Autonomous_Discovery_with_Minimal_Search_Scaffolding/AgentDiscover/agentdiscover/server/evaluator.py#L197-L267) & `Station` [`STAGNATION.md#L28-L36`](file:///D:/Documents/deepseek%20harness/论文研读/2608.23691_Autonomous_Mathematical_Discovery_in_an_Open-World_Multi-Agent_Environment/station/example/doc/STAGNATION.md#L28-L36)（多条独立进展轨道 `progress_records`）
+> **模块归属**：`works_engineer`、`evaluators/isolated_runner.py`、校准集回归引擎与 `skills/SKILL_LEDGER.json`。  
+> **配套阅读**：[`04` 顶层白皮书 §4.1](../architecture/04_长城%20Agent%20V6-Up：面向长周期自主科学发现的多智能体系统架构白皮书（v3.0）.md#41-工造司科研仪器科统一仪器三档四态与校准升级) ｜ [`09` 工程开发总说明书 §4](../architecture/09长城%20Agent%20V6-Up（v3.0）零前提工程架构与系统开发总说明书.md#第四章通用隔离执行器isolated_runnerpy与校准引擎实现规格)
 
 ---
 
-## 一、定位纠正：从“强行判生死的判官”回归【科研仪器科】
+## 一、第一性定位：实验室仪器提供商，而非科学判官
 
-### 1.1 v2.2 工造司为什么必须推倒重构？
-在 v2.2 与第四轮实机中，工造司被错误写成了带有 CUMCM B 题强烈印记的“全卷判官”：强迫每道纯理论题凭空写零号基线、写死 `<5%` 分布门禁、在通用底座里硬塞“全零/常数解拦截”和“`Q3` 脚本禁出现 `second_pass`”、拿 Beta 分位数和 `tie -> incumbent` 卡死修 Bug 的 `hook_Q1` v4、并在漏读 `spec.public_input` 时给 `Obs-031` 反例判 `0` 分记为“算法无改进”。
+工造司是科研体系中的**“科研仪器科”**——它的核心使命是为一线探索者打造**透明、隔离、可信的测量仪器、诊断探针与计算环境**，而不是给每一道科学难题强行制造标量打分器。
 
-**v3.0 根本重置**：
-- **工造司是基础设施与仪器提供商，不是科学结论的裁决者**。
-- 剥离全部竞赛特异性硬编码，底座贯彻纯粹的 **`plugin is everything`**：所有领域校验规则（含是否需要基线、是否禁常数解、分布容差指标等）完全下放给具体课题的插件实例，**通用容器一条都不硬写**。
-- 在开放式无客观标尺任务中，允许 Parse 0 **一个判定器都不注册**（梯度的方向交给同行盲审 + `37%` 元反思 + 人类检查点），工造司只负责搭环境、写探针、加速工具、确保沙箱可复现。
-
-### 1.2 工造司日常工作优先级（由高到低）
-1. **修故障工单**：处理来自 `INSTRUMENT_ERROR` / `INFRA_ERROR` 自动开单、探索者提报痛点、盲审发现的刷分漏洞、以及多个探索分支重复手写的轮子（收编成公共仪器）。
-2. **扩张科研可观测性（最高杠杆价值）**：遵循 [`Audit the Scaffold`](file:///D:/Documents/deepseek%20harness/论文研读/2609.34924_Audit_the_Scaffold_Not_the_Checkpoint_A_Stationarity_Dichotomy_for_Recursive_Self-Improvement_in_Agentic_Coding/2609.34924_AuditTheScaffold_%E4%B8%AD%E6%96%87%E7%BB%BC%E8%BF%B0.md#L314-L329) 与 [`../architecture/手写project.md#L168`](../architecture/手写project.md#L168) 洞见——啰嗦复述报错对进展效应归零；唯有透明化黑盒（如分随机种子耗时分解、长尾比例剖面、守恒量残差轨迹等探针），才能真实扩张探索者可达假设类 $\mathcal{H}_t(C)$。
-3. **堵住刷分漏洞（Reward Hacking 加固）**与**压力分级管理**（早期可先提供宽容的部分进展轨道以免扼杀萌芽，成熟后再升版严苛口径）。
+1. **纯粹的 `plugin is everything`**：通用隔离容器（`isolated_runner.py`）保持极薄，只管进程隔离、数据键位标准化、外部产物持久化、复合缓存与返回协议校验；一切具体学科校验逻辑（是否需要参考基线、某题是否允许全零解、物理仿真误差容忍度等）全部属于课题级插件，通用底座一条都不硬编码。
+2. **原生兼容无判定器开放任务**：在纯理论数学证明或无客观标尺的开放机理探索中，Parse 0 完全允许 **0 个判定器（`VERDICT`）开局**，梯度方向交给同行盲审、`37%` 元反思与人类检查点，工造司专攻搭建计算环境与高信噪比诊断探针。
+3. **日常工作优先级（由高到低）**：
+   - **① 修复故障与痛点工单**：优先处理 `INSTRUMENT_ERROR / INFRA_ERROR` 自动工单、前线上报的工具痛点、盲审发现的刷分漏洞，以及收编多分支重复手造的实用工具；
+   - **② 扩张科研可观测性（最高杠杆价值）**：`Audit the Scaffold` 实证表明，复述冗长报错对解题进展的效应量为零（$F=0.50, p=0.61$），唯有提供能看到新物理/数学维度的透明探针（如分随机种子耗时拆解、长尾剖面、守恒律残差谱），才能在冻结模型权重下真实扩张可达假设空间 $\mathcal{H}_t(C)$；
+   - **③ 防作弊加固与压力分级**：持续修补 Reward Hacking 漏洞；在需要渐进课程的仿真/优化任务中，可先发布宽容的部分进展轨道以保护早期创意萌芽，成熟后再发布更严格的新版本。
 
 ---
 
-## 二、唯一核心抽象：仪器（Instrument）× 统一接口 × 三档四态
+## 二、唯一核心抽象：仪器（`Instrument`）× 统一接口 × 三档四态
 
-### 2.1 三类仪器与统一调用签名
-系统中所有判定脚本、验证器、诊断探针、仿真环境统一抽象为 **Instrument**，分三种 `instrument_role`：
-- **`VERDICT`（判定器）**：可产出正式科学结论 `verdict` 与 `[Obs###]`；
-- **`PROBE`（只读探针）**：只产出结构化多维诊断剖面，不打 `verdict`；
-- **`ENV`（环境与数据集）**：提供模拟器、算例数据流、Lean/SymPy 计算运行时。
+### 2.1 三类仪器角色与统一调用协议
+系统中所有验证器、诊断探针与仿真环境统一抽象为 **Instrument**，分为三类 `instrument_role`：
+- **`VERDICT`（判定器）**：产出正式科学结论 `verdict` 与 `[Obs###]` 收据（如数值验证器、Lean 4 编译检查器、通用反例校验器、学习型审稿插件）；
+- **`PROBE`（只读探针）**：只产出多维诊断剖面（`tracks` + `details`），`verdict` 恒为 `null`；
+- **`ENV`（环境与数据集）**：提供模拟器运行时、基准算例数据或符号计算依赖。
 
-**全平台唯一标准化调用协议**：
-```text
+**全平台唯一调用协议**：
+```python
 evaluate(artifact, spec, tier) -> {
-  "status":  "OK" | "CANDIDATE_ERROR" | "INSTRUMENT_ERROR" | "INFRA_ERROR",
-  "verdict": "PASS" | "FAIL" | "UNDECIDED" | null,   # 仅 VERDICT 类填写；PROBE 恒为 null
-  "tracks":  dict[str, float | int | str | bool],     # 0..N 条独立进展轨道（不假定单一标量）
-  "details": str                                      # 结构化诊断回执
+    "status":  "OK" | "CANDIDATE_ERROR" | "INSTRUMENT_ERROR" | "INFRA_ERROR",
+    "verdict": "PASS" | "FAIL" | "UNDECIDED" | None,   # 仅 VERDICT 填写；PROBE 恒为 None
+    "tracks":  dict[str, float | int | str | bool],    # 0..N 条独立进展轨道，不假设单一标量
+    "details": str                                     # 结构化诊断文本
 }
 ```
-- `artifact` 可为 Python 模块（默认 `run(public_input)`）、`.lean` 源码目录、构造反例 JSON 或数据文件集，由仪器插件自声明校验；
-- 通用容器（`isolated_runner.py`）仅做：环境变量白名单隔离、`network="none"`（若需无网）、标准化取数 `get_public_input(spec)`（防再漏读 `public_input`）、持久化输出（用于按需重评）、以及校验返回体格式合规。
+- `artifact` 形态由仪器插件自声明（Python `run(public_input)` 模块、`.lean` 源码目录、构造反例 JSON 数据包或文本手稿）；
+- 平台测试输入唯一放置在 `evaluator_spec["public_input"]`，通过标准辅助函数 `get_public_input(spec)` 读取，严禁从候选返回值倒推输入，严禁缺键静默判 0 分。
 
-### 2.2 四态物理隔离与“判不了绝不判负”铁律（根治 `Obs-031`）
-| 返回 `status` | 精确归因 | 平台处理铁律 |
+### 2.2 四态物理隔离与“判不了绝不判负”铁律
+
+| 返回 `status` | 精确归因 | 平台确定性处理动作 |
 |---|---|---|
-| **`OK`** | 仪器健康跑完并给出有效观测 | 按 `verdict`（`PASS` / `FAIL` / `UNDECIDED`）和 `tracks` 正常登记科学事实 |
-| **`CANDIDATE_ERROR`** | 候选产物自身语法错、崩溃、缺入口、超时 | 记入探索者修补账（触发后勤 `LEVEL_2` 原地修补），不计入科学否定 |
-| **`INSTRUMENT_ERROR`** | 仪器本身抛未捕获异常、读错键名（如 `Obs-031` 漏 `spec.public_input`） | **严格零处罚探索者**（不记 0 分、不记非改进、不扣修补配额、不推高停滞计数）！**同事务自动开单进 `works_engineering_queue` 并通知探索者“平台仪器故障已报修”**；若同一仪器连续出错达阈值（默认 `3` 次），自动熔断置为 **`UNHEALTHY`** 拒绝 `official` 调用 |
-| **`INFRA_ERROR`** | 容器、磁盘、RPC 超时等底座故障 | 同样**零处罚探索者**、穿透幂等缓存允许直接重试，并自动告警 |
+| **`OK`** | 仪器健康跑完并给出有效观测 | 按 `verdict`（`PASS` / `FAIL` / `UNDECIDED`）映射为 `VALID_PASS` / `MEASURED_REJECTION` / `VALID_UNDECIDED` 写入科学账本 |
+| **`CANDIDATE_ERROR`** | 候选产物自身语法错、运行时崩溃、缺入口、超时 | 记入探索者修补账（触发后勤 `LEVEL_2` 原地修补上限 3 次），不计入科学否定 |
+| **`INSTRUMENT_ERROR`** | 仪器自身抛未捕获异常、漏读键名、返回体违约 | **严格零处罚探索者**（不打 0 分、不扣修补配额、不推高停滞计数、不进永久缓存）！**同事务自动开单 `works_engineering_queue`** 并通知探索者已报修；同一仪器连续出错达 `3` 次自动熔断置 **`UNHEALTHY`** 拒绝 `official` 调用 |
+| **`INFRA_ERROR`** | 容器、磁盘或 RPC 超时等底座故障 | 同样**零处罚探索者**、穿透幂等缓存允许重试，并记录系统告警 |
 
-### 2.3 同一套仪器代码、三档调用模式（`probe / official / heavy`）
-终结“本地自测走 CLI stdout、官方沙箱调 `run()`”的两套契约割裂事故：
-1. **`probe`（快速探索档）**：使用公开/开发集样例，探索者可高频随时调用获得完整诊断输出；**只写诊断日志，不生成正式 `[Obs###]`**；
-2. **`official`（正式受控凭证档）**：在受控沙箱中以不可篡改方式产出正式 `[Obs###]`（含 `VALID_PASS / MEASURED_REJECTION / VALID_UNDECIDED`），作为分诊与盲审凭据——**有保留/隐藏判定集的题跑隔离保留集；无隐藏集的开放数值/仿真发现题则跑固定公开配置+多种子复现集，后续由 `library_verifier` 在隔离盲审沙箱内变种子/扰动边界独立复现核验，绝不为过审硬造假隐藏集**；
-3. **`heavy`（重型实验档）**：高成本长耗时仿真，强制探索者先填预期 `linguistic_prediction` 后异步排队执行（记入 `async_eval_jobs`）。
-> **自由微验证保留**：彻底废除 `[Local-Sweep]` 强制格式术语与“强制先自测再正式交”；保留探索者随时用 `pwsh` 写一次性微型校验脚本的科研自由，但凡提交正式科学凭证统一调用对应仪器。
+### 2.3 同一份仪器代码、三档调用模式（`probe / official / heavy`）
+使用同一套仪器代码、仅切换挂载数据切片与记账策略，彻底保证开发自测与正式凭证协议 100% 同构：
+1. **`probe`（快速探索档）**：挂载公开/开发样例，探索者可高频随时调用获取完整诊断剖面；**只写 `probe_diagnostic_logs`，不记入正式 `[Obs###]`**；
+2. **`official`（正式受控凭证档）**：在受控隔离沙箱中不可篡改执行并产出正式 `[Obs###]`——**有保留/隐藏判定集的题跑隔离保留集；无隐藏集的开放数值/仿真发现题跑固定公开配置 + 多种子复现集（允许返回 `OK + UNDECIDED`），后续由盲审官在独立盲审沙箱内做变种子/扰动边界复现核验**；
+3. **`heavy`（重型实验档）**：长耗时高成本仿真，调用前强制填事前预期 `linguistic_prediction`，入队 `async_eval_jobs` 时同步冻结候选与 `tools/` 快照（`$PLUGIN_DATA/workspaces/<ws_hash>/job_inputs/<job_id>/`）、原 `instrument_version` 与验证规格，重启后按原冻结现场续跑，并支持探索者凭同一 `job_id` 调用 `run_isolated_eval` 幂等取回且仅扣一次预算。
+*(注：探索者在自身 Worktree 始终保留随时用平台 Shell 写一次性微验证脚本的科研自由。)*
+
+### 2.4 四元复合缓存键（严防跨档与辅助模块变更误命中）
+```text
+cache_key = sha256(
+  candidate_entry_sha256
+  + recursive_tools_dir_sha256
+  + spec_sha256(必须包含 tier 字符串与该档实际挂载数据的 data_slice_sha256)
+  + instrument_sha256
+)
+```
+且 `INSTRUMENT_ERROR` 与 `INFRA_ERROR` 绝对穿透缓存，不写永久命中记录。
 
 ---
 
-## 三、校准集驱动版本演进（`RQGM` + `Audit the Scaffold` 纯净落地）
+## 三、校准集回归驱动版本演进与版本域可比性
 
-把原论文中针对万次带噪采样的复杂 Beta 分位数（$BB_\epsilon = I^{-1}_\epsilon$）、提交计数回退、以及强迫“平局保在位”等不适配条款**彻底剔除**，保留最纯粹、最有生命力的三根工程支柱：
-
-1. **上线与升版的唯一门控：独立校准集（Calibration Suite）**
-   - **最低校准门槛**：纯探测/环境类（`PROBE` / `ENV`）允许免配校准集（`null`）；**`VERDICT` 仪器上线与升版至少须配 `>= 1` 条回归或毒样本用例**（若开放题目尚无参考正例，允许暂缺 `gold` 案例但必须有结构退化/反作弊拦截或边界冒烟校准）。
-   - **每个案例自声明预期 `(expected_status, expected_verdict)`（绝不把全零/空输入在通用底座写死为 `OK + FAIL`！）**：
-     - **格式/入口退化用例**（如空文件、缺 `run()` 入口、语法崩溃）：预期 **`expected_status = "CANDIDATE_ERROR"`、`expected_verdict = null`**（确保仪器不把候选报错误判成仪器异常或科学失败）；
-     - **课题退化/作弊毒样本（Poison Cases）**：如照抄输入作输出、把已知公开样硬编码进返回值、已知历史刷分手法（或在该题被领域规约禁用的平凡退化解）：预期 **`expected_status = "OK"`、`expected_verdict = "FAIL"`**；**注意：若某物理/数学问题在定义上允许零解，则零解属于 `gold` 用例（预期 `OK + PASS`），通用底座禁止一刀切禁零！**
-     - **金样本（Gold Cases — 有则必测）**：已知正确参考解或构造验证通过实例：预期 **`expected_status = "OK"`、`expected_verdict = "PASS"`**（借鉴 `Audit the Scaffold` 上线前金补丁实测揪出 23/50 测试器 Bug 之法）。
-   - **Bugfix 与堵漏零死锁流程**：发现仪器 Bug（如空输入误判通过 `10/16` 或漏读 `public_input` 崩溃）或刷分漏洞，**先将复现案例写成校准集用例并标定预期结果，确认旧版确实违背预期，再修补仪器代码；只要新版 100% 匹配全部校准用例的 `(expected_status, expected_verdict)` 即可直接上线发布**，绝不强求在老考卷上刷出更高通过率！
-2. **版本域隔离（只在同 `(instrument_id, version)` 内比高下）**
-   - 任何 `[Obs###]` 永久锁定产出时的 `(instrument_id, instrument_version, artifact_sha256)`；
-   - 跨版本排名与突破比较禁止混算；历史产物确实需要跨版本对齐时，调 `recompute_stage_b_only` 用持久化的阶段产物按新版本重跑——若老产物缺少新口径所需字段或测试输入本身已变更，**诚实标记为 `INCOMPATIBLE`（不可比），绝不做“秒级重算必然恢复 VALID”的空头保证**。
-3. **仪器内部修复 vs 题目口径变更的权限界线（红灯续跑原则）**
-   - 修读取错误、防作弊、加诊断维度属于仪器内部完善，**工造司自主校准升级即可**；
-   - 若工造司判定题目原验收目标、输入口径存在根本性歧义（超出内部维修范围）：**在 `compliance_alerts` 与系统界面亮起 `ALERT_AMBIGUOUS_SPEC` 红灯请求人类事后核查，同时无人值守任务严格按照原已签口径继续推进（绝不停机挂起）**。
+1. **上线与升版唯一门控：独立校准集（Calibration Suite）**
+   - `PROBE` / `ENV` 类仪器可免配校准集（`null`）；**`VERDICT` 仪器注册与升版必须附带 `>= 1` 条独立校准用例**（JSON 数组，含 `{case_id, expected_status, expected_verdict, artifact_rel_path, public_input}`）；
+   - **每个用例自声明精确预期 `(expected_status, expected_verdict)`**：
+     - 格式/入口退化用例（空文件、语法错、缺 `run()`）$\to$ 预期 `("CANDIDATE_ERROR", null)`；
+     - 课题作弊/平凡毒样本（照抄输入、硬编码已知值、历史刷分手法）$\to$ 预期 `("OK", "FAIL")`；
+     - 金样本（已知参考正解、或该题物理定义下合法的零解/常数基态）$\to$ 预期 `("OK", "PASS")`；
+   - **修 Bug 与堵漏零死锁流程**：发现仪器读数缺陷或刷分漏洞 $\to$ 先把复现案例写入校准集并确认旧版违背预期 $\to$ 修复仪器代码 $\to$ **服务端在独立子进程实跑全量校准集，100% 匹配所有用例的自声明预期即直接升版发布**。
+2. **版本域隔离与诚实重评**
+   - 所有 `[Obs###]` 永久绑定产出时的 `(instrument_id, instrument_version)`；跨版本得分严禁混排比较；
+   - 需对历史产物按新版口径重算时，工造司先在 `get_works_engineering_queue` 查见 `pending_revalidation` 队列，再调用 `recompute_stage_b_only` 读取外部 `$PLUGIN_DATA/workspaces/<ws_hash>/eval_artifacts/<obs_id>/stage_a_output.json`：**永久保留旧 `[Obs###]` 不覆盖**（置 `SUPERSEDED_REVALIDATED`），重评成功生成绑定新版 `(instrument_id, new_version)` 的新 `[Obs###]` 收据（含 `revalidated_from_obs_id`）并将队列项置 `DONE`；若旧产物缺少新版本所需字段或测试输入本身已变更，**诚实将旧收据与队列项标记为 `INCOMPATIBLE`** 结案。
+3. **仪器维修 vs 题目口径歧义边界**
+   - 修读取错误、防作弊、加诊断维度属仪器内部完善，由工造司自主走校准集升版；
+   - 若发现题目原始验收目标或输入定义本身存在根本歧义，向 `compliance_alerts` 亮起 **`ALERT_AMBIGUOUS_SPEC` 红灯**交人类事后核查，同时无人值守任务严格按原已签口径继续推进。
 
 ---
 
 ## 四、工具沉淀账本（`SKILL_LEDGER.json`）
-保留分支私有 `<worktree>/tools/` 自动扫描清单；当某类实用工具在多条分支重复手造时自动开单工造司收编为公共只读探测仪器，经可执行与 **`No File` 落盘检验**后登记 `skills/SKILL_LEDGER.json`（保留原始 `(S, F)` 计数、`applicable_scope`、`verified_artifact_rel_path`、`rollback_pointer`）。
+
+分支私有 `<worktree>/tools/` 中的可复用脚本由宿主在每代探索者启动时自动扫描注入清单（每个模块 docstring 须写清 `What it does / Interface / What it does NOT do`）。当多个分支重复手造同类工具时，系统自动开单工造司收编为全社区共享只读探针，经可执行与文件实存校验后登记至 `skills/SKILL_LEDGER.json`（记录 `skill_id`（匹配 `^[a-z0-9_]+$`）、`applicable_scope`、`version`、`raw_success_count`、`raw_failure_count`、`verified_artifact_rel_path`、`rollback_pointer`）。
