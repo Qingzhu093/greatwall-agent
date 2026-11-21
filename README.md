@@ -1,42 +1,43 @@
-# 长城科研共同体 V6-Up (v2.2) · GreatWall Agent
+# 长城科研共同体 V6-Up (v3.0) · GreatWall Agent
 
-> 面向长周期、高复杂度科学计算、数学建模与数值求解（AI for Science）的 **DeepSeek Harness (`0.2.2-rc.3`) × Python Single-Writer 控制面** 多智能体科研协同系统。  
-> **状态说明**：核心架构改造、模块化拆分、DSH `0.2.2-rc.3` 声明式 Preset 适配与右侧栏「长城控制台」已落地并通过单元/SDK E2E 门禁，目前正处于 DSH 桌面端真题联调与实战测试阶段，完全不建议使用和下载，因为非常不稳定。
+> 面向长周期、高并发、无人值守通用 **AI for Science**（科学计算、物理仿真、数学推导与形式化发现）的 **DeepSeek Harness (`0.2.2-rc.3`) × Python Single-Writer 控制面 × 双隔离沙箱** 多智能体科研协同系统。  
+> **当前版本状态（2026-11-21 第四轮复盘后）**：
+> - **顶层架构与知识库（v3.0 已定版）**：已完成去竞赛过拟合大重构与全套工程契约闭环（见 [`PROJECT.md`](PROJECT.md)、[`04` 顶层专报](docs/architecture/04_十三篇前沿论文深度解惑与V6Up架构融合专报.md)、[`09` 工程交接说明书](docs/architecture/09_V6Up_v2.2_实施侧工程交接与系统开发总说明书.md) 及 [`docs/agent_kb/`](docs/agent_kb/00_INDEX_Agent知识库总导航与必读映射.md)）。
+> - **代码实现底座（[`greatwall-v6up/`](greatwall-v6up/)）**：当前代码停留在 `3dfa211`（v2.2 基线 + 第 4 轮应急门禁修复），**待按 [`09` 说明书](docs/architecture/09_V6Up_v2.2_实施侧工程交接与系统开发总说明书.md) 进入 P0–P4 的 v3.0 重构落地**。系统仍处实验验证期，暂不建议外部直接下载用于生产。
 
 ---
 
-## 一、核心设计思想与架构全景
+## 一、核心设计思想与 v3.0 架构全景
 
-系统采用**双层解耦与单写并发控制面（Single-Writer Control Plane + External Event Pool）**，让擅长数值与代码演绎的探索分支与严苛的验证、盲审、治理制度彻底隔离：
+以**开源 DSH `ctx.agents.create()` 确定性极薄事件总线**串联**“一委三部 + 1 对 1 探索伴随单元”**，遵循 **3 真相（`Obs` / 谱系 `DAG + lineage_dead_ends` / 中央图书馆内外两翼）+ 2 视图（增量看板 & A 档图检索）+ 沙箱平权 + 科研仪器科三档四态校准**，根除长周期科研中的集体跟风坍缩、竞赛硬编码过拟合与平台报错冤案：
 
 ```mermaid
 flowchart LR
-    User["人类科研者 / 主控会话"] -->|greatwall_orchestrate & 右侧栏控制台| Orch["DSH 异步事件池 Orchestrator\n(dsh_plugin/lib/)"]
-    Orch -->|ctx.agents.create + 5套声明式 Preset| Agents["7 大独立会话角色\n(3-5 个窄 MCP 工具 + 沙箱 Guard)"]
+    User["人类科研者 / 主控会话"] -->|Parse 0 六项表单 & ALERT_AMBIGUOUS_SPEC 告警| Orch["开源 DSH 极薄事件总线\n(ctx.agents.create · 无Root无偏见)"]
+    Orch -->|按角色挂载 3-5 窄工具 + OS 平台 Shell 断言| Agents["7 大无状态短会话角色\n(零过程 .md 公文 · 动态族谱与五车道)"]
     Agents -->|JSON-RPC 2.0 stdio| MCP["Python Single-Writer 控制面\n(core_python/mcp_server/)"]
-    MCP -->|WAL 独占事务 & 数据库触发器| DB[("隔离目录 greatwall.db\n& eval_artifacts")]
-    MCP -->|独立子进程 / 隔离数据样本| Runner["Isolated Eval Runner\n(Stage A 计算 / Stage B 验证钩子)"]
+    MCP -->|WAL 独占事务 & 约束| DB[("隔离目录 greatwall.db\nObs / DAG+dead_ends / 两翼图书馆")]
+    MCP -->|explore Worktree / blind_sandbox_<review_id>| Runner["双隔离执行沙箱\n(统一三档仪器 evaluate & 盲审沙箱跑证)"]
 ```
 
-### 1. 七大标准角色与 31 个单一职责窄工具
+### 1. 七大角色契约与沙箱平权矩阵（v3.0）
 
-每个被拉起的节点都是主工作区下的一等独立 DSH 会话（可直接在 UI 列表中点开对话纠偏或由右侧栏控制），只持有 **3–5 个窄 MCP 工具** 及受控原生工具集：
+每个被拉起的节点都是主工作区下的无状态短会话（经 `agentCtx.tools.restrict()` + OS DACL + `realpathSync` 物理隔离，仅持有 **3–5 个窄 MCP 工具**）：
 
-| 角色 ID | 职能定位 | 挂载 Preset | 权限特征与工具规模 |
+| 角色 ID | 职能定位 | 隔离沙箱与原生工具边界 | 核心制度保障（v3.0） |
 | :--- | :--- | :--- | :--- |
-| `explorer` | 前沿探索者 | `greatwall-explorer` | 隔离 Git Worktree 读写与 Shell + 5 MCP 工具（禁网络、禁压缩、禁读全局库/基线） |
-| `lineage_companion` | 1 对 1 伴随助手 | `greatwall-companion` | 只读配对 Worktree + 4 MCP 工具（37% 夜科学反思、`<=2` 轮质询、去思维链黑匣子提炼） |
-| `library_verifier` | 两阶段盲审裁判 | `greatwall-verifier` | **物理 0 原生工具净室** + 5 MCP 工具（Stage 1 盲审对账 → Stage 2 解盲对比） |
-| `works_engineer` | 工造司工程师 | `greatwall-works` | `evaluators/hooks` 与 `baselines` 锻造 + 5 MCP 工具（`RQGM` 正负对照池与 `Q_P` 门禁） |
-| `logistics_coordinator` | 后勤调度总管 | `greatwall-governance` | 只读 Worktree + 5 MCP 工具（分支派发、`depends_on_questions` 依赖锁、四级分诊、五车道破局） |
-| `library_surveyor` | 采编查新与终审交付 | `greatwall-governance` | Web 查新 + 只读文件 + 3 MCP 工具（按 `fulfilled_request_ids` 精确核销、Stage 3 终稿导出） |
-| `supervisory_committee` | 监察审计委员会 | `greatwall-governance` | 只读审计 + 4 MCP 工具（Stage 2 闭环合规审查、孤立技能台账与安全图查询） |
+| `explorer` | 前沿探索者 | 独立 Git Worktree + `read/write/edit/glob/grep` + 平台 Shell（`win32->pwsh`, 非`win32->bash`）；**禁读 DB / 隐藏集 / 他脉 / 禁网** | `0–37%` 极简推进（仅查外藏 `[R###]` + 自主 `pwsh` 与三档仪器）；`37%` 后解锁内藏 `L3/L2` 与深层谱系 |
+| `lineage_companion` | 1 对 1 伴随助手 | 单向只读配对探索节点的 Worktree（禁写、禁 Shell） | `37%`（**废除 `eval_count>=1` 阻塞**）2 轮夜科学元反思当场解锁内藏；`70%` 单写 DAG（`<100` 字 `mechanism_summary` + `evidence_grade`）+ 只追加 `lineage_dead_ends` + `<=2200` 字增量看板 |
+| `library_verifier` | 沙箱实测盲审 & 打捞 | **每次唤醒挂载独立空白临时盲审沙箱 `blind_sandbox_<review_id>/`**，开放 `read/glob/grep` + 平台 Shell/SymPy/Lean 4；**OS 物理隔离 DB / B 栏 / 隐藏集 / 原 Worktree** | 两阶段盲审：Stage 1 盲态跑证复算 -> Stage 2 解盲对比；三态裁决：`ACCEPT*`（含确证反例/障碍入 `L3` 并标 `goal_coverage`）、`REVISE`（Stage 1/2 共用 `<=2` 轮返工，禁 `Auditor` 插手）、`REFUTED`（入 `L2` 解锁打捞） |
+| `works_engineer` | 工造司 · 科研仪器科 | 锁定 `evaluators/` 与 `skills/` + 平台 Shell（严禁篡改研究 Worktree） | 剥离判官权力，回归仪器提供商；统一 `evaluate(artifact, spec, tier)`（`probe/official/heavy`）；`INSTRUMENT_ERROR/INFRA_ERROR` 零处罚并自动熔断；按案例自声明预期 `(expected_status, expected_verdict)` 校准升级 |
+| `logistics_coordinator` | 后勤调度总管 | **`0` 原生工具**（纯 DB 状态机驱动） | 机制归类；同题任一学派 `branch_count>=2 && share>50%` **无豁免刚性正交打散**；分支级确定性 `requires`（不跨分支取并集）；按主张匹配可核验载体（废除 `passed=1` 死锁）；四级分诊与五车道停滞复苏 |
+| `library_surveyor` | 外藏采编 & Stage 3 整编 | Web 查新 / 文献 PDF 只读 + 3 MCP 工具 | 采编左翼外藏 `[R###]`（明确标注“未复验外部参考摘要”，校验 `support_scope` 5 枚举与摘要长度）；Stage 3 仅组装已审 `L3` 与精确剩余缺口 |
+| `supervisory_committee` | 监察委员会 | **`0` 原生工具**（纯只读 DB 视图，零磁盘 `.md` 写入） | 核验 Parse 0 六项表单；无人值守口径歧义后台亮红灯 `ALERT_AMBIGUOUS_SPEC` **按原口径续跑不停机**；CDC 双段终局锁（`FULL` 要求必答子题 `goal_coverage="FULL_GOAL"` `L3>=1`；人类叫停支持 `PARTIAL_ON_HUMAN_STOP`） |
 
-### 2. 关键机制保障
-
-- **500k 真实上下文时钟 & `concludeTurn` 回合间隙控制流**：优先采样 `sessionProjections(['contextPressure'])`（兜底 `tokenMeter.measure()`），结合 `agent/pre-step` 与 `tools/result` 追帧同步至 SQLite；到达 `37%`（且首测完成）或 `70%` 时切断当前回合，交由伴随助手在回合间隙接手元反思或黑匣子交接。
-- **方案 A 混合路径隔离沙箱**：通过 `fs.realpathSync()` 最深祖先解析彻底拦截 `..` 逃逸、`$env:` 读取、兄弟分支越界、`python -c sqlite3` 偷读，并从底层阻断向工作区写入无关过程文档。
-- **右侧栏「长城控制台」**：内置 DSH Web/Desktop 插件客户端（`dsh_plugin/lib/client.js`）与 Connection 鉴权路由，实时展示子题 L3 进展、依赖锁状态、`500k` 压力条，并支持 UI 一键暂停/恢复/停止与节点定向 `intervene`。
+### 2. v3.0 相比 v2.2 的关键纠偏
+- **废除竞赛特例硬编码**：取消全题强建基线、全局 `<5%` 误差门禁、底座一刀切拦截全零/常数解、AST `Q3 second_pass` 黑名单与 `[Local-Sweep]` 教条；支持无隐藏集开放数值发现通过固定配置+多种子 `official`/`heavy` 送审并由盲审沙箱扰动复现。
+- **判不了绝不判负**：将平台/仪器自身崩溃（`INSTRUMENT_ERROR` / `INFRA_ERROR`）与候选报错（`CANDIDATE_ERROR`）、科学否定（`MEASURED_REJECTION`）物理隔离；工程修补失败仅写本脉 `lineage_dead_ends`，不污染图书馆 `L2`。
+- **G3 看板解耦与无连坐引用**：只追加表 `lineage_dead_ends` 承担历代死胡同记忆，看板维持增量更新与 `<= 2200` 字单一上限；引用边默认 `MOTIVATING_REF`，仅 Stage 2 显式认证的 `REQUIRED_PREMISE` 才传播级联撤回。
 
 ---
 
@@ -44,44 +45,43 @@ flowchart LR
 
 ```text
 .
-├── README.md                  # 项目总览（本文档）
-├── PROJECT.md                 # 系统总体架构设计与目标纲领
-├── greatwall-v6up/            # 【核心工程主体】
-│   ├── core_python/           # Python Single-Writer 控制面、31 窄工具 MCP 与隔离评测器
-│   │   ├── agents/            # 7 大标准角色原典提示词契约 (.md)
-│   │   ├── evaluators/        # Stage A/B 双阶段物理隔离评测器 (isolated_runner.py)
-│   │   ├── mcp_server/        # 模块化拆分的 MCP 控制面、SQLite WAL Schema、工具实现
+├── README.md                  # 项目总览与状态说明（本文档）
+├── PROJECT.md                 # V6-Up v3.0 顶层架构与目录总入口
+├── greatwall-v6up/            # 【工程代码仓】（当前为 v2.2 基线，待按 09 说明书推进 P0–P4 升级至 v3.0）
+│   ├── core_python/           # Python Single-Writer 控制面、MCP Server、隔离评测器与角色模板
+│   │   ├── agents/            # 7 大角色运行态提示词契约 (.md)
+│   │   ├── evaluators/        # 物理隔离评测执行器 (isolated_runner.py)
+│   │   ├── mcp_server/        # 模块化 MCP 工具、SQLite WAL Schema、参数校验与服务实现
 │   │   ├── prompts/           # 29 条夜科学元反思提示库 (holiday_prompts.yaml)
 │   │   ├── skills/            # 主控科研 SOP (SKILL.md) 与技能台账 (SKILL_LEDGER.json)
-│   │   └── config.json        # v2.2 权威参数表（500k 窗口 / 37% / 70% 水位等）
+│   │   └── config.json        # 运行时核心参数表
 │   ├── dsh_plugin/            # DeepSeek Harness (0.2.2-rc.3) 插件本体
-│   │   ├── lib/               # 编排器、会话宿主、5 套 Preset、沙箱、遥测与右侧栏控制台
-│   │   ├── presets/           # 本地随附的 5 套子角色 Preset 定义文件
-│   │   ├── test/              # DSH SDK 0.2.2-rc.3 零 Mock E2E 与 Hard Gates (#2–#7)
-│   │   ├── cordis.patch.yml   # DSH Bundle 补丁与 5 套 @deepseek-ai/dsh-agent-preset 声明
+│   │   ├── lib/               # 编排器、会话宿主、Preset 注册、沙箱、遥测与右侧栏控制台
+│   │   ├── presets/           # 子角色 Preset 定义文件
+│   │   ├── test/              # DSH SDK E2E 与 Hard Gates 测试 (.test.mjs)
+│   │   ├── cordis.patch.yml   # DSH Bundle 补丁与 @deepseek-ai/dsh-agent-preset 声明
 │   │   └── package.json       # 插件清单与 dsh.client 入口声明
-│   └── tests/                 # 15 项 Python 契约、触发器、沙箱与 Round 4 门禁单元测试
-└── docs/                      # 【架构设计、知识库与历史审计】
-    ├── architecture/          # 顶层融合专报、思辨集、实机复盘与工程交接规范 (04/05/06/09)
-    ├── agent_kb/              # 一委三部制度详则、文献行号索引与 Prompt 模板库 (00–06)
-    └── round2_audit/          # 第二轮测试全链路复盘与专项审计报告
+│   └── tests/                 # Python 契约、触发器、沙箱与 Round 4 门禁单测 (test_*.py)
+└── docs/                      # 【顶层定稿、知识库与多轮实机审计档案】
+    ├── architecture/          # 第一性手稿、13 篇论文融合专报 (04)、演进思辨 (05) 与 v3.0 工程交接说明书 (09)
+    ├── agent_kb/              # v3.0 全套 7 份中层实施与 Prompt 零缩水直抄知识库 (00–06)
+    ├── round2_audit/          # 第二轮实机全链路复盘与专项审计报告
+    └── round4_audit/          # 第四轮实测对齐审计、原文溯源决策对照与用户批注原件
 ```
 
-> 注：早期 `.agents/` 过程记录与 `archive/` 已保留在本地工作区（并通过 `.gitignore` 排除），GitHub 主线仅维护干净源码与核心文档；旧版 V4 历史快照已备份至远端分支 `archive/v4`。
+> 注：`.agents/`、`archive/`（含 `v2.2` 顶层设计全量备份）及运行期 `*.db` / `worktrees/` 均通过 [`.gitignore`](.gitignore) 保留在本地工作区，不纳入 GitHub 公共主线；旧版 V4 快照保留在远端 `archive/v4` 分支。
 
 ---
 
-## 三、环境要求与本地挂载运行
+## 三、环境要求、挂载与当前基线测试
 
 ### 1. 前置依赖
-
 - **DeepSeek Harness (DSH)**：`>= 0.2.2-rc.3 < 0.3.0-0`
 - **Node.js**：`>= 22.19.0` 或 `>= 24.0.0`
-- **Python**：`>= 3.11`（仅依赖标准库 + 科研课题自身按需使用的 `numpy`/`scipy`/`sympy` 等）
+- **Python**：`>= 3.11`（控制面仅依赖标准库；科研课题按需使用 `numpy`/`scipy`/`sympy`/`lean` 等）
 
 ### 2. 挂载至 DSH Desktop Profile
-
-在 `~/.dsh/profiles/desktop/package.json` 中通过本地软链添加依赖并加入 `dsh.profile.bundles`：
+在 `~/.dsh/profiles/desktop/package.json` 中通过本地软链挂载 `greatwall-v6up/dsh_plugin` 并加入 `dsh.profile.bundles`（详见 [`greatwall-v6up/dsh_plugin/README.md`](greatwall-v6up/dsh_plugin/README.md)）：
 
 ```json
 {
@@ -90,32 +90,20 @@ flowchart LR
   },
   "dsh": {
     "profile": {
-      "bundles": [
-        "...其他官方或个人 bundles...",
-        "dsh-greatwall-v6up"
-      ]
+      "bundles": ["...其他 bundles...", "dsh-greatwall-v6up"]
     }
   }
 }
 ```
 
-重启 DSH Desktop 后即可启用：
-
-1. 在主控对话中直接调用 `greatwall_orchestrate(action="start", workspace_root="...", goal_md="...", required_questions=["Q1", ...])` 非阻塞启动后台科研池；
-2. 打开右侧栏新建 Tab 页中的 **「长城控制台」** 实时查看推进状态、水位与下发干预；
-3. 或使用 `action="status" | "pause" | "resume" | "stop" | "intervene"` 随时调控。
-
----
-
-## 四、自动化测试验证
-
-在仓库根目录执行以下两套全量自检（需本机 Node >= 22 与 Python >= 3.11）：
+### 3. 当前基线（`3dfa211`）自动化自检
+在仓库根目录使用 PowerShell 7 (`pwsh`) 或对应 Shell 运行现有测试套件（待后续 P0–P4 改造同步扩充 v3.0 测试）：
 
 ```powershell
-# 1. 运行 15 项 Python 契约与控制面单测
+# 1. 运行 Python 控制面与门禁单元测试 (4 套 test_*.py)
 python -m unittest discover -s "./greatwall-v6up/tests" -p "test_*.py" -v
 
-# 2. 运行 9 项 DSH SDK E2E 与 Hard Gates (#2–#7) 测试
+# 2. 运行 DSH SDK E2E 与 Round 4 Hard Gates 测试 (2 套 .test.mjs)
 node --test --test-reporter=spec --test-force-exit --test-timeout=20000 `
   "./greatwall-v6up/dsh_plugin/test/dsh_orchestrator_e2e.test.mjs" `
   "./greatwall-v6up/dsh_plugin/test/round4_hard_gates.test.mjs"
@@ -123,10 +111,12 @@ node --test --test-reporter=spec --test-force-exit --test-timeout=20000 `
 
 ---
 
-## 五、相关文档导航
+## 四、权威文档导航（v3.0）
 
-- 总体愿景与构想：[`PROJECT.md`](PROJECT.md)
-- 实施侧开发总说明与工程规范：[`docs/architecture/09_V6Up_v2.2_实施侧工程交接与系统开发总说明书.md`](docs/architecture/09_V6Up_v2.2_实施侧工程交接与系统开发总说明书.md)
-- 十三篇前沿论文架构融合专报：[`docs/architecture/04_十三篇前沿论文深度解惑与V6Up架构融合专报.md`](docs/architecture/04_十三篇前沿论文深度解惑与V6Up架构融合专报.md)
-- Agent 制度与 Prompt 知识库总导航：[`docs/agent_kb/00_INDEX_Agent知识库总导航与必读映射.md`](docs/agent_kb/00_INDEX_Agent知识库总导航与必读映射.md)
-- DSH 插件模块说明：[`greatwall-v6up/dsh_plugin/README.md`](greatwall-v6up/dsh_plugin/README.md)
+- **全局总入口**：[`PROJECT.md`](PROJECT.md)
+- **第一性思想原点**：[`docs/architecture/手写project.md`](docs/architecture/手写project.md)
+- **顶层架构总纲（v3.0 定稿）**：[`docs/architecture/04_十三篇前沿论文深度解惑与V6Up架构融合专报.md`](docs/architecture/04_十三篇前沿论文深度解惑与V6Up架构融合专报.md)
+- **工程交接与 P0–P4 施工总说明书**：[`docs/architecture/09_V6Up_v2.2_实施侧工程交接与系统开发总说明书.md`](docs/architecture/09_V6Up_v2.2_实施侧工程交接与系统开发总说明书.md)
+- **Agent 制度与 Prompt 零缩水直抄知识库**：[`docs/agent_kb/00_INDEX_Agent知识库总导航与必读映射.md`](docs/agent_kb/00_INDEX_Agent知识库总导航与必读映射.md)
+- **演进思辨与第 4 轮复盘**：[`docs/architecture/05_V6Up架构演进思辨与文献取舍絮语集.md`](docs/architecture/05_V6Up架构演进思辨与文献取舍絮语集.md) · [`docs/round4_audit/`](docs/round4_audit/01_交顶层设计者_原文对照与架构讨论稿_对齐版.md)
+- **DSH 插件模块说明**：[`greatwall-v6up/dsh_plugin/README.md`](greatwall-v6up/dsh_plugin/README.md)
