@@ -1,4 +1,4 @@
-# dsh-greatwall-v6up v3.0 Cordis Bundle 声明（100% 对齐 DSH 0.2.2-rc.3）
+# dsh-greatwall-v6up v3.0 Cordis Bundle 声明（DSH 0.2.2-rc.5）
 # - 通过 `@deepseek-ai/dsh-agent-preset` 正式注册 6 套长城子角色独立预设（零 standard/ptc/compaction 污染）
 # - 保留桌面用户默认 preset (`standard`/`ptc` 等) 原能力不变，绝不覆盖主控配置
 - insert:

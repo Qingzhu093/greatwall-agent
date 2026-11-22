@@ -603,6 +603,16 @@ export class AgentSessionHost {
     return ''
   }
 
+  _recordContentRefusal(sessionId, role, turnEndReason) {
+    if (turnEndReason?.kind !== 'error' || turnEndReason.error?.code !== 'CONTENT_REFUSED') return
+    this.telemetry.recordEvent('model_content_refused', {
+      sessionId,
+      role,
+      code: turnEndReason.error.code,
+      message: '模型提供方拒绝了本轮请求。',
+    })
+  }
+
   /**
    * 仅当主控父会话已获人类显式授权（例如桌面端 defaultPreset 或 CLI `--permission-mode danger-full-access`）时，
    * 将父会话的权限预设 / `sandbox/mode` 同步给新创建的子会话，避免 headless 下子会话跌落 `workspace-write`
@@ -775,7 +785,7 @@ export class AgentSessionHost {
             if (ev?.trigger === 'REFLECT_37' || ev?.trigger === 'HANDOFF_70' || ev?.trigger === 'NODE_TERMINATED') {
               thresholdCancelled = true
               try {
-                liveHandleRef?.agent?.cancel?.({ kind: 'greatwall_threshold' })
+                liveHandleRef?.agent?.cancel?.({ kind: 'hook', reason: ev.trigger })
               } catch {}
             }
           },
@@ -885,6 +895,7 @@ export class AgentSessionHost {
     }
 
     const turnEndReason = await this.inspectLastTurnEndReason(effSid, handle?.agent?.session)
+    this._recordContentRefusal(effSid, role, turnEndReason)
     const isAbnormalEnd = Boolean(
       !thresholdCancelled && turnEndReason && (turnEndReason.kind === 'error' || turnEndReason.kind === 'aborted'),
     )
@@ -947,6 +958,7 @@ export class AgentSessionHost {
       await syncLivePressureToDb(this.ctx, entry.handle.agent, this.bridge, this.workspaceRoot, entry.nodeId, this.effectiveContextWindow)
     }
     const turnEndReason = await this.inspectLastTurnEndReason(sessionId, entry.handle?.agent?.session)
+    this._recordContentRefusal(sessionId, entry.role, turnEndReason)
     const wasThresholdCancel = Boolean(entry.consumeThresholdCancel?.())
     const blackbox = entry.role === 'explorer' ? await buildBlackboxTrajectorySummary(this.ctx, sessionId, 4800, entry.handle?.agent?.session) : ''
     const lastAssistantText = await this._readLastAssistantText(sessionId, entry.handle?.agent?.session)

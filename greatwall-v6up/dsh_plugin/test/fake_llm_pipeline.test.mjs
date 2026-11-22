@@ -96,8 +96,10 @@ function createScriptedDshContext({ modelWindow = 272_000, onAgentTurn }) {
           options: createOpts.agentOptions || {},
           session,
           cancel(reason) {
+            assert.ok(['user', 'parent', 'disposed', 'hook'].includes(reason.kind), 'invalid DSH cancel cause')
+            if (reason.kind === 'hook') assert.equal(typeof reason.reason, 'string')
             cancelled = true
-            events.push({ type: 'turn/end', data: { reason: reason || { kind: 'cancelled' } } })
+            events.push({ type: 'turn/end', data: { reason: { kind: 'aborted', reason } } })
           },
           followup(msg) {
             const promptText = msg?.content?.map((c) => c.text).join('\n') || ''
@@ -701,6 +703,7 @@ test('L2 剧本 2：第五轮全故障回归（缺绑定拒启、无解查新不
             fs.mkdirSync(path.join(ws, 'rulings'), { recursive: true })
             fs.writeFileSync(path.join(ws, 'rulings', 'ruling_v1.md'), '# 补充裁决 v1\n请改用新约束。\n', 'utf8')
             await orchRef.abortNode(nid, 'SWITCH_TO_RULING_V1')
+            assert.equal(api.isCancelled(), true, 'abortNode 应向 DSH 发送有效取消原因')
             await orchRef.resumeBackground()
           }
           return '探索者一轮结束'

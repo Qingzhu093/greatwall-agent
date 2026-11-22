@@ -1,7 +1,7 @@
 {
   "name": "dsh-greatwall-v6up",
   "version": "3.0.0",
-  "description": "长城 Agent V6-Up (v3.0)：面向通用长周期自主科学发现的 DSH 0.2.2-rc.3 极薄事件总线 × 双向隔离沙箱（探索 Worktree + 空白盲审沙箱）× Python Single-Writer 32 窄工具与三档四态仪器内核。",
+  "description": "长城 Agent V6-Up (v3.0)：面向通用长周期自主科学发现的 DSH 0.2.2-rc.5 极薄事件总线 × 双向隔离沙箱（探索 Worktree + 空白盲审沙箱）× Python Single-Writer 32 窄工具与三档四态仪器内核。",
   "keywords": [
     "dsh-plugin",
     "deepseek-harness",
@@ -16,7 +16,7 @@
   "main": "./lib/index.js",
   "engines": {
     "node": "^22.19.0 || >=24.0.0",
-    "dsh": ">=0.2.2-rc.3 <0.3.0-0"
+    "dsh": ">=0.2.2-rc.5 <0.3.0-0"
   },
   "exports": {
     ".": "./lib/index.js",

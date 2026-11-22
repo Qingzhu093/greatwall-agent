@@ -486,7 +486,7 @@ export class GreatwallOrchestrator {
     if (running) {
       const sessEntry = this.liveSessions.get(running.sessionId)
       try {
-        sessEntry?.handle?.agent?.cancel?.({ kind: 'greatwall_abort_node' })
+        sessEntry?.handle?.agent?.cancel?.({ kind: 'parent' })
       } catch {}
     }
     await disposeNodeCompanion(this, nid, 'aborted')

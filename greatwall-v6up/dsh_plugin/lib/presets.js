@@ -1,7 +1,7 @@
 /**
  * 长城 V6-Up (v3.0) 六套子角色专用 DSH Agent Presets 管理与注册器。
  *
- * 全面对齐 DSH 0.2.2-rc.3 与 v3.0 沙箱平权矩阵：
+ * 遵循 DSH 0.2.2-rc.5 的预设契约与 v3.0 沙箱权限矩阵：
  * - `greatwall-explorer`  : 读写 fs + search + 平台 Shell（探索者，锁在分支 worktree）
  * - `greatwall-verifier`  : 只读 fs + search + 平台 Shell（盲审官，锁在独立空白盲审沙箱，禁写/禁外网/禁 DB）
  * - `greatwall-companion` : 只读 fs + search（伴随助手，单节点暂停续传）
@@ -82,7 +82,7 @@ function buildReadWriteFsPlugins() {
 }
 
 /**
- * 构建对齐 DSH 0.2.2-rc.3 `@deepseek-ai/dsh-agent-preset` 声明结构的 6 套预设配置数组。
+ * 构建 `@deepseek-ai/dsh-agent-preset` 的 6 套角色预设配置。
  * @param {string} [platform]
  */
 export function buildDeclarativePresetConfigs(platform = process.platform) {
@@ -315,7 +315,7 @@ function writeIfChanged(filePath, content) {
 }
 
 /**
- * 向 0.2.2-rc.3 `@deepseek-ai/dsh-agent-preset-registry` 运行时幂等注册缺失的 6 套预设。
+ * 向 `@deepseek-ai/dsh-agent-preset-registry` 幂等注册缺失的角色预设。
  * @param {any} ctx
  * @param {any} [agentPresetsSvc]
  * @param {{ logger?: any, targetId?: string }} [opts]

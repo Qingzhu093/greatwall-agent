@@ -45,6 +45,54 @@ import { pickController } from '../lib/console_routes.js'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CORE_PYTHON_ROOT = path.resolve(__dirname, '..', '..', 'core_python')
 
+test('DSH RC5 流式拒答：首次回合与续跑均保留错误码并写入遥测', async () => {
+  const refusal = { kind: 'error', error: { code: 'CONTENT_REFUSED', message: 'Provider refused the request' } }
+  const reasons = [{ kind: 'completed' }, refusal, refusal]
+  const recorded = []
+  const host = new AgentSessionHost({
+    ctx: {
+      agents: {
+        async create() {
+          const events = []
+          return {
+            agent: {
+              session: { snapshotEvents: () => events },
+              followup() {
+                events.push({ type: 'turn/end', data: { reason: reasons.shift() } })
+              },
+              async whenIdle() {},
+            },
+            async dispose() {},
+          }
+        },
+      },
+    },
+    bridge: { listTools: async () => [] },
+    workspaceRoot: os.tmpdir(),
+    telemetry: {
+      recordSessionStart() {},
+      recordSessionEnd() {},
+      recordEvent: (type, detail) => recorded.push({ type, ...detail }),
+    },
+  })
+  const run = { role: 'library_surveyor', prompt: 'Replay a model turn', archiveOnComplete: false }
+  const first = await host.spawnAndRunAgent({ ...run, sessionId: 'live', keepAliveAfterIdle: true })
+  assert.equal(first.isAbnormalEnd, false)
+  assert.deepEqual(recorded, [])
+
+  const resumed = await host.continueAliveAgent('live', run.prompt)
+  const short = await host.spawnAndRunAgent({ ...run, sessionId: 'short' })
+  for (const result of [resumed, short]) {
+    assert.equal(result.isAbnormalEnd, true)
+    assert.deepEqual(result.turnEndReason, refusal)
+  }
+  assert.deepEqual(recorded.map(({ type, sessionId, code }) => [type, sessionId, code]), [
+    ['model_content_refused', 'live', 'CONTENT_REFUSED'],
+    ['model_content_refused', 'short', 'CONTENT_REFUSED'],
+  ])
+  await host.disposeAllSessions()
+})
+
 test('1. 6套Preset、角色路由与平台感知原生工具白名单', () => {
   assert.equal(ALL_31_MCP_TOOLS.size, 32)
   assert.ok(ROLE_MCP_TOOLS.works_engineer.includes('register_question_instrument'))

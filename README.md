@@ -1,6 +1,6 @@
 # 长城科研共同体 V6-Up (v3.0) · GreatWall Agent
 
-> 面向长周期、高并发、无人值守通用 **AI for Science**（科学计算、物理仿真、数学推导与形式化发现）的 **DeepSeek Harness (`0.2.2-rc.3`) × Python Single-Writer 控制面 × 双隔离沙箱** 多智能体科研协同系统。  
+> 面向长周期、高并发、无人值守通用 **AI for Science**（科学计算、物理仿真、数学推导与形式化发现）的 **DeepSeek Harness (`0.2.2-rc.5`) × Python Single-Writer 控制面 × 双隔离沙箱** 多智能体科研协同系统。
 > **当前版本状态（2026-11-21 · v3.0.0 重构落地）**：
 > - **顶层架构与知识库（v3.0 已定版）**：已完成去竞赛过拟合大重构与全套工程契约闭环（见 [`PROJECT.md`](PROJECT.md)、[`04` 顶层专报](docs/architecture/04_长城%20Agent%20V6-Up：面向长周期自主科学发现的多智能体系统架构白皮书（v3.0）.md)、[`09` 工程交接说明书](docs/architecture/09长城%20Agent%20V6-Up（v3.0）零前提工程架构与系统开发总说明书.md) 及 [`docs/agent_kb/`](docs/agent_kb/00_INDEX_Agent知识库总导航与必读映射.md)）。
 > - **代码实现底座（[`greatwall-v6up/`](greatwall-v6up/)）**：已严格依照 [`09` 说明书](docs/architecture/09长城%20Agent%20V6-Up（v3.0）零前提工程架构与系统开发总说明书.md) 完成 **v3.0.0 全量升级（P0 静态契约 + P1 隔离仪器容器与 17 组 SQLite 表 + P2 31 窄工具控制面 + P3 DSH 6 套 Preset/双隔离沙箱/单节点伴随续传与两步联合终核）**，全套 Python 与 Node 快速单元测试已通过；最终端到端 SDK 实测与审阅由独立评审流程跟进。
@@ -55,7 +55,7 @@ flowchart LR
 │   │   ├── prompts/           # 29 条夜科学元反思提示库 (holiday_prompts.yaml)
 │   │   ├── skills/            # 主控科研 SOP (SKILL.md) 与技能台账 (SKILL_LEDGER.json)
 │   │   └── config.json        # 运行时核心参数表（逐字段对齐 04 §6.1）
-│   ├── dsh_plugin/            # DeepSeek Harness (0.2.2-rc.3) 插件本体
+│   ├── dsh_plugin/            # DeepSeek Harness (0.2.2-rc.5) 插件本体
 │   │   ├── lib/               # 编排器、会话宿主、6 套 Preset 注册、双隔离沙箱、遥测与右侧栏控制台
 │   │   ├── presets/           # 6 套子角色 Preset 定义文件
 │   │   ├── test/              # Node 纯模块级控制面与双隔离沙箱单元测试 (.test.mjs)
@@ -76,7 +76,7 @@ flowchart LR
 ## 三、环境要求、挂载与当前基线测试
 
 ### 1. 前置依赖
-- **DeepSeek Harness (DSH)**：`>= 0.2.2-rc.3 < 0.3.0-0`
+- **DeepSeek Harness (DSH)**：最低 `0.2.2-rc.5`，插件声明范围为 `>=0.2.2-rc.5 <0.3.0-0`。从 RC3 升级时，参见[插件迁移说明](greatwall-v6up/dsh_plugin/README.md)。
 - **Node.js**：`>= 22.19.0` 或 `>= 24.0.0`
 - **Python**：`>= 3.11`（控制面仅依赖标准库；科研课题按需使用 `numpy`/`scipy`/`sympy`/`lean` 等）
 
