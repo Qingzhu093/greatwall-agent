@@ -4,8 +4,8 @@
 > **长城 Agent V6-Up** 是一套构建在开源 **DeepSeek Harness（DSH）** 与 **Python MCP / 双隔离沙箱**之上的通用、长周期（10–20 小时）、高并发、无人值守 **AI for Science** 自主科研系统，原生支持纯解析数学推导与构造反例、形式化定理证明（如 Lean 4）、多保真数值仿真、多目标 Pareto 前沿与无客观标尺开放探索。
 >
 > - **① 顶层架构白皮书（推荐首读）**：[`docs/architecture/04_长城 Agent V6-Up：面向长周期自主科学发现的多智能体系统架构白皮书（v3.0）.md`](./docs/architecture/04_长城%20Agent%20V6-Up：面向长周期自主科学发现的多智能体系统架构白皮书（v3.0）.md) — 从第一性原理出发，系统阐述五大架构刚性不变量、一委三部、“3 真相 + 2 视图”、沙箱平权、四大子系统机理及四类异构科研任务的端到端走查。
-> - **② 工程开发总说明书（中层施工蓝图）**：[`docs/architecture/09长城 Agent V6-Up（v3.0）零前提工程架构与系统开发总说明书.md`](./docs/architecture/09长城%20Agent%20V6-Up（v3.0）零前提工程架构与系统开发总说明书.md) — 完整覆盖两层物理架构、DSH Cordis `ctx.agents.create()` 编排骨架、双隔离沙箱（探索 Worktree + 盲审临时空沙箱）、完整 17 表 + 3 触发器 SQLite WAL Schema、通用隔离仪器执行器与 P0–P4 验收门槛。
-> - **③ 模块细化手册与 7 角色直抄模板库**：[`docs/agent_kb/00_INDEX_Agent知识库总导航与必读映射.md`](./docs/agent_kb/00_INDEX_Agent知识库总导航与必读映射.md)（含 [`agent_kb/01–04`](./docs/agent_kb/) 子系统手册、[`agent_kb/05`](./docs/agent_kb/05_原论文级Prompt武器库与五大角色完整模板直抄库.md) 全部 31 窄工具签名与 7 份零缩水直抄模板、[`agent_kb/06`](./docs/agent_kb/06_十三篇核心文献工程速查卡与本机源码行号索引.md) 文献行号总表）。
+> - **② 工程开发总说明书（中层施工蓝图）**：[`docs/architecture/09长城 Agent V6-Up（v3.0）零前提工程架构与系统开发总说明书.md`](./docs/architecture/09长城%20Agent%20V6-Up（v3.0）零前提工程架构与系统开发总说明书.md) — 完整覆盖两层物理架构、DSH Cordis `ctx.agents.create()` 编排骨架、显式模型绑定与治理队列熔断、双向隔离沙箱（探索 Worktree + 盲审临时空沙箱）、完整 17 表 + 3 触发器 SQLite WAL Schema、通用隔离仪器执行器与三层 P0–P4 验收门槛。
+> - **③ 模块细化手册与 7 角色直抄模板库**：[`docs/agent_kb/00_INDEX_Agent知识库总导航与必读映射.md`](./docs/agent_kb/00_INDEX_Agent知识库总导航与必读映射.md)（含 [`agent_kb/01–04`](./docs/agent_kb/) 子系统手册、[`agent_kb/05`](./docs/agent_kb/05_原论文级Prompt武器库与五大角色完整模板直抄库.md) 全部 32 窄工具签名与 7 份零缩水直抄模板、[`agent_kb/06`](./docs/agent_kb/06_十三篇核心文献工程速查卡与本机源码行号索引.md) 文献行号总表）。
 > - **④ 思想原点与历史演进备案（选读）**：[`docs/architecture/手写project.md`](./docs/architecture/手写project.md) ｜ [`docs/architecture/05_V6Up架构演进思辨与文献取舍絮语集.md`](./docs/architecture/05_V6Up架构演进思辨与文献取舍絮语集.md)
 
 ---
@@ -30,10 +30,10 @@
                                 ▼
        ╔══════════════════════════════════════════════════════════════════════╗
        ║  一线科学单元 = [ 探索者 (explorer) ◄─ 1 对 1 ─► 伴随助手 (companion) ] × W ║
-       ║  （同一节点内伴随暂停续传，节点结束即销毁，绝不跨代常驻）                   ║
-       ║  · 0–37%：极简独思净室 + 外藏 [R###] + 沙箱 Shell 与三档仪器               ║
-       ║  · 37%（185k）：伴随扫目录做 2 轮专家诊断+编号指针反思，当场解锁内藏与 DAG  ║
-       ║  · 70%（350k）：探索者先只读亲笔总结立遗嘱 -> 伴随核对单写 DAG 与 dead_ends ║
+       ║  （同一节点内伴随暂停续传，节点结束即销毁，绝不跨代常驻；W = min(500k, 模型窗口)）  ║
+       ║  · 0–37%：极简独思净室 + 公开 inputs/ + 外藏 [R###] + 沙箱 Shell 与三档仪器         ║
+       ║  · 37%：伴随扫目录做 2 轮专家诊断+编号指针反思，当场解锁内藏与 DAG                  ║
+       ║  · 70%（硬性跑满）：探索者先只读亲笔总结立遗嘱 -> 伴随核对单写 DAG 与 dead_ends     ║
        ╚══════════════════════════════════════════════════════════════════════╝
 ```
 
@@ -45,7 +45,7 @@
 |---|---|
 | [`docs/architecture/04_长城 Agent V6-Up：面向长周期自主科学发现的多智能体系统架构白皮书（v3.0）.md`](./docs/architecture/04_长城%20Agent%20V6-Up：面向长周期自主科学发现的多智能体系统架构白皮书（v3.0）.md) | 顶层系统架构白皮书（唯一权威理论与机制设计总纲） |
 | [`docs/architecture/09长城 Agent V6-Up（v3.0）零前提工程架构与系统开发总说明书.md`](./docs/architecture/09长城%20Agent%20V6-Up（v3.0）零前提工程架构与系统开发总说明书.md) | 面向中层实施的完整工程施工总说明书（DSH 插件、DDL、执行器、P0–P4 验收） |
-| [`docs/agent_kb/`](./docs/agent_kb/00_INDEX_Agent知识库总导航与必读映射.md) | `00` 总导航、`01–04` 四大子系统手册、`05` 31 工具契约与 7 份直抄模板、`06` 文献索引 |
+| [`docs/agent_kb/`](./docs/agent_kb/00_INDEX_Agent知识库总导航与必读映射.md) | `00` 总导航、`01–04` 四大子系统手册、`05` 32 工具契约与 7 份直抄模板、`06` 文献索引 |
 | [`docs/architecture/手写project.md`](./docs/architecture/手写project.md) | 项目最初原创第一性纲领（只读保留） |
 | [`docs/architecture/05_V6Up架构演进思辨与文献取舍絮语集.md`](./docs/architecture/05_V6Up架构演进思辨与文献取舍絮语集.md) | 历史架构演化思辨与文献取舍记录 |
 | [`greatwall-v6up/`](./greatwall-v6up/) | DSH Cordis 插件（`dsh_plugin/`）、Python MCP 与隔离内核（`core_python/`）及回归测试（`tests/`） |

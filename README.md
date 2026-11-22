@@ -14,25 +14,25 @@
 ```mermaid
 flowchart LR
     User["人类科研者 / 主控会话"] -->|Parse 0 六项表单 & ALERT_AMBIGUOUS_SPEC 告警| Orch["开源 DSH 极薄事件总线\n(ctx.agents.create · 无Root无偏见)"]
-    Orch -->|按角色挂载 3-5 窄工具 + OS 平台 Shell 断言| Agents["7 大无状态短会话角色\n(零过程 .md 公文 · 动态族谱与五车道)"]
+    Orch -->|按角色挂载 3-6 窄工具 + OS 平台 Shell 断言| Agents["7 大短生命周期角色\n(零过程 .md 公文 · 动态族谱与五车道)"]
     Agents -->|JSON-RPC 2.0 stdio| MCP["Python Single-Writer 控制面\n(core_python/mcp_server/)"]
     MCP -->|WAL 独占事务 & 约束| DB[("隔离目录 greatwall.db\nObs / DAG+dead_ends / 两翼图书馆")]
-    MCP -->|explore Worktree / blind_sandbox_<review_id>| Runner["双隔离执行沙箱\n(统一三档仪器 evaluate & 盲审沙箱跑证)"]
+    MCP -->|explore Worktree / blind_sandbox_<review_id>| Runner["双向隔离执行沙箱\n(公开 inputs 只读 + 统一三档仪器 & 盲审沙箱跑证)"]
 ```
 
-### 1. 七大角色契约与沙箱平权矩阵（v3.0）
+### 1. 七大角色契约与双向沙箱平权矩阵（v3.0）
 
-每个被拉起的节点都是主工作区下的无状态短会话（经 `agentCtx.tools.restrict()` + OS DACL + `realpathSync` 物理隔离，仅持有 **3–5 个窄 MCP 工具**）：
+每个被拉起的节点都是主工作区下的受控短生命周期会话（经 `agentCtx.tools.restrict()` + 工作区外 `$PLUGIN_DATA` 隔离 + `realpathSync` 同步 Guard 与可选容器隔离约束，仅持有 **3–6 个窄 MCP 工具**，全系统共 **32 个**）：
 
 | 角色 ID | 职能定位 | 隔离沙箱与原生工具边界 | 核心制度保障（v3.0） |
 | :--- | :--- | :--- | :--- |
-| `explorer` | 前沿探索者 | 独立 Git Worktree + `read/write/edit/glob/grep` + 平台 Shell（`win32->pwsh`, 非`win32->bash`）；**禁读 DB / 隐藏集 / 他脉 / 禁网** | `0–37%` 极简推进（仅查外藏 `[R###]` + 自主 `pwsh` 与三档仪器）；`37%` 后解锁内藏 `L3/L2` 与深层谱系 |
-| `lineage_companion` | 1 对 1 伴随助手 | 单向只读配对探索节点的 Worktree（禁写、禁 Shell） | `37%`（**废除 `eval_count>=1` 阻塞**）2 轮夜科学元反思当场解锁内藏；`70%` 单写 DAG（`<100` 字 `mechanism_summary` + `evidence_grade`）+ 只追加 `lineage_dead_ends` + `<=2200` 字增量看板 |
-| `library_verifier` | 沙箱实测盲审 & 打捞 | **每次唤醒挂载独立空白临时盲审沙箱 `blind_sandbox_<review_id>/`**，开放 `read/glob/grep` + 平台 Shell/SymPy/Lean 4；**OS 物理隔离 DB / B 栏 / 隐藏集 / 原 Worktree** | 两阶段盲审：Stage 1 盲态跑证复算 -> Stage 2 解盲对比；三态裁决：`ACCEPT*`（含确证反例/障碍入 `L3` 并标 `goal_coverage`）、`REVISE`（Stage 1/2 共用 `<=2` 轮返工，禁 `Auditor` 插手）、`REFUTED`（入 `L2` 解锁打捞） |
-| `works_engineer` | 工造司 · 科研仪器科 | 锁定 `evaluators/` 与 `skills/` + 平台 Shell（严禁篡改研究 Worktree） | 剥离判官权力，回归仪器提供商；统一 `evaluate(artifact, spec, tier)`（`probe/official/heavy`）；`INSTRUMENT_ERROR/INFRA_ERROR` 零处罚并自动熔断；按案例自声明预期 `(expected_status, expected_verdict)` 校准升级 |
+| `explorer` | 前沿探索者 | 独立 Git Worktree（自动挂载只读公开 `inputs/` 题面与裁决文档）+ `read/write/edit/glob/grep` + 平台 Shell（`win32->pwsh`, 非`win32->bash`）；**禁读 DB / 隐藏集 / `evaluators/` / 他脉 / 禁网** | 自适应窗口 `W = min(500k, 模型窗口)` 硬性跑满 `37% -> 70%`：`0–37%` 极简推进（仅查外藏 `[R###]` + 公开 `inputs/` + 自主 `pwsh` 与三档仪器）；`37%` 后解锁内藏 `L3/L2` 与深层谱系；`70%` 先只读亲笔总结立遗嘱 |
+| `lineage_companion` | 1 对 1 伴随助手 | 单向只读配对探索节点的 Worktree 与公开输入区（禁写、禁 Shell） | 单节点内同会话暂停续传（`PRE_SPAWN -> REFLECT_37 -> HANDOFF_70`，绝不跨代常驻）：`37%`（无 `eval_count` 门槛）先扫目录再做 2 轮专家诊断与夜科学反思当场解锁内藏；`70%` 核对遗嘱独占单写 DAG（`<100` 字 `mechanism_summary` + `evidence_grade`，已闭环节点写入不同内容硬报 `ERR_LOCKED`）+ 只追加 `lineage_dead_ends` + `<=2200` 字定额重压缩看板 |
+| `library_verifier` | 沙箱实测盲审 & 打捞 | **每次唤醒挂载独立空白临时盲审沙箱 `blind_sandbox_<review_id>/`**（含只读公开 `inputs/`），开放 `read/glob/grep` + 平台 Shell/SymPy/Lean 4；**0 写权，物理隔离 DB / B 栏 / 隐藏集 / 原 Worktree / 外网** | 两阶段盲审：Stage 1 盲态跑证复算 -> Stage 2 解盲对比；三态裁决：`ACCEPT*`（含确证反例/障碍入 `L3` 并标 `goal_coverage`）、`REVISE`（Stage 1/2 共用 `<=2` 轮返工，禁 `Auditor` 插手）、`REFUTED`（入 `L2` 解锁打捞）；支持 `STAGE3_FINAL_AUDIT:<delivery_id>` 版本哈希绑定终核 |
+| `works_engineer` | 工造司 · 科研仪器科 | 锁定 `evaluators/`、`skills/` 与公开输入区 + 平台 Shell（严禁篡改研究 Worktree） | 剥离判官权力，回归仪器提供商；Stage 1 固定统一核查一次 `initial_instruments`；统一 `evaluate(artifact, spec, tier)`（`probe/official/heavy`）；`INSTRUMENT_ERROR/INFRA_ERROR` 零处罚并自动熔断；按案例自声明预期校准升级；通过 `resolve_works_ticket` 显式闭合非仪器工单 |
 | `logistics_coordinator` | 后勤调度总管 | **`0` 原生工具**（纯 DB 状态机驱动） | 机制归类；同题任一学派 `branch_count>=2 && share>50%` **无豁免刚性正交打散**；分支级确定性 `requires`（不跨分支取并集）；按主张匹配可核验载体（废除 `passed=1` 死锁）；四级分诊与五车道停滞复苏 |
-| `library_surveyor` | 外藏采编 & Stage 3 整编 | Web 查新 / 文献 PDF 只读 + 3 MCP 工具 | 采编左翼外藏 `[R###]`（明确标注“未复验外部参考摘要”，校验 `support_scope` 5 枚举与摘要长度）；Stage 3 仅组装已审 `L3` 与精确剩余缺口 |
-| `supervisory_committee` | 监察委员会 | **`0` 原生工具**（纯只读 DB 视图，零磁盘 `.md` 写入） | 核验 Parse 0 六项表单；无人值守口径歧义后台亮红灯 `ALERT_AMBIGUOUS_SPEC` **按原口径续跑不停机**；CDC 双段终局锁（`FULL` 要求必答子题 `goal_coverage="FULL_GOAL"` `L3>=1`；人类叫停支持 `PARTIAL_ON_HUMAN_STOP`） |
+| `library_surveyor` | 外藏采编 & Stage 3 整编 | 公开输入区、Web 查新 / 文献 PDF 只读 + 3 MCP 工具 | 采编左翼外藏 `[R###]`（明确标注“未复验外部参考摘要”，校验 `support_scope` 5 枚举与摘要长度；无解查新通过 `outcome="UNAVAILABLE_REPORT"` 结案为 `CLOSED_UNAVAILABLE` 且绝不伪造 `[R###]` 卡）；Stage 3 仅组装已审 `L3` 与精确剩余缺口 |
+| `supervisory_committee` | 监察委员会 | **`0` 原生工具**（纯只读 DB 视图，零磁盘 `.md` 写入） | 核验 Parse 0 六项表单；无人值守口径歧义后台亮红灯 `ALERT_AMBIGUOUS_SPEC` **按原口径续跑不停机**；CDC 双段终局锁（`FULL` 要求必答子题 `goal_coverage="FULL_GOAL"` `L3>=1`；人类叫停强校验控制面 `human_stop_requested_at`） |
 
 ### 2. v3.0 相比 v2.2 的关键纠偏
 - **废除竞赛特例硬编码**：取消全题强建基线、全局 `<5%` 误差门禁、底座一刀切拦截全零/常数解、AST `Q3 second_pass` 黑名单与 `[Local-Sweep]` 教条；支持无隐藏集开放数值发现通过固定配置+多种子 `official`/`heavy` 送审并由盲审沙箱扰动复现。
