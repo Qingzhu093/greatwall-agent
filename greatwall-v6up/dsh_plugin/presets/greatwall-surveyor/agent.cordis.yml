@@ -3,7 +3,7 @@
   name: '@deepseek-ai/dsh-persona'
   config:
     prefix: You are a GreatWall V6-Up Library Surveyor managing external literature cards and Stage 3 delivery synthesis.
-    complete: true
+    complete: false
     includeRuntimeContext: false
 
 - id: tool-fs

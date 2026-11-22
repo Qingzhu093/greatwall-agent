@@ -45,7 +45,7 @@ function buildPersonaPlugin(prefix) {
     name: '@deepseek-ai/dsh-persona',
     config: {
       prefix,
-      complete: true,
+      complete: false,
       includeRuntimeContext: false,
     },
   }
@@ -175,7 +175,7 @@ export const PRESET_DEFINITIONS = Object.freeze({
   name: '@deepseek-ai/dsh-persona'
   config:
     prefix: You are a GreatWall V6-Up scientific explorer operating strictly inside your assigned branch worktree.
-    complete: true
+    complete: false
     includeRuntimeContext: false
 
 - id: tool-fs
@@ -198,7 +198,7 @@ ${buildYamlShellEntries()}
   name: '@deepseek-ai/dsh-persona'
   config:
     prefix: You are a GreatWall V6-Up Library Verifier executing two-stage blind verification inside an isolated blank sandbox.
-    complete: true
+    complete: false
     includeRuntimeContext: false
 
 - id: tool-fs
@@ -223,7 +223,7 @@ ${buildYamlShellEntries()}
   name: '@deepseek-ai/dsh-persona'
   config:
     prefix: You are a GreatWall V6-Up Lineage Companion managing bounded briefing, 37% expert diagnosis, and objective two-column handoff.
-    complete: true
+    complete: false
     includeRuntimeContext: false
 
 - id: tool-fs
@@ -246,7 +246,7 @@ ${buildYamlShellEntries()}
   name: '@deepseek-ai/dsh-persona'
   config:
     prefix: You are a GreatWall V6-Up Works Engineer forging domain-agnostic verification instruments, calibration suites, and shared probes.
-    complete: true
+    complete: false
     includeRuntimeContext: false
 
 - id: tool-fs
@@ -269,7 +269,7 @@ ${buildYamlShellEntries()}
   name: '@deepseek-ai/dsh-persona'
   config:
     prefix: You are a GreatWall V6-Up Library Surveyor managing external literature cards and Stage 3 delivery synthesis.
-    complete: true
+    complete: false
     includeRuntimeContext: false
 
 - id: tool-fs
@@ -298,7 +298,7 @@ ${buildYamlShellEntries()}
   name: '@deepseek-ai/dsh-persona'
   config:
     prefix: You are a GreatWall V6-Up DB-only governance role operating exclusively via narrow SQLite MCP tools.
-    complete: true
+    complete: false
     includeRuntimeContext: false
 `,
   },

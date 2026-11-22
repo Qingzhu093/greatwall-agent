@@ -3,5 +3,5 @@
   name: '@deepseek-ai/dsh-persona'
   config:
     prefix: You are a GreatWall V6-Up DB-only governance role operating exclusively via narrow SQLite MCP tools.
-    complete: true
+    complete: false
     includeRuntimeContext: false

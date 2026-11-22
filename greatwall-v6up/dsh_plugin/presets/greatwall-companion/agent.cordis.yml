@@ -3,7 +3,7 @@
   name: '@deepseek-ai/dsh-persona'
   config:
     prefix: You are a GreatWall V6-Up Lineage Companion managing bounded briefing, 37% expert diagnosis, and objective two-column handoff.
-    complete: true
+    complete: false
     includeRuntimeContext: false
 
 - id: tool-fs

@@ -277,10 +277,17 @@ export async function driveExplorerCompanionPair(
   )
   const instrumentsMd = availableInstruments.length
     ? availableInstruments
-        .map(
-          (inst) =>
-            `- \`${inst.instrument_id}\` (v${inst.version}, role=${inst.instrument_role}, schema=${inst.artifact_schema || 'python_run'}, q=${inst.question_id})`,
-        )
+        .map((inst) => {
+          let hintText = ''
+          try {
+            const specObj = typeof inst.default_spec_json === 'string'
+              ? JSON.parse(inst.default_spec_json || '{}')
+              : (inst.default_spec_json || {})
+            const hint = specObj?.interface_hint || specObj?.entry_point || specObj?.expected_format
+            if (hint) hintText = ` | 接口约定: ${String(hint).slice(0, 260)}`
+          } catch {}
+          return `- \`${inst.instrument_id}\` (v${inst.version}, role=${inst.instrument_role}, schema=${inst.artifact_schema || 'python_run'}, q=${inst.question_id})${hintText}`
+        })
         .join('\n')
     : ''
 
@@ -292,6 +299,7 @@ export async function driveExplorerCompanionPair(
     `- spec_revision: \`v${specRev}\``,
     `- effective_context_window: \`${effWindow}\` tokens (37% 反思 / 70% 硬交接)`,
     `- worktree_abs_path: \`${node.worktree_abs_path}\``,
+    '- 工程执行守则：自测脚本请先小样本快跑控制在 30–60 秒内再分级放大（防 600s 终端硬超时）；命令与文件读写请基于当前 worktree 根目录使用相对路径，勿用 `../` 越界。',
     goalMd ? `### Parse 0 课题目标与完成判据\n${goalMd}` : '',
     instrumentsMd
       ? `### 本子题已激活科研仪器清单 (run_isolated_eval 可直接调用)\n${instrumentsMd}`

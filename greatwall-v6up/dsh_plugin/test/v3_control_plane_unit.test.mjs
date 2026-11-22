@@ -1086,3 +1086,188 @@ test('22. 子会话自动继承父会话 permissionPresets / sandbox/mode（根�
   assert.ok(childEvents.some((e) => e.type === 'sandbox/mode' && e.data.mode === 'danger-full-access'))
   assert.ok(childEvents.some((e) => e.type === 'approval/policy' && e.data.policy === 'never'))
 })
+
+test('23. 4处Preset定义100%对齐 complete:false + AgentSessionHost 白名单防全局污染且保留 required 上下文', async () => {
+  // 1) JS 声明式 Preset
+  for (const def of buildDeclarativePresetConfigs('win32')) {
+    const persona = def.plugins.find((p) => p.id === 'persona')
+    assert.equal(persona?.config?.complete, false, `${def.id} declarative persona 必须为 complete:false`)
+    assert.equal(persona?.config?.includeRuntimeContext, false, `${def.id} 必须保持 includeRuntimeContext:false`)
+  }
+  // 2) PRESET_DEFINITIONS YAML 模板
+  for (const [id, def] of Object.entries(PRESET_DEFINITIONS)) {
+    assert.ok(def.cordisYml.includes('complete: false'), `${id} PRESET_DEFINITIONS 必须含 complete: false`)
+    assert.ok(!def.cordisYml.includes('complete: true'), `${id} PRESET_DEFINITIONS 严禁残留 complete: true`)
+  }
+  // 3) cordis.patch.yml 与 dsh_plugin/presets/*/agent.cordis.yml
+  const patchYml = fs.readFileSync(path.resolve(__dirname, '..', 'cordis.patch.yml'), 'utf8')
+  assert.ok(!patchYml.includes('complete: true'), 'cordis.patch.yml 严禁残留 complete: true')
+  for (const id of Object.keys(PRESET_DEFINITIONS)) {
+    const pFile = path.resolve(__dirname, '..', 'presets', id, 'agent.cordis.yml')
+    const txt = fs.readFileSync(pFile, 'utf8')
+    assert.ok(txt.includes('complete: false'), `${pFile} 必须含 complete: false`)
+    assert.ok(!txt.includes('complete: true'), `${pFile} 严禁残留 complete: true`)
+  }
+
+  // 4) AgentSessionHost 注册 interpolate:false + required:true 及 assemble 白名单防第三方插件污染
+  const regSections = []
+  const regContexts = []
+  let assembleHook = null
+  const fakeAgentCtx = {
+    tools: {
+      schemas: () => [],
+      restrict() {},
+      guard: () => () => {},
+      register: () => () => {},
+    },
+    systemPrompt: {
+      section(s) { regSections.push(s); return () => {} },
+      context(c) { regContexts.push(c); return () => {} },
+    },
+    on(ev, fn) {
+      if (ev === 'system-prompt/assemble') assembleHook = fn
+      return () => {}
+    },
+  }
+  const host = new AgentSessionHost({
+    ctx: { on: () => () => {} },
+    bridge: {},
+    workspaceRoot: os.tmpdir(),
+    rolePrompts: { explorer: '# Explorer Contract with {{formula}}' },
+    telemetry: { recordEvent() {} },
+  })
+  host.mountCapabilitiesOnAgent(fakeAgentCtx, { id: 'exp_test_1', session: { id: 'exp_test_1' } }, {
+    role: 'explorer',
+    nodeId: 'n1',
+    cwd: os.tmpdir(),
+    toolSchemas: [],
+    taskContextText: '## Task with {{x}}',
+    cleanupFns: [],
+    turnSignals: [],
+  })
+  const contractSec = regSections.find((s) => s.name === 'greatwall:contract:explorer')
+  const taskCtx = regContexts.find((c) => c.name === 'greatwall:task:exp_test_1')
+  assert.equal(contractSec?.interpolate, false, '角色模板必须关闭 {{var}} 插值防崩溃')
+  assert.equal(taskCtx?.required, true, '任务上下文必须标记 required:true 穿透 includeRuntimeContext:false')
+  assert.equal(taskCtx?.interpolate, false, '任务上下文必须关闭 {{var}} 插值防崩溃')
+
+  const filtered = await assembleHook(
+    {},
+    {},
+    async () => ({
+      sections: [
+        { name: 'harness:identity', text: 'id' },
+        { name: 'greatwall:contract:explorer', text: 'contract' },
+        { name: 'tool-pwsh', text: 'pwsh' },
+        { name: 'tool-fs:guidance', text: 'drop' },
+        { name: 'mcp:playwright', text: 'third-party-drop' },
+        { name: 'deployment:persona-prefix', text: 'persona-drop' },
+      ],
+    }),
+  )
+  assert.deepEqual(
+    filtered.sections.map((s) => s.name),
+    ['harness:identity', 'greatwall:contract:explorer', 'tool-pwsh'],
+  )
+})
+
+test('24. 含空格自身沙箱路径零误杀 + 100% 拦截同辈 Worktree（含前缀碰撞）、Evaluators 与宿主机外部路径', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_v3_space_sandbox_'))
+  try {
+    const ws = path.join(tmpRoot, 'deepseek harness', 'v6 第六轮测试')
+    const wt1 = path.join(ws, 'worktrees', 'b_q1_1')
+    const wt10 = path.join(ws, 'worktrees', 'b_q1_10')
+    const wt2 = path.join(ws, 'worktrees', 'b_q1_2')
+    const evalDir = path.join(ws, 'evaluators')
+    fs.mkdirSync(path.join(wt1, 'code'), { recursive: true })
+    fs.mkdirSync(path.join(wt10, 'code'), { recursive: true })
+    fs.mkdirSync(path.join(wt2, 'code'), { recursive: true })
+    fs.mkdirSync(evalDir, { recursive: true })
+
+    const evalExp = createSandboxCallEvaluator({
+      role: 'explorer',
+      workspaceRoot: ws,
+      worktreeAbsPath: wt1,
+      protectedDirs: [path.join(tmpRoot, 'plugin_data')],
+    })
+
+    // 1) 自身含空格沙箱路径（双引号/单引号/正斜杠）全部放行
+    assert.equal(evalExp({ name: 'pwsh', arguments: { command: `cd "${path.join(wt1, 'code')}"; python q1.py` } }), undefined)
+    assert.equal(evalExp({ name: 'pwsh', arguments: { command: `cd '${path.join(wt1, 'code')}'` } }), undefined)
+    assert.equal(evalExp({ name: 'pwsh', arguments: { command: `python "${path.join(wt1, 'code', 'q1.py').replace(/\\/g, '/')}"` } }), undefined)
+
+    // 2) 同辈他脉（含 b_q1_1 vs b_q1_10 前缀碰撞！）必须 100% 拦截
+    assert.match(String(evalExp({ name: 'pwsh', arguments: { command: `Get-Content "${path.join(wt2, 'code', 'secret.py')}"` } })), /SANDBOX_VIOLATION/)
+    assert.match(String(evalExp({ name: 'pwsh', arguments: { command: `Get-Content "${path.join(wt10, 'code', 'secret.py')}"` } })), /SANDBOX_VIOLATION/)
+
+    // 3) 主工作区 evaluators/ 与宿主机含空格外部路径必须 100% 拦截
+    assert.match(String(evalExp({ name: 'pwsh', arguments: { command: `Get-Content "${path.join(evalDir, 'loc.py')}"` } })), /SANDBOX_VIOLATION/)
+    assert.match(String(evalExp({ name: 'pwsh', arguments: { command: `Get-Content "${path.join(tmpRoot, 'other folder', 'secret.txt')}"` } })), /SANDBOX_VIOLATION/)
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('25. 活跃仪器 default_spec_json.interface_hint 自动渲染进探索者上下文', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_v3_hint_'))
+  const wt = path.join(tmpRoot, 'wt')
+  fs.mkdirSync(wt, { recursive: true })
+  try {
+    let capturedTaskCtx = ''
+    const fakeOrch = {
+      workspaceRoot: tmpRoot,
+      _poolState: 'running',
+      liveSessions: new Map(),
+      _nodeCompanionSessions: new Map(),
+      _handoffsSinceHeartbeat: 0,
+      telemetry: { recordEvent() {} },
+      bridge: {
+        async control(method) {
+          if (method === 'control_plane/sync_pressure') return { ok: true, data: { node_status: 'CLOSED' } }
+          return { ok: true }
+        },
+      },
+      host: { effectiveContextWindow: 500_000, setSessionReadonly() {}, async archiveSession() {} },
+      async spawnAndRunAgent(opts) {
+        capturedTaskCtx = opts.taskContextText || ''
+        return {
+          sessionId: opts.sessionId,
+          role: opts.role,
+          turnSignals: [],
+          nativeThresholds: [],
+          isAbnormalEnd: false,
+          blackboxSummary: 'bb',
+          lastAssistantText: 'ok',
+          handle: { agent: { session: { id: opts.sessionId } } },
+          async dispose() {},
+        }
+      },
+      async continueAliveAgent() {
+        return { lastAssistantText: 'ok', turnSignals: [], nativeThresholds: [], isAbnormalEnd: false }
+      },
+    }
+    await driveExplorerCompanionPair(
+      fakeOrch,
+      { node_id: 'n_h', branch_id: 'b_h', question_id: 'Q1', worktree_abs_path: wt, briefing_snapshot_md: 'BRIEF' },
+      {
+        goal_and_completion_md: '# G',
+        active_instruments: [
+          {
+            instrument_id: 'LOCATOR_EVAL',
+            version: 1,
+            question_id: 'Q1',
+            instrument_role: 'VERDICT',
+            artifact_schema: 'python_run',
+            health_status: 'HEALTHY',
+            default_spec_json: JSON.stringify({ interface_hint: '脚本须向 stdout 输出含 {"error_max": float} 的 JSON' }),
+          },
+        ],
+      },
+      'exp_hint_1',
+    )
+    assert.ok(capturedTaskCtx.includes('LOCATOR_EVAL'))
+    assert.ok(capturedTaskCtx.includes('接口约定: 脚本须向 stdout 输出含 {"error_max": float} 的 JSON'))
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})

@@ -3,7 +3,7 @@
   name: '@deepseek-ai/dsh-persona'
   config:
     prefix: You are a GreatWall V6-Up Works Engineer forging domain-agnostic verification instruments, calibration suites, and shared probes.
-    complete: true
+    complete: false
     includeRuntimeContext: false
 
 - id: tool-fs

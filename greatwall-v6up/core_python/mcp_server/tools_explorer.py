@@ -199,7 +199,23 @@ def tool_run_isolated_eval(
         (instrument_id,),
     ).fetchone()
     if inst is None:
-        raise FailClosedError(ERR_NOT_FOUND, f"找不到活跃仪器 {instrument_id!r}，请核对已注册仪器清单")
+        avail_rows = conn.execute(
+            """
+            SELECT instrument_id, version, instrument_role, artifact_schema
+            FROM instruments
+            WHERE is_active = 1 AND health_status = 'HEALTHY' AND (question_id = ? OR question_id = 'ALL')
+            ORDER BY instrument_id, version DESC
+            """,
+            (question_id,),
+        ).fetchall()
+        avail_desc = ", ".join(
+            f"{r['instrument_id']}(v{r['version']}/{r['instrument_role']}/{r['artifact_schema']})"
+            for r in avail_rows
+        ) or "（当前子题尚无已注册活跃仪器）"
+        raise FailClosedError(
+            ERR_NOT_FOUND,
+            f"找不到活跃仪器 {instrument_id!r}，请核对已注册仪器清单。当前可用仪器: {avail_desc}",
+        )
     if str(inst["question_id"]) not in (str(question_id), "ALL"):
         raise FailClosedError(ERR_INVALID_INPUT, f"仪器 {instrument_id!r} 归属 {inst['question_id']!r}，不可跨题调用")
     if tier_l == "official" and str(inst["health_status"]) == "UNHEALTHY":

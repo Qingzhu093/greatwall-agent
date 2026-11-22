@@ -1243,9 +1243,13 @@ export class GreatwallOrchestrator {
         }
       }
 
-      // 7) 监察委周期心跳审计
+      // 7) 监察委周期心跳审计（仅在有新交接/分诊进展时按频次或 3 分钟节律触发，0 进展期间绝不空转）
       const nowMs = Date.now()
-      if (snap.stage === 'STAGE2_EVOLVE' && (this._handoffsSinceHeartbeat >= 3 || (this._lastHeartbeatAt > 0 && nowMs - this._lastHeartbeatAt > 180_000))) {
+      if (
+        snap.stage === 'STAGE2_EVOLVE' &&
+        (this._handoffsSinceHeartbeat >= 3 ||
+          (this._handoffsSinceHeartbeat > 0 && this._lastHeartbeatAt > 0 && nowMs - this._lastHeartbeatAt > 180_000))
+      ) {
         if (this._launchGovTask('supervisory:heartbeat', async () => {
           this._handoffsSinceHeartbeat = 0
           this._lastHeartbeatAt = Date.now()

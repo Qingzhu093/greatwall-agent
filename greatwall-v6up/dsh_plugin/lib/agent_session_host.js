@@ -496,6 +496,7 @@ export class AgentSessionHost {
         name: `greatwall:contract:${role}`,
         order: 10,
         text: rolePromptText,
+        interpolate: false,
       }),
     )
 
@@ -505,6 +506,8 @@ export class AgentSessionHost {
           name: `greatwall:task:${agent.id}`,
           order: 20,
           text: taskContextText,
+          required: true,
+          interpolate: false,
         }),
       )
     }
@@ -513,15 +516,11 @@ export class AgentSessionHost {
       agentCtx.on('system-prompt/assemble', async (assembly, _assembleCtx, next) => {
         const out = await next()
         if (Array.isArray(out?.sections)) {
+          // 严格白名单：仅保留 harness:identity、本插件 greatwall:* 角色契约与本 Preset 自带 tool-* 说明，挡住全局第三方插件 section 污染
           out.sections = out.sections.filter((sec) => {
             const nm = String(sec?.name || '')
-            return (
-              !nm.startsWith('deployment:persona') &&
-              nm !== 'tool-fs:guidance' &&
-              nm !== 'coding-agent' &&
-              nm !== 'agent-instructions' &&
-              !nm.startsWith('subagent:')
-            )
+            if (nm === 'tool-fs:guidance') return false
+            return nm === 'harness:identity' || nm.startsWith('greatwall:') || nm.startsWith('tool-')
           })
         }
         return out

@@ -3,7 +3,7 @@
   name: '@deepseek-ai/dsh-persona'
   config:
     prefix: You are a GreatWall V6-Up Library Verifier executing two-stage blind verification inside an isolated blank sandbox.
-    complete: true
+    complete: false
     includeRuntimeContext: false
 
 - id: tool-fs

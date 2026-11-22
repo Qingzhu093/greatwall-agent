@@ -485,6 +485,24 @@ class TestP4Round5RemediationContracts(unittest.TestCase):
         pre_ids = [x["instrument_id"] for x in ctx_pre["data"].get("active_instruments", [])]
         self.assertIn("inst_q1_probe_push", pre_ids)
 
+        # 3. 探索者调用未知 instrument_id 时，ERR_NOT_FOUND 必须附带当前可用仪器 ID 列表以便一秒自纠
+        bad_eval = self._call(
+            "run_isolated_eval",
+            {
+                "node_id": fb["data"]["node_id"],
+                "question_id": "Q1",
+                "instrument_id": "inst_nonexistent_guess",
+                "tier": "probe",
+                "artifact_rel_path": "cand.py",
+                "linguistic_prediction": "猜错仪器名应返回可用列表",
+            },
+            role="explorer",
+            sid="exp_push",
+        )
+        self.assertFalse(bad_eval["ok"])
+        self.assertEqual(bad_eval["error_code"], "ERR_NOT_FOUND")
+        self.assertIn("inst_q1_probe_push", bad_eval["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -248,15 +248,25 @@ _TOOL_PROP_PATCHES: dict[str, dict[str, dict[str, Any]]] = {
     },
     "register_question_instrument": {
         "instrument_role": {"enum": sorted(ALLOWED_INSTRUMENT_ROLES), "description": "仪器角色枚举：VERDICT | PROBE | ENV。"},
-        "instrument_rel_path": {"description": "仪器 Python 脚本相对工作区路径，须导出 evaluate(artifact, spec, tier)。"},
-        "calibration_suite_rel_path": {"description": "校准集 JSON 相对路径（VERDICT 必填且 100% 通过自声明预期；PROBE/ENV 可传 null）。"},
+        "instrument_rel_path": {
+            "description": "仪器 Python 脚本相对工作区路径，须导出 evaluate(artifact, spec, tier) -> {'status': 'OK|CANDIDATE_ERROR|INSTRUMENT_ERROR|INFRA_ERROR', 'verdict': 'PASS|FAIL|UNDECIDED'|None（非 OK 态必须为 None）, 'tracks': {str: 有限数值}, 'details': str}。",
+        },
+        "calibration_suite_rel_path": {
+            "description": "校准集 JSON 相对路径（VERDICT 必填且 100% 通过；PROBE/ENV 可传 null）。格式为非空 JSON 数组，每项含 {'name', 'artifact_rel_path' 或 'artifact', 'tier': 'probe|official|heavy', 'expected_status', 'expected_verdict'（非 OK 态填 null）}。",
+        },
         "artifact_schema": {"description": "自声明待测 artifact 形态（如 python_run / raw_file / counterexample_json / lean4）。"},
         "plugin_protocol_version": {"description": "仪器协议版本，默认 v3。"},
-        "default_spec": {"description": "可选：仪器默认配置规格字典（可含 public_input）。"},
+        "default_spec": {
+            "description": "可选：仪器默认配置规格字典（可含 public_input，并推荐写入 'interface_hint' 简述待测产物入口/输出约定，服务端会自动推送给探索者）。",
+        },
     },
     "upgrade_instrument_with_calibration": {
-        "new_instrument_rel_path": {"description": "新版仪器脚本相对路径。"},
-        "calibration_suite_rel_path": {"description": "独立校准集 JSON 相对路径（100% 匹配所有用例自声明预期即直接升版）。"},
+        "new_instrument_rel_path": {
+            "description": "新版仪器脚本相对路径，须导出 evaluate(artifact, spec, tier) -> {'status', 'verdict', 'tracks': {数值}, 'details': str}（非 OK 态 verdict 必须为 None）。",
+        },
+        "calibration_suite_rel_path": {
+            "description": "独立校准集 JSON 相对路径（非空 JSON 数组，tier 仅限 probe/official/heavy，非 OK 态 expected_verdict 为 null，100% 匹配即直接升版）。",
+        },
     },
     "recompute_stage_b_only": {
         "obs_id": {"description": "需按新版仪器免重跑 Stage A 重评的旧观测 ID（保留旧收据，成功生成新版新收据，缺字段标 INCOMPATIBLE）。"},

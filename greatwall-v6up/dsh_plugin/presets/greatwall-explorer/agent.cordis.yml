@@ -3,7 +3,7 @@
   name: '@deepseek-ai/dsh-persona'
   config:
     prefix: You are a GreatWall V6-Up scientific explorer operating strictly inside your assigned branch worktree.
-    complete: true
+    complete: false
     includeRuntimeContext: false
 
 - id: tool-fs

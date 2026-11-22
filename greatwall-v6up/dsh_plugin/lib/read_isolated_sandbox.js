@@ -154,9 +154,27 @@ export function extractPathValues(args) {
 }
 
 /**
+ * 将命令字符串中指向当前隔离沙箱自身规范路径的片段替换为 `<OWN_SANDBOX>`，
+ * 使用右边界断言严防前缀碰撞（如 `b_q1_1` 绝不误匹配同辈 `b_q1_10`），
+ * 彻底根治 Windows 含空格路径（如 `D:\Documents\deepseek harness\...`）的正则截断误杀。
+ * @param {string} cmd
+ * @param {string} sandboxCanon
+ */
+function maskOwnSandboxInCommand(cmd, sandboxCanon) {
+  if (!cmd || !sandboxCanon) return cmd
+  const trimmed = sandboxCanon.replace(/[\\/]+$/, '')
+  if (!trimmed) return cmd
+  // 允许命令中混用 / 或 \，Win32 下忽略大小写
+  const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\\|\\\//g, '[\\\\/]')
+  const flags = process.platform === 'win32' ? 'gi' : 'g'
+  const ownRe = new RegExp(`${escaped}(?=[\\\\/"'\\s,;)|&>]|$)`, flags)
+  return cmd.replace(ownRe, '<OWN_SANDBOX>')
+}
+
+/**
  * 对 Shell 命令字符串执行逃逸、越权与外网静态审查。
  * @param {string} commandText
- * @param {{ role: string, sandboxCanon: string, workspaceCanon: string, worktreesCanon?: string, protectedCanons?: string[], readonly?: boolean }} opts
+ * @param {{ role: string, sandboxCanon: string, workspaceCanon: string, worktreesCanon?: string, evaluatorsCanon?: string, protectedCanons?: string[], readonly?: boolean }} opts
  * @returns {string | null} 若命中违规则返回拒绝原因，否则 null
  */
 export function evaluateShellCommandGuard(commandText, opts) {
@@ -185,7 +203,7 @@ export function evaluateShellCommandGuard(commandText, opts) {
   // 探索者与盲审官：同属严格单目录隔离沙箱
   if (role === 'explorer' || role === 'library_verifier') {
     if (/(?:^|[\s"'`(=,;\\\/])\.\.(?:[\\/]|$|['"`\s;,)])/.test(cmd)) {
-      return `SANDBOX_VIOLATION: ${role} 隔离区严禁使用上跳路径 (..)`
+      return `SANDBOX_VIOLATION: ${role} 隔离区严禁使用上跳路径 (..)，请基于当前工作树根目录使用相对路径（如 reports/...）`
     }
     if (/~[\\/]|HOME\b|\$(?:env:)?(?:USERPROFILE|HOME|APPDATA|LOCALAPPDATA|TEMP|TMP|GREATWALL_|PLUGIN_DATA|DSH_HOME)/i.test(cmd)) {
       return `SANDBOX_VIOLATION: ${role} 严禁探测宿主敏感环境变量或用户主目录`
@@ -201,20 +219,33 @@ export function evaluateShellCommandGuard(commandText, opts) {
         return 'SANDBOX_VIOLATION: library_verifier 严禁访问原探索分支 worktrees/ 目录'
       }
     }
-    for (const prot of opts.protectedCanons || []) {
-      const normalizedCmd = process.platform === 'win32' ? cmd.toLowerCase().replace(/\//g, '\\') : cmd
-      const normalizedProt = process.platform === 'win32' ? prot.toLowerCase() : prot
-      if (normalizedProt && normalizedCmd.includes(normalizedProt)) {
-        return `SANDBOX_VIOLATION: ${role} 严禁在 Shell 中引用受保护外部目录 (${prot})`
+
+    // 先带边界消去自身沙箱路径，确保含空格的合法自身路径零误杀，同时精准暴露同辈他脉 worktree 与外部禁区
+    const maskedCmd = maskOwnSandboxInCommand(cmd, opts.sandboxCanon)
+    const normalizedMasked = process.platform === 'win32'
+      ? maskedCmd.toLowerCase().replace(/\//g, '\\')
+      : maskedCmd
+
+    const denyCanons = [
+      ...(opts.protectedCanons || []),
+      ...(opts.worktreesCanon ? [opts.worktreesCanon] : []),
+      ...(opts.evaluatorsCanon ? [opts.evaluatorsCanon] : []),
+    ]
+    for (const prot of denyCanons) {
+      const normalizedProt = process.platform === 'win32' ? String(prot || '').toLowerCase() : String(prot || '')
+      if (normalizedProt && normalizedMasked.includes(normalizedProt)) {
+        return `SANDBOX_VIOLATION: ${role} 严禁在 Shell 中引用受保护或他脉外部目录 (${prot})`
       }
     }
-    // 扫描显式绝对路径（Windows 盘符/UNC 与 POSIX 根路径），加左边界防误切 https:// URL，仅放行本沙箱内路径与常见解释器路径
+
+    // 扫描消去自身沙箱后仍残留的显式绝对路径（优先匹配成对引号内含空格路径，再匹配无引号路径）
     const absRe = process.platform === 'win32'
-      ? /(?:^|[\s"'`(=,;])((?:[a-zA-Z]:[\\/]|\\\\)[^\s"'`;|><&()]+)/g
-      : /(?:^|[\s"'`(=,;])(\/[^\s"'`;|><&()]+)/g
+      ? /"((?:[a-zA-Z]:[\\/]|\\\\)[^"]+)"|'((?:[a-zA-Z]:[\\/]|\\\\)[^']+)'|(?:^|[\s`(=,;])((?:[a-zA-Z]:[\\/]|\\\\)[^\s"'`;|><&()]+)/g
+      : /"(\/[^"]+)"|'(\/[^']+)'|(?:^|[\s`(=,;])(\/[^\s"'`;|><&()]+)/g
     let m
-    while ((m = absRe.exec(cmd)) !== null) {
-      const rawHit = m[1]
+    while ((m = absRe.exec(maskedCmd)) !== null) {
+      const rawHit = m[1] || m[2] || m[3]
+      if (!rawHit) continue
       const candidate = resolveCanonicalTarget(rawHit)
       const inOwnSandbox = isInsideRoot(candidate, opts.sandboxCanon)
       const isRuntimeBin = /(?:python(?:\d+(?:\.\d+)*)?(?:\.exe)?|python3|uv(?:\.exe)?|lean(?:\.exe)?|node(?:\.exe)?|\.venv)[\\/]?$/i.test(candidate) ||
@@ -248,6 +279,7 @@ export function createSandboxCallEvaluator(opts) {
   const getReadonly = typeof opts.readonly === 'function' ? opts.readonly : () => Boolean(opts.readonly)
   const wsCanon = resolveCanonicalTarget(opts.workspaceRoot || process.cwd())
   const worktreesCanon = resolveCanonicalTarget(path.join(opts.workspaceRoot || process.cwd(), 'worktrees'))
+  const evaluatorsCanon = resolveCanonicalTarget(path.join(opts.workspaceRoot || process.cwd(), 'evaluators'))
   const hiddenCalCanon = resolveCanonicalTarget(path.join(opts.workspaceRoot || process.cwd(), 'evaluators', '_hidden_calibrations'))
   const finalDeliveryCanon = resolveCanonicalTarget(path.join(opts.workspaceRoot || process.cwd(), 'final_delivery'))
 
@@ -397,6 +429,7 @@ export function createSandboxCallEvaluator(opts) {
         sandboxCanon,
         workspaceCanon: wsCanon,
         worktreesCanon,
+        evaluatorsCanon,
         protectedCanons: role === 'library_verifier'
           ? protectedCanons.filter((p) => !isInsideRoot(sandboxCanon, p))
           : protectedCanons,
