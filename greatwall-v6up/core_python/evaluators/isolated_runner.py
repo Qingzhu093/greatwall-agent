@@ -135,6 +135,32 @@ def _is_python_run_artifact(artifact_path: Path, artifact_schema: str) -> bool:
     return artifact_path.suffix.lower() == ".py"
 
 
+def _candidate_py_exports_run(cand_file: Path) -> bool:
+    """AST 静态检查 `.py` 候选是否定义了顶层 `run(...)` 函数（有语法错误时交由 Stage A 报 CANDIDATE_ERROR）。"""
+    import ast as _ast
+
+    try:
+        src = cand_file.read_text(encoding="utf-8", errors="replace")
+        tree = _ast.parse(src, filename=str(cand_file))
+    except SyntaxError:
+        return True
+    except OSError:
+        return False
+    for node in tree.body:
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)) and node.name == "run":
+            return True
+    return False
+
+
+def _instrument_calls_get_public_input(inst_file: Path) -> bool:
+    """检查仪器脚本是否显式依赖 `get_public_input`（若不依赖且 spec 未配 public_input，支持直通 Stage B）。"""
+    try:
+        src = inst_file.read_text(encoding="utf-8", errors="replace")
+        return "get_public_input" in src
+    except OSError:
+        return False
+
+
 _STAGE_A_CHILD_SCRIPT = r"""
 import json, pathlib, runpy, sys, traceback
 
@@ -464,9 +490,15 @@ def run_isolated_instrument(
     eff_spec = dict(spec) if isinstance(spec, dict) else {}
     timeout_sec = max(1.0, min(600.0, float(eff_spec.get("timeout_sec", 60.0))))
 
-    # Stage A：对 Python `run(public_input)` 类型产物隔离执行并持久化；其他形态原样封装传递
-    if art_file.is_file() and _is_python_run_artifact(art_file, artifact_schema):
-        if "public_input" not in eff_spec or not isinstance(eff_spec["public_input"], dict):
+    # Stage A：对 Python `run(public_input)` 类型产物隔离执行并持久化；
+    # 若候选脚本导出的是自定义函数（如 solve/q1_answer）或仪器本身不依赖 get_public_input 且未配置 public_input，则自动直通 Stage B！
+    has_pub_dict = "public_input" in eff_spec and isinstance(eff_spec["public_input"], dict)
+    is_py_cand = art_file.is_file() and _is_python_run_artifact(art_file, artifact_schema)
+    cand_has_run = _candidate_py_exports_run(art_file) if is_py_cand else False
+    inst_needs_pub = _instrument_calls_get_public_input(inst_file) if is_py_cand else False
+
+    if is_py_cand and ((has_pub_dict and cand_has_run) or (not has_pub_dict and cand_has_run and inst_needs_pub)):
+        if not has_pub_dict:
             # 平台缺失 public_input 归属仪器/规格配置错误，绝不判候选失败！
             return {
                 "status": "INSTRUMENT_ERROR",
@@ -494,7 +526,7 @@ def run_isolated_instrument(
             }
         artifact_payload: Any = stage_a_data
     else:
-        # 非 Python 产物（JSON 反例 / .lean 文件 / 文本 / 目录）
+        # 非 Stage-A `run(public_input)` 产物（JSON 反例 / 导出 solve() 的 .py 脚本 / .lean 文件 / 文本 / 目录）
         if art_file.is_file() and art_file.suffix.lower() == ".json":
             try:
                 artifact_payload = json.loads(art_file.read_text(encoding="utf-8"))
@@ -507,13 +539,20 @@ def run_isolated_instrument(
                     "obs_status": "CANDIDATE_ERROR",
                 }
         elif art_file.is_file():
+            txt = art_file.read_text(encoding="utf-8", errors="replace")
             artifact_payload = {
                 "artifact_path": str(art_file),
+                "path": str(art_file),
+                "module_path": str(art_file),
                 "artifact_name": art_file.name,
-                "artifact_text": art_file.read_text(encoding="utf-8", errors="replace"),
+                "artifact_text": txt,
             }
         else:
-            artifact_payload = {"artifact_dir": str(art_file)}
+            artifact_payload = {
+                "artifact_dir": str(art_file),
+                "artifact_path": str(art_file),
+                "path": str(art_file),
+            }
 
         if persist_stage_a_path:
             dst = Path(persist_stage_a_path)

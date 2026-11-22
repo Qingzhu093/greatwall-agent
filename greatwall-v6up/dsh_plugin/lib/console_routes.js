@@ -1,15 +1,21 @@
 /**
- * 长城 V6-Up (v3.0) 右侧栏「长城控制台」服务端鉴权 HTTP 路由：
+ * 长城 V6-Up (v3.0) 右侧栏「长城科研指挥舱」服务端鉴权 HTTP 路由：
  *
  * 通过 DSH 原生 `ctx.connection.fetch.register(...)`（处于 Connection 鉴权围栏内）暴露：
- * - GET  /api/greatwall.status  : 获取活跃或磁盘历史工作区的实时编排状态、子题 L3 进度、红灯告警与节点遥测；
- * - POST /api/greatwall.control : 在 UI 面板直接执行 pause / resume / stop / human_stop / intervene 节点定向纠偏。
+ * - GET  /api/greatwall.status  : 获取活跃或磁盘历史工作区的实时编排状态、谱系 DAG Flow、五段看板/37%元反思/70%遗嘱、跨 cwd 对话流、Worktree 文件树与源码预览；
+ * - POST /api/greatwall.control : 在 UI 面板直接执行 pause / resume / stop / human_stop / abort_node 节点定向纠偏。
  * @module dsh-greatwall-v6up/console_routes
  */
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { buildBlackboxTrajectorySummary } from './blackbox_projection.js'
+import { GreatwallMcpBridge } from './mcp_bridge.js'
 import { computeWorkspaceHash } from './telemetry.js'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const DEFAULT_CORE_PYTHON_ROOT = path.resolve(__dirname, '..', '..', 'core_python')
 
 const STATUS_PATH = '/api/greatwall.status'
 const CONTROL_PATH = '/api/greatwall.control'
@@ -86,8 +92,58 @@ function readDiskTelemetry(workspaceRoot, dataDir = '') {
   }
 }
 
-export function registerGreatwallConsoleRoutes(ctx, { activeControllersByWs, dataDir = '', logger = console }) {
+async function extractNodeConversations(ctx, telemetryState, selectedNodeId) {
+  if (!selectedNodeId || !telemetryState?.sessions) return []
+  const matched = Object.values(telemetryState.sessions)
+    .filter((s) => s && String(s.nodeId || '') === String(selectedNodeId))
+    .sort((a, b) => String(a.startedAt || '').localeCompare(String(b.startedAt || '')))
+  const out = []
+  for (const s of matched.slice(-6)) {
+    const sid = String(s.sessionId || '')
+    if (!sid) continue
+    let traceText = ''
+    try {
+      traceText = await buildBlackboxTrajectorySummary(ctx, sid, 6400)
+    } catch {
+      traceText = '(无法提取该会话轨迹)'
+    }
+    out.push({
+      sessionId: sid,
+      role: s.role || 'explorer',
+      title: s.title || s.role || sid,
+      status: s.status || 'completed',
+      startedAt: s.startedAt || null,
+      endedAt: s.endedAt || null,
+      pressureTokens: Number(s.pressureTokens || 0),
+      traceText,
+    })
+  }
+  return out
+}
+
+export function registerGreatwallConsoleRoutes(
+  ctx,
+  { activeControllersByWs, corePythonRoot = DEFAULT_CORE_PYTHON_ROOT, dataDir = '', pythonBin = '', logger = console },
+) {
   if (!ctx) return () => {}
+
+  /** @type {Map<string, GreatwallMcpBridge>} */
+  const readonlyBridgesByWs = new Map()
+  const getOrCreateReadonlyBridge = (wsRoot) => {
+    const norm = path.resolve(wsRoot).toLowerCase()
+    let b = readonlyBridgesByWs.get(norm)
+    if (!b) {
+      b = new GreatwallMcpBridge({
+        corePythonRoot: corePythonRoot || DEFAULT_CORE_PYTHON_ROOT,
+        workspaceRoot: path.resolve(wsRoot),
+        dataDir,
+        pythonBin: pythonBin || undefined,
+        requestTimeoutMs: 25_000,
+      })
+      readonlyBridgesByWs.set(norm, b)
+    }
+    return b
+  }
 
   let mountedDisposer = null
   const mountOnConnection = (connCtx, connObj) => {
@@ -103,6 +159,8 @@ export function registerGreatwallConsoleRoutes(ctx, { activeControllersByWs, dat
           const url = new URL(request.url)
           const reqWs = (url.searchParams.get('workspaceRoot') || '').trim()
           const sessionId = (url.searchParams.get('sessionId') || '').trim()
+          const selectedNodeId = (url.searchParams.get('selectedNodeId') || '').trim()
+          const selectedFileRel = (url.searchParams.get('selectedFile') || '').trim()
           const sessionCwd = resolveSessionCwd(connCtx, sessionId)
 
           const ctrl = pickController({
@@ -122,6 +180,17 @@ export function registerGreatwallConsoleRoutes(ctx, { activeControllersByWs, dat
           if (ctrl) {
             const status = await ctrl.orchestrator.getControlStatus()
             const tState = ctrl.orchestrator.telemetry?.state || {}
+            let inspector = null
+            try {
+              const inspRes = await ctrl.bridge.control('control_plane/ui_inspector', {
+                workspace_root: ctrl.workspaceRoot,
+                selected_node_id: selectedNodeId || null,
+                selected_worktree_rel_file: selectedFileRel || null,
+              })
+              inspector = inspRes?.data || null
+            } catch {}
+            const activeNid = selectedNodeId || inspector?.selected_node_detail?.node_id || ''
+            const nodeConversations = await extractNodeConversations(connCtx, tState, activeNid)
             return Response.json(
               {
                 ok: true,
@@ -129,6 +198,8 @@ export function registerGreatwallConsoleRoutes(ctx, { activeControllersByWs, dat
                 workspaceRoot: ctrl.workspaceRoot,
                 knownWorkspaces,
                 status,
+                inspector,
+                nodeConversations,
                 telemetryState: {
                   orchestratorState: tState.orchestratorState || status.state,
                   stage: tState.stage || status.stage,
@@ -145,19 +216,41 @@ export function registerGreatwallConsoleRoutes(ctx, { activeControllersByWs, dat
 
           const fallbackWs = reqWs || sessionCwd || diskList[0]?.data?.workspaceRoot || ''
           const diskData = readDiskTelemetry(fallbackWs, dataDir) || diskList[0]?.data || null
+          let inspector = null
+          if (fallbackWs) {
+            try {
+              const roBridge = getOrCreateReadonlyBridge(fallbackWs)
+              const inspRes = await roBridge.control('control_plane/ui_inspector', {
+                workspace_root: fallbackWs,
+                selected_node_id: selectedNodeId || null,
+                selected_worktree_rel_file: selectedFileRel || null,
+              })
+              inspector = inspRes?.data || null
+            } catch {}
+          }
+          const activeNid = selectedNodeId || inspector?.selected_node_detail?.node_id || ''
+          const nodeConversations = await extractNodeConversations(connCtx, diskData, activeNid)
+          const snap = inspector?.snapshot || null
           return Response.json(
             {
               ok: true,
-              source: diskData ? 'disk_telemetry' : 'empty',
+              source: diskData || snap?.initialized ? 'disk_telemetry' : 'empty',
               workspaceRoot: fallbackWs,
               knownWorkspaces,
-              status: diskData
+              inspector,
+              nodeConversations,
+              status: diskData || snap
                 ? {
-                    state: diskData.orchestratorState || 'idle',
-                    stage: diskData.stage || 'STAGE1_PARSE0',
-                    runningExplorers: diskData.activeExplorers || [],
-                    runningGovernanceTasks: diskData.activeGovernance || [],
-                    snapshot: null,
+                    poolState: diskData?.orchestratorState || 'archived',
+                    state: diskData?.orchestratorState || 'archived',
+                    kernelAlive: Boolean(snap),
+                    initialized: Boolean(snap?.initialized),
+                    stage: snap?.stage || diskData?.stage || 'STAGE1_PARSE0',
+                    closureStatus: snap?.closure_state?.status || 'OPEN',
+                    latestSpecRevision: Number(snap?.latest_spec_revision || 0),
+                    runningExplorers: diskData?.activeExplorers || [],
+                    runningGovernanceTasks: diskData?.activeGovernance || [],
+                    snapshot: snap,
                   }
                 : null,
               telemetryState: diskData,
@@ -226,6 +319,20 @@ export function registerGreatwallConsoleRoutes(ctx, { activeControllersByWs, dat
             )
             return Response.json({ ok: Boolean(res?.aborted), action, ...res })
           }
+          if (action === 'submit_works_ticket') {
+            const res = await ctrl.orchestrator.submitWorksTicket({
+              questionId: String(body?.questionId || body?.question_id || 'ALL'),
+              ticketType: String(body?.ticketType || body?.ticket_type || 'INSTRUMENT_ERROR'),
+              instrumentId: body?.instrumentId || body?.instrument_id || null,
+              description: String(body?.description || body?.reason || ''),
+              source: String(body?.source || 'ui_console'),
+            })
+            return Response.json({ ok: Boolean(res?.submitted), action, ...res })
+          }
+          if (action === 'sync_rulings') {
+            const res = await ctrl.orchestrator.syncPublicRulings(Boolean(body?.refreshActiveWorktrees || body?.refresh_active_worktrees))
+            return Response.json({ ok: Boolean(res?.synced), action, ...res })
+          }
           return Response.json({ ok: false, error: `不支持的控制台动作: ${action}` }, { status: 400 })
         } catch (err) {
           logger.warn?.('[dsh-greatwall-v6up] /api/greatwall.control error:', err?.message || err)
@@ -265,5 +372,9 @@ export function registerGreatwallConsoleRoutes(ctx, { activeControllersByWs, dat
   return () => {
     try { mountedDisposer?.() } catch {}
     try { typeof injectDisposer === 'function' && injectDisposer() } catch {}
+    for (const b of readonlyBridgesByWs.values()) {
+      void b.dispose().catch(() => {})
+    }
+    readonlyBridgesByWs.clear()
   }
 }

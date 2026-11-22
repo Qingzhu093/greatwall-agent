@@ -13,6 +13,7 @@ from .control_plane_service import (
     check_stage2_closure_gate_data,
     compute_delivery_dir_sha256,
     compute_family_concentration_alerts,
+    compute_topology_and_revision_health,
 )
 from .db_schema import (
     ALLOWED_COMPLIANCE_STAGES,
@@ -36,7 +37,7 @@ def tool_get_supervisory_audit_snapshot(
     caller_role: str,
     session_id: str,
 ) -> dict[str, Any]:
-    """纯查 SQLite (<50ms) 返回全局流程审计快照：Parse 0、仪器健康、口径红灯、学派聚拢、最短投入时间与两步终局状态。"""
+    """纯查 SQLite (<50ms) 返回全局流程审计快照：Parse 0、仪器与探针真实健康度、口径红灯、学派聚拢、断代分支与孤儿返工单、单线退化告警、最短投入时间与两步终局状态。"""
     enforce_role_tool_permission(conn, caller_role, "get_supervisory_audit_snapshot", session_id=session_id)
 
     p0 = conn.execute("SELECT * FROM parse0_contract WHERE contract_id = 'active'").fetchone()
@@ -59,21 +60,141 @@ def tool_get_supervisory_audit_snapshot(
     ]
     conc_alerts = compute_family_concentration_alerts(conn)
     gate_full = check_stage2_closure_gate_data(conn, mode="FULL", human_aborted=False)
+    topology_health = compute_topology_and_revision_health(conn, question_filter="ALL")
 
     latest_spec_rev = int(p0["latest_spec_revision"] or 0) if (p0 and "latest_spec_revision" in p0.keys()) else 0
     latest_ruling_summary = str(p0["latest_ruling_summary_md"] or "") if (p0 and "latest_ruling_summary_md" in p0.keys()) else ""
     active_node_revs = [
         dict(r)
         for r in conn.execute(
-            "SELECT node_id, question_id, branch_id, node_status, spec_revision FROM lineage_nodes WHERE node_status IN ('EXPLORING','ACTIVE_REVISING','AWAITING_TRIAGE','PENDING_REVIEW') ORDER BY updated_at DESC LIMIT 30"
+            """
+            SELECT node_id, question_id, branch_id, family_id, generation, node_status,
+                   spec_revision, pressure_tokens, effective_context_window, first_reflection_unlocked
+            FROM lineage_nodes
+            WHERE node_status IN ('EXPLORING','ACTIVE_REVISING','AWAITING_TRIAGE','PENDING_REVIEW')
+            ORDER BY updated_at DESC LIMIT 30
+            """
         ).fetchall()
     ]
+
+    # 仪器与探针真实运行遥测（避免工造司升版重置 consecutive_error_count 后掩盖前线真实失败率）
+    probe_stats_row = conn.execute(
+        """
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN status = 'OK' THEN 1 ELSE 0 END) AS ok_cnt,
+               SUM(CASE WHEN status != 'OK' THEN 1 ELSE 0 END) AS err_cnt
+        FROM probe_diagnostic_logs
+        """
+    ).fetchone()
+    probe_total = int(probe_stats_row["total"] or 0) if probe_stats_row else 0
+    probe_ok = int(probe_stats_row["ok_cnt"] or 0) if probe_stats_row else 0
+    probe_err = int(probe_stats_row["err_cnt"] or 0) if probe_stats_row else 0
+
+    obs_inst_errors = int(
+        conn.execute("SELECT COUNT(*) AS cnt FROM observations WHERE obs_status = 'INSTRUMENT_ERROR'").fetchone()["cnt"]
+        or 0
+    )
+    open_works_tickets = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT ticket_id, question_id, ticket_type, instrument_id, payload_json, created_at FROM works_engineering_queue WHERE status = 'OPEN' ORDER BY created_at DESC LIMIT 10"
+        ).fetchall()
+    ]
+    inst_counts_by_q = [
+        dict(r)
+        for r in conn.execute(
+            """
+            SELECT question_id,
+                   COUNT(DISTINCT instrument_id) AS distinct_instruments,
+                   COUNT(*) AS total_versions
+            FROM instruments
+            GROUP BY question_id
+            """
+        ).fetchall()
+    ]
+    instrument_telemetry = {
+        "probe_calls_total": probe_total,
+        "probe_calls_ok": probe_ok,
+        "probe_calls_error": probe_err,
+        "official_instrument_errors_total": obs_inst_errors,
+        "open_works_tickets_count": len(open_works_tickets),
+        "open_works_tickets": open_works_tickets,
+        "instrument_versions_by_question": inst_counts_by_q,
+    }
+
+    # 汇总结构化异常清单（watchdog_anomalies），让 0 工具监察委一眼看清流程失真并签发 ALERT
+    watchdog_anomalies: list[dict[str, Any]] = []
+    blocking_qs_set: set[str] = set()
+
+    for orph in topology_health.get("orphaned_blind_review_revisions") or []:
+        qid_o = str(orph.get("question_id") or "Q1")
+        blocking_qs_set.add(qid_o)
+        watchdog_anomalies.append(
+            {
+                "anomaly_type": "ORPHANED_BLIND_REVIEW_REVISION",
+                "question_id": qid_o,
+                "review_id": orph.get("review_id"),
+                "source_node_id": orph.get("source_node_id"),
+                "branch_id": orph.get("branch_id"),
+                "family_id": orph.get("family_id"),
+                "summary": f"盲审单 {orph.get('review_id')} 判为 REVISE 待返工，但原分支 {orph.get('branch_id')} ({orph.get('source_node_id')}) 已被中止或断代，当前无活跃节点承接返工单！需唤醒 Logistics 执行 fork_branch 续接。",
+            }
+        )
+
+    for us in topology_health.get("understaffed_questions") or []:
+        qid_u = str(us.get("question_id") or "Q1")
+        blocking_qs_set.add(qid_u)
+        watchdog_anomalies.append(
+            {
+                "anomaly_type": "SINGLE_BRANCH_DEGENERATION_OR_UNDERSTAFFED_FAMILIES",
+                "question_id": qid_u,
+                "active_branch_count": us.get("active_branch_count"),
+                "missing_active_family_ids": us.get("missing_active_family_ids"),
+                "free_explorer_slots": us.get("free_explorer_slots"),
+                "summary": (
+                    f"子题 {qid_u} 已登记 {len(us.get('registered_active_families') or [])} 个正交学派，"
+                    f"但当前仅 {us.get('active_branch_count')} 条分支在跑（空闲槽位 {us.get('free_explorer_slots')} 个），"
+                    f"正交学派 {us.get('missing_active_family_ids')} 断代缺编！需唤醒 Logistics 补齐多路 Worktree。"
+                ),
+            }
+        )
+
+    if unhealthy:
+        for u in unhealthy:
+            qid_i = str(u.get("question_id") or "Q1")
+            if qid_i != "ALL":
+                blocking_qs_set.add(qid_i)
+        watchdog_anomalies.append(
+            {
+                "anomaly_type": "UNHEALTHY_INSTRUMENT_CIRCUIT_BROKEN",
+                "instruments": [u["instrument_id"] for u in unhealthy],
+                "summary": f"存在 {len(unhealthy)} 台连续报错熔断的 UNHEALTHY 仪器，需工造司修复升版。",
+            }
+        )
+
+    if probe_total >= 3 and probe_ok == 0:
+        watchdog_anomalies.append(
+            {
+                "anomaly_type": "PROBE_100PCT_FAILURE_RATE",
+                "probe_calls_total": probe_total,
+                "probe_calls_error": probe_err,
+                "summary": f"前线探索者累计调用 {probe_total} 次 tier='probe' 全部失败（0 次成功），存在仪器派发契约摩擦。",
+            }
+        )
+
+    if watchdog_anomalies:
+        guidance = (
+            f"检测到 {len(watchdog_anomalies)} 项流程/拓扑异常（{[a['anomaly_type'] for a in watchdog_anomalies]}）！"
+            f"请调用 record_compliance_check(stage='STAGE2_HEARTBEAT', status='ALERT', blocking_questions={sorted(blocking_qs_set)!r}, notes='...') 登记告警以驱动后勤/工造司闭环纠偏。"
+        )
+    else:
+        guidance = "纯只读审计快照已就绪；请严格遵循流程正义与零 .md 落盘原则调用 record_compliance_check 写库。"
 
     return build_tool_receipt(
         conn=conn,
         tool_name="get_supervisory_audit_snapshot",
         question_id="ALL",
-        next_step_guidance="纯只读审计快照已就绪；请严格遵循流程正义与零 .md 落盘原则调用 record_compliance_check 写库。",
+        next_step_guidance=guidance,
         data={
             "parse0_signed": bool(p0 and str(p0["human_signed_at"] or "").strip()),
             "stage": str(p0["stage"]) if p0 else "STAGE1_PARSE0",
@@ -82,8 +203,11 @@ def tool_get_supervisory_audit_snapshot(
             "active_node_spec_revisions": active_node_revs,
             "consecutive_non_l1_handoffs": int(p0["consecutive_non_l1_handoffs"] or 0) if p0 else 0,
             "unhealthy_instruments": unhealthy,
+            "instrument_and_probe_telemetry": instrument_telemetry,
             "ambiguous_spec_alerts": ambiguous_alerts,
             "family_concentration_alerts": conc_alerts,
+            "topology_and_slot_health": topology_health,
+            "watchdog_anomalies": watchdog_anomalies,
             "project_closure_state": dict(closure_row) if closure_row else {},
             "closure_gate_full": gate_full,
             "recent_compliance_alerts": recent_checks,

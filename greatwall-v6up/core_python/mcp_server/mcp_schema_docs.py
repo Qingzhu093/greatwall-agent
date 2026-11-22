@@ -267,6 +267,12 @@ _TOOL_PROP_PATCHES: dict[str, dict[str, dict[str, Any]]] = {
         "calibration_suite_rel_path": {
             "description": "独立校准集 JSON 相对路径（非空 JSON 数组，tier 仅限 probe/official/heavy，非 OK 态 expected_verdict 为 null，100% 匹配即直接升版）。",
         },
+        "artifact_schema": {
+            "description": "可选：升版时同步更新仪器的 artifact_schema（如 python_run / raw_file）；不传或 null 则保持原 schema。",
+        },
+        "default_spec": {
+            "description": "可选：升版时同步更新仪器的 default_spec 配置字典（含 public_input 或 interface_hint）；不传或 null 则保持原配置。",
+        },
     },
     "recompute_stage_b_only": {
         "obs_id": {"description": "需按新版仪器免重跑 Stage A 重评的旧观测 ID（保留旧收据，成功生成新版新收据，缺字段标 INCOMPATIBLE）。"},

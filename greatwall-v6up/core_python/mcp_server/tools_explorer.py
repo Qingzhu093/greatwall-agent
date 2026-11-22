@@ -225,7 +225,11 @@ def tool_run_isolated_eval(
         )
 
     worktree_abs = str(node["worktree_abs_path"])
-    art_abs = safe_resolve_in_worktree(worktree_abs, artifact_rel_path)
+    raw_rel = str(artifact_rel_path or "").strip()
+    if tier_l == "probe" and raw_rel in ("", "."):
+        art_abs = Path(os.path.realpath(worktree_abs))
+    else:
+        art_abs = safe_resolve_in_worktree(worktree_abs, artifact_rel_path)
     if not art_abs.exists():
         raise FailClosedError(
             ERR_NOT_FOUND,

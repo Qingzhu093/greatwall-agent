@@ -13,9 +13,11 @@ from .control_plane_service import (
     backup_retained_candidate_snapshot,
     check_branch_requires_satisfied,
     compute_family_concentration_alerts,
+    compute_topology_and_revision_health,
     get_question_order_status,
     restore_retained_candidate_snapshot,
     sync_public_inputs_to_worktree,
+    sync_public_instruments_and_skills_to_worktree,
 )
 from .db_schema import (
     ALLOWED_FORK_MODES,
@@ -147,11 +149,42 @@ def tool_get_logistics_dashboard(
             for o in obs_rows
         ]
 
-    guidance = (
-        f"发现 {len(conc_alerts)} 条无豁免学派聚拢告警 (>50%)，请立即执行 fork_branch(fork_mode='orthogonal') 正交分流！"
-        if conc_alerts
-        else f"当前待分诊 {len(triage_nodes)} 节点、Ready Queue {len(ready_queue)} 条、已登记学派 {len(families)} 个。"
-    )
+    topo = compute_topology_and_revision_health(conn, question_filter=qf)
+    orphaned_revs = topo.get("orphaned_blind_review_revisions") or []
+    understaffed_qs = topo.get("understaffed_questions") or []
+    stalled_branches = topo.get("stalled_or_aborted_branches") or []
+    slot_util = topo.get("slot_utilization") or {}
+
+    latest_hb = conn.execute(
+        """
+        SELECT alert_id, stage, status, blocking_questions_json, notes, created_at
+        FROM compliance_alerts
+        WHERE stage = 'STAGE2_HEARTBEAT'
+        ORDER BY created_at DESC LIMIT 1
+        """
+    ).fetchone()
+    supervisory_alert = dict(latest_hb) if (latest_hb and str(latest_hb["status"]).upper() == "ALERT") else None
+
+    guidance_parts: list[str] = []
+    if conc_alerts:
+        guidance_parts.append(f"发现 {len(conc_alerts)} 条无豁免学派聚拢告警 (>50%)，请立即执行 fork_branch(fork_mode='orthogonal') 正交分流！")
+    if orphaned_revs:
+        guidance_parts.append(
+            f"发现 {len(orphaned_revs)} 条孤儿盲审返工单（{[r['review_id'] for r in orphaned_revs]}：原分支被中止或断代），"
+            f"请立即调用 fork_branch(parent_node_id=source_node_id, fork_mode='lateral', target_family_id=...) 继承快照与返工单继续冲刺二审！"
+        )
+    if understaffed_qs:
+        guidance_parts.append(
+            f"子题 {[u['question_id'] for u in understaffed_qs]} 存在正交学派断代缺编（单线独苗退化，空闲槽位 {slot_util.get('free_slots', 0)} 个），"
+            f"请对 missing_active_family_ids 调用 fork_branch 恢复多 Worktree 并行探索！"
+        )
+    if not guidance_parts:
+        guidance_parts.append(
+            f"当前待分诊 {len(triage_nodes)} 节点、活跃分支 {len(active_branches)} 条（空闲槽位 {slot_util.get('free_slots', 0)}）、"
+            f"断代分支 {len(stalled_branches)} 条、Ready Queue {len(ready_queue)} 条、已登记学派 {len(families)} 个。"
+        )
+    guidance = " ".join(guidance_parts)
+
     latest_spec_rev = int(p0["latest_spec_revision"] or 0) if (p0 and "latest_spec_revision" in p0.keys()) else 0
     latest_ruling_summary = str(p0["latest_ruling_summary_md"] or "") if (p0 and "latest_ruling_summary_md" in p0.keys()) else ""
     return build_tool_receipt(
@@ -166,8 +199,13 @@ def tool_get_logistics_dashboard(
             "required_questions": json.loads(p0["subquestions_json"]) if p0 else [],
             "question_order_status": order_status,
             "consecutive_non_l1_handoffs": int(p0["consecutive_non_l1_handoffs"] or 0) if p0 else 0,
+            "slot_utilization": slot_util,
             "method_families": families,
             "active_branches": active_branches,
+            "stalled_or_aborted_branches": stalled_branches,
+            "orphaned_blind_review_revisions": orphaned_revs,
+            "understaffed_questions": understaffed_qs,
+            "active_supervisory_alert": supervisory_alert,
             "family_concentration_alerts": conc_alerts,
             "awaiting_triage": triage_nodes,
             "ready_queue": ready_queue,
@@ -428,17 +466,33 @@ def tool_triage_node(
 
     if lvl == "LEVEL_2" or act == "INPLACE_REPAIR":
         cur_repairs = int(node["inplace_repair_count"] or 0)
-        # 若此前有物理快照先恢复工作区，并同步最新公开 inputs/ 供新代节点使用
+        # 防跨学派吞并：原地修补（INPLACE_REPAIR）属于同一路线的代码缺陷修复，若原节点所属学派为子题内该学派唯一分支，保持原学派不消灭正交学派
+        orig_fid = str(node["family_id"] or "").strip()
+        eff_repair_fid = fid
+        if orig_fid and orig_fid != fid:
+            rem_in_orig = conn.execute(
+                """
+                SELECT COUNT(DISTINCT branch_id) AS cnt FROM lineage_nodes
+                WHERE question_id = ? AND family_id = ? AND branch_id != ?
+                  AND node_status IN ('EXPLORING', 'ACTIVE_REVISING', 'AWAITING_TRIAGE', 'PENDING_REVIEW')
+                """,
+                (qid, orig_fid, bid),
+            ).fetchone()
+            if int(rem_in_orig["cnt"] or 0) == 0:
+                eff_repair_fid = orig_fid
+
+        # 若此前有物理快照先恢复工作区，并同步最新公开 inputs/ 与 PROBE/ENV 仪器镜像供新代节点使用
         if node["retained_snapshot_abs_path"]:
             restore_retained_candidate_snapshot(str(node["retained_snapshot_abs_path"]), str(node["worktree_abs_path"]))
         sync_public_inputs_to_worktree(workspace_root, str(node["worktree_abs_path"]), shared_rels)
+        sync_public_instruments_and_skills_to_worktree(conn, workspace_root, str(node["worktree_abs_path"]))
 
         next_node_id = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
         exhausted = cur_repairs >= max_repairs
         with rw_immediate_tx(conn):
             conn.execute(
                 "UPDATE lineage_nodes SET family_id = ?, node_status = 'CLOSED', updated_at = ? WHERE node_id = ?",
-                (fid, now, node_id),
+                (eff_repair_fid, now, node_id),
             )
             if exhausted:
                 # 满 3 次原地修补失败：仅记入本脉 lineage_dead_ends(IMPL_FAILURE)，绝对严禁污染中央图书馆 L2！
@@ -455,14 +509,14 @@ def tool_triage_node(
                 INSERT INTO lineage_nodes(
                     node_id, question_id, branch_id, family_id, parent_node_id, generation, node_status,
                     worktree_abs_path, retained_snapshot_abs_path, requires_json, revise_count,
-                    inplace_repair_count, spec_revision, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'EXPLORING', ?, ?, ?, ?, ?, ?, ?, ?)
+                    inplace_repair_count, last_revision_requests_json, spec_revision, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'EXPLORING', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     next_node_id,
                     qid,
                     bid,
-                    fid,
+                    eff_repair_fid,
                     node_id,
                     int(node["generation"]) + 1,
                     str(node["worktree_abs_path"]),
@@ -470,6 +524,7 @@ def tool_triage_node(
                     str(node["requires_json"] or "[]"),
                     int(node["revise_count"] or 0),
                     0 if exhausted else cur_repairs + 1,
+                    str(node["last_revision_requests_json"] or "[]"),
                     latest_spec_rev,
                     now,
                     now,
@@ -484,9 +539,9 @@ def tool_triage_node(
             next_step_guidance=(
                 f"原地修补满 {max_repairs} 次已写入本脉 lineage_dead_ends(IMPL_FAILURE)（未污染图书馆 L2）并回退重启 {next_node_id}。"
                 if exhausted
-                else f"已启动第 {cur_repairs + 1}/{max_repairs} 次 LEVEL_2 原地修补节点 {next_node_id}。"
+                else f"已启动第 {cur_repairs + 1}/{max_repairs} 次 LEVEL_2 原地修补节点 {next_node_id}（学派锁定为 {eff_repair_fid}）。"
             ),
-            data={"closed_node_id": node_id, "next_node_id": next_node_id, "repair_exhausted": exhausted},
+            data={"closed_node_id": node_id, "next_node_id": next_node_id, "assigned_family_id": eff_repair_fid, "repair_exhausted": exhausted},
         )
 
     if lvl == "LEVEL_3" or act == "SPAWN_PROTECTED":
@@ -501,6 +556,7 @@ def tool_triage_node(
         )
         restore_retained_candidate_snapshot(snap_path, str(prot_wt))
         sync_public_inputs_to_worktree(workspace_root, prot_wt, shared_rels)
+        sync_public_instruments_and_skills_to_worktree(conn, workspace_root, prot_wt)
         prot_nid = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
         with rw_immediate_tx(conn):
             conn.execute(
@@ -533,6 +589,7 @@ def tool_triage_node(
         candidate_rel_path=node["candidate_rel_path"],
     )
     sync_public_inputs_to_worktree(workspace_root, str(node["worktree_abs_path"]), shared_rels)
+    sync_public_instruments_and_skills_to_worktree(conn, workspace_root, str(node["worktree_abs_path"]))
     next_node_id = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
     with rw_immediate_tx(conn):
         conn.execute(
@@ -544,8 +601,8 @@ def tool_triage_node(
             INSERT INTO lineage_nodes(
                 node_id, question_id, branch_id, family_id, parent_node_id, generation, node_status,
                 worktree_abs_path, retained_snapshot_abs_path, requires_json, revise_count,
-                inplace_repair_count, spec_revision, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'EXPLORING', ?, ?, ?, ?, 0, ?, ?, ?)
+                inplace_repair_count, last_revision_requests_json, spec_revision, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'EXPLORING', ?, ?, ?, ?, 0, ?, ?, ?, ?)
             """,
             (
                 next_node_id,
@@ -558,6 +615,7 @@ def tool_triage_node(
                 snap_path,
                 str(node["requires_json"] or "[]"),
                 int(node["revise_count"] or 0),
+                str(node["last_revision_requests_json"] or "[]"),
                 latest_spec_rev,
                 now,
                 now,
@@ -588,7 +646,7 @@ def tool_fork_branch(
     new_mechanism_note: str | None = None,
     source_l3_id: str | None = None,
 ) -> dict[str, Any]:
-    """开启新探索分支（分支级确定性 requires、WHERE branch_id != :self 查重、跨脉授粉双 L3 门槛）。"""
+    """开启新探索分支（分支级确定性 requires、WHERE branch_id != :self 查重、跨脉授粉双 L3 门槛、断代/盲审返工快照无损继承）。"""
     enforce_role_tool_permission(conn, caller_role, "fork_branch", session_id=session_id)
     mode_l = str(fork_mode or "").strip().lower()
     if mode_l not in ALLOWED_FORK_MODES:
@@ -609,6 +667,7 @@ def tool_fork_branch(
 
     parent_branch_id = ""
     parent_family_id = ""
+    pnode: sqlite3.Row | None = None
     if parent_node_id:
         pnode = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ?", (parent_node_id,)).fetchone()
         if pnode is None:
@@ -664,6 +723,39 @@ def tool_fork_branch(
     new_nid = f"node_{question_id.lower()}_{uuid.uuid4().hex[:8]}"
     wt_dir = Path(os.path.realpath(workspace_root)) / "worktrees" / new_bid
     wt_dir.mkdir(parents=True, exist_ok=True)
+
+    # 若指定了 parent_node_id，自动继承父节点快照或父 Worktree 中的代码/工具资产，以及未结清的 REVISE 盲审返工意见！
+    inherited_snap_path: str | None = None
+    inherited_revise_count = 0
+    inherited_rev_reqs_json = "[]"
+    initial_status = "EXPLORING"
+
+    if pnode is not None:
+        p_snap = str(pnode["retained_snapshot_abs_path"] or "").strip()
+        p_wt = str(pnode["worktree_abs_path"] or "").strip()
+        if p_snap and Path(p_snap).is_dir():
+            restore_retained_candidate_snapshot(p_snap, str(wt_dir))
+            inherited_snap_path = p_snap
+        elif p_wt and Path(p_wt).is_dir():
+            restore_retained_candidate_snapshot(p_wt, str(wt_dir))
+
+        raw_reqs = str(pnode["last_revision_requests_json"] or "[]")
+        if raw_reqs in ("", "[]", "null"):
+            rev_row = conn.execute(
+                "SELECT revision_requests_json FROM review_queue WHERE source_node_id = ? AND review_status = 'CLOSED_REVISE' ORDER BY updated_at DESC LIMIT 1",
+                (str(pnode["node_id"]),),
+            ).fetchone()
+            if rev_row and rev_row["revision_requests_json"]:
+                raw_reqs = str(rev_row["revision_requests_json"])
+        try:
+            parsed_reqs = json.loads(raw_reqs)
+            if isinstance(parsed_reqs, list) and len(parsed_reqs) > 0 and parent_family_id == fid:
+                inherited_rev_reqs_json = json.dumps(parsed_reqs, ensure_ascii=False)
+                inherited_revise_count = int(pnode["revise_count"] or 1)
+                initial_status = "ACTIVE_REVISING"
+        except Exception:
+            pass
+
     try:
         p0_row = conn.execute(
             "SELECT shared_inputs_json, latest_spec_revision FROM parse0_contract WHERE contract_id = 'active'"
@@ -674,6 +766,8 @@ def tool_fork_branch(
         shared_rels = []
         latest_spec_rev = 0
     mounted_inputs = sync_public_inputs_to_worktree(workspace_root, wt_dir, shared_rels)
+    synced_insts = sync_public_instruments_and_skills_to_worktree(conn, workspace_root, wt_dir)
+    mounted_inputs.extend(synced_insts)
     now = utc_now_iso()
 
     with rw_immediate_tx(conn):
@@ -683,8 +777,9 @@ def tool_fork_branch(
             """
             INSERT INTO lineage_nodes(
                 node_id, question_id, branch_id, family_id, parent_node_id, generation, node_status,
-                worktree_abs_path, mechanism_summary, requires_json, spec_revision, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, 1, 'EXPLORING', ?, ?, ?, ?, ?, ?)
+                worktree_abs_path, retained_snapshot_abs_path, mechanism_summary, requires_json,
+                revise_count, last_revision_requests_json, spec_revision, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 new_nid,
@@ -692,9 +787,13 @@ def tool_fork_branch(
                 new_bid,
                 fid,
                 parent_node_id,
+                initial_status,
                 str(wt_dir),
-                str(new_mechanism_note or "")[:99],
+                inherited_snap_path,
+                str(new_mechanism_note or (pnode["mechanism_summary"] if pnode else "") or "")[:99],
                 json.dumps(clean_reqs, ensure_ascii=False),
+                inherited_revise_count,
+                inherited_rev_reqs_json,
                 latest_spec_rev,
                 now,
                 now,
@@ -709,7 +808,7 @@ def tool_fork_branch(
         next_step_guidance=(
             f"新分支 {new_bid} ({new_nid}) 已建立（前置 requires 未满足项 {unmet}，仅暂锁本分支不影响同题兄弟分支）。"
             if not sat
-            else f"新分支 {new_bid} ({new_nid}) 已就绪，将由伴随助手写行前看板并立即启动探索。"
+            else f"新分支 {new_bid} ({new_nid}, status={initial_status}) 已就绪，将由伴随助手写行前看板并立即启动探索。"
         ),
         data={
             "question_id": question_id,
@@ -717,6 +816,8 @@ def tool_fork_branch(
             "node_id": new_nid,
             "family_id": fid,
             "fork_mode": mode_l,
+            "node_status": initial_status,
+            "inherited_revision_requests": json.loads(inherited_rev_reqs_json),
             "worktree_abs_path": str(wt_dir),
             "mounted_public_inputs": mounted_inputs,
             "requires": clean_reqs,

@@ -17,6 +17,7 @@ from ..evaluators.isolated_runner import (
     sha256_file,
 )
 
+from .control_plane_service import sync_public_instruments_to_all_active_worktrees
 from .db_schema import (
     ALLOWED_INSTRUMENT_ROLES,
     ALLOWED_TICKET_RESOLUTIONS,
@@ -198,11 +199,13 @@ def tool_register_question_instrument(
             ),
         )
 
+    sync_public_instruments_to_all_active_worktrees(conn, workspace_root)
+
     return build_tool_receipt(
         conn=conn,
         tool_name="register_question_instrument",
         question_id=question_id,
-        next_step_guidance=f"仪器 {iid} v1 ({role_u}) 已通过校准集并激活（SHA={inst_sha[:12]}）。",
+        next_step_guidance=f"仪器 {iid} v1 ({role_u}) 已通过校准集并激活（SHA={inst_sha[:12]}，公开 PROBE/ENV 与仪器目录已同步至活跃 Worktree）。",
         data={
             "question_id": question_id,
             "instrument_id": iid,
@@ -223,8 +226,10 @@ def tool_upgrade_instrument_with_calibration(
     instrument_id: str,
     new_instrument_rel_path: str,
     calibration_suite_rel_path: str,
+    artifact_schema: str | None = None,
+    default_spec: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """校准集回归驱动仪器升版（100% 过校准即直接升版，仅局部将该仪器旧观测入待重评队列，绝零误杀他题）。"""
+    """校准集回归驱动仪器升版（100% 过校准即直接升版，支持同步更新 artifact_schema 与 default_spec，仅局部将该仪器旧观测入待重评队列，绝零误杀他题）。"""
     enforce_role_tool_permission(conn, caller_role, "upgrade_instrument_with_calibration", session_id=session_id)
     cur = conn.execute(
         "SELECT * FROM instruments WHERE instrument_id = ? AND is_active = 1 ORDER BY version DESC LIMIT 1",
@@ -241,7 +246,12 @@ def tool_upgrade_instrument_with_calibration(
     norm_cal_rel = _norm_rel_path(workspace_root, cal_abs, calibration_suite_rel_path)
 
     role_u = str(cur["instrument_role"])
-    art_schema = str(cur["artifact_schema"])
+    art_schema = str(artifact_schema).strip() if (artifact_schema and str(artifact_schema).strip()) else str(cur["artifact_schema"])
+    eff_default_spec_json = (
+        json.dumps(default_spec, ensure_ascii=False)
+        if isinstance(default_spec, dict)
+        else str(cur["default_spec_json"] or "{}")
+    )
     cal_report = run_calibration_suite(
         instrument_path=new_abs,
         instrument_role=role_u,
@@ -286,7 +296,7 @@ def tool_upgrade_instrument_with_calibration(
                 norm_cal_rel,
                 art_schema,
                 str(cur["plugin_protocol_version"]),
-                str(cur["default_spec_json"] or "{}"),
+                eff_default_spec_json,
                 now,
                 now,
             ),
@@ -338,6 +348,8 @@ def tool_upgrade_instrument_with_calibration(
             "UPDATE works_engineering_queue SET status = 'RESOLVED', updated_at = ? WHERE instrument_id = ? AND ticket_type = 'INSTRUMENT_ERROR' AND status = 'OPEN'",
             (now, instrument_id),
         )
+
+    sync_public_instruments_to_all_active_worktrees(conn, workspace_root)
 
     return build_tool_receipt(
         conn=conn,
@@ -592,6 +604,7 @@ def tool_update_skill_ledger(
     }
     skills_map[sid] = entry
     ledger_path.write_text(json.dumps(ledger, ensure_ascii=False, indent=2), encoding="utf-8")
+    sync_public_instruments_to_all_active_worktrees(conn, workspace_root)
 
     return build_tool_receipt(
         conn=conn,

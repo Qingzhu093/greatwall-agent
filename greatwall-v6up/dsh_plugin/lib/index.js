@@ -185,14 +185,14 @@ export function apply(ctx, config = {}) {
     disposeEntryTool = ctx.tools.register({
       name: 'greatwall_orchestrate',
       description:
-        '在 DeepSeek Harness 桌面会话中签署 Parse 0 或非阻塞操控长城科研共同体 V6-Up (v3.0) 后台异步事件池（init / start / pause / resume / stop / human_stop / abort_node / status）。',
+        '在 DeepSeek Harness 桌面会话中签署 Parse 0 或非阻塞操控长城科研共同体 V6-Up (v3.0) 后台异步事件池（init / start / pause / resume / stop / human_stop / abort_node / submit_works_ticket / sync_rulings / inspect / status）。',
       parameters: {
         type: 'object',
         properties: {
           action: {
             type: 'string',
-            enum: ['init', 'start', 'pause', 'resume', 'stop', 'human_stop', 'abort_node', 'status'],
-            description: 'init=签署Parse0六项表单; start=锁定模型绑定并异步启动事件池; pause/resume/stop=暂停/恢复并同步rulings/停止; human_stop=写入人类叫停真源; abort_node=确定性中止单节点; status=查实时状态',
+            enum: ['init', 'start', 'pause', 'resume', 'stop', 'human_stop', 'abort_node', 'submit_works_ticket', 'sync_rulings', 'inspect', 'status'],
+            description: 'init=签署Parse0六项表单; start=锁定模型绑定并异步启动事件池; pause/resume/stop=暂停/恢复并同步rulings/停止; human_stop=写入人类叫停真源; abort_node=确定性中止单节点; submit_works_ticket=向科研仪器科签发正式工单并立刻唤醒工造司修复/升级仪器; sync_rulings=同步工作区rulings补充裁决; inspect=深度只读透视仪器/工单/谱系/盲审/监察状态; status=查实时状态',
           },
           workspace_root: {
             type: 'string',
@@ -270,11 +270,32 @@ export function apply(ctx, config = {}) {
           },
           node_id: {
             type: 'string',
-            description: 'abort_node 要中止的目标节点 ID（如 node_q1_xxxx）',
+            description: 'abort_node 要中止的目标节点 ID，或 inspect 要深度查看的节点 ID（如 node_q1_xxxx）',
           },
           reason: {
             type: 'string',
-            description: 'abort_node 中止原因或 human_stop 备注说明',
+            description: 'abort_node 中止原因、human_stop 备注说明，或 submit_works_ticket 问题描述兼容字段',
+          },
+          question_id: {
+            type: 'string',
+            description: 'submit_works_ticket 目标子题编号（如 Q1 / Q3 / ALL，默认 ALL）',
+          },
+          ticket_type: {
+            type: 'string',
+            enum: ['INSTRUMENT_ERROR', 'PAIN_POINT', 'DUPLICATE_TOOL', 'EXPLOIT'],
+            description: 'submit_works_ticket 工单类型（默认 INSTRUMENT_ERROR）',
+          },
+          instrument_id: {
+            type: 'string',
+            description: 'submit_works_ticket 可选：指定故障或需升级的仪器 ID（如 inst_surrogate_simulator）',
+          },
+          description: {
+            type: 'string',
+            description: 'submit_works_ticket 必填：仪器缺陷、校准问题或改造需求详细说明',
+          },
+          refresh_active_worktrees: {
+            type: 'boolean',
+            description: 'sync_rulings 可选：是否同时刷新在线探索者的 inputs/rulings/（默认 false，仅升版 spec_revision）',
           },
         },
         required: ['action', 'workspace_root'],
@@ -376,6 +397,32 @@ export function apply(ctx, config = {}) {
           )
           return { ok: Boolean(res?.aborted), action: act, ...res }
         }
+        if (act === 'submit_works_ticket') {
+          const res = await ctrl.orchestrator.submitWorksTicket({
+            questionId: String(args.question_id || 'ALL'),
+            ticketType: String(args.ticket_type || 'INSTRUMENT_ERROR'),
+            instrumentId: args.instrument_id ? String(args.instrument_id) : null,
+            description: String(args.description || args.reason || ''),
+            source: 'main_controller',
+          })
+          return { ok: Boolean(res?.submitted), action: act, ...res }
+        }
+        if (act === 'sync_rulings') {
+          const res = await ctrl.orchestrator.syncPublicRulings(Boolean(args.refresh_active_worktrees))
+          return { ok: Boolean(res?.synced), action: act, ...res }
+        }
+        if (act === 'inspect') {
+          const insp = await ctrl.bridge.control('control_plane/ui_inspector', {
+            workspace_root: ws,
+            ...(args.node_id ? { selected_node_id: String(args.node_id) } : {}),
+          })
+          return {
+            ok: Boolean(insp?.ok),
+            action: act,
+            inspector: insp?.data || null,
+            error: insp?.ok ? null : (insp?.error || 'inspect failed'),
+          }
+        }
         if (act === 'status') {
           return {
             ok: true,
@@ -413,7 +460,9 @@ export function apply(ctx, config = {}) {
 
   const disposeConsoleRoutes = registerGreatwallConsoleRoutes(ctx, {
     activeControllersByWs,
+    corePythonRoot: coreRoot,
     dataDir: config.dataDir || '',
+    pythonBin: config.pythonBin || '',
     logger,
   })
 

@@ -490,6 +490,7 @@ export class GreatwallOrchestrator {
       } catch {}
     }
     await disposeNodeCompanion(this, nid, 'aborted')
+    this._handoffsSinceHeartbeat += 1
     this.telemetry.recordEvent('node_aborted', { nodeId: nid, reason, dbOk: Boolean(dbRes?.ok) })
     this._wakeLoop()
     return {
@@ -498,6 +499,70 @@ export class GreatwallOrchestrator {
       dbResult: dbRes?.data || null,
       error: dbRes?.ok ? null : (dbRes?.error || 'abort_node failed'),
       status: await this.getControlStatus(),
+    }
+  }
+
+  /**
+   * 主控/人类通过控制面正规通道向科研仪器科（works_engineering_queue）签发 OPEN 工单，
+   * 复位工单队列冷却并立刻唤醒后台事件池派发 works_engineer 处置。
+   */
+  async submitWorksTicket({
+    questionId = 'ALL',
+    ticketType = 'INSTRUMENT_ERROR',
+    instrumentId = null,
+    description = '',
+    source = 'main_controller',
+  } = {}) {
+    const desc = String(description || '').trim()
+    if (!desc) {
+      return { submitted: false, error: 'description（工单问题描述）不能为空' }
+    }
+    const dbRes = await this.bridge.control('control_plane/submit_works_ticket', {
+      workspace_root: this.workspaceRoot,
+      question_id: String(questionId || 'ALL').trim() || 'ALL',
+      ticket_type: String(ticketType || 'INSTRUMENT_ERROR').trim().toUpperCase(),
+      instrument_id: instrumentId ? String(instrumentId).trim() : null,
+      description: desc,
+      source: String(source || 'main_controller'),
+    })
+    if (dbRes?.ok) {
+      this._govCooldownUntil.delete('works:queue')
+      this.telemetry.recordEvent('works_ticket_submitted', {
+        ticketId: dbRes?.data?.ticket_id || null,
+        questionId: dbRes?.data?.question_id || questionId,
+        ticketType: dbRes?.data?.ticket_type || ticketType,
+        instrumentId: dbRes?.data?.instrument_id || instrumentId,
+        source,
+      })
+      this._wakeLoop()
+    }
+    return {
+      submitted: Boolean(dbRes?.ok),
+      ticket: dbRes?.data || null,
+      error: dbRes?.ok ? null : (dbRes?.error || 'submit_works_ticket failed'),
+      status: await this.getControlStatus(),
+    }
+  }
+
+  /**
+   * 主控显式同步工作区 `rulings/` 补充裁决文档（升版 spec_revision 并可选刷新活跃 Worktree），无需暂停重启。
+   */
+  async syncPublicRulings(refreshActiveWorktrees = false) {
+    const dbRes = await this.bridge.control('control_plane/sync_public_rulings', {
+      workspace_root: this.workspaceRoot,
+      refresh_active_worktrees: Boolean(refreshActiveWorktrees),
+    })
+    if (dbRes?.ok) {
+      this.telemetry.recordEvent('public_rulings_synced', {
+        changed: Boolean(dbRes?.data?.changed),
+        latestSpecRevision: dbRes?.data?.latest_spec_revision ?? null,
+      })
+      this._wakeLoop()
+    }
+    return {
+      synced: Boolean(dbRes?.ok),
+      rulingSync: dbRes?.data || null,
+      error: dbRes?.ok ? null : (dbRes?.error || 'sync_public_rulings failed'),
     }
   }
 
@@ -860,7 +925,7 @@ export class GreatwallOrchestrator {
                 signal: sig,
                 taskContextText: `### Parse 0 课题目标\n${snap.goal_and_completion_md || ''}\n### 待就绪初始仪器清单\n${JSON.stringify(missingInsts, null, 2)}`,
                 prompt: missingInsts.length > 0
-                  ? `Stage 1 初始仪器核查：请调用 get_works_engineering_queue(question_id="ALL")，为 Parse 0 声明且尚未激活的初始仪器 ${JSON.stringify(missingInsts)} 逐一编写脚本与校准集并调用 register_question_instrument 完成激活。`
+                  ? `Stage 1 初始仪器核查：请调用 get_works_engineering_queue(question_id="ALL")，为 Parse 0 声明且尚未激活的初始仪器 ${JSON.stringify(missingInsts)} 逐一编写脚本与校准集并调用 register_question_instrument 完成激活（请优先严格使用声明中的 instrument_id，不要随意增删 inst_ 前缀）。`
                   : 'Stage 1 统一初始仪器核查：Parse 0 未声明初始仪器（如纯理论/推导课题）。请调用一次 get_works_engineering_queue(question_id="ALL") 确认当前无需锻造初始仪器后直接正常返回，控制面将自动标记 stage1_works_checked=1 推进后续流程。',
               })
               // 控制面客观测验全部初始仪器是否已激活（或初始清单为空），达标即落标 stage1_works_checked=1
@@ -1148,7 +1213,7 @@ export class GreatwallOrchestrator {
         }
       }
 
-      // 4) 后勤总管：分诊 AWAITING_TRIAGE + 无豁免聚拢分流 + 已解锁无分支子题派单
+      // 4) 后勤总管：分诊 AWAITING_TRIAGE + 无豁免聚拢分流 + 已解锁无分支子题派单 + 孤儿盲审返工单续接 + 缺编正交学派补齐（闭环响应监察委 ALERT）
       const triageFpMap = buildTriageItemFingerprints(snap)
       const activeTriageItems = []
       for (const [k, fp] of triageFpMap.entries()) {
@@ -1162,6 +1227,16 @@ export class GreatwallOrchestrator {
       const needQs = (snap.questions_needing_branch || []).filter(
         (q) => !this._itemBreaker.isBroken(`need_branch:${q}`, `need:${q}`),
       )
+      const orphanedRevs = (snap.orphaned_blind_review_revisions || []).filter(
+        (r) => !this._itemBreaker.isBroken(`orphan_rev:${r.review_id}`, `orphan:${r.review_id}:${r.source_node_id}`),
+      )
+      const understaffedQs = (snap.understaffed_questions || []).filter(
+        (u) => !this._itemBreaker.isBroken(
+          `understaffed:${u.question_id}`,
+          `active=${u.active_branch_count}:missing=${(u.missing_active_family_ids || []).join(',')}`,
+        ),
+      )
+      const supAlert = snap.active_supervisory_alert || null
       const logisticsItems = [
         ...activeTriageItems,
         ...concAlerts.map((a) => ({
@@ -1169,27 +1244,49 @@ export class GreatwallOrchestrator {
           beforeFp: `cnt=${a.branch_count_in_family}/${a.total_active_branches}`,
         })),
         ...needQs.map((q) => ({ key: `need_branch:${q}`, beforeFp: `need:${q}` })),
+        ...orphanedRevs.map((r) => ({
+          key: `orphan_rev:${r.review_id}`,
+          beforeFp: `orphan:${r.review_id}:${r.source_node_id}`,
+        })),
+        ...understaffedQs.map((u) => ({
+          key: `understaffed:${u.question_id}`,
+          beforeFp: `active=${u.active_branch_count}:missing=${(u.missing_active_family_ids || []).join(',')}`,
+        })),
       ]
       if (logisticsItems.length > 0) {
         const triageCount = activeTriageItems.length
+        const uiActionLabel = triageCount > 0
+          ? `分诊(${triageCount})`
+          : (orphanedRevs.length > 0
+              ? `续接盲审返工(${orphanedRevs.map((r) => r.review_id).join(',')})`
+              : (concAlerts.length > 0
+                  ? '正交分流'
+                  : (understaffedQs.length > 0
+                      ? `补齐正交分支(${understaffedQs.map((u) => u.question_id).join(',')})`
+                      : `派单(${needQs.join(',')})`)))
         if (this._launchGovTask('logistics:triage', async () => {
           await this.spawnAndRunAgent({
             role: 'logistics_coordinator',
-            uiLabel: `[后勤总管] ${triageCount > 0 ? `分诊(${triageCount})` : (concAlerts.length > 0 ? '正交分流' : `派单(${needQs.join(',')})`)}`,
+            uiLabel: `[后勤总管] ${uiActionLabel}`,
             shortTransaction: false,
             signal: sig,
             taskContextText: [
+              supAlert ? `### [监察委员会合规告警与纠偏指令] (${supAlert.alert_id})\n${supAlert.notes || ''}` : '',
               concAlerts.length > 0 ? `### 学派聚拢红线告警 (>=2 且 >50%，无高产豁免)\n${JSON.stringify(concAlerts, null, 2)}` : '',
+              orphanedRevs.length > 0 ? `### 孤儿盲审返工单（原分支已被中止/断代，必须用 fork_branch 继承快照与返工单！）\n${JSON.stringify(orphanedRevs, null, 2)}` : '',
+              understaffedQs.length > 0 ? `### 正交学派断代缺编告警（单线独苗退化，请补齐多 Worktree 并行探索）\n${JSON.stringify(understaffedQs, null, 2)}` : '',
               snap.latest_spec_revision > 0 ? `### 最新公开裁决版本 v${snap.latest_spec_revision}\n${snap.latest_ruling_summary_md || ''}` : '',
             ].filter(Boolean).join('\n\n'),
             prompt: [
-              '请调用 get_logistics_dashboard(question_id="ALL") 查看全卷待分诊节点、方法学派分布、最新公开裁决版本与子题进度：',
-              triageCount > 0 ? `- 现有 ${triageCount} 个节点处于 AWAITING_TRIAGE（其分支已被硬锁禁止抢跑），请逐一调用 triage_node 做出裁决；` : '',
+              '请调用 get_logistics_dashboard(question_id="ALL") 查看全卷待分诊节点、方法学派分布、断代分支（stalled_or_aborted_branches）、孤儿盲审返工单（orphaned_blind_review_revisions）、最新公开裁决版本与并发槽位利用率（slot_utilization）：',
+              triageCount > 0 ? `- 现有 ${triageCount} 个节点处于 AWAITING_TRIAGE（其分支已被硬锁禁止抢跑），请逐一调用 triage_node 做出裁决（注意：LEVEL_2 原地修补不得跨学派吞并消灭原正交学派；发现特异新侧面可判 LEVEL_3 / SPAWN_PROTECTED 派生受保护新 Worktree）；` : '',
+              orphanedRevs.length > 0 ? `- 存在 ${orphanedRevs.length} 条孤儿盲审返工单（${orphanedRevs.map((r) => `${r.review_id} -> parent_node_id="${r.source_node_id}", target_family_id="${r.family_id}"`).join('; ')}）：请立即调用 fork_branch(question_id=..., parent_node_id=..., fork_mode="lateral", target_family_id=...) 继承其快照与返工单继续冲刺二次盲审！` : '',
+              understaffedQs.length > 0 ? `- 子题 ${understaffedQs.map((u) => `${u.question_id}(缺编学派: ${(u.missing_active_family_ids || []).join(',')})`).join('; ')} 发生单线独苗退化且有空闲并发槽位：请调用 fork_branch(fork_mode="orthogonal" | "lateral") 补齐缺编正交学派的探索 Worktree！` : '',
               concAlerts.length > 0 ? `- 触发学派聚拢红线告警（>=2 分支且占比 >50%，严禁高产豁免），请立即登记新正交学派并通过 fork_branch(fork_mode="orthogonal") 分流！` : '',
               needQs.length > 0 ? `- 子题 ${needQs.join(', ')} 尚无活跃探索分支，请按需开枝。` : '',
             ].filter(Boolean).join('\n'),
           })
-          this._handoffsSinceHeartbeat += triageCount
+          this._handoffsSinceHeartbeat += Math.max(1, triageCount)
           await this._evaluateBreakerAfterTask('logistics_coordinator', logisticsItems, (nextSnap) => {
             const m = buildTriageItemFingerprints(nextSnap)
             for (const a of nextSnap?.family_concentration_alerts || []) {
@@ -1197,6 +1294,12 @@ export class GreatwallOrchestrator {
             }
             for (const q of nextSnap?.questions_needing_branch || []) {
               m.set(`need_branch:${q}`, `need:${q}`)
+            }
+            for (const r of nextSnap?.orphaned_blind_review_revisions || []) {
+              m.set(`orphan_rev:${r.review_id}`, `orphan:${r.review_id}:${r.source_node_id}`)
+            }
+            for (const u of nextSnap?.understaffed_questions || []) {
+              m.set(`understaffed:${u.question_id}`, `active=${u.active_branch_count}:missing=${(u.missing_active_family_ids || []).join(',')}`)
             }
             return m
           })
@@ -1243,12 +1346,14 @@ export class GreatwallOrchestrator {
         }
       }
 
-      // 7) 监察委周期心跳审计（仅在有新交接/分诊进展时按频次或 3 分钟节律触发，0 进展期间绝不空转）
+      // 7) 监察委周期心跳审计（有新交接/分诊/节点中止进展时按频次或 3 分钟节律触发；单线长跑期每 10 分钟保底巡检一次，0 探索者闲置时绝不空转）
       const nowMs = Date.now()
+      const hasActiveExploration = this._runningExplorers.size > 0
       if (
         snap.stage === 'STAGE2_EVOLVE' &&
         (this._handoffsSinceHeartbeat >= 3 ||
-          (this._handoffsSinceHeartbeat > 0 && this._lastHeartbeatAt > 0 && nowMs - this._lastHeartbeatAt > 180_000))
+          (this._handoffsSinceHeartbeat > 0 && this._lastHeartbeatAt > 0 && nowMs - this._lastHeartbeatAt > 180_000) ||
+          (hasActiveExploration && this._lastHeartbeatAt > 0 && nowMs - this._lastHeartbeatAt > 600_000))
       ) {
         if (this._launchGovTask('supervisory:heartbeat', async () => {
           this._handoffsSinceHeartbeat = 0
@@ -1258,7 +1363,7 @@ export class GreatwallOrchestrator {
             uiLabel: '[监察委员会] Stage2 心跳审计',
             shortTransaction: false,
             signal: sig,
-            prompt: '执行 STAGE2_HEARTBEAT 周期审计：请调 get_supervisory_audit_snapshot 核对流程合规、聚拢告警、最新公开裁决版本与仪器健康，调 record_compliance_check(stage="STAGE2_HEARTBEAT", status="PASSED" 或 "ALERT" 或 "ALERT_AMBIGUOUS_SPEC") 落库。',
+            prompt: '执行 STAGE2_HEARTBEAT 周期审计：请调 get_supervisory_audit_snapshot 核对流程合规、watchdog_anomalies（孤儿盲审返工单、单线独苗退化/正交学派缺编、Probe 失败率、仪器熔断）、聚拢告警與最新公开裁决版本；若 watchdog_anomalies 非空请调 record_compliance_check(stage="STAGE2_HEARTBEAT", status="ALERT", blocking_questions=..., notes=...) 触发闭环纠偏，否则调 status="PASSED" 或 "ALERT_AMBIGUOUS_SPEC" 落库。',
           })
         })) {
           dispatchedSomething = true

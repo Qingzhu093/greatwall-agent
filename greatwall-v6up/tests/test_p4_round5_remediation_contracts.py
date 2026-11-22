@@ -395,6 +395,35 @@ class TestP4Round5RemediationContracts(unittest.TestCase):
         self.assertFalse(chk_missing["data"]["stage1_works_checked"])
         self.assertEqual(len(chk_missing["data"]["missing_initial_instruments"]), 2)
 
+        # 2.5 Parse 0 声明无前缀 ID（如 surrogate_simulator），工造司注册 inst_surrogate_simulator 后应正确匹配落标
+        self._ctrl(
+            "control_plane/init_parse0",
+            {
+                "goal_and_completion_md": "inst_ 前缀归一化匹配核验",
+                "subquestions": ["Q1"],
+                "initial_instruments": [{"instrument_id": "surrogate_simulator", "question_id": "Q1"}],
+            },
+        )
+        conn = db.open_rw_connection(paths["db_path"])
+        try:
+            conn.execute("UPDATE parse0_contract SET stage1_works_checked = 0 WHERE contract_id = 'active'")
+            conn.execute(
+                """
+                INSERT INTO instruments(
+                    instrument_id, version, question_id, instrument_role, instrument_rel_path,
+                    instrument_sha256, calibration_suite_rel_path, artifact_schema, default_spec_json,
+                    is_active, health_status, consecutive_error_count, created_at, updated_at
+                ) VALUES ('inst_surrogate_simulator', 1, 'Q1', 'ENV', 'evaluators/sim.py',
+                          'sha_dummy', 'evaluators/cal.py', 'python_run', '{}', 1, 'HEALTHY', 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        chk_norm = self._ctrl("control_plane/mark_stage1_works_checked", {})
+        self.assertTrue(chk_norm["data"]["stage1_works_checked"], chk_norm)
+        self.assertEqual(chk_norm["data"]["missing_initial_instruments"], [])
+
         # 3. 272k 小窗口模型自适应时钟（W = min(500k, 272k) = 272k）
         self._call(
             "register_method_family",
@@ -502,6 +531,306 @@ class TestP4Round5RemediationContracts(unittest.TestCase):
         self.assertFalse(bad_eval["ok"])
         self.assertEqual(bad_eval["error_code"], "ERR_NOT_FOUND")
         self.assertIn("inst_q1_probe_push", bad_eval["error"])
+
+    def test_6_round6_supervisory_watchdog_orphaned_revision_and_worktree_probe_mirror(self) -> None:
+        """第六轮法医复现回归：
+        1. PROBE/ENV 公开仪器自动同步至探索者 <worktree>/inputs/instruments/ 与 <worktree>/tools/shared_probes/，且严禁泄漏 _hidden_calibrations；
+        2. 导出 solve() 的 .py 候选或无参 probe (artifact_rel_path='') 在无 public_input 时自动直通 Stage B；
+        3. upgrade_instrument_with_calibration 支持同步更新 artifact_schema 与 default_spec；
+        4. abort_node 中止 ACTIVE_REVISING 节点后，监察委快照与后勤看板均能检出 orphaned_blind_review_revisions 与 understaffed_questions，且 fork_branch 无损继承返工单；
+        5. triage_node(INPLACE_REPAIR) 禁止跨学派吞并消灭原正交学派的唯一分支。
+        """
+        self._ctrl(
+            "control_plane/init_parse0",
+            {"goal_and_completion_md": "第六轮法医闭环测试", "subquestions": ["Q1"], "initial_instruments": []},
+        )
+        eval_dir = self.ws / "evaluators"
+        hidden_dir = eval_dir / "_hidden_calibrations"
+        hidden_dir.mkdir(parents=True, exist_ok=True)
+        (hidden_dir / "secret_cal.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "case_id": "c1",
+                        "tier": "official",
+                        "spec": {},
+                        "artifact": {"ok": True},
+                        "expected_status": "OK",
+                        "expected_verdict": "PASS",
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (eval_dir / "probe_tool.py").write_text(
+            "def evaluate(artifact, spec, tier='probe'):\n"
+            "    return {'status': 'OK', 'verdict': None, 'tracks': {'checked': 1}, 'details': 'probe_ok'}\n",
+            encoding="utf-8",
+        )
+        (eval_dir / "geom_verdict.py").write_text(
+            "def evaluate(artifact, spec, tier='official'):\n"
+            "    return {'status': 'OK', 'verdict': 'PASS', 'tracks': {'err': 0.0}, 'details': 'geom_ok'}\n",
+            encoding="utf-8",
+        )
+
+        # 注册 3 个正交学派：wedge, rotat, jung
+        for fid in ("fam_wedge", "fam_rotat", "fam_jung"):
+            self.assertTrue(
+                self._call(
+                    "register_method_family",
+                    {"question_id": "Q1", "family_id": fid, "mechanism_signature": f"sig_{fid}", "orthogonal_contrast": "orth"},
+                    role="logistics_coordinator",
+                    sid="log_r6",
+                )["ok"]
+            )
+
+        fb_w = self._call("fork_branch", {"question_id": "Q1", "fork_mode": "orthogonal", "target_family_id": "fam_wedge"}, role="logistics_coordinator", sid="log_r6")
+        fb_r = self._call("fork_branch", {"question_id": "Q1", "fork_mode": "orthogonal", "target_family_id": "fam_rotat"}, role="logistics_coordinator", sid="log_r6")
+        fb_j = self._call("fork_branch", {"question_id": "Q1", "fork_mode": "orthogonal", "target_family_id": "fam_jung"}, role="logistics_coordinator", sid="log_r6")
+        nid_w, bid_w, wt_w = fb_w["data"]["node_id"], fb_w["data"]["branch_id"], Path(fb_w["data"]["worktree_abs_path"])
+        nid_r, bid_r, wt_r = fb_r["data"]["node_id"], fb_r["data"]["branch_id"], Path(fb_r["data"]["worktree_abs_path"])
+        nid_j, bid_j = fb_j["data"]["node_id"], fb_j["data"]["branch_id"]
+
+        # 工造司注册 PROBE 与 VERDICT 仪器 -> 活跃 Worktree 立即获得 PROBE 镜像与 INSTRUMENT_CATALOG.json，且无隐藏校准集
+        reg_p = self._call(
+            "register_question_instrument",
+            {
+                "question_id": "Q1",
+                "instrument_id": "inst_probe_r6",
+                "instrument_role": "PROBE",
+                "instrument_rel_path": "evaluators/probe_tool.py",
+                "artifact_schema": "python_run",
+                "default_spec": {"interface_hint": "无参自检探针"},
+            },
+            role="works_engineer",
+            sid="wks_r6",
+        )
+        self.assertTrue(reg_p["ok"], reg_p)
+        reg_v = self._call(
+            "register_question_instrument",
+            {
+                "question_id": "Q1",
+                "instrument_id": "inst_geom_r6",
+                "instrument_role": "VERDICT",
+                "instrument_rel_path": "evaluators/geom_verdict.py",
+                "calibration_suite_rel_path": "evaluators/_hidden_calibrations/secret_cal.json",
+                "artifact_schema": "python_run",
+                "default_spec": {"hw_deg": 1},
+            },
+            role="works_engineer",
+            sid="wks_r6",
+        )
+        self.assertTrue(reg_v["ok"], reg_v)
+
+        self.assertTrue((wt_w / "inputs" / "instruments" / "probe_tool.py").is_file())
+        self.assertTrue((wt_w / "tools" / "shared_probes" / "probe_tool.py").is_file())
+        self.assertTrue((wt_w / "inputs" / "instruments" / "INSTRUMENT_CATALOG.json").is_file())
+        self.assertFalse((wt_w / "inputs" / "instruments" / "secret_cal.json").exists())
+
+        # 探索者调用 tier='probe' 且 artifact_rel_path=''（无参目录自检）直接成功！
+        pr_res = self._call(
+            "run_isolated_eval",
+            {
+                "node_id": nid_w,
+                "question_id": "Q1",
+                "instrument_id": "inst_probe_r6",
+                "tier": "probe",
+                "artifact_rel_path": "",
+                "linguistic_prediction": "无参目录探针自检",
+            },
+            role="explorer",
+            sid="exp_w",
+        )
+        self.assertTrue(pr_res["ok"], pr_res)
+        self.assertEqual(pr_res["data"]["status"], "OK")
+
+        # 探索者提交导出 solve()（而非 run()）的 .py 脚本给无 public_input 的 inst_geom_r6 -> 直通 Stage B PASS！
+        (wt_w / "solver.py").write_text("def solve(pts, brs):\n    return {'area': 1.0}\n", encoding="utf-8")
+        off_res = self._call(
+            "run_isolated_eval",
+            {
+                "node_id": nid_w,
+                "question_id": "Q1",
+                "instrument_id": "inst_geom_r6",
+                "tier": "official",
+                "artifact_rel_path": "solver.py",
+                "linguistic_prediction": "导出 solve 的脚本应直通 Stage B 评测通过",
+            },
+            role="explorer",
+            sid="exp_w",
+        )
+        self.assertTrue(off_res["ok"], off_res)
+        self.assertEqual(off_res["data"]["obs_status"], "VALID_PASS")
+
+        # 工造司升版 inst_geom_r6 时同步更新 artifact_schema 与 default_spec
+        upg_res = self._call(
+            "upgrade_instrument_with_calibration",
+            {
+                "question_id": "Q1",
+                "instrument_id": "inst_geom_r6",
+                "new_instrument_rel_path": "evaluators/geom_verdict.py",
+                "calibration_suite_rel_path": "evaluators/_hidden_calibrations/secret_cal.json",
+                "artifact_schema": "raw_file",
+                "default_spec": {"hw_deg": 1, "interface_hint": "已升级为 raw_file 直通"},
+            },
+            role="works_engineer",
+            sid="wks_r6",
+        )
+        self.assertTrue(upg_res["ok"], upg_res)
+        cat_data = json.loads((wt_w / "inputs" / "instruments" / "INSTRUMENT_CATALOG.json").read_text(encoding="utf-8"))
+        geom_entry = next(x for x in cat_data["instruments"] if x["instrument_id"] == "inst_geom_r6")
+        self.assertEqual(geom_entry["artifact_schema"], "raw_file")
+        self.assertIn("raw_file 直通", geom_entry["interface_hint"])
+
+        # 模拟第六轮：wedge 分支交接送盲审 -> 盲审判 REVISE -> 主控 abort_node 杀掉 wedge 与 jung
+        self._call(
+            "submit_node_handoff",
+            {
+                "node_id": nid_w,
+                "branch_id": bid_w,
+                "question_id": "Q1",
+                "mechanism_summary": "半平面楔形偶极反例",
+                "evidence_grade": "ARTIFACT_ONLY",
+                "column_a_facts_md": "A栏：构造双站大距离偶极极限反例并验证 ρ=1/sin(2δ)，满六十字符核验载体要求，送盲审检验。",
+                "column_b_hypothesis_md": "B栏猜想",
+                "will_md": "送审",
+                "obs_ids": [],
+                "dead_ends": [],
+                "candidate_rel_path": "solver.py",
+                "is_empty_crash": False,
+            },
+            role="lineage_companion",
+            sid="comp_w",
+        )
+        tr_w = self._call(
+            "triage_node",
+            {"node_id": nid_w, "assigned_family_id": "fam_wedge", "triage_level": "LEVEL_1", "action": "SUBMIT_BLIND_REVIEW", "rationale": "送审"},
+            role="logistics_coordinator",
+            sid="log_r6",
+        )
+        rev_id = tr_w["data"]["created_review_id"]
+        self._call(
+            "submit_stage1_blind_ledger",
+            {
+                "review_id": rev_id,
+                "question_id": "Q1",
+                "ledger_items": [{"claim": "反例需补全对称与物理界", "evidence_location_and_quote": "manuscript_column_a.md", "is_verified": False}],
+                "stage1_verdict": "REVISE",
+                "revision_or_refutation_reason": "请补全 R1..R3 三项边界",
+            },
+            role="library_verifier",
+            sid="ver_r6",
+        )
+
+        # 主控 abort_node 中止 nid_w（手握 rev_001 的 ACTIVE_REVISING 节点）与 nid_j
+        self._ctrl("control_plane/abort_node", {"node_id": nid_w, "reason": "R1 裁决切换"})
+        self._ctrl("control_plane/abort_node", {"node_id": nid_j, "reason": "R1 裁决切换"})
+
+        # rotat 分支交接后，后勤判 LEVEL_2 (INPLACE_REPAIR) 时若试图把 assigned_family_id 偷改成 fam_jung，服务端自动保护原学派 fam_rotat！
+        self._call(
+            "submit_node_handoff",
+            {
+                "node_id": nid_r,
+                "branch_id": bid_r,
+                "question_id": "Q1",
+                "mechanism_summary": "旋转卡壳直径圆",
+                "evidence_grade": "ARTIFACT_ONLY",
+                "column_a_facts_md": "A栏：partA 脚本出现 TypeError 待原地修补。",
+                "column_b_hypothesis_md": "B栏",
+                "will_md": "修补 TypeError",
+                "obs_ids": [],
+                "dead_ends": [],
+                "is_empty_crash": False,
+            },
+            role="lineage_companion",
+            sid="comp_r",
+        )
+        tr_r = self._call(
+            "triage_node",
+            {"node_id": nid_r, "assigned_family_id": "fam_jung", "triage_level": "LEVEL_2", "action": "INPLACE_REPAIR", "rationale": "修补 TypeError"},
+            role="logistics_coordinator",
+            sid="log_r6",
+        )
+        self.assertTrue(tr_r["ok"], tr_r)
+        self.assertEqual(tr_r["data"]["assigned_family_id"], "fam_rotat")
+
+        # 此时监察委调用 get_supervisory_audit_snapshot：必须一眼检出 ORPHANED_BLIND_REVIEW_REVISION 与 SINGLE_BRANCH_DEGENERATION！
+        sup_snap = self._call("get_supervisory_audit_snapshot", {}, role="supervisory_committee", sid="sup_r6")
+        self.assertTrue(sup_snap["ok"], sup_snap)
+        anom_types = {a["anomaly_type"] for a in sup_snap["data"]["watchdog_anomalies"]}
+        self.assertIn("ORPHANED_BLIND_REVIEW_REVISION", anom_types)
+        self.assertIn("SINGLE_BRANCH_DEGENERATION_OR_UNDERSTAFFED_FAMILIES", anom_types)
+        self.assertIn("status='ALERT'", sup_snap["next_step_guidance"])
+
+        # 后勤调用 get_logistics_dashboard：同样清晰看到孤儿返工单与断代分支，并调用 fork_branch 无损续接 nid_w！
+        dash = self._call("get_logistics_dashboard", {"question_id": "Q1"}, role="logistics_coordinator", sid="log_r6")
+        self.assertEqual(len(dash["data"]["orphaned_blind_review_revisions"]), 1)
+        self.assertEqual(dash["data"]["orphaned_blind_review_revisions"][0]["source_node_id"], nid_w)
+
+        respawn = self._call(
+            "fork_branch",
+            {"question_id": "Q1", "parent_node_id": nid_w, "fork_mode": "lateral", "target_family_id": "fam_wedge"},
+            role="logistics_coordinator",
+            sid="log_r6",
+        )
+        self.assertTrue(respawn["ok"], respawn)
+        self.assertEqual(respawn["data"]["node_status"], "ACTIVE_REVISING")
+        self.assertTrue(len(respawn["data"]["inherited_revision_requests"]) >= 1)
+        respawn_wt = Path(respawn["data"]["worktree_abs_path"])
+        self.assertTrue((respawn_wt / "solver.py").is_file())
+
+        # 续接后孤儿盲审返工单立即清零！
+        dash_after = self._call("get_logistics_dashboard", {"question_id": "Q1"}, role="logistics_coordinator", sid="log_r6")
+        self.assertEqual(len(dash_after["data"]["orphaned_blind_review_revisions"]), 0)
+
+        # 验证 UI 全景透视原语 control_plane/ui_inspector
+        ui_insp = self._ctrl("control_plane/ui_inspector", {"selected_node_id": respawn["data"]["node_id"], "selected_worktree_rel_file": "solver.py"})
+        self.assertTrue(ui_insp["ok"], ui_insp)
+        self.assertEqual(ui_insp["data"]["selected_node_detail"]["node_id"], respawn["data"]["node_id"])
+        self.assertIn("def solve", ui_insp["data"]["selected_node_detail"]["preview_file_content"])
+
+    def test_7_main_controller_submit_works_ticket(self) -> None:
+        self._ctrl("control_plane/init_parse0", {"goal_and_completion_md": "主控直发工单至科研仪器科测试", "subquestions": ["Q1", "Q3"]})
+        # 空描述应 fail-closed 拒收
+        bad = self._ctrl("control_plane/submit_works_ticket", {"question_id": "Q3", "ticket_type": "INSTRUMENT_ERROR", "description": "  "})
+        self.assertFalse(bad["ok"])
+
+        # 主控签发正式工单
+        res = self._ctrl(
+            "control_plane/submit_works_ticket",
+            {
+                "question_id": "Q3",
+                "ticket_type": "INSTRUMENT_ERROR",
+                "instrument_id": "inst_surrogate_simulator",
+                "description": "模拟器物理边界条件符号写反，请核验并升版校准。",
+                "source": "main_controller",
+            },
+        )
+        self.assertTrue(res["ok"], res)
+        tid = res["data"]["ticket_id"]
+        self.assertEqual(res["data"]["status"], "OPEN")
+
+        # 调度快照立即可见 open_works_tickets，确保 orchestrator 立刻唤醒 works_engineer
+        snap = self._ctrl("control_plane/schedule_snapshot", {})["data"]
+        open_ids = [t["ticket_id"] for t in snap["open_works_tickets"]]
+        self.assertIn(tid, open_ids)
+
+        # 工造司通过 get_works_engineering_queue 看到并显式结案
+        q = self._call("get_works_engineering_queue", {"question_id": "ALL"}, role="works_engineer", sid="wk_mc")
+        self.assertTrue(q["ok"], q)
+        matched = [t for t in q["data"]["engineering_tickets"] if t["ticket_id"] == tid]
+        self.assertEqual(len(matched), 1)
+        self.assertIn("符号写反", matched[0]["payload_json"])
+
+        closed = self._call(
+            "resolve_works_ticket",
+            {"ticket_id": tid, "resolution": "RESOLVED", "resolution_note": "已修复边界符号并重新通过校准集。"},
+            role="works_engineer",
+            sid="wk_mc",
+        )
+        self.assertTrue(closed["ok"], closed)
+        snap2 = self._ctrl("control_plane/schedule_snapshot", {})["data"]
+        self.assertNotIn(tid, [t["ticket_id"] for t in snap2["open_works_tickets"]])
 
 
 if __name__ == "__main__":

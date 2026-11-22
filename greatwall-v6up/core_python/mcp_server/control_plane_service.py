@@ -211,6 +211,180 @@ def sync_public_inputs_to_worktree(
     return mounted
 
 
+def sync_public_instruments_and_skills_to_worktree(
+    conn: sqlite3.Connection,
+    workspace_root: str,
+    target_root: str | Path,
+) -> list[str]:
+    """将已激活的公开 PROBE/ENV 仪器源码、SKILL_LEDGER 共享探针及全量活跃仪器说明书清单只读镜像至探索者 Worktree。
+
+    严守安全边界：
+    1. 绝不拷贝任何校准集（`calibration_suite_rel_path` / `_hidden_calibrations`）或 `VERDICT` 裁判内部隐藏真值；
+    2. `PROBE` 与 `ENV` 仪器（以及 `SKILL_LEDGER.json` 登记的共享探针）同步至 `<worktree>/inputs/instruments/`
+       与 `<worktree>/tools/shared_probes/`，使探索者在自身 Worktree 内即可用 `pwsh` / `import` 直接运行探针与模拟器；
+    3. 生成 `<worktree>/inputs/instruments/INSTRUMENT_CATALOG.json`，清晰列出全部活跃仪器（含 `VERDICT`）的
+       `instrument_id`、`version`、`artifact_schema` 与 `default_spec_json`（含 `interface_hint`）。
+    """
+    ws = Path(os.path.realpath(workspace_root or ""))
+    tgt_base = Path(os.path.realpath(str(target_root)))
+    if not tgt_base.is_dir():
+        return []
+
+    core_root = Path(__file__).resolve().parent.parent
+    inst_out_dir = tgt_base / "inputs" / "instruments"
+    shared_tools_dir = tgt_base / "tools" / "shared_probes"
+    synced: list[str] = []
+
+    try:
+        active_rows = conn.execute(
+            """
+            SELECT instrument_id, version, question_id, instrument_role, instrument_rel_path,
+                   frozen_snapshot_path, artifact_schema, health_status, default_spec_json, updated_at
+            FROM instruments
+            WHERE is_active = 1
+            ORDER BY question_id, instrument_id, version DESC
+            """
+        ).fetchall()
+    except Exception:
+        active_rows = []
+
+    catalog_entries: list[dict[str, Any]] = []
+    for r in active_rows:
+        iid = str(r["instrument_id"])
+        role_u = str(r["instrument_role"]).upper()
+        rel_p = str(r["instrument_rel_path"] or "").strip()
+        frozen_p = str(r["frozen_snapshot_path"] or "").strip() if "frozen_snapshot_path" in r.keys() else ""
+        try:
+            spec_obj = json.loads(r["default_spec_json"] or "{}")
+            if not isinstance(spec_obj, dict):
+                spec_obj = {}
+        except Exception:
+            spec_obj = {}
+
+        local_mirror_rel: str | None = None
+        if role_u in ("PROBE", "ENV"):
+            src_fp: Path | None = None
+            if ws.is_dir() and rel_p:
+                cand_ws = Path(os.path.realpath(ws / rel_p))
+                if cand_ws.is_file() and "_hidden" not in cand_ws.as_posix().lower():
+                    src_fp = cand_ws
+            if src_fp is None and rel_p:
+                cand_core = Path(os.path.realpath(core_root / rel_p))
+                if cand_core.is_file() and "_hidden" not in cand_core.as_posix().lower():
+                    src_fp = cand_core
+            if src_fp is None and frozen_p:
+                cand_frz = Path(frozen_p)
+                if cand_frz.is_file():
+                    src_fp = cand_frz
+
+            if src_fp is not None and src_fp.is_file():
+                safe_name = Path(rel_p).name if rel_p else f"{iid}.py"
+                inst_out_dir.mkdir(parents=True, exist_ok=True)
+                shared_tools_dir.mkdir(parents=True, exist_ok=True)
+                dst1 = inst_out_dir / safe_name
+                dst2 = shared_tools_dir / safe_name
+                try:
+                    shutil.copy2(src_fp, dst1)
+                    shutil.copy2(src_fp, dst2)
+                    local_mirror_rel = dst1.relative_to(tgt_base).as_posix()
+                    synced.append(local_mirror_rel)
+                    synced.append(dst2.relative_to(tgt_base).as_posix())
+                except OSError:
+                    pass
+
+        catalog_entries.append(
+            {
+                "instrument_id": iid,
+                "version": int(r["version"]),
+                "question_id": str(r["question_id"]),
+                "instrument_role": role_u,
+                "artifact_schema": str(r["artifact_schema"] or "python_run"),
+                "health_status": str(r["health_status"] or "HEALTHY"),
+                "interface_hint": str(spec_obj.get("interface_hint") or ""),
+                "default_spec": spec_obj,
+                "worktree_local_path": local_mirror_rel,
+            }
+        )
+
+    # 同步 SKILL_LEDGER.json 中的共享探针
+    try:
+        paths = resolve_storage_paths(workspace_root, create_dirs=False)
+        ledger_path = paths["skills_ledger_path"]
+        if not ledger_path.is_file():
+            ledger_path = core_root / "skills" / "SKILL_LEDGER.json"
+        if ledger_path.is_file():
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+            skills_map = ledger.get("skills") if isinstance(ledger, dict) else {}
+            if isinstance(skills_map, dict):
+                for sid, sinfo in sorted(skills_map.items()):
+                    if not isinstance(sinfo, dict):
+                        continue
+                    v_rel = str(sinfo.get("verified_artifact_rel_path") or "").strip()
+                    if not v_rel:
+                        continue
+                    src_sk: Path | None = None
+                    if ws.is_dir() and (ws / v_rel).is_file():
+                        src_sk = ws / v_rel
+                    elif (core_root / v_rel).is_file():
+                        src_sk = core_root / v_rel
+                    if src_sk is not None and src_sk.is_file() and "_hidden" not in src_sk.as_posix().lower():
+                        shared_tools_dir.mkdir(parents=True, exist_ok=True)
+                        dst_sk = shared_tools_dir / Path(v_rel).name
+                        try:
+                            shutil.copy2(src_sk, dst_sk)
+                            synced.append(dst_sk.relative_to(tgt_base).as_posix())
+                        except OSError:
+                            pass
+    except Exception:
+        pass
+
+    if catalog_entries:
+        inst_out_dir.mkdir(parents=True, exist_ok=True)
+        cat_fp = inst_out_dir / "INSTRUMENT_CATALOG.json"
+        try:
+            cat_fp.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "3.0.0",
+                        "note": "活跃科研仪器与本地镜像清单：PROBE/ENV 已同步至 inputs/instruments/ 与 tools/shared_probes/ 可直接在本地 pwsh/python 调用；正式 [Obs###] 凭证请调 run_isolated_eval(tier='official')。",
+                        "instruments": catalog_entries,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            synced.append(cat_fp.relative_to(tgt_base).as_posix())
+        except OSError:
+            pass
+
+    return synced
+
+
+def sync_public_instruments_to_all_active_worktrees(
+    conn: sqlite3.Connection,
+    workspace_root: str,
+) -> int:
+    """当工造司注册/升版仪器或更新共享探针时，增量同步至所有当前活跃探索分支的 Worktree。"""
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT worktree_abs_path
+            FROM lineage_nodes
+            WHERE node_status IN ('EXPLORING', 'ACTIVE_REVISING', 'AWAITING_TRIAGE')
+            """
+        ).fetchall()
+    except Exception:
+        return 0
+    count = 0
+    for r in rows:
+        wt = str(r["worktree_abs_path"] or "").strip()
+        if wt and Path(wt).is_dir():
+            sync_public_instruments_and_skills_to_worktree(conn, workspace_root, wt)
+            count += 1
+    return count
+
+
 def sync_public_rulings(conn: sqlite3.Connection, *, workspace_root: str) -> dict[str, Any]:
     """轻量检测工作区 `rulings/` 公开补充裁决文档变动：仅在文件指纹变化时递增 `latest_spec_revision` 并留存版本快照。"""
     p0 = conn.execute(
@@ -285,6 +459,14 @@ def sync_public_rulings(conn: sqlite3.Connection, *, workspace_root: str) -> dic
     }
 
 
+def _canonical_instrument_key(iid: str) -> str:
+    """将仪器 ID 归一化（去空白、小写、剥离常见 `inst_` 前缀），避免 Parse 0 声明 `foo` 而工造司注册 `inst_foo` 导致假缺失。"""
+    s = str(iid or "").strip().lower()
+    if s.startswith("inst_"):
+        s = s[5:]
+    return s
+
+
 def compute_missing_initial_instruments(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """对比 Parse 0 `initial_instruments_json` 与 `instruments` 活跃表，返回尚未注册激活的初始仪器清单。"""
     p0 = conn.execute("SELECT initial_instruments_json FROM parse0_contract WHERE contract_id = 'active'").fetchone()
@@ -300,16 +482,26 @@ def compute_missing_initial_instruments(conn: sqlite3.Connection) -> list[dict[s
         "SELECT instrument_id, question_id, instrument_role FROM instruments WHERE is_active = 1"
     ).fetchall()
     active_ids = {str(r["instrument_id"]) for r in active_rows}
+    active_canonical = {_canonical_instrument_key(str(r["instrument_id"])) for r in active_rows}
+
+    def _is_registered(target_id: str) -> bool:
+        if not target_id:
+            return False
+        if target_id in active_ids:
+            return True
+        canon = _canonical_instrument_key(target_id)
+        return bool(canon and canon in active_canonical)
+
     missing: list[dict[str, Any]] = []
     for raw in items:
         if isinstance(raw, str):
             iid = raw.strip()
-            if iid and iid not in active_ids:
+            if iid and not _is_registered(iid):
                 missing.append({"instrument_id": iid})
         elif isinstance(raw, dict):
             iid = str(raw.get("instrument_id") or raw.get("id") or "").strip()
             if iid:
-                if iid not in active_ids:
+                if not _is_registered(iid):
                     missing.append(raw)
             else:
                 # 未指定 ID 时，要求该子题至少存在 1 台活跃仪器
@@ -604,6 +796,65 @@ def abort_lineage_node(
         "prev_status": prev_status,
         "node_status": "CLOSED",
         "reason": clean_reason,
+    }
+
+
+_ALLOWED_WORKS_TICKET_TYPES = {"INSTRUMENT_ERROR", "PAIN_POINT", "DUPLICATE_TOOL", "EXPLOIT"}
+
+
+def submit_works_ticket(
+    conn: sqlite3.Connection,
+    *,
+    question_id: str = "ALL",
+    ticket_type: str = "INSTRUMENT_ERROR",
+    instrument_id: str | None = None,
+    description: str = "",
+    source: str = "main_controller",
+) -> dict[str, Any]:
+    """控制面/主控向科研仪器科（works_engineering_queue）直接签发正式 OPEN 工单。
+
+    适用场景：主控或人类在运行期间发现明显的仪器逻辑缺陷、接口错误、校准集漏洞或缺失探针，
+    通过控制面正规通道入队并立即唤醒工造司（works_engineer）定向修复与升版，严禁越权直改 DB。
+    """
+    desc = str(description or "").strip()
+    if not desc:
+        raise FailClosedError(ERR_INVALID_INPUT, "工单描述 description 不能为空")
+    qid = str(question_id or "ALL").strip() or "ALL"
+    ttype = str(ticket_type or "INSTRUMENT_ERROR").strip().upper()
+    if ttype not in _ALLOWED_WORKS_TICKET_TYPES:
+        raise FailClosedError(
+            ERR_INVALID_INPUT,
+            f"不支持的工单类型 {ttype!r}，允许值: {sorted(_ALLOWED_WORKS_TICKET_TYPES)}",
+        )
+    iid = str(instrument_id).strip() if instrument_id else None
+    src = str(source or "main_controller").strip() or "main_controller"
+    tid = f"tkt_{uuid.uuid4().hex[:10]}"
+    now = utc_now_iso()
+    payload = {
+        "source": src,
+        "description": desc,
+        "instrument_id": iid,
+        "submitted_at": now,
+    }
+    with rw_immediate_tx(conn):
+        conn.execute(
+            """
+            INSERT INTO works_engineering_queue(
+                ticket_id, question_id, ticket_type, instrument_id,
+                payload_json, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?)
+            """,
+            (tid, qid, ttype, iid, json.dumps(payload, ensure_ascii=False), now, now),
+        )
+    return {
+        "ticket_id": tid,
+        "question_id": qid,
+        "ticket_type": ttype,
+        "instrument_id": iid,
+        "status": "OPEN",
+        "source": src,
+        "description": desc,
+        "created_at": now,
     }
 
 
@@ -1065,6 +1316,247 @@ def compute_family_concentration_alerts(conn: sqlite3.Connection) -> list[dict[s
     return alerts
 
 
+def compute_topology_and_revision_health(
+    conn: sqlite3.Connection,
+    *,
+    question_filter: str = "ALL",
+    slot_cap: int | None = None,
+) -> dict[str, Any]:
+    """纯查 SQLite (<15ms) 计算全卷或指定子题的 Worktree 拓扑健康度、断代分支、孤儿盲审返工单与缺编正交学派。
+
+    消除第六轮暴露的四大治理盲区：
+    1. 断代分支（`stalled_or_aborted_branches`）：最新节点为 `CLOSED`（含被 `abort_node` 中止）且所在子题尚未取得 `FULL_GOAL L3`；
+    2. 孤儿盲审返工单（`orphaned_blind_review_revisions`）：盲审判了 `REVISE`（`CLOSED_REVISE`）要求定向返工，但原分支被中止或断代、当前无活跃节点承接；
+    3. 缺编正交学派与单线独苗退化（`understaffed_questions`）：子题已注册 >=2 个 `ACTIVE` 学派且有空闲槽位，但在跑活跃学派数 < min(2, 已登记活跃学派数)；
+    4. 并发槽位利用率（`slot_utilization`）：`active_branches_count` / `slot_cap` / `free_slots`。
+    """
+    cfg = load_runtime_config()
+    eff_slot_cap = int(slot_cap or cfg.get("max_concurrent_workers", 6))
+    qf = str(question_filter or "ALL").strip()
+    order_status = get_question_order_status(conn)
+
+    # 1. 已注册方法学派
+    if qf.upper() == "ALL":
+        fam_rows = conn.execute("SELECT * FROM method_families ORDER BY question_id, family_id").fetchall()
+    else:
+        fam_rows = conn.execute(
+            "SELECT * FROM method_families WHERE question_id = ? ORDER BY family_id",
+            (qf,),
+        ).fetchall()
+
+    active_families_by_q: dict[str, list[str]] = {}
+    for fr in fam_rows:
+        if str(fr["family_status"] or "ACTIVE") == "ACTIVE":
+            active_families_by_q.setdefault(str(fr["question_id"]), []).append(str(fr["family_id"]))
+
+    # 2. 按 branch_id 聚合每条分支的最新一代节点状态
+    if qf.upper() == "ALL":
+        all_nodes = conn.execute(
+            """
+            SELECT node_id, question_id, branch_id, family_id, parent_node_id, generation,
+                   spec_revision, node_status, worktree_abs_path, retained_snapshot_abs_path,
+                   mechanism_summary, evidence_grade, candidate_rel_path, revise_count,
+                   inplace_repair_count, last_revision_requests_json, pending_handoff_reason,
+                   pressure_tokens, effective_context_window, first_reflection_unlocked,
+                   created_at, updated_at
+            FROM lineage_nodes
+            ORDER BY generation ASC, created_at ASC
+            """
+        ).fetchall()
+    else:
+        all_nodes = conn.execute(
+            """
+            SELECT node_id, question_id, branch_id, family_id, parent_node_id, generation,
+                   spec_revision, node_status, worktree_abs_path, retained_snapshot_abs_path,
+                   mechanism_summary, evidence_grade, candidate_rel_path, revise_count,
+                   inplace_repair_count, last_revision_requests_json, pending_handoff_reason,
+                   pressure_tokens, effective_context_window, first_reflection_unlocked,
+                   created_at, updated_at
+            FROM lineage_nodes
+            WHERE question_id = ?
+            ORDER BY generation ASC, created_at ASC
+            """,
+            (qf,),
+        ).fetchall()
+
+    latest_by_branch: dict[str, dict[str, Any]] = {}
+    branch_has_live_node: set[str] = set()
+    live_statuses = ("EXPLORING", "ACTIVE_REVISING", "AWAITING_TRIAGE", "PENDING_REVIEW")
+    for r in all_nodes:
+        d = dict(r)
+        bid = str(d["branch_id"])
+        latest_by_branch[bid] = d
+        if str(d["node_status"]) in live_statuses:
+            branch_has_live_node.add(bid)
+
+    # 统计总活跃探索分支槽位（全卷口径）
+    total_live_branches = int(
+        conn.execute(
+            """
+            SELECT COUNT(DISTINCT branch_id) AS cnt
+            FROM lineage_nodes
+            WHERE node_status IN ('EXPLORING', 'ACTIVE_REVISING', 'AWAITING_TRIAGE', 'PENDING_REVIEW')
+            """
+        ).fetchone()["cnt"]
+        or 0
+    )
+    free_slots = max(0, eff_slot_cap - total_live_branches)
+
+    # 3. 检索所有 CLOSED_REVISE 盲审单，判断是否已被后续活跃分支承接
+    if qf.upper() == "ALL":
+        rev_rows = conn.execute(
+            """
+            SELECT r.review_id, r.question_id, r.source_node_id, r.manuscript_title,
+                   r.final_verdict, r.revision_requests_json, r.updated_at,
+                   n.branch_id, n.family_id, n.retained_snapshot_abs_path, n.worktree_abs_path
+            FROM review_queue r
+            LEFT JOIN lineage_nodes n ON n.node_id = r.source_node_id
+            WHERE r.review_status = 'CLOSED_REVISE'
+            ORDER BY r.updated_at DESC
+            """
+        ).fetchall()
+    else:
+        rev_rows = conn.execute(
+            """
+            SELECT r.review_id, r.question_id, r.source_node_id, r.manuscript_title,
+                   r.final_verdict, r.revision_requests_json, r.updated_at,
+                   n.branch_id, n.family_id, n.retained_snapshot_abs_path, n.worktree_abs_path
+            FROM review_queue r
+            LEFT JOIN lineage_nodes n ON n.node_id = r.source_node_id
+            WHERE r.review_status = 'CLOSED_REVISE' AND r.question_id = ?
+            ORDER BY r.updated_at DESC
+            """,
+            (qf,),
+        ).fetchall()
+
+    # 判断某个 source_node_id 是否已有后代节点送过新盲审或正处于活跃态
+    active_parent_ids = {
+        str(r["parent_node_id"])
+        for r in all_nodes
+        if r["parent_node_id"] and str(r["node_status"]) in live_statuses
+    }
+    reviewed_source_nodes = {
+        str(r["source_node_id"])
+        for r in conn.execute("SELECT source_node_id FROM review_queue").fetchall()
+    }
+
+    orphaned_revisions: list[dict[str, Any]] = []
+    orphaned_by_branch: dict[str, dict[str, Any]] = {}
+    for rr in rev_rows:
+        rqid = str(rr["question_id"])
+        if order_status.get(rqid, {}).get("full_goal_l3_count", 0) > 0:
+            continue
+        rbid = str(rr["branch_id"] or "")
+        src_nid = str(rr["source_node_id"])
+        if rbid in branch_has_live_node or src_nid in active_parent_ids:
+            continue
+        # 检查是否有后代节点已经重新送审
+        descendant_resubmitted = any(
+            str(n["parent_node_id"] or "") == src_nid and str(n["node_id"]) in reviewed_source_nodes
+            for n in all_nodes
+        )
+        if descendant_resubmitted:
+            continue
+        try:
+            reqs_list = json.loads(rr["revision_requests_json"] or "[]")
+        except Exception:
+            reqs_list = []
+        item = {
+            "review_id": str(rr["review_id"]),
+            "question_id": rqid,
+            "source_node_id": src_nid,
+            "branch_id": rbid,
+            "family_id": str(rr["family_id"] or ""),
+            "manuscript_title": str(rr["manuscript_title"] or ""),
+            "revision_requests": reqs_list,
+            "retained_snapshot_abs_path": rr["retained_snapshot_abs_path"],
+            "worktree_abs_path": rr["worktree_abs_path"],
+            "respawn_guidance": (
+                f"调用 fork_branch(question_id={rqid!r}, parent_node_id={src_nid!r}, "
+                f"fork_mode='lateral', target_family_id={str(rr['family_id'] or '')!r}) "
+                f"即可继承其快照与 {rr['review_id']} 返工单继续冲刺二审"
+            ),
+        }
+        orphaned_revisions.append(item)
+        if rbid:
+            orphaned_by_branch[rbid] = item
+
+    # 4. 整理断代/被中止分支列表
+    stalled_branches: list[dict[str, Any]] = []
+    live_families_by_q: dict[str, set[str]] = {}
+    live_branches_by_q: dict[str, list[str]] = {}
+
+    for bid, latest in sorted(latest_by_branch.items()):
+        qid = str(latest["question_id"])
+        fid = str(latest["family_id"] or "")
+        st = str(latest["node_status"])
+        if st in live_statuses:
+            if fid:
+                live_families_by_q.setdefault(qid, set()).add(fid)
+            live_branches_by_q.setdefault(qid, []).append(bid)
+            continue
+        if st == "CLOSED" and order_status.get(qid, {}).get("full_goal_l3_count", 0) == 0:
+            try:
+                rev_reqs = json.loads(latest.get("last_revision_requests_json") or "[]")
+            except Exception:
+                rev_reqs = []
+            orphan_rev = orphaned_by_branch.get(bid)
+            if orphan_rev and not rev_reqs:
+                rev_reqs = orphan_rev.get("revision_requests") or []
+            stalled_branches.append(
+                {
+                    "branch_id": bid,
+                    "question_id": qid,
+                    "family_id": fid,
+                    "last_node_id": str(latest["node_id"]),
+                    "last_generation": int(latest["generation"] or 1),
+                    "last_node_status": st,
+                    "close_reason": str(latest.get("pending_handoff_reason") or "CLOSED_OR_ABORTED"),
+                    "retained_snapshot_abs_path": latest.get("retained_snapshot_abs_path"),
+                    "worktree_abs_path": latest.get("worktree_abs_path"),
+                    "pending_blind_review_id": orphan_rev["review_id"] if orphan_rev else None,
+                    "pending_revision_requests": rev_reqs,
+                }
+            )
+
+    # 5. 检查各解锁子题是否存在“正交学派缺编 / 单线独苗退化”
+    understaffed_questions: list[dict[str, Any]] = []
+    check_qs = sorted(active_families_by_q.keys()) if qf.upper() == "ALL" else [qf]
+    for q in check_qs:
+        q_info = order_status.get(q, {})
+        if not q_info.get("unlocked", True) or q_info.get("full_goal_l3_count", 0) > 0:
+            continue
+        reg_fams = active_families_by_q.get(q, [])
+        live_fams = sorted(live_families_by_q.get(q, set()))
+        missing_fams = [f for f in reg_fams if f not in live_fams]
+        live_b_list = live_branches_by_q.get(q, [])
+        # 当注册了 >=2 个活跃学派，但当前在跑分支数退化为 <=1（独苗或全空），且有空闲槽位时告警
+        is_degenerated = len(reg_fams) >= 2 and len(live_b_list) < min(2, len(reg_fams)) and free_slots > 0
+        if missing_fams and (is_degenerated or len(live_b_list) == 0):
+            understaffed_questions.append(
+                {
+                    "question_id": q,
+                    "registered_active_families": reg_fams,
+                    "active_families_in_flight": live_fams,
+                    "missing_active_family_ids": missing_fams,
+                    "active_branch_count": len(live_b_list),
+                    "free_explorer_slots": free_slots,
+                    "single_branch_monopoly": len(live_b_list) == 1 and len(reg_fams) >= 2,
+                }
+            )
+
+    return {
+        "slot_utilization": {
+            "active_branches_count": total_live_branches,
+            "slot_cap": eff_slot_cap,
+            "free_slots": free_slots,
+        },
+        "stalled_or_aborted_branches": stalled_branches,
+        "orphaned_blind_review_revisions": orphaned_revisions,
+        "understaffed_questions": understaffed_questions,
+    }
+
+
 def check_stage2_closure_gate_data(
     conn: sqlite3.Connection,
     *,
@@ -1400,6 +1892,23 @@ def schedule_control_plane_snapshot(
     ]
     external_lit_count = int(conn.execute("SELECT COUNT(*) AS cnt FROM external_literature_cards").fetchone()["cnt"] or 0)
     family_concentration_alerts = compute_family_concentration_alerts(conn)
+    topology_health = compute_topology_and_revision_health(conn, question_filter="ALL", slot_cap=slot_cap)
+    orphaned_revisions = topology_health.get("orphaned_blind_review_revisions") or []
+    understaffed_questions = topology_health.get("understaffed_questions") or []
+    stalled_branches = topology_health.get("stalled_or_aborted_branches") or []
+
+    # 读取最近一条监察委 STAGE2_HEARTBEAT 合规告警（若状态为 ALERT，用于闭环唤醒后勤/工造司）
+    latest_hb_row = conn.execute(
+        """
+        SELECT alert_id, stage, status, blocking_questions_json, notes, created_at
+        FROM compliance_alerts
+        WHERE stage = 'STAGE2_HEARTBEAT'
+        ORDER BY created_at DESC LIMIT 1
+        """
+    ).fetchone()
+    active_supervisory_alert: dict[str, Any] | None = None
+    if latest_hb_row is not None and str(latest_hb_row["status"]).upper() == "ALERT":
+        active_supervisory_alert = dict(latest_hb_row)
 
     # 判断已解锁但既无 FULL_GOAL L3 也无在研/待分诊/待盲审节点的子题
     in_flight_qs = {
@@ -1462,6 +1971,11 @@ def schedule_control_plane_snapshot(
         "shared_inputs_rel_paths": shared_inputs,
         "question_order_status": order_status,
         "questions_needing_branch": questions_needing_branch,
+        "understaffed_questions": [] if stop_new_dispatch else understaffed_questions,
+        "orphaned_blind_review_revisions": [] if stop_new_dispatch else orphaned_revisions,
+        "stalled_or_aborted_branches": stalled_branches,
+        "slot_utilization": topology_health.get("slot_utilization") or {"active_branches_count": 0, "slot_cap": slot_cap, "free_slots": slot_cap},
+        "active_supervisory_alert": active_supervisory_alert,
         "external_literature_count": external_lit_count,
         "active_instruments": active_instruments,
         "active_instruments_fingerprint": active_instruments_fingerprint,
@@ -1510,6 +2024,11 @@ def uninitialized_schedule_snapshot(max_concurrent_workers: int | None = None) -
         "shared_inputs_rel_paths": [],
         "question_order_status": {},
         "questions_needing_branch": [],
+        "understaffed_questions": [],
+        "orphaned_blind_review_revisions": [],
+        "stalled_or_aborted_branches": [],
+        "slot_utilization": {"active_branches_count": 0, "slot_cap": slot_cap, "free_slots": slot_cap},
+        "active_supervisory_alert": None,
         "external_literature_count": 0,
         "active_instruments": [],
         "active_instruments_fingerprint": [],
@@ -1951,3 +2470,233 @@ def recover_pending_heavy_jobs(conn: sqlite3.Connection, *, workspace_root: str)
     for r in rows:
         out.append(execute_heavy_async_job(conn, workspace_root=workspace_root, job_id=str(r["job_id"])))
     return out
+
+
+def get_ui_full_inspector_payload(
+    conn: sqlite3.Connection,
+    *,
+    workspace_root: str = "",
+    selected_node_id: str | None = None,
+    selected_worktree_rel_file: str | None = None,
+) -> dict[str, Any]:
+    """为右侧挂板 UI「长城科研指挥舱」提供全景只读透视数据（<30ms）：
+    1. 全部探索节点谱系 DAG 树（含 0%—37%—70% 水位、绑定 [Obs-###]、学派、状态与父子关系）；
+    2. 方法学派与断代分支、孤儿盲审返工单、监察委 watchdog_anomalies；
+    3. 观测账 summary + 探针日志 summary + 盲审单列表 + 工造司工单；
+    4. 选中节点的深潜文书详情（五段看板全文、37% 元反思问答原文、70% 探索者亲笔遗嘱 + A/B 栏交接单、死胡同列表、Worktree 文件树与源码预览）。
+    """
+    snap = schedule_control_plane_snapshot(conn, workspace_root=workspace_root)
+    topo = compute_topology_and_revision_health(conn, question_filter="ALL")
+
+    families = [
+        dict(r)
+        for r in conn.execute("SELECT * FROM method_families ORDER BY question_id, family_id").fetchall()
+    ]
+    all_nodes = [
+        dict(r)
+        for r in conn.execute(
+            """
+            SELECT node_id, question_id, branch_id, family_id, parent_node_id, generation,
+                   spec_revision, node_status, worktree_abs_path, retained_snapshot_abs_path,
+                   mechanism_summary, evidence_grade, candidate_rel_path, bound_obs_ids_json,
+                   revise_count, inplace_repair_count, pressure_tokens, effective_context_window,
+                   first_reflection_unlocked, lane_assignment, pending_handoff_mode,
+                   pending_handoff_reason, created_at, updated_at
+            FROM lineage_nodes
+            ORDER BY created_at ASC
+            """
+        ).fetchall()
+    ]
+    for nd in all_nodes:
+        try:
+            nd["bound_obs_ids"] = json.loads(nd.get("bound_obs_ids_json") or "[]")
+        except Exception:
+            nd["bound_obs_ids"] = []
+        win = max(1, int(nd.get("effective_context_window") or 500000))
+        tok = int(nd.get("pressure_tokens") or 0)
+        nd["pressure_pct"] = round((tok / float(win)) * 100.0, 1)
+
+    obs_list = [
+        dict(r)
+        for r in conn.execute(
+            """
+            SELECT obs_id, question_id, branch_id, node_id, instrument_id, instrument_version,
+                   tier, obs_status, tracks_json, substr(details_text, 1, 500) AS details_preview, created_at
+            FROM observations
+            ORDER BY created_at DESC LIMIT 60
+            """
+        ).fetchall()
+    ]
+    probes_list = [
+        dict(r)
+        for r in conn.execute(
+            """
+            SELECT probe_id, node_id, question_id, instrument_id, instrument_version,
+                   status, tracks_json, substr(details_text, 1, 400) AS details_preview, created_at
+            FROM probe_diagnostic_logs
+            ORDER BY created_at DESC LIMIT 30
+            """
+        ).fetchall()
+    ]
+    reviews_list = [
+        dict(r)
+        for r in conn.execute(
+            """
+            SELECT review_id, question_id, source_node_id, source_type, review_status,
+                   manuscript_title, spec_revision, final_verdict, stage1_ledger_json,
+                   revision_requests_json, created_at, updated_at
+            FROM review_queue
+            ORDER BY created_at DESC LIMIT 30
+            """
+        ).fetchall()
+    ]
+    l3_l2_entries = [
+        dict(r)
+        for r in conn.execute(
+            """
+            SELECT entry_id, question_id, ledger_type, l3_entry_kind, goal_coverage,
+                   l2_category, title, substr(abstract_md, 1, 400) AS abstract_preview,
+                   exact_verified_scope_md, exact_refuted_scope_md, verified_review_id, created_at
+            FROM internal_research_ledger
+            WHERE is_active = 1
+            ORDER BY created_at DESC LIMIT 40
+            """
+        ).fetchall()
+    ]
+    works_tickets = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT * FROM works_engineering_queue ORDER BY created_at DESC LIMIT 30"
+        ).fetchall()
+    ]
+    compliance_logs = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT * FROM compliance_alerts ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+    ]
+
+    # 若未指定 selected_node_id，默认选最新更新的探索节点
+    target_nid = str(selected_node_id or "").strip()
+    if not target_nid and all_nodes:
+        target_nid = str(all_nodes[-1]["node_id"])
+
+    node_detail: dict[str, Any] | None = None
+    if target_nid:
+        nrow = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ?", (target_nid,)).fetchone()
+        if nrow is not None:
+            nd_full = dict(nrow)
+            briefings = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM lineage_briefings WHERE node_id = ? OR branch_id = ? ORDER BY created_at DESC LIMIT 5",
+                    (target_nid, nd_full["branch_id"]),
+                ).fetchall()
+            ]
+            dead_ends = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM lineage_dead_ends WHERE branch_id = ? ORDER BY created_at DESC LIMIT 20",
+                    (nd_full["branch_id"],),
+                ).fetchall()
+            ]
+            node_obs = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT obs_id, instrument_id, instrument_version, tier, obs_status, tracks_json, details_text, created_at FROM observations WHERE node_id = ? ORDER BY created_at ASC",
+                    (target_nid,),
+                ).fetchall()
+            ]
+            node_reviews = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM review_queue WHERE source_node_id = ? ORDER BY created_at DESC",
+                    (target_nid,),
+                ).fetchall()
+            ]
+            try:
+                reflections_parsed = json.loads(nd_full.get("reflections_json") or "[]")
+            except Exception:
+                reflections_parsed = []
+            try:
+                rev_reqs_parsed = json.loads(nd_full.get("last_revision_requests_json") or "[]")
+            except Exception:
+                rev_reqs_parsed = []
+
+            # 扫描该节点 Worktree（及快照目录）文件树
+            wt_abs = str(nd_full.get("worktree_abs_path") or "").strip()
+            wt_files: list[dict[str, Any]] = []
+            preview_file_rel = str(selected_worktree_rel_file or nd_full.get("candidate_rel_path") or "").strip()
+            preview_content = ""
+
+            if wt_abs and Path(wt_abs).is_dir():
+                wt_root = Path(os.path.realpath(wt_abs))
+                for fp in sorted(wt_root.rglob("*")):
+                    if not fp.is_file():
+                        continue
+                    rel_parts = fp.relative_to(wt_root).parts
+                    if any(p in (".git", "__pycache__", ".venv", "node_modules") for p in rel_parts):
+                        continue
+                    rel_p = fp.relative_to(wt_root).as_posix()
+                    try:
+                        sz = fp.stat().st_size
+                    except OSError:
+                        sz = 0
+                    wt_files.append({"rel_path": rel_p, "size": sz})
+                    if not preview_file_rel and fp.suffix.lower() in (".py", ".md", ".json", ".txt") and not rel_p.startswith("inputs/"):
+                        preview_file_rel = rel_p
+
+                if preview_file_rel:
+                    try:
+                        target_fp = safe_resolve_in_worktree(str(wt_root), preview_file_rel)
+                        if target_fp.is_file():
+                            preview_content = target_fp.read_text(encoding="utf-8", errors="replace")[:16000]
+                    except Exception:
+                        preview_content = ""
+
+            node_detail = {
+                "node_id": target_nid,
+                "question_id": str(nd_full["question_id"]),
+                "branch_id": str(nd_full["branch_id"]),
+                "family_id": str(nd_full.get("family_id") or ""),
+                "parent_node_id": nd_full.get("parent_node_id"),
+                "generation": int(nd_full.get("generation") or 1),
+                "spec_revision": int(nd_full.get("spec_revision") or 0),
+                "node_status": str(nd_full["node_status"]),
+                "pressure_tokens": int(nd_full.get("pressure_tokens") or 0),
+                "effective_context_window": int(nd_full.get("effective_context_window") or 500000),
+                "first_reflection_unlocked": int(nd_full.get("first_reflection_unlocked") or 0),
+                "mechanism_summary": str(nd_full.get("mechanism_summary") or ""),
+                "evidence_grade": str(nd_full.get("evidence_grade") or "NONE"),
+                "candidate_rel_path": nd_full.get("candidate_rel_path"),
+                "worktree_abs_path": wt_abs,
+                "retained_snapshot_abs_path": nd_full.get("retained_snapshot_abs_path"),
+                "explorer_will_md": str(nd_full.get("explorer_will_md") or nd_full.get("will_md") or ""),
+                "will_md": str(nd_full.get("will_md") or ""),
+                "column_a_facts_md": str(nd_full.get("column_a_facts_md") or ""),
+                "column_b_hypothesis_md": str(nd_full.get("column_b_hypothesis_md") or ""),
+                "sanitized_code_diff_md": str(nd_full.get("sanitized_code_diff_md") or "")[:12000],
+                "reflections": reflections_parsed,
+                "active_revision_requests": rev_reqs_parsed,
+                "briefings": briefings,
+                "dead_ends": dead_ends,
+                "observations": node_obs,
+                "reviews": node_reviews,
+                "worktree_files": wt_files[:120],
+                "preview_file_rel": preview_file_rel,
+                "preview_file_content": preview_content,
+            }
+
+    return {
+        "snapshot": snap,
+        "topology_health": topo,
+        "method_families": families,
+        "lineage_nodes": all_nodes,
+        "observations": obs_list,
+        "probes": probes_list,
+        "reviews": reviews_list,
+        "internal_ledger": l3_l2_entries,
+        "works_tickets": works_tickets,
+        "compliance_logs": compliance_logs,
+        "selected_node_detail": node_detail,
+    }

@@ -21,6 +21,7 @@ if __package__ in (None, ""):
 from .control_plane_service import (  # noqa: E402
     abort_lineage_node,
     cleanup_blind_review_sandbox,
+    get_ui_full_inspector_payload,
     init_parse0_contract,
     mark_stage1_works_checked,
     record_human_stop,
@@ -28,6 +29,7 @@ from .control_plane_service import (  # noqa: E402
     recover_pending_heavy_jobs,
     schedule_control_plane_snapshot,
     stage_blind_review_sandbox,
+    submit_works_ticket,
     sync_public_inputs_to_worktree,
     sync_public_rulings,
     sync_session_pressure,
@@ -397,13 +399,15 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = enrich_tool_definitions(
         },
         {
             "name": "upgrade_instrument_with_calibration",
-            "description": "[works_engineer] 校准集 100% 通过即升版仪器，仅选择性将本仪器旧观测入待重评队列（零误杀他题）。",
+            "description": "[works_engineer] 校准集 100% 通过即升版仪器（支持可选更新 artifact_schema 与 default_spec），仅选择性将本仪器旧观测入待重评队列（零误杀他题）。",
             "inputSchema": _schema(
                 {
                     "question_id": {"type": "string"},
                     "instrument_id": {"type": "string"},
                     "new_instrument_rel_path": {"type": "string"},
                     "calibration_suite_rel_path": {"type": "string"},
+                    "artifact_schema": {"type": ["string", "null"], "default": None},
+                    "default_spec": {"type": ["object", "null"], "default": None},
                 },
                 ["question_id", "instrument_id", "new_instrument_rel_path", "calibration_suite_rel_path"],
             ),
@@ -579,7 +583,7 @@ def dispatch_control_call(method: str, params: dict[str, Any] | None) -> dict[st
     conn = None
     try:
         # 纯只读探测与启动恢复：若尚未初始化数据库，严禁无故创建目录与 300KB 空库
-        if method in ("control_plane/schedule_snapshot", "control_plane/recover_heavy_jobs"):
+        if method in ("control_plane/schedule_snapshot", "control_plane/recover_heavy_jobs", "control_plane/ui_inspector"):
             probe_paths = resolve_storage_paths(eff_ws, create_dirs=False)
             if not probe_paths["db_path"].is_file():
                 if method == "control_plane/schedule_snapshot":
@@ -588,6 +592,23 @@ def dispatch_control_call(method: str, params: dict[str, Any] | None) -> dict[st
                         "data": uninitialized_schedule_snapshot(
                             max_concurrent_workers=p.get("max_concurrent_workers")
                         ),
+                    }
+                if method == "control_plane/ui_inspector":
+                    return {
+                        "ok": True,
+                        "data": {
+                            "snapshot": uninitialized_schedule_snapshot(),
+                            "topology_health": {},
+                            "method_families": [],
+                            "lineage_nodes": [],
+                            "observations": [],
+                            "probes": [],
+                            "reviews": [],
+                            "internal_ledger": [],
+                            "works_tickets": [],
+                            "compliance_logs": [],
+                            "selected_node_detail": None,
+                        },
                     }
                 return {"ok": True, "data": {"recovered_jobs": []}}
 
@@ -615,6 +636,14 @@ def dispatch_control_call(method: str, params: dict[str, Any] | None) -> dict[st
                 conn,
                 max_concurrent_workers=p.get("max_concurrent_workers"),
                 workspace_root=eff_ws,
+            )
+            return {"ok": True, "data": res}
+        if method == "control_plane/ui_inspector":
+            res = get_ui_full_inspector_payload(
+                conn,
+                workspace_root=eff_ws,
+                selected_node_id=p.get("selected_node_id"),
+                selected_worktree_rel_file=p.get("selected_worktree_rel_file"),
             )
             return {"ok": True, "data": res}
         if method == "control_plane/sync_pressure":
@@ -649,6 +678,16 @@ def dispatch_control_call(method: str, params: dict[str, Any] | None) -> dict[st
                 conn,
                 node_id=str(p["node_id"]),
                 reason=str(p.get("reason", "ABORTED_BY_CONTROLLER")),
+            )
+            return {"ok": True, "data": res}
+        if method == "control_plane/submit_works_ticket":
+            res = submit_works_ticket(
+                conn,
+                question_id=str(p.get("question_id", "ALL")),
+                ticket_type=str(p.get("ticket_type", "INSTRUMENT_ERROR")),
+                instrument_id=p.get("instrument_id"),
+                description=str(p.get("description", p.get("reason", ""))),
+                source=str(p.get("source", "main_controller")),
             )
             return {"ok": True, "data": res}
         if method == "control_plane/record_human_stop":
