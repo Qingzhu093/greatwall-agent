@@ -123,6 +123,7 @@ export function apply(ctx, config = {}) {
         totalBudget = {},
         minCommitmentWindowSec = 0,
         deliverySpecMd = '',
+        sharedInputsRelPaths = [],
         stage = null,
         epochId = 1,
       } = {}) {
@@ -136,6 +137,7 @@ export function apply(ctx, config = {}) {
           total_budget: totalBudget,
           min_commitment_window_sec: minCommitmentWindowSec,
           delivery_spec_md: deliverySpecMd,
+          shared_inputs_rel_paths: sharedInputsRelPaths,
           ...(stage ? { stage } : {}),
           epoch_id: epochId,
         })
@@ -183,18 +185,34 @@ export function apply(ctx, config = {}) {
     disposeEntryTool = ctx.tools.register({
       name: 'greatwall_orchestrate',
       description:
-        '在 DeepSeek Harness 桌面会话中签署 Parse 0 或非阻塞操控长城科研共同体 V6-Up (v3.0) 后台异步事件池（init / start / pause / resume / stop / human_stop / status / intervene）。',
+        '在 DeepSeek Harness 桌面会话中签署 Parse 0 或非阻塞操控长城科研共同体 V6-Up (v3.0) 后台异步事件池（init / start / pause / resume / stop / human_stop / abort_node / status）。',
       parameters: {
         type: 'object',
         properties: {
           action: {
             type: 'string',
-            enum: ['init', 'start', 'pause', 'resume', 'stop', 'human_stop', 'status', 'intervene'],
-            description: 'init=签署Parse0六项表单; start=后台异步启动事件池; pause/resume/stop=暂停/恢复/停止; human_stop=写入人类叫停真源并允许PARTIAL_ON_HUMAN_STOP结项; status=查实时状态; intervene=定向纠偏',
+            enum: ['init', 'start', 'pause', 'resume', 'stop', 'human_stop', 'abort_node', 'status'],
+            description: 'init=签署Parse0六项表单; start=锁定模型绑定并异步启动事件池; pause/resume/stop=暂停/恢复并同步rulings/停止; human_stop=写入人类叫停真源; abort_node=确定性中止单节点; status=查实时状态',
           },
           workspace_root: {
             type: 'string',
             description: '科研工作区根目录绝对路径',
+          },
+          provider: {
+            type: 'string',
+            description: '可选：显式锁定模型提供商 ID（如 deepseek-account）；缺省自动继承主控当前选中模型',
+          },
+          model: {
+            type: 'string',
+            description: '可选：显式锁定模型 ID（如 deepseek-flash）；缺省自动继承主控当前选中模型，无法解析将拒启',
+          },
+          effective_context_window: {
+            type: 'integer',
+            description: '可选：显式上下文窗口上限（最终按 min(500000, model_physical_window) 取值）',
+          },
+          context_window_tokens: {
+            type: 'integer',
+            description: 'effective_context_window 兼容字段',
           },
           goal_and_completion_md: {
             type: 'string',
@@ -241,27 +259,22 @@ export function apply(ctx, config = {}) {
             type: 'string',
             description: 'Parse 0 最终交付物形态规范（如论文格式、复现脚本或形式化内核要求）',
           },
+          shared_inputs_rel_paths: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '可选：额外声明的工作区公开题面/输入数据/裁决文档相对路径（自动只读挂载至沙箱 inputs/）',
+          },
           max_concurrent_workers: {
             type: 'integer',
             description: '最大并发探索者槽位数（默认 6，硬上限 10）',
           },
-          target_type: {
+          node_id: {
             type: 'string',
-            enum: ['global', 'question', 'node', 'role'],
-            description: 'intervene 干预对象类型',
+            description: 'abort_node 要中止的目标节点 ID（如 node_q1_xxxx）',
           },
-          target_id: {
+          reason: {
             type: 'string',
-            description: 'intervene 干预目标 ID（如 Q2、node_q2_003 或 ALL）',
-          },
-          directive: {
-            type: 'string',
-            description: 'intervene 下发的纠偏/指令内容，或 human_stop 的备注说明',
-          },
-          intervention_action: {
-            type: 'string',
-            enum: ['steer', 'requeue', 'unlock', 'abort_node'],
-            description: 'intervene 具体操作，默认 steer',
+            description: 'abort_node 中止原因或 human_stop 备注说明',
           },
         },
         required: ['action', 'workspace_root'],
@@ -287,6 +300,9 @@ export function apply(ctx, config = {}) {
               ...(callerOpts.reasoningEffort ? { reasoningEffort: callerOpts.reasoningEffort } : {}),
             },
           })
+        } else if (exec?.agent) {
+          ctrl.orchestrator.parentAgent = exec.agent
+          if (ctrl.orchestrator.host) ctrl.orchestrator.host.parentAgent = exec.agent
         }
         const act = String(args.action)
         const goalText = String(args.goal_and_completion_md || args.goal_md || '')
@@ -303,6 +319,7 @@ export function apply(ctx, config = {}) {
           totalBudget: args.total_budget && typeof args.total_budget === 'object' ? args.total_budget : {},
           minCommitmentWindowSec: Number(args.min_commitment_window_sec || 0),
           deliverySpecMd: String(args.delivery_spec_md || ''),
+          sharedInputsRelPaths: Array.isArray(args.shared_inputs_rel_paths) ? args.shared_inputs_rel_paths : [],
         }
 
         if (act === 'init') {
@@ -315,7 +332,7 @@ export function apply(ctx, config = {}) {
               (Array.isArray(args.subquestions) && args.subquestions.length) ||
               (Array.isArray(args.required_questions) && args.required_questions.length),
           )
-          // start 只在尚未启动且未签署 Parse 0 的首次冷启动时顺手立项；运行中或已签过契约时绝不借 start 悄悄覆写契约（中途修订请显式调 init）
+          // start 只在尚未启动且未签署 Parse 0 的首次冷启动时顺手立项；运行中或已签过契约时绝不借 start 悄悄覆写契约
           if (hasInlineInit && !ctrl.orchestrator._backgroundTask) {
             const preSnap = await ctrl.scheduleSnapshot()
             if (preSnap?.ok && !preSnap?.data?.parse0_signed) {
@@ -325,8 +342,16 @@ export function apply(ctx, config = {}) {
               }
             }
           }
+          const explicitAgentOpts = {}
+          if (args.provider) explicitAgentOpts.provider = String(args.provider).trim()
+          if (args.model) explicitAgentOpts.model = String(args.model).trim()
+          const expWin = Number(args.effective_context_window || args.context_window_tokens || 0)
+          if (Number.isFinite(expWin) && expWin > 0) explicitAgentOpts.effectiveContextWindow = expWin
+
           const startRes = await ctrl.orchestrator.startBackground({
             maxConcurrentWorkers: args.max_concurrent_workers ? Number(args.max_concurrent_workers) : null,
+            agentOptions: explicitAgentOpts,
+            callerAgent: exec?.agent || null,
           })
           return { ok: Boolean(startRes?.started), action: act, ...startRes }
         }
@@ -334,25 +359,22 @@ export function apply(ctx, config = {}) {
           return { ok: true, action: act, ...ctrl.orchestrator.pauseBackground() }
         }
         if (act === 'resume') {
-          return { ok: true, action: act, ...ctrl.orchestrator.resumeBackground() }
+          return { ok: true, action: act, ...(await ctrl.orchestrator.resumeBackground()) }
         }
         if (act === 'stop') {
-          return { ok: true, action: act, ...(await ctrl.orchestrator.stopBackground('MCP_STOP')) }
+          const stopRes = await ctrl.orchestrator.stopBackground('MCP_STOP')
+          await ctrl.bridge.closeIdleChild?.()
+          return { ok: true, action: act, ...stopRes }
         }
         if (act === 'human_stop') {
-          return { ok: true, action: act, ...(await ctrl.orchestrator.humanStop(String(args.directive || 'MCP_HUMAN_STOP'))) }
+          return { ok: true, action: act, ...(await ctrl.orchestrator.humanStop(String(args.reason || 'MCP_HUMAN_STOP'))) }
         }
-        if (act === 'intervene') {
-          return {
-            ok: true,
-            action: act,
-            ...(await ctrl.orchestrator.intervene({
-              targetType: args.target_type || 'global',
-              targetId: args.target_id || 'ALL',
-              directive: args.directive || '',
-              action: args.intervention_action || 'steer',
-            })),
-          }
+        if (act === 'abort_node') {
+          const res = await ctrl.orchestrator.abortNode(
+            String(args.node_id || ''),
+            String(args.reason || 'MCP_ABORT_NODE'),
+          )
+          return { ok: Boolean(res?.aborted), action: act, ...res }
         }
         if (act === 'status') {
           return {

@@ -19,13 +19,17 @@ if __package__ in (None, ""):
     __package__ = "core_python.mcp_server"
 
 from .control_plane_service import (  # noqa: E402
+    abort_lineage_node,
     cleanup_blind_review_sandbox,
     init_parse0_contract,
+    mark_stage1_works_checked,
     record_human_stop,
     record_pending_handoff,
     recover_pending_heavy_jobs,
     schedule_control_plane_snapshot,
     stage_blind_review_sandbox,
+    sync_public_inputs_to_worktree,
+    sync_public_rulings,
     sync_session_pressure,
     uninitialized_schedule_snapshot,
 )
@@ -56,6 +60,7 @@ from .tools_governance import (  # noqa: E402
     tool_register_method_family,
     tool_register_question_instrument,
     tool_register_saved_graph_query,
+    tool_resolve_works_ticket,
     tool_submit_stage1_blind_ledger,
     tool_submit_stage2_unblind_verdict,
     tool_triage_node,
@@ -270,21 +275,23 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = enrich_tool_definitions(
         },
         {
             "name": "publish_external_literature_card",
-            "description": "[library_surveyor] 将外部文献/定理卡入库左翼外藏 [R###]（严格 5 枚举 support_scope 与 60-1500 字独立摘要）。",
+            "description": "[library_surveyor] 将外部文献/定理卡入库左翼外藏 [R###]（outcome='CARD_PUBLISHED'），或对无解/不合规查新请求做无卡结案（outcome='UNAVAILABLE_REPORT'，不插伪卡）。",
             "inputSchema": _schema(
                 {
-                    "ref_id": {"type": "string"},
+                    "outcome": {"type": "string", "default": "CARD_PUBLISHED"},
+                    "ref_id": {"type": ["string", "null"], "default": None},
                     "question_id": {"type": "string"},
-                    "title": {"type": "string"},
-                    "abstract_md": {"type": "string"},
-                    "exact_preconditions_md": {"type": "string"},
-                    "formulas_or_operators_md": {"type": "string"},
-                    "read_depth": {"type": "string"},
-                    "support_scope": {"type": "string"},
-                    "source_citation": {"type": "string"},
+                    "title": {"type": ["string", "null"], "default": None},
+                    "abstract_md": {"type": ["string", "null"], "default": None},
+                    "exact_preconditions_md": {"type": ["string", "null"], "default": None},
+                    "formulas_or_operators_md": {"type": ["string", "null"], "default": None},
+                    "read_depth": {"type": ["string", "null"], "default": None},
+                    "support_scope": {"type": ["string", "null"], "default": None},
+                    "source_citation": {"type": ["string", "null"], "default": None},
                     "fulfilled_request_ids": {"type": ["array", "null"], "items": {"type": "string"}, "default": None},
+                    "unavailable_reason_md": {"type": ["string", "null"], "default": None},
                 },
-                ["ref_id", "question_id", "title", "abstract_md", "exact_preconditions_md", "formulas_or_operators_md", "read_depth", "support_scope", "source_citation"],
+                ["question_id"],
             ),
         },
         {
@@ -425,6 +432,18 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = enrich_tool_definitions(
                 ["skill_id", "applicable_scope", "version", "raw_success_count", "raw_failure_count", "verified_artifact_rel_path", "rollback_pointer"],
             ),
         },
+        {
+            "name": "resolve_works_ticket",
+            "description": "[works_engineer] 显式结案工造司工单（RESOLVED / WONTFIX / DUPLICATE），防止 OPEN 工单无限自旋唤醒。",
+            "inputSchema": _schema(
+                {
+                    "ticket_id": {"type": "string"},
+                    "resolution": {"type": "string"},
+                    "resolution_note": {"type": "string"},
+                },
+                ["ticket_id", "resolution", "resolution_note"],
+            ),
+        },
         # 7. supervisory_committee (4)
         {
             "name": "get_supervisory_audit_snapshot",
@@ -492,6 +511,7 @@ _TOOL_REGISTRY: dict[str, tuple[Any, bool]] = {
     "upgrade_instrument_with_calibration": (tool_upgrade_instrument_with_calibration, True),
     "recompute_stage_b_only": (tool_recompute_stage_b_only, True),
     "update_skill_ledger": (tool_update_skill_ledger, True),
+    "resolve_works_ticket": (tool_resolve_works_ticket, False),
     "get_supervisory_audit_snapshot": (tool_get_supervisory_audit_snapshot, False),
     "check_stage2_closure_gate": (tool_check_stage2_closure_gate, False),
     "record_compliance_check": (tool_record_compliance_check, True),
@@ -584,16 +604,52 @@ def dispatch_control_call(method: str, params: dict[str, Any] | None) -> dict[st
                 total_budget=p.get("total_budget"),
                 min_commitment_window_sec=int(p.get("min_commitment_window_sec", 0) or 0),
                 delivery_spec_md=str(p.get("delivery_spec_md") or ""),
+                shared_inputs_rel_paths=p.get("shared_inputs_rel_paths"),
                 stage=p.get("stage") if p.get("stage") else None,
                 epoch_id=int(p.get("epoch_id", 1)),
                 human_signed_at=p.get("human_signed_at"),
             )
             return {"ok": True, "data": res}
         if method == "control_plane/schedule_snapshot":
-            res = schedule_control_plane_snapshot(conn, max_concurrent_workers=p.get("max_concurrent_workers"))
+            res = schedule_control_plane_snapshot(
+                conn,
+                max_concurrent_workers=p.get("max_concurrent_workers"),
+                workspace_root=eff_ws,
+            )
             return {"ok": True, "data": res}
         if method == "control_plane/sync_pressure":
-            res = sync_session_pressure(conn, node_id=str(p["node_id"]), pressure_tokens=int(p["pressure_tokens"]))
+            res = sync_session_pressure(
+                conn,
+                node_id=str(p["node_id"]),
+                pressure_tokens=int(p["pressure_tokens"]),
+                effective_context_window=p.get("effective_context_window"),
+                context_window_tokens=p.get("context_window_tokens"),
+            )
+            return {"ok": True, "data": res}
+        if method == "control_plane/mark_stage1_works_checked":
+            res = mark_stage1_works_checked(conn)
+            return {"ok": True, "data": res}
+        if method == "control_plane/sync_public_rulings":
+            res = sync_public_rulings(conn, workspace_root=eff_ws)
+            refreshed_worktrees: list[str] = []
+            if bool(p.get("refresh_active_worktrees", False)):
+                p0_row = conn.execute("SELECT shared_inputs_json FROM parse0_contract WHERE contract_id = 'active'").fetchone()
+                shared_rels = json.loads(p0_row["shared_inputs_json"] or "[]") if p0_row else []
+                for r in conn.execute(
+                    "SELECT DISTINCT worktree_abs_path FROM lineage_nodes WHERE node_status IN ('EXPLORING','ACTIVE_REVISING')"
+                ).fetchall():
+                    wt = str(r["worktree_abs_path"] or "").strip()
+                    if wt and Path(wt).is_dir():
+                        sync_public_inputs_to_worktree(eff_ws, wt, shared_rels)
+                        refreshed_worktrees.append(wt)
+            res["refreshed_worktrees"] = refreshed_worktrees
+            return {"ok": True, "data": res}
+        if method == "control_plane/abort_node":
+            res = abort_lineage_node(
+                conn,
+                node_id=str(p["node_id"]),
+                reason=str(p.get("reason", "ABORTED_BY_CONTROLLER")),
+            )
             return {"ok": True, "data": res}
         if method == "control_plane/record_human_stop":
             res = record_human_stop(conn, note=str(p.get("note", "HUMAN_UI_OR_CLI_STOP")))

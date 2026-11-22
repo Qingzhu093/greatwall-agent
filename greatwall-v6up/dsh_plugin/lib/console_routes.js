@@ -134,7 +134,6 @@ export function registerGreatwallConsoleRoutes(ctx, { activeControllersByWs, dat
                   stage: tState.stage || status.stage,
                   startedAt: tState.startedAt || null,
                   updatedAt: tState.updatedAt || null,
-                  interventions: tState.interventions || [],
                   countersByRole: tState.countersByRole || {},
                   sessions: tState.sessions || {},
                   recentEvents: tState.recentEvents || [],
@@ -206,26 +205,26 @@ export function registerGreatwallConsoleRoutes(ctx, { activeControllersByWs, dat
             return Response.json({ ok: true, action, ...(ctrl.orchestrator.pauseBackground()) })
           }
           if (action === 'resume') {
-            return Response.json({ ok: true, action, ...(ctrl.orchestrator.resumeBackground()) })
+            return Response.json({ ok: true, action, ...(await ctrl.orchestrator.resumeBackground()) })
           }
           if (action === 'stop') {
-            return Response.json({ ok: true, action, ...(await ctrl.orchestrator.stopBackground('UI_CONSOLE_STOP')) })
+            const stopRes = await ctrl.orchestrator.stopBackground('UI_CONSOLE_STOP')
+            await ctrl.bridge?.closeIdleChild?.()
+            return Response.json({ ok: true, action, ...stopRes })
           }
           if (action === 'human_stop') {
             return Response.json({
               ok: true,
               action,
-              ...(await ctrl.orchestrator.humanStop(String(body?.note || body?.directive || 'UI_CONSOLE_HUMAN_STOP'))),
+              ...(await ctrl.orchestrator.humanStop(String(body?.note || body?.reason || 'UI_CONSOLE_HUMAN_STOP'))),
             })
           }
-          if (action === 'intervene') {
-            const res = await ctrl.orchestrator.intervene({
-              targetType: String(body?.targetType || 'global'),
-              targetId: String(body?.targetId || 'ALL'),
-              directive: String(body?.directive || ''),
-              action: String(body?.interventionAction || 'steer'),
-            })
-            return Response.json({ ok: true, action, ...res })
+          if (action === 'abort_node') {
+            const res = await ctrl.orchestrator.abortNode(
+              String(body?.nodeId || body?.node_id || body?.targetId || ''),
+              String(body?.reason || 'UI_CONSOLE_ABORT_NODE'),
+            )
+            return Response.json({ ok: Boolean(res?.aborted), action, ...res })
           }
           return Response.json({ ok: false, error: `不支持的控制台动作: ${action}` }, { status: 400 })
         } catch (err) {

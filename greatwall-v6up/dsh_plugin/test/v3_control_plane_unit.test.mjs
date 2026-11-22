@@ -22,13 +22,23 @@ import {
   sampleAgentContextPressure,
   shouldConcludeTurnAfterTool,
 } from '../lib/clock_and_turn_gap.js'
-import { assertRequiredNativeTools } from '../lib/agent_session_host.js'
+import {
+  AgentSessionHost,
+  assertRequiredNativeTools,
+  extractModelBindingFromEvents,
+  resolveAuthoritativeModelBinding,
+  resolveEffectiveContextWindow,
+} from '../lib/agent_session_host.js'
 import { GreatwallMcpBridge } from '../lib/mcp_bridge.js'
 import {
   driveExplorerCompanionPair,
   runPreSpawnBriefingWithCompanion,
 } from '../lib/pair_lifecycle.js'
-import { GreatwallOrchestrator, selectDispatchableExplorers } from '../lib/orchestrator.js'
+import {
+  GovernanceItemCircuitBreaker,
+  GreatwallOrchestrator,
+  selectDispatchableExplorers,
+} from '../lib/orchestrator.js'
 import { TelemetryCollector } from '../lib/telemetry.js'
 import { pickController } from '../lib/console_routes.js'
 
@@ -36,9 +46,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CORE_PYTHON_ROOT = path.resolve(__dirname, '..', '..', 'core_python')
 
 test('1. 6套Preset、角色路由与平台感知原生工具白名单', () => {
-  assert.equal(ALL_31_MCP_TOOLS.size, 31)
+  assert.equal(ALL_31_MCP_TOOLS.size, 32)
   assert.ok(ROLE_MCP_TOOLS.works_engineer.includes('register_question_instrument'))
   assert.ok(ROLE_MCP_TOOLS.works_engineer.includes('upgrade_instrument_with_calibration'))
+  assert.ok(ROLE_MCP_TOOLS.works_engineer.includes('resolve_works_ticket'))
 
   // 7 角色全映射到 6 套职责极净 Preset
   const presets = Object.keys(PRESET_DEFINITIONS)
@@ -198,7 +209,7 @@ test('5. GreatwallMcpBridge 分级超时与 Python 31 窄工具实时握手冒�
     assert.equal(bridge.resolveControlTimeoutMs('control_plane/recover_heavy_jobs'), 300_000)
 
     const tools = await bridge.listTools()
-    assert.equal(tools.length, 31)
+    assert.equal(tools.length, 32)
     const snap = await bridge.control('control_plane/schedule_snapshot', {})
     assert.equal(snap?.ok, true)
     assert.equal(snap?.data?.stage, 'STAGE1_PARSE0')
@@ -639,7 +650,9 @@ test('14. pause 后再 start 复用原循环不双开 + _waitWakeOrTimeout 无�
         releaseLoop = resolve
       })
     }
-    const r1 = await orch.startBackground()
+    const r1 = await orch.startBackground({
+      agentOptions: { provider: 'deepseek-account', model: 'deepseek-flash' },
+    })
     assert.equal(r1.started, true)
     assert.equal(r1.alreadyRunning, false)
     assert.equal(loopsStarted, 1)
@@ -679,7 +692,9 @@ test('15. 未签 Parse 0 禁止 start 空转 + TelemetryCollector 跨重建保�
       workspaceRoot: tmpRoot,
       dataDir,
     })
-    const res = await orch.startBackground()
+    const res = await orch.startBackground({
+      agentOptions: { provider: 'deepseek-account', model: 'deepseek-flash' },
+    })
     assert.equal(res.started, false)
     assert.equal(res.blocked, 'NEED_PARSE0_SIGNATURE')
     assert.equal(orch._poolState, 'idle')
@@ -726,4 +741,348 @@ test('16. _launchGovTask 失败进入冷却且不立刻 _wakeLoop()，防紧循�
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true })
   }
+})
+
+test('17. 显式模型绑定拒启 (MISSING_MODEL_BINDING) + 主控事件流模型继承与 272k 自适应窗口', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_v3_modelbind_'))
+  const dataDir = path.join(tmpRoot, 'data')
+  try {
+    // 1) 无任何模型绑定 -> 必拒启 MISSING_MODEL_BINDING
+    const orch = new GreatwallOrchestrator({
+      ctx: {},
+      bridge: {
+        async control() {
+          return { ok: true, data: { initialized: true, parse0_signed: true, stage: 'STAGE2_EVOLVE', closure_state: { status: 'OPEN' } } }
+        },
+      },
+      corePythonRoot: CORE_PYTHON_ROOT,
+      workspaceRoot: tmpRoot,
+      dataDir,
+    })
+    const blocked = await orch.startBackground()
+    assert.equal(blocked.started, false)
+    assert.equal(blocked.blocked, 'MISSING_MODEL_BINDING')
+    assert.equal(orch._poolState, 'idle')
+
+    // 2) 从主控会话事件流 (model/selection + request/context) 自动继承真实模型与 272k 窗口
+    const fakeCaller = {
+      id: 'ptc_sess',
+      options: {},
+      session: {
+        snapshotEvents: () => [
+          { type: 'model/selection', data: { provider: 'deepseek-account', model: 'deepseek-flash' } },
+          { type: 'request/context', data: { provider: 'deepseek-account', model: 'deepseek-flash', contextWindow: 272_000 } },
+        ],
+      },
+    }
+    const evBind = extractModelBindingFromEvents(fakeCaller.session.snapshotEvents())
+    assert.equal(evBind.provider, 'deepseek-account')
+    assert.equal(evBind.model, 'deepseek-flash')
+    assert.equal(evBind.contextWindow, 272_000)
+
+    const resolved = await resolveAuthoritativeModelBinding({ callerAgent: fakeCaller, runtimeDefaultWindow: 500_000 })
+    assert.equal(resolved.ok, true)
+    assert.equal(resolved.provider, 'deepseek-account')
+    assert.equal(resolved.model, 'deepseek-flash')
+    assert.equal(resolved.effectiveContextWindow, 272_000)
+
+    // 1M 模型钳位至 500k
+    assert.equal(resolveEffectiveContextWindow({ modelWindow: 1_000_000, runtimeDefaultWindow: 500_000 }), 500_000)
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('18. 双向沙箱放行公开输入/https URL/dsh-spill-*，严防内部向外部逃逸', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_v3_bisandbox_'))
+  try {
+    const ws = path.join(tmpRoot, 'ws')
+    const wt = path.join(ws, 'worktrees', 'b_q1_1')
+    const probDir = path.join(ws, 'problem_pack')
+    const evalDir = path.join(ws, 'evaluators')
+    const hiddenDir = path.join(ws, '_hidden_calibrations')
+    const spillFile = path.join(os.tmpdir(), 'dsh-spill-abc123', 'out.txt')
+    fs.mkdirSync(wt, { recursive: true })
+    fs.mkdirSync(probDir, { recursive: true })
+    fs.mkdirSync(evalDir, { recursive: true })
+    fs.mkdirSync(hiddenDir, { recursive: true })
+    fs.mkdirSync(path.dirname(spillFile), { recursive: true })
+    fs.writeFileSync(path.join(probDir, 'q.md'), '# Q1')
+    fs.writeFileSync(spillFile, 'spilled')
+
+    const evalExp = createSandboxCallEvaluator({
+      role: 'explorer',
+      workspaceRoot: ws,
+      worktreeAbsPath: wt,
+      protectedDirs: [path.join(tmpRoot, 'plugin_data')],
+    })
+    // 公开输入与 dsh-spill-* 只读放行；写公开输入（含工作树内 inputs/ 副本）禁止
+    assert.equal(evalExp({ name: 'read', arguments: { file_path: path.join(probDir, 'q.md') } }), undefined)
+    assert.equal(evalExp({ name: 'read', arguments: { file_path: spillFile } }), undefined)
+    assert.match(String(evalExp({ name: 'write', arguments: { file_path: path.join(probDir, 'q.md') } })), /SANDBOX_VIOLATION/)
+    assert.match(String(evalExp({ name: 'write', arguments: { file_path: path.join(wt, 'inputs', 'q.md') } })), /SANDBOX_VIOLATION/)
+    // 严拦 evaluators/ 与 _hidden_calibrations/
+    assert.match(String(evalExp({ name: 'read', arguments: { file_path: path.join(evalDir, 'eval.py') } })), /SANDBOX_VIOLATION/)
+    assert.match(String(evalExp({ name: 'read', arguments: { file_path: path.join(hiddenDir, 'c.json') } })), /SANDBOX_VIOLATION/)
+
+    // 盲审官仅限独立空白沙箱内只读（不可越界读主工作区事后新增的 rulings/）
+    const rulingsDir = path.join(ws, 'rulings')
+    const blindDir = path.join(tmpRoot, 'plugin_data', 'blind_sandbox_rev_001')
+    fs.mkdirSync(rulingsDir, { recursive: true })
+    fs.mkdirSync(blindDir, { recursive: true })
+    fs.writeFileSync(path.join(rulingsDir, 'ruling_new.md'), '# v1')
+    const evalVer = createSandboxCallEvaluator({
+      role: 'library_verifier',
+      workspaceRoot: ws,
+      sandboxAbsPath: blindDir,
+      protectedDirs: [path.join(tmpRoot, 'plugin_data')],
+    })
+    assert.match(String(evalVer({ name: 'read', arguments: { file_path: path.join(rulingsDir, 'ruling_new.md') } })), /SANDBOX_VIOLATION/)
+    assert.equal(evalVer({ name: 'read', arguments: { file_path: spillFile } }), undefined)
+
+    // surveyor web_fetch https:// 零误杀
+    const evalSurv = createSandboxCallEvaluator({
+      role: 'library_surveyor',
+      workspaceRoot: ws,
+      protectedDirs: [path.join(tmpRoot, 'plugin_data')],
+    })
+    assert.equal(evalSurv({ name: 'web_fetch', arguments: { url: 'https://arxiv.org/abs/2401.00001' } }), undefined)
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('19. GovernanceItemCircuitBreaker 单待办熔断：分步进展不误杀、2次无进展仅熔断单项、状态变化自动复位', () => {
+  const cb = new GovernanceItemCircuitBreaker(2)
+  // 第 1 次调度：tkt_stuck 无变化 (count=1)，tkt_progress 指纹变化 (count=0)
+  let res = cb.evaluateBatch(
+    [
+      { key: 'works:ticket:tkt_stuck', beforeFp: 'v1' },
+      { key: 'works:ticket:tkt_progress', beforeFp: 'p1' },
+    ],
+    new Map([
+      ['works:ticket:tkt_stuck', 'v1'],
+      ['works:ticket:tkt_progress', 'p2'],
+    ]),
+  )
+  assert.equal(cb.isBroken('works:ticket:tkt_stuck', 'v1'), false)
+  assert.equal(cb.isBroken('works:ticket:tkt_progress', 'p2'), false)
+  assert.equal(res.find((r) => r.key === 'works:ticket:tkt_progress')?.stalledCount, 0)
+
+  // 第 2 次调度：tkt_stuck 仍无变化 -> 熔断；tkt_progress 仍在推进 -> 绝不连坐！
+  res = cb.evaluateBatch(
+    [
+      { key: 'works:ticket:tkt_stuck', beforeFp: 'v1' },
+      { key: 'works:ticket:tkt_progress', beforeFp: 'p2' },
+    ],
+    new Map([
+      ['works:ticket:tkt_stuck', 'v1'],
+      ['works:ticket:tkt_progress', 'p3'],
+    ]),
+  )
+  assert.equal(res.find((r) => r.key === 'works:ticket:tkt_stuck')?.newlyBroken, true)
+  assert.equal(cb.isBroken('works:ticket:tkt_stuck', 'v1'), true)
+  assert.equal(cb.isBroken('works:ticket:tkt_progress', 'p3'), false)
+
+  // 若 tkt_stuck 的外部指纹发生变化（如人类或他工具改动）-> 自动复位解除熔断
+  assert.equal(cb.isBroken('works:ticket:tkt_stuck', 'v2_changed'), false)
+})
+
+test('20. 防僵尸探索者核查：DB 节点置 CLOSED 后下一轮立即停推并同时销毁探索者与私有伴随', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_v3_zombie_'))
+  const wt = path.join(tmpRoot, 'wt')
+  fs.mkdirSync(wt, { recursive: true })
+  try {
+    const node = { node_id: 'n_zombie', branch_id: 'b_z', question_id: 'Q1', worktree_abs_path: wt }
+    let continueCalls = 0
+    const disposed = []
+    const liveSessions = new Map()
+    const compHandle = {
+      sessionId: 'comp_z_1',
+      async dispose(st) {
+        liveSessions.delete('comp_z_1')
+        disposed.push({ role: 'lineage_companion', st })
+      },
+    }
+    liveSessions.set('comp_z_1', { role: 'lineage_companion' })
+
+    const fakeOrch = {
+      workspaceRoot: tmpRoot,
+      _poolState: 'running',
+      liveSessions,
+      _nodeCompanionSessions: new Map([['n_zombie', compHandle]]),
+      _handoffsSinceHeartbeat: 0,
+      telemetry: { recordEvent() {} },
+      bridge: {
+        async control(method) {
+          if (method === 'control_plane/sync_pressure') {
+            return { ok: true, data: { node_status: 'CLOSED', pressure_tokens: 10000, effective_context_window: 272000 } }
+          }
+          return { ok: true }
+        },
+      },
+      host: {
+        effectiveContextWindow: 272000,
+        setSessionReadonly() {},
+        async archiveSession() {},
+      },
+      async spawnAndRunAgent(opts) {
+        const sid = opts.sessionId
+        liveSessions.set(sid, { role: opts.role })
+        return {
+          sessionId: sid,
+          role: opts.role,
+          turnSignals: [],
+          nativeThresholds: [],
+          isAbnormalEnd: false,
+          blackboxSummary: 'bb',
+          lastAssistantText: 'turn1',
+          handle: { agent: { session: { id: sid } } },
+          async dispose(st) {
+            liveSessions.delete(sid)
+            disposed.push({ role: opts.role, st })
+          },
+        }
+      },
+      async continueAliveAgent() {
+        continueCalls += 1
+        return { lastAssistantText: 'should_not_run', turnSignals: [], nativeThresholds: [], isAbnormalEnd: false }
+      },
+    }
+
+    await driveExplorerCompanionPair(fakeOrch, node, { goal_and_completion_md: '# G' }, 'exp_zombie')
+    assert.equal(continueCalls, 0, 'DB 节点已置 CLOSED 时，严禁继续调用 continueAliveAgent 占槽续推！')
+    assert.equal(fakeOrch._nodeCompanionSessions.has('n_zombie'), false, '私有伴随必须同步销毁释槽')
+    assert.ok(disposed.some((d) => d.role === 'explorer' && d.st === 'terminated_external'))
+    assert.ok(disposed.some((d) => d.role === 'lineage_companion' && d.st === 'terminated_external'))
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('21. 活跃科研仪器清单自动 Push 给对应子题探索者（屏蔽他题与 UNHEALTHY 仪器）', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_v3_inst_push_'))
+  const wt = path.join(tmpRoot, 'wt')
+  fs.mkdirSync(wt, { recursive: true })
+  try {
+    let capturedTaskCtx = ''
+    const node = {
+      node_id: 'n_inst',
+      branch_id: 'b_inst',
+      question_id: 'Q1',
+      worktree_abs_path: wt,
+      briefing_snapshot_md: 'BRIEF_OK',
+    }
+    const snap = {
+      goal_and_completion_md: '# Goal',
+      active_instruments: [
+        { instrument_id: 'inst_q1_mec', version: 2, question_id: 'Q1', instrument_role: 'VERDICT', artifact_schema: 'python_run', health_status: 'HEALTHY' },
+        { instrument_id: 'inst_all_probe', version: 1, question_id: 'ALL', instrument_role: 'PROBE', artifact_schema: 'python_run', health_status: 'HEALTHY' },
+        { instrument_id: 'inst_q2_other', version: 1, question_id: 'Q2', instrument_role: 'VERDICT', artifact_schema: 'python_run', health_status: 'HEALTHY' },
+        { instrument_id: 'inst_q1_broken', version: 1, question_id: 'Q1', instrument_role: 'PROBE', artifact_schema: 'python_run', health_status: 'UNHEALTHY' },
+      ],
+    }
+    const fakeOrch = {
+      workspaceRoot: tmpRoot,
+      _poolState: 'running',
+      liveSessions: new Map(),
+      _nodeCompanionSessions: new Map(),
+      _handoffsSinceHeartbeat: 0,
+      telemetry: { recordEvent() {} },
+      bridge: {
+        async control(method) {
+          if (method === 'control_plane/sync_pressure') return { ok: true, data: { node_status: 'CLOSED' } }
+          return { ok: true }
+        },
+      },
+      host: { effectiveContextWindow: 272000, setSessionReadonly() {}, async archiveSession() {} },
+      async spawnAndRunAgent(opts) {
+        capturedTaskCtx = opts.taskContextText || ''
+        return {
+          sessionId: opts.sessionId,
+          role: opts.role,
+          turnSignals: [],
+          nativeThresholds: [],
+          isAbnormalEnd: false,
+          blackboxSummary: 'bb',
+          lastAssistantText: 'ok',
+          handle: { agent: { session: { id: opts.sessionId } } },
+          async dispose() {},
+        }
+      },
+      async continueAliveAgent() {
+        return { lastAssistantText: 'ok', turnSignals: [], nativeThresholds: [], isAbnormalEnd: false }
+      },
+    }
+
+    await driveExplorerCompanionPair(fakeOrch, node, snap, 'exp_inst_push')
+    assert.ok(capturedTaskCtx.includes('inst_q1_mec'), '必须推送本子题健康仪器 inst_q1_mec')
+    assert.ok(capturedTaskCtx.includes('inst_all_probe'), '必须推送全局健康仪器 inst_all_probe')
+    assert.ok(!capturedTaskCtx.includes('inst_q2_other'), '不得误推其他子题仪器 inst_q2_other')
+    assert.ok(!capturedTaskCtx.includes('inst_q1_broken'), '不得推送已熔断 UNHEALTHY 仪器')
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('22. 子会话自动继承父会话 permissionPresets / sandbox/mode（根治 Windows headless 子会话 pwsh ACL 崩溃）', () => {
+  const applied = []
+  const parentSession = {
+    id: 'parent_1',
+    snapshotEvents: () => [
+      { type: 'sandbox/mode', data: { mode: 'danger-full-access' } },
+      { type: 'approval/policy', data: { policy: 'never' } },
+    ],
+  }
+  const childEvents = []
+  const childSession = {
+    id: 'child_1',
+    append(type, data) {
+      childEvents.push({ type, data })
+    },
+  }
+
+  // 路径 A：permissionPresets 服务可用时，直接通过官方 set 同步
+  const hostA = new AgentSessionHost({
+    ctx: {
+      get(name) {
+        if (name === 'permissionPresets') {
+          return {
+            current: (s) => (s === parentSession ? 'danger-full-access' : 'workspace-write'),
+            set: (s, preset) => applied.push({ sid: s.id, preset }),
+          }
+        }
+        return null
+      },
+    },
+    bridge: {},
+    workspaceRoot: os.tmpdir(),
+    rolePrompts: {},
+    parentAgent: { session: parentSession },
+    telemetry: { recordEvent() {} },
+  })
+  hostA._inheritParentPermissionState(childSession)
+  assert.deepEqual(applied, [{ sid: 'child_1', preset: 'danger-full-access' }])
+
+  // 路径 B：无 permissionPresets 时，回退同步 sandbox/mode 与 approval/policy 事件
+  const hostB = new AgentSessionHost({
+    ctx: {
+      get(name) {
+        if (name === 'sandboxPolicy') {
+          return {
+            resolve: ({ session }) => ({ mode: session === parentSession ? 'danger-full-access' : 'workspace-write' }),
+          }
+        }
+        return null
+      },
+    },
+    bridge: {},
+    workspaceRoot: os.tmpdir(),
+    rolePrompts: {},
+    parentAgent: { session: parentSession },
+    telemetry: { recordEvent() {} },
+  })
+  hostB._inheritParentPermissionState(childSession)
+  assert.ok(childEvents.some((e) => e.type === 'sandbox/mode' && e.data.mode === 'danger-full-access'))
+  assert.ok(childEvents.some((e) => e.type === 'approval/policy' && e.data.policy === 'never'))
 })

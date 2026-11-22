@@ -95,6 +95,9 @@ ALLOWED_COMPLIANCE_STAGES = frozenset({"PARSE0_GATE", "STAGE2_HEARTBEAT", "AMBIG
 ALLOWED_COMPLIANCE_STATUSES = frozenset({"PASSED", "ALERT_AMBIGUOUS_SPEC", "ALERT", "BLOCKED"})
 ALLOWED_COMPANION_MODES = frozenset({"PRE_SPAWN", "REFLECT_37", "HANDOFF_70", "CRASH_RECOVERY"})
 ALLOWED_VERDICT_3STATE = frozenset({"SUFFICIENT_EVIDENCE", "MINIMAL_EXPERIMENT_NEXT", "NEED_CONTROL_GROUP"})
+ALLOWED_TICKET_RESOLUTIONS = frozenset({"RESOLVED", "WONTFIX", "DUPLICATE"})
+ALLOWED_SURVEY_OUTCOMES = frozenset({"CARD_PUBLISHED", "UNAVAILABLE_REPORT"})
+ALLOWED_SURVEY_STATUSES = frozenset({"PENDING", "FULFILLED", "CLOSED_UNAVAILABLE"})
 
 _FTS5_META_RE = re.compile(r"[:*(){}^+\-.,;!?/\\|=<>&~@#$%\[\]\"']+")
 _FTS5_RESERVED_WORDS = frozenset({"AND", "OR", "NOT", "NEAR"})
@@ -149,6 +152,7 @@ def resolve_storage_paths(workspace_root: str = "", *, create_dirs: bool = True)
     blind_sandboxes_dir = data_dir / "blind_sandboxes"
     instrument_snapshots_dir = data_dir / "instrument_snapshots"
     skills_dir = data_dir / "skills"
+    ruling_revisions_dir = data_dir / "ruling_revisions"
 
     if create_dirs:
         for d in (
@@ -160,6 +164,7 @@ def resolve_storage_paths(workspace_root: str = "", *, create_dirs: bool = True)
             blind_sandboxes_dir,
             instrument_snapshots_dir,
             skills_dir,
+            ruling_revisions_dir,
         ):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -173,6 +178,7 @@ def resolve_storage_paths(workspace_root: str = "", *, create_dirs: bool = True)
         "blind_sandboxes_dir": blind_sandboxes_dir,
         "instrument_snapshots_dir": instrument_snapshots_dir,
         "skills_ledger_path": skills_dir / "SKILL_LEDGER.json",
+        "ruling_revisions_dir": ruling_revisions_dir,
     }
 
 
@@ -190,6 +196,11 @@ CREATE TABLE IF NOT EXISTS parse0_contract (
     total_budget_json TEXT NOT NULL DEFAULT '{}',
     min_commitment_window_sec INTEGER NOT NULL DEFAULT 0,
     delivery_spec_md TEXT NOT NULL DEFAULT '',
+    shared_inputs_json TEXT NOT NULL DEFAULT '[]',
+    stage1_works_checked INTEGER NOT NULL DEFAULT 0,
+    latest_spec_revision INTEGER NOT NULL DEFAULT 0,
+    latest_ruling_summary_md TEXT NOT NULL DEFAULT '',
+    ruling_fingerprint_sha256 TEXT NOT NULL DEFAULT '',
     human_signed_at TEXT NOT NULL,
     stage TEXT NOT NULL DEFAULT 'STAGE1_PARSE0'
         CHECK(stage IN ('STAGE1_PARSE0','STAGE2_EVOLVE','STAGE3_CONSOLIDATE','CLOSED_VERIFIED')),
@@ -326,6 +337,8 @@ CREATE TABLE IF NOT EXISTS lineage_nodes (
     candidate_rel_path TEXT,
     bound_obs_ids_json TEXT NOT NULL DEFAULT '[]',
     pressure_tokens INTEGER NOT NULL DEFAULT 0,
+    effective_context_window INTEGER NOT NULL DEFAULT 500000,
+    spec_revision INTEGER NOT NULL DEFAULT 0,
     first_reflection_unlocked INTEGER NOT NULL DEFAULT 0,
     inplace_repair_count INTEGER NOT NULL DEFAULT 0,
     reopen_condition TEXT,
@@ -438,6 +451,7 @@ CREATE TABLE IF NOT EXISTS review_queue (
         'STAGE1_BLIND','STAGE2_UNBLIND','CLOSED_ACCEPTED','CLOSED_REVISE','CLOSED_REFUTED'
     )),
     manuscript_title TEXT NOT NULL DEFAULT '',
+    spec_revision INTEGER NOT NULL DEFAULT 0,
     column_a_snapshot_md TEXT NOT NULL DEFAULT '',
     column_b_snapshot_md TEXT NOT NULL DEFAULT '',
     bound_obs_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -577,8 +591,9 @@ CREATE TABLE IF NOT EXISTS survey_requests (
     node_id TEXT NOT NULL,
     topic_query TEXT NOT NULL,
     reason TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','FULFILLED')),
+    status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','FULFILLED','CLOSED_UNAVAILABLE')),
     fulfilled_ref_id TEXT,
+    resolution_note TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -748,10 +763,63 @@ def _migrate_closure_state_check_constraint(conn: sqlite3.Connection) -> None:
         conn.execute("DROP TABLE _project_closure_state_old")
 
 
+def _migrate_survey_requests_check_constraint(conn: sqlite3.Connection) -> None:
+    """兼容早期 v3.0 数据库：若 survey_requests 的 CHECK 约束缺少 CLOSED_UNAVAILABLE，单事务安全重建该表。"""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'survey_requests'"
+    ).fetchone()
+    ddl = str(row["sql"] or "") if row else ""
+    if not ddl or "CLOSED_UNAVAILABLE" in ddl:
+        return
+    cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(survey_requests)").fetchall()}
+    target_cols = [
+        ("req_id", "''"),
+        ("question_id", "''"),
+        ("node_id", "''"),
+        ("topic_query", "''"),
+        ("reason", "''"),
+        ("status", "'PENDING'"),
+        ("fulfilled_ref_id", "NULL"),
+        ("resolution_note", "''"),
+        ("created_at", "''"),
+        ("updated_at", "''"),
+    ]
+    insert_cols = ", ".join(name for name, _ in target_cols)
+    select_exprs = ", ".join(name if name in cols else default_expr for name, default_expr in target_cols)
+    with rw_immediate_tx(conn):
+        conn.execute("ALTER TABLE survey_requests RENAME TO _survey_requests_old")
+        conn.execute(
+            """
+            CREATE TABLE survey_requests (
+                req_id TEXT PRIMARY KEY,
+                question_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                topic_query TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','FULFILLED','CLOSED_UNAVAILABLE')),
+                fulfilled_ref_id TEXT,
+                resolution_note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            f"""
+            INSERT INTO survey_requests({insert_cols})
+            SELECT {select_exprs}
+            FROM _survey_requests_old
+            """
+        )
+        conn.execute("DROP TABLE _survey_requests_old")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_survey_status ON survey_requests(status, question_id)")
+
+
 def init_database_schema(conn: sqlite3.Connection) -> None:
     _detect_legacy_v2_database(conn)
     conn.executescript(SCHEMA_SQL)
     _migrate_closure_state_check_constraint(conn)
+    _migrate_survey_requests_check_constraint(conn)
     # 轻量补齐 v3.0 内部新增可选列（仅限已创建的 v3.0 库）
     for tbl, col, col_def in (
         ("instruments", "frozen_snapshot_path", "TEXT"),
@@ -759,6 +827,15 @@ def init_database_schema(conn: sqlite3.Connection) -> None:
         ("lineage_nodes", "explorer_will_md", "TEXT NOT NULL DEFAULT ''"),
         ("lineage_nodes", "pending_handoff_mode", "TEXT"),
         ("lineage_nodes", "pending_handoff_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("lineage_nodes", "effective_context_window", "INTEGER NOT NULL DEFAULT 500000"),
+        ("lineage_nodes", "spec_revision", "INTEGER NOT NULL DEFAULT 0"),
+        ("review_queue", "spec_revision", "INTEGER NOT NULL DEFAULT 0"),
+        ("parse0_contract", "shared_inputs_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("parse0_contract", "stage1_works_checked", "INTEGER NOT NULL DEFAULT 0"),
+        ("parse0_contract", "latest_spec_revision", "INTEGER NOT NULL DEFAULT 0"),
+        ("parse0_contract", "latest_ruling_summary_md", "TEXT NOT NULL DEFAULT ''"),
+        ("parse0_contract", "ruling_fingerprint_sha256", "TEXT NOT NULL DEFAULT ''"),
+        ("survey_requests", "resolution_note", "TEXT NOT NULL DEFAULT ''"),
         ("project_closure_state", "verifier_revision_notes", "TEXT NOT NULL DEFAULT ''"),
     ):
         existing = {str(r["name"]) for r in conn.execute(f"PRAGMA table_info({tbl})").fetchall()}

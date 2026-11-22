@@ -27,6 +27,7 @@ from .tools_works import (
     tool_get_works_engineering_queue,
     tool_recompute_stage_b_only,
     tool_register_question_instrument,
+    tool_resolve_works_ticket,
     tool_update_skill_ledger,
     tool_upgrade_instrument_with_calibration,
 )
@@ -50,6 +51,7 @@ __all__ = [
     "tool_upgrade_instrument_with_calibration",
     "tool_recompute_stage_b_only",
     "tool_update_skill_ledger",
+    "tool_resolve_works_ticket",
     "tool_get_supervisory_audit_snapshot",
     "tool_check_stage2_closure_gate",
     "tool_record_compliance_check",

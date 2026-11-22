@@ -19,6 +19,7 @@ from ..evaluators.isolated_runner import (
 
 from .db_schema import (
     ALLOWED_INSTRUMENT_ROLES,
+    ALLOWED_TICKET_RESOLUTIONS,
     ERR_CONFLICT,
     ERR_INVALID_INPUT,
     ERR_INVARIANT,
@@ -598,4 +599,78 @@ def tool_update_skill_ledger(
         question_id="ALL",
         next_step_guidance=f"共享技能 {sid} v{version} 已通过 No-File 校验并写入工作区隔离台账。",
         data={"skill_id": sid, "ledger_path": str(ledger_path), "entry": entry},
+    )
+
+
+def tool_resolve_works_ticket(
+    conn: sqlite3.Connection,
+    caller_role: str,
+    session_id: str,
+    ticket_id: str,
+    resolution: str,
+    resolution_note: str,
+) -> dict[str, Any]:
+    """显式结案工造司工单（含 PAIN_POINT / DUPLICATE_TOOL / EXPLOIT / INSTRUMENT_ERROR），杜绝 OPEN 工单无限自旋唤醒。"""
+    enforce_role_tool_permission(conn, caller_role, "resolve_works_ticket", session_id=session_id)
+    tid = str(ticket_id or "").strip()
+    if not tid:
+        raise FailClosedError(ERR_INVALID_INPUT, "ticket_id 不能为空")
+    res_u = str(resolution or "").strip().upper()
+    if res_u not in ALLOWED_TICKET_RESOLUTIONS:
+        raise FailClosedError(
+            ERR_INVALID_INPUT,
+            f"非法 resolution={resolution!r}，仅允许 {sorted(ALLOWED_TICKET_RESOLUTIONS)}",
+        )
+    note = str(resolution_note or "").strip()
+    if len(note) < 5:
+        raise FailClosedError(ERR_INVALID_INPUT, "resolution_note 须至少 5 个字符，清楚写明核查结果或处理依据")
+
+    row = conn.execute("SELECT * FROM works_engineering_queue WHERE ticket_id = ?", (tid,)).fetchone()
+    if row is None:
+        raise FailClosedError(ERR_NOT_FOUND, f"工单 {tid!r} 不存在")
+    if str(row["status"]) == "RESOLVED":
+        return build_tool_receipt(
+            conn=conn,
+            tool_name="resolve_works_ticket",
+            question_id=str(row["question_id"]),
+            next_step_guidance=f"工单 {tid} 此前已结案，幂等跳过。",
+            data={"ticket_id": tid, "status": "RESOLVED", "idempotent_skip": True},
+        )
+
+    try:
+        payload = json.loads(row["payload_json"] or "{}")
+        if not isinstance(payload, dict):
+            payload = {"raw_payload": payload}
+    except Exception:
+        payload = {"raw_payload": str(row["payload_json"] or "")}
+
+    now = utc_now_iso()
+    payload["resolution"] = res_u
+    payload["resolution_note"] = note
+    payload["resolved_by_session"] = str(session_id or "")
+    payload["resolved_at"] = now
+
+    with rw_immediate_tx(conn):
+        conn.execute(
+            """
+            UPDATE works_engineering_queue
+            SET status = 'RESOLVED', payload_json = ?, updated_at = ?
+            WHERE ticket_id = ?
+            """,
+            (json.dumps(payload, ensure_ascii=False), now, tid),
+        )
+
+    return build_tool_receipt(
+        conn=conn,
+        tool_name="resolve_works_ticket",
+        question_id=str(row["question_id"]),
+        next_step_guidance=f"工单 {tid} ({row['ticket_type']}) 已结案（{res_u}），不再重复触发 works:queue 唤醒。",
+        data={
+            "ticket_id": tid,
+            "ticket_type": str(row["ticket_type"]),
+            "question_id": str(row["question_id"]),
+            "status": "RESOLVED",
+            "resolution": res_u,
+            "resolution_note": note,
+        },
     )

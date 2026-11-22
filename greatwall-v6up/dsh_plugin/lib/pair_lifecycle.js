@@ -1,20 +1,24 @@
 /**
  * 长城 V6-Up (v3.0) 单探索节点生命周期驱动（PairLifecycle）：
  *
- * 严格落实 v3.0 两大核心协议：
+ * 严格落实 v3.0 顶层核心协议：
  * 1. **单节点同会话伴随暂停续传**（`PRE_SPAWN` -> pause -> `REFLECT_37` -> pause -> `HANDOFF_70` -> dispose，绝不跨代常驻！
- *    仅在宿主重启/句柄丢失或 `<70%` 崩溃抢救时无状态冷启动兜底）；
- * 2. **70% 两步清醒交接**：
- *    - 第一步：将在线探索者动态切换至只读态 (`setSessionReadonly(expSessionId, true)`)，让清醒探索者执行最后 1 轮只读文本收官，
- *      亲笔输出客观总结与《科研遗嘱》，随后安全归档销毁探索者；
- *    - 第二步：续传同节点伴随会话，携探索者亲笔遗嘱与黑匣子轨迹摘要核对客观证据，独占单写 `submit_node_handoff`，
- *      完成后在 `finally` 中彻底销毁该节点伴随句柄。
+ *    仅在宿主重启/句柄丢失或 `<70%` 崩溃抢救时从 SQLite 单真源冷启动兜底）；
+ * 2. **防僵尸探索者实时核查**：每轮续推前校验 SQLite 实时 `node_status`，节点一旦处于非活跃态（如 `abort_node` / 外部关闭 / 结项），
+ *    立刻停止续推并同时销毁探索者与私有伴随句柄，绝不占槽烧钱；
+ * 3. **硬性跑满 `37% -> 70%` 与两步清醒交接（无 Cost Note / 无提前逃跑后门）**：
+ *    - 第一步：将在线探索者动态切换至只读态 (`setSessionReadonly(expSessionId, true)`)，亲笔输出客观总结与《科研遗嘱》，
+ *      **先可靠持久化至 SQLite `lineage_nodes.will_md` / `pending_handoff_mode='HANDOFF_70'` 后再销毁探索者句柄**；
+ *    - 第二步：续传同节点伴随会话核对客观证据，独占单写 `submit_node_handoff`，并在 `finally` 中彻底销毁该节点伴随句柄。
  * @module dsh-greatwall-v6up/pair_lifecycle
  */
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { syncLivePressureToDb } from './clock_and_turn_gap.js'
 import { formatNodeSessionTitle } from './prompts.js'
+
+const ACTIVE_EXPLORE_STATUSES = new Set(['EXPLORING', 'ACTIVE_REVISING'])
 
 export function scanLocalWorktreeTools(worktreeAbsPath) {
   const toolsDir = path.join(worktreeAbsPath, 'tools')
@@ -34,6 +38,27 @@ export function scanLocalWorktreeTools(worktreeAbsPath) {
     }
   } catch {}
   return items
+}
+
+export function scanLocalWorktreePublicInputs(worktreeAbsPath) {
+  const inputsDir = path.join(worktreeAbsPath, 'inputs')
+  if (!fs.existsSync(inputsDir)) return []
+  const found = []
+  const walk = (dir, prefix = 'inputs') => {
+    try {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const rel = `${prefix}/${entry.name}`
+        if (entry.isDirectory()) {
+          if (found.length < 30) walk(path.join(dir, entry.name), rel)
+        } else if (entry.isFile()) {
+          found.push(rel)
+          if (found.length >= 30) return
+        }
+      }
+    } catch {}
+  }
+  walk(inputsDir)
+  return found
 }
 
 /** 获取当前节点保活中的同会话伴随句柄（若未保活或已掉线则返回 null）。 */
@@ -79,7 +104,6 @@ export async function runPreSpawnBriefingWithCompanion(orchestrator, node, { sig
     shortTransaction: true,
     keepAliveAfterIdle: true,
     signal,
-    taskContextText: orchestrator._formatInterventionsForTarget('lineage_companion', node.question_id, node.node_id),
     prompt: `阶段 PRE_SPAWN：请调用 get_companion_context(branch_id="${node.branch_id}", node_id="${node.node_id}", mode="PRE_SPAWN")，按五段滚动压缩预算 (<=2200字，不直接追加旧看板) 调用 save_lineage_briefing 写入本代初始看板；完成后挂起等待本节点的 37% 诊断与 70% 交接。`,
   })
   orchestrator._nodeCompanionSessions?.set?.(node.node_id, compRes)
@@ -118,7 +142,6 @@ ${latestBlackbox}
       shortTransaction: true,
       keepAliveAfterIdle: true,
       signal,
-      taskContextText: orchestrator._formatInterventionsForTarget('lineage_companion', node.question_id, node.node_id),
       prompt: r37Prompt,
     })
     orchestrator._nodeCompanionSessions?.set?.(node.node_id, compHandle)
@@ -151,7 +174,7 @@ ${latestBlackbox}
     }
   }
 
-  // 以真实工具成功回执或 SQLite 真源为准，严禁假解锁！
+  // 以真实工具成功回执或 SQLite 真源为准，严禁假解锁
   let unlocked = hasUnlockedSignal()
   if (!unlocked && orchestrator.bridge?.control) {
     try {
@@ -188,18 +211,19 @@ export async function runHandoffWithCompanion(
 ) {
   const isCrash = mode === 'CRASH_RECOVERY'
   const compHandle = isCrash ? null : getLiveNodeCompanion(orchestrator, node.node_id)
+  const effectiveWill = String(explorerWillText || node?.will_md || node?.explorer_will_md || '').trim()
 
   const promptBody = isCrash
-    ? `阶段 CRASH_RECOVERY（探索者 ${node.node_id} 在 <70% 异常中断：${interruptReason || 'unknown'}）。
+    ? `阶段 CRASH_RECOVERY（探索者 ${node.node_id} 在 <70% 异常中断或未落库亲笔遗嘱即重启：${interruptReason || 'unknown'}）。
 ### 中断前黑匣子轨迹摘要
-${latestBlackbox || '(无额外轨迹)'}
+${latestBlackbox || '(无额外轨迹，亲笔遗嘱原文缺失，请直接以工作树工件与客观观测为准)'}
 
 请调用 get_companion_context(branch_id="${node.branch_id}", node_id="${node.node_id}", mode="CRASH_RECOVERY")，只读扫描 worktree 与已有 [Obs###]：
 - 只要工作树存在任何有价值的纯数学推导草稿、反例构造或有效产物（即使 eval_count == 0），必须设 is_empty_crash=false、evidence_grade="ARTIFACT_ONLY" 或 "MEASURED" 抢救入 DAG；
 - 仅在彻底空白无产物时设 is_empty_crash=true。请立即调 submit_node_handoff 落库。`
     : `阶段 HANDOFF_70（探索者已完成只读亲笔遗嘱收官并安全退场）。
 ### 探索者亲笔总结与《科研遗嘱》
-${explorerWillText || '(探索者未输出额外遗嘱正文，请直接依据工作树与客观观测核对)'}
+${effectiveWill || '(探索者未输出额外遗嘱正文，请直接依据工作树与客观观测核对)'}
 
 ### 探索者退场前黑匣子轨迹摘要 (去思维链)
 ${latestBlackbox || '(无额外轨迹)'}
@@ -223,12 +247,11 @@ ${latestBlackbox || '(无额外轨迹)'}
         }),
         shortTransaction: true,
         signal,
-        taskContextText: orchestrator._appendInterventions('', 'lineage_companion', node.question_id, node.node_id),
         prompt: promptBody,
       })
     }
   } finally {
-    // 无论成功或异常，该节点伴随句柄必须随节点一同销毁，严禁跨代常驻！
+    // 无论成功或异常，该节点伴随句柄必须随节点一同销毁，严禁跨代常驻
     await disposeNodeCompanion(orchestrator, node.node_id, isCrash ? 'completed_crash_recovery' : 'completed')
   }
 }
@@ -242,20 +265,43 @@ export async function driveExplorerCompanionPair(
 ) {
   const qid = node.question_id || ''
   const toolsManifest = scanLocalWorktreeTools(node.worktree_abs_path)
-  const interventionsText = orchestrator._formatInterventionsForTarget('explorer', qid, node.node_id)
+  const publicInputsList = scanLocalWorktreePublicInputs(node.worktree_abs_path)
   const goalMd = snap?.goal_and_completion_md || ''
+  const specRev = Number(node.spec_revision ?? snap?.latest_spec_revision ?? 0)
+  const effWindow = Number(orchestrator.host?.effectiveContextWindow || node.effective_context_window || 500_000)
+  const availableInstruments = (snap?.active_instruments || []).filter(
+    (inst) =>
+      inst &&
+      inst.health_status !== 'UNHEALTHY' &&
+      (String(inst.question_id || '') === String(qid) || String(inst.question_id || '') === 'ALL'),
+  )
+  const instrumentsMd = availableInstruments.length
+    ? availableInstruments
+        .map(
+          (inst) =>
+            `- \`${inst.instrument_id}\` (v${inst.version}, role=${inst.instrument_role}, schema=${inst.artifact_schema || 'python_run'}, q=${inst.question_id})`,
+        )
+        .join('\n')
+    : ''
 
   const taskContextParts = [
     '## 当前分配工作区与任务契约',
     `- node_id: \`${node.node_id}\``,
     `- branch_id: \`${node.branch_id}\``,
     `- question_id: \`${qid}\``,
+    `- spec_revision: \`v${specRev}\``,
+    `- effective_context_window: \`${effWindow}\` tokens (37% 反思 / 70% 硬交接)`,
     `- worktree_abs_path: \`${node.worktree_abs_path}\``,
     goalMd ? `### Parse 0 课题目标与完成判据\n${goalMd}` : '',
+    instrumentsMd
+      ? `### 本子题已激活科研仪器清单 (run_isolated_eval 可直接调用)\n${instrumentsMd}`
+      : '',
+    publicInputsList.length
+      ? `### 只读公开题面与裁决文档目录 (inputs/)\n${publicInputsList.map((p) => `- \`${p}\``).join('\n')}`
+      : '',
     node.lane_assignment ? `### 五车道停滞分流专项任务 (Lane Assignment)\n${node.lane_assignment}` : '',
     toolsManifest.length ? `### 本工作树 tools/ 已有模块清单\n${JSON.stringify(toolsManifest, null, 2)}` : '',
     node.briefing_snapshot_md ? `### Lineage Briefing 五段看板\n${node.briefing_snapshot_md}` : '',
-    interventionsText,
   ].filter(Boolean)
 
   const expRes = await orchestrator.spawnAndRunAgent({
@@ -269,13 +315,15 @@ export async function driveExplorerCompanionPair(
     shortTransaction: false,
     signal,
     taskContextText: taskContextParts.join('\n\n'),
-    prompt: `请面向子题 ${qid}（node_id="${node.node_id}"）开展首轮独立探索（0–37% 可自由查阅外部文献 [R###]，暂不可拉取内藏 L2/L3）：既可进行严格解析推导/反例构造，也可在已有科研仪器时调用 run_isolated_eval 获取客观观测。`,
+    prompt: `请面向子题 ${qid}（node_id="${node.node_id}"，口径 v${specRev}）开展首轮独立探索（0–37% 可自由查阅 inputs/ 公开题面与外藏 [R###]，暂不可拉取内藏 L2/L3）：既可进行严格解析推导/反例构造，也可在已有科研仪器时调用 run_isolated_eval 获取客观观测。`,
     keepAliveAfterIdle: true,
   })
 
   let latestBlackbox = expRes.blackboxSummary
   let interrupted = expRes.isAbnormalEnd
   let interruptReason = expRes.turnEndReason ? JSON.stringify(expRes.turnEndReason) : ''
+  let terminatedExternally = false
+  let externalTermReason = ''
   let explorerWillText = ''
   let reflectedDone = Boolean(node.first_reflection_unlocked)
   let currentTurnSignals = expRes.turnSignals || []
@@ -285,9 +333,63 @@ export async function driveExplorerCompanionPair(
     currentTurnSignals.some((s) => s.trigger === name) ||
     currentNativeThresholds.some((t) => t.trigger === name)
 
+  /**
+   * 防僵尸核查：每轮续推前检查 SQLite 实时 `node_status` 与外部控制面状态。
+   * 一旦节点在 DB 中已被置为 CLOSED/SEALED/AWAITING_TRIAGE/PENDING_REVIEW/BLOCKED_L4B 或发生外部中止，
+   * 立即退场销毁探索者与伴随句柄，绝不占槽续推！
+   */
+  const checkNodeStillActiveInDb = async () => {
+    if (signal?.aborted || orchestrator._poolState === 'stopped') {
+      terminatedExternally = true
+      externalTermReason = 'POOL_STOPPED_OR_ABORTED'
+      return false
+    }
+    if (hasTrigger('NODE_TERMINATED')) {
+      terminatedExternally = true
+      externalTermReason = 'NODE_TERMINATED_SIGNAL'
+      return false
+    }
+    if (!orchestrator.bridge?.control) return true
+    try {
+      const syncRes = await syncLivePressureToDb(
+        orchestrator.ctx,
+        expRes.handle?.agent,
+        orchestrator.bridge,
+        orchestrator.workspaceRoot,
+        node.node_id,
+        effWindow,
+      )
+      const rowData = syncRes?.data ?? syncRes ?? {}
+      const liveStatus = String(rowData.node_status || '')
+      if (liveStatus && !ACTIVE_EXPLORE_STATUSES.has(liveStatus)) {
+        terminatedExternally = true
+        externalTermReason = `DB_NODE_STATUS:${liveStatus}`
+        orchestrator.telemetry?.recordEvent?.('explorer_terminated_by_db_status', {
+          nodeId: node.node_id,
+          nodeStatus: liveStatus,
+        })
+        return false
+      }
+      if (rowData.first_reflection_unlocked) {
+        reflectedDone = true
+      }
+      if (rowData.trigger === 'HANDOFF_70' && !hasTrigger('HANDOFF_70')) {
+        currentNativeThresholds.push({ trigger: 'HANDOFF_70', pressurePct: rowData.pressure_pct, sourceHook: 'db_sync' })
+      } else if (rowData.trigger === 'REFLECT_37' && !reflectedDone && !hasTrigger('REFLECT_37')) {
+        currentNativeThresholds.push({ trigger: 'REFLECT_37', pressurePct: rowData.pressure_pct, sourceHook: 'db_sync' })
+      }
+    } catch {}
+    return true
+  }
+
   try {
     let turnsUsed = 1
     while (!interrupted) {
+      const stillActive = await checkNodeStillActiveInDb()
+      if (!stillActive) {
+        break
+      }
+
       const hitHandoff = hasTrigger('HANDOFF_70')
       const hitReflect = hasTrigger('REFLECT_37')
 
@@ -301,6 +403,9 @@ export async function driveExplorerCompanionPair(
         if (actuallyUnlocked) {
           reflectedDone = true
         }
+        // 反思完毕后再次核查节点活跃性，防止反思期间外部 abort_node
+        if (!(await checkNodeStillActiveInDb())) break
+
         const postReflectPrompt = actuallyUnlocked
           ? '伴随助手已完成 37% 专家诊断并解锁内藏 L3/L2 与本脉 DAG！请按需定向调 query_library_catalog / get_library_entry / read_lineage_graph，推进 37–70% 深度攻坚。'
           : '37% 反思对话暂未完成服务端内藏解锁（内藏 L3/L2 仍处于锁定态，切勿强行调用内藏检索）。请先基于当前工作区与外藏 [R###] 继续推进实质研究，下个回合间隙将重新核验解锁。'
@@ -316,8 +421,7 @@ export async function driveExplorerCompanionPair(
         continue
       }
 
-      // 不跑到 70%（或触发 Cost Note）不准停工！绝不把普通短回合轮数上限伪装成 HANDOFF_70；
-      // 仅在调用方显式指定有限安全熔断轮次且确实撞线时，按异常停滞中断转 CRASH_RECOVERY。
+      // 硬性跑满 70%（不设提前逃跑或 Cost Note 后门）；仅在测试显式指定有限安全上限时按异常中断转 CRASH_RECOVERY
       if (Number.isFinite(maxExploreTurns) && turnsUsed >= maxExploreTurns) {
         interrupted = true
         interruptReason = `TURN_LIMIT_WITHOUT_HANDOFF_70:${turnsUsed}`
@@ -337,7 +441,12 @@ export async function driveExplorerCompanionPair(
       }
     }
 
-    // 70% 两步清醒交接 · 第一步：将清醒探索者动态置为只读态，由其亲笔完成最后 1 轮文本总结与《科研遗嘱》
+    // 外部终态/中止：不写假交接、不入崩溃抢救，直接交由 finally 释放探索者与伴随句柄
+    if (terminatedExternally) {
+      return
+    }
+
+    // 70% 两步清醒交接 · 第一步：切只读 -> 亲笔立遗嘱 -> 必须先持久化至 SQLite will_md，再销毁探索者句柄
     if (!interrupted) {
       orchestrator.host?.setSessionReadonly?.(expSessionId, true)
       try {
@@ -349,9 +458,8 @@ export async function driveExplorerCompanionPair(
         explorerWillText = willTurn.lastAssistantText || ''
         latestBlackbox = willTurn.blackboxSummary || latestBlackbox
       } catch {
-        // 若收官回合超时或中止，不影响后续伴随直接基于黑匣子与 worktree 交接
+        // 收官回合超时时仍保留已有黑匣子供伴随兜底
       }
-      // 销毁探索者前将亲笔遗嘱持久化入 SQLite，失败时显式记告警不静默吞错
       if (orchestrator.bridge?.control) {
         try {
           const persistRes = await orchestrator.bridge.control('control_plane/record_pending_handoff', {
@@ -377,6 +485,7 @@ export async function driveExplorerCompanionPair(
         }
       }
     } else if (orchestrator.bridge?.control) {
+      // <70% 异常中断：唯一真源直接落 SQLite `pending_handoff_mode='CRASH_RECOVERY'`，取消内存双账本
       try {
         const persistRes = await orchestrator.bridge.control('control_plane/record_pending_handoff', {
           workspace_root: orchestrator.workspaceRoot,
@@ -402,16 +511,20 @@ export async function driveExplorerCompanionPair(
     }
   } finally {
     await orchestrator.host?.archiveSession?.(expSessionId, expRes.handle?.agent?.session)
-    await expRes.dispose(interrupted ? 'interrupted_unclaimed' : 'completed', expRes.turnEndReason)
+    await expRes.dispose(
+      terminatedExternally ? 'terminated_external' : (interrupted ? 'interrupted_unclaimed' : 'completed'),
+      terminatedExternally ? { kind: 'terminated_external', reason: externalTermReason } : expRes.turnEndReason,
+    )
+    if (terminatedExternally || interrupted) {
+      await disposeNodeCompanion(
+        orchestrator,
+        node.node_id,
+        terminatedExternally ? 'terminated_external' : 'interrupted_explorer',
+      )
+    }
   }
 
-  if (interrupted) {
-    await disposeNodeCompanion(orchestrator, node.node_id, 'interrupted_explorer')
-    orchestrator._pendingSalvageNodes.set(node.node_id, {
-      node,
-      reason: interruptReason || 'abnormal_turn_end',
-      blackboxSummary: latestBlackbox,
-    })
+  if (terminatedExternally || interrupted) {
     return
   }
 

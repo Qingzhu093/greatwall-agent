@@ -72,6 +72,7 @@ ALLOWED_TOOLS_BY_ROLE: dict[str, frozenset[str]] = {
             "upgrade_instrument_with_calibration",
             "recompute_stage_b_only",
             "update_skill_ledger",
+            "resolve_works_ticket",
         }
     ),
     "supervisory_committee": frozenset(
@@ -84,7 +85,9 @@ ALLOWED_TOOLS_BY_ROLE: dict[str, frozenset[str]] = {
     ),
 }
 
-ALL_31_TOOL_NAMES: frozenset[str] = frozenset().union(*ALLOWED_TOOLS_BY_ROLE.values())
+ALL_TOOL_NAMES: frozenset[str] = frozenset().union(*ALLOWED_TOOLS_BY_ROLE.values())
+# 向后兼容别名（含 resolve_works_ticket 后共 32 个窄工具）
+ALL_31_TOOL_NAMES: frozenset[str] = ALL_TOOL_NAMES
 
 _SQL_WRITE_FORBIDDEN_RE = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|ATTACH|DETACH|PRAGMA|VACUUM|REINDEX)\b",
@@ -240,10 +243,53 @@ def record_declared_refs(
     return recorded
 
 
-def compute_clock_signal(pressure_tokens: int, first_reflection_unlocked: int, cfg: dict[str, Any] | None = None) -> dict[str, Any]:
-    """基于 500,000 真时钟计算回合间隙信号（v3.0 彻底废除 `eval_count >= 1` 前置门槛！）。"""
+def resolve_effective_context_window(
+    conn: sqlite3.Connection | None = None,
+    *,
+    node_window: int | None = None,
+    explicit_window: int | None = None,
+    cfg: dict[str, Any] | None = None,
+) -> int:
+    """解析节点有效上下文窗口 W = min(500,000, model_physical_window)（显式传入 > 节点实测窗口 > Parse0 合同窗口 > cap 500,000）。"""
     c = cfg or load_runtime_config()
-    window = int(c.get("context_window_tokens", 500000))
+    cap = max(1, int(c.get("context_window_cap_tokens", c.get("context_window_tokens", 500000))))
+    for cand in (explicit_window, node_window):
+        if cand is not None:
+            try:
+                iv = int(cand)
+                if iv > 0:
+                    return min(cap, iv)
+            except (TypeError, ValueError):
+                pass
+    if conn is not None:
+        try:
+            p0 = conn.execute("SELECT total_budget_json FROM parse0_contract WHERE contract_id = 'active'").fetchone()
+            if p0 and p0["total_budget_json"]:
+                tb = json.loads(p0["total_budget_json"] or "{}")
+                if isinstance(tb, dict):
+                    raw_w = tb.get("effective_context_window") or tb.get("context_window_tokens")
+                    if raw_w:
+                        iv = int(raw_w)
+                        if iv > 0:
+                            return min(cap, iv)
+        except Exception:
+            pass
+    return cap
+
+
+def compute_clock_signal(
+    pressure_tokens: int,
+    first_reflection_unlocked: int,
+    cfg: dict[str, Any] | None = None,
+    *,
+    effective_context_window: int | None = None,
+    context_window_tokens: int | None = None,
+) -> dict[str, Any]:
+    """基于节点真实有效上下文窗口 W = min(500,000, model_window) 计算回合间隙信号（v3.0 彻底废除 `eval_count >= 1` 前置门槛）。"""
+    c = cfg or load_runtime_config()
+    cap = max(1, int(c.get("context_window_cap_tokens", c.get("context_window_tokens", 500000))))
+    raw_win = effective_context_window if effective_context_window is not None else context_window_tokens
+    window = min(cap, int(raw_win)) if (raw_win and int(raw_win) > 0) else cap
     reflect_pct = float(c.get("context_reflect_hint_pct", 0.37))
     handoff_pct = float(c.get("context_handoff_pct", 0.70))
     pct = float(pressure_tokens) / float(max(1, window))
@@ -256,7 +302,7 @@ def compute_clock_signal(pressure_tokens: int, first_reflection_unlocked: int, c
 
     return {
         "pressure_tokens": int(pressure_tokens),
-        "context_window_tokens": window,
+        "effective_context_window": window,
         "pressure_pct": round(pct, 4),
         "first_reflection_unlocked": int(first_reflection_unlocked or 0),
         "trigger": trigger,
@@ -265,31 +311,32 @@ def compute_clock_signal(pressure_tokens: int, first_reflection_unlocked: int, c
 
 def build_state_snapshot(conn: sqlite3.Connection, *, node_id: str = "", question_id: str = "") -> dict[str, Any]:
     cfg = load_runtime_config()
-    window = int(cfg.get("context_window_tokens", 500000))
     if node_id:
         row = conn.execute(
-            "SELECT question_id, branch_id, node_id, node_status, pressure_tokens, first_reflection_unlocked FROM lineage_nodes WHERE node_id = ?",
+            "SELECT question_id, branch_id, node_id, node_status, pressure_tokens, effective_context_window, first_reflection_unlocked FROM lineage_nodes WHERE node_id = ?",
             (node_id,),
         ).fetchone()
         if row is not None:
             pt = int(row["pressure_tokens"] or 0)
+            window = resolve_effective_context_window(conn, node_window=row["effective_context_window"], cfg=cfg)
             return {
                 "question_id": str(row["question_id"]),
                 "branch_id": str(row["branch_id"]),
                 "node_id": str(row["node_id"]),
                 "node_status": str(row["node_status"]),
                 "pressure_tokens": pt,
-                "context_window_tokens": window,
+                "effective_context_window": window,
                 "pressure_pct": round(pt / float(max(1, window)), 4),
                 "first_reflection_unlocked": int(row["first_reflection_unlocked"] or 0),
             }
+    window = resolve_effective_context_window(conn, cfg=cfg)
     return {
         "question_id": str(question_id or "ALL"),
         "branch_id": "",
         "node_id": str(node_id or ""),
         "node_status": "",
         "pressure_tokens": 0,
-        "context_window_tokens": window,
+        "effective_context_window": window,
         "pressure_pct": 0.0,
         "first_reflection_unlocked": 0,
     }

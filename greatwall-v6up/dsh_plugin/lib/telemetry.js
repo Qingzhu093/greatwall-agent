@@ -59,7 +59,6 @@ export class TelemetryCollector {
       startedAt: null,
       activeExplorers: [],
       activeGovernance: [],
-      interventions: [],
       countersByRole: persistedCounters,
       sessions: persistedSessions,
       recentEvents: [],
@@ -130,12 +129,13 @@ export class TelemetryCollector {
     rec.endedAt = new Date().toISOString()
     if (turnEndReason !== null) rec.turnEndReason = turnEndReason
     if (typeof pressureTokens === 'number') rec.pressureTokens = pressureTokens
+    const wasArchived = Boolean(rec.archived)
     if (archived) rec.archived = true
     const c = (this.state.countersByRole[rec.role] ||= { total: 0, abnormalEnds: 0, archived: 0 })
     if (status === 'interrupted_unclaimed' || status === 'error') {
       c.abnormalEnds += 1
     }
-    if (archived) {
+    if (archived && !wasArchived) {
       c.archived += 1
     }
     this.flush()
@@ -168,17 +168,6 @@ export class TelemetryCollector {
       }
     } catch {}
     return null
-  }
-
-  addIntervention(entry) {
-    this.state.interventions.push({
-      at: new Date().toISOString(),
-      ...entry,
-    })
-    if (this.state.interventions.length > 40) {
-      this.state.interventions.splice(0, this.state.interventions.length - 40)
-    }
-    this.flush()
   }
 
   updateActiveSlots({ activeExplorers = [], activeGovernance = [], stage = '' }) {

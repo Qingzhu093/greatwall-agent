@@ -67,6 +67,7 @@ export const ROLE_MCP_TOOLS = Object.freeze({
     'upgrade_instrument_with_calibration',
     'recompute_stage_b_only',
     'update_skill_ledger',
+    'resolve_works_ticket',
   ]),
   supervisory_committee: Object.freeze([
     'get_supervisory_audit_snapshot',
@@ -76,7 +77,9 @@ export const ROLE_MCP_TOOLS = Object.freeze({
   ]),
 })
 
-export const ALL_31_MCP_TOOLS = Object.freeze(new Set(Object.values(ROLE_MCP_TOOLS).flat()))
+export const ALL_MCP_TOOLS = Object.freeze(new Set(Object.values(ROLE_MCP_TOOLS).flat()))
+// 向后兼容导出名（现含 resolve_works_ticket 共 32 个窄工具）
+export const ALL_31_MCP_TOOLS = ALL_MCP_TOOLS
 
 /** 按宿主机平台解析 Shell 工具名（Windows -> pwsh，非 Windows -> bash）。 */
 export function resolvePlatformShellTool(platform = process.platform) {

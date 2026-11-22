@@ -19,6 +19,7 @@ from .db_schema import (
     ALLOWED_READ_DEPTHS,
     ALLOWED_STAGE1_VERDICTS,
     ALLOWED_SUPPORT_SCOPES,
+    ALLOWED_SURVEY_OUTCOMES,
     ERR_CONFLICT,
     ERR_INVALID_INPUT,
     ERR_LOCKED,
@@ -97,20 +98,77 @@ def tool_publish_external_literature_card(
     conn: sqlite3.Connection,
     caller_role: str,
     session_id: str,
-    ref_id: str,
     question_id: str,
-    title: str,
-    abstract_md: str,
-    exact_preconditions_md: str,
-    formulas_or_operators_md: str,
-    read_depth: str,
-    support_scope: str,
-    source_citation: str,
+    ref_id: str | None = None,
+    title: str | None = None,
+    abstract_md: str | None = None,
+    exact_preconditions_md: str | None = None,
+    formulas_or_operators_md: str | None = None,
+    read_depth: str | None = None,
+    support_scope: str | None = None,
+    source_citation: str | None = None,
     fulfilled_request_ids: list[str] | None = None,
+    outcome: str = "CARD_PUBLISHED",
+    unavailable_reason_md: str | None = None,
 ) -> dict[str, Any]:
-    """入库左翼外藏 [R###]（显式标定为未复验外部参考摘要；严格 5 枚举 support_scope 与 60-1500 字摘要）。"""
+    """入库左翼外藏 [R###]（outcome='CARD_PUBLISHED'），或对客观不存在/违背合规边界的查新委托做无卡结案（outcome='UNAVAILABLE_REPORT'，绝不插入伪 [R###]）。"""
     enforce_role_tool_permission(conn, caller_role, "publish_external_literature_card", session_id=session_id)
 
+    out_u = str(outcome or "CARD_PUBLISHED").strip().upper()
+    if out_u not in ALLOWED_SURVEY_OUTCOMES:
+        raise FailClosedError(
+            ERR_INVALID_INPUT,
+            f"非法 outcome={outcome!r}，仅允许 {sorted(ALLOWED_SURVEY_OUTCOMES)}",
+        )
+
+    now = utc_now_iso()
+
+    # 分支 1：客观不存在或违背合规边界 -> 不向 external_literature_cards 插入任何伪卡，仅将 survey_requests 置为 CLOSED_UNAVAILABLE
+    if out_u == "UNAVAILABLE_REPORT":
+        reason_clean = str(unavailable_reason_md or "").strip()
+        if len(reason_clean) < 10:
+            raise FailClosedError(
+                ERR_INVALID_INPUT,
+                "outcome='UNAVAILABLE_REPORT' 时必须提供 >= 10 字的 unavailable_reason_md（写明已查范围与不可得原因）",
+            )
+        req_ids = [str(r).strip() for r in (fulfilled_request_ids or []) if str(r).strip()]
+        if not req_ids:
+            raise FailClosedError(
+                ERR_INVALID_INPUT,
+                "outcome='UNAVAILABLE_REPORT' 必须提供非空 fulfilled_request_ids 以结案对应的 survey_requests",
+            )
+        closed_reqs: list[str] = []
+        with rw_immediate_tx(conn):
+            for req_id in req_ids:
+                cur = conn.execute(
+                    """
+                    UPDATE survey_requests
+                    SET status = 'CLOSED_UNAVAILABLE',
+                        fulfilled_ref_id = NULL,
+                        resolution_note = ?,
+                        updated_at = ?
+                    WHERE req_id = ? AND status = 'PENDING'
+                    """,
+                    (reason_clean[:1500], now, req_id),
+                )
+                if cur.rowcount > 0:
+                    closed_reqs.append(req_id)
+        return build_tool_receipt(
+            conn=conn,
+            tool_name="publish_external_literature_card",
+            question_id=question_id,
+            next_step_guidance=(
+                f"已将 {len(closed_reqs)} 条无解查新单诚实结案为 CLOSED_UNAVAILABLE（未向 external_literature_cards 插入任何伪 [R###] 卡片）。"
+            ),
+            data={
+                "outcome": "UNAVAILABLE_REPORT",
+                "ref_id": None,
+                "closed_unavailable_request_ids": closed_reqs,
+                "resolution_note": reason_clean[:1500],
+            },
+        )
+
+    # 分支 2：CARD_PUBLISHED -> 严格校验 5 枚举 support_scope、read_depth 与 60-1500 字独立摘要
     rid = str(ref_id or "").strip()
     if not rid:
         raise FailClosedError(ERR_INVALID_INPUT, "ref_id 不能为空（建议格式 R001 / R002）")
@@ -135,7 +193,6 @@ def tool_publish_external_literature_card(
     if not str(source_citation or "").strip():
         raise FailClosedError(ERR_INVALID_INPUT, "source_citation 不能为空")
 
-    now = utc_now_iso()
     fulfilled: list[str] = []
     with rw_immediate_tx(conn):
         conn.execute(
@@ -160,11 +217,11 @@ def tool_publish_external_literature_card(
                 question_id,
                 str(title or "").strip(),
                 abs_clean,
-                exact_preconditions_md.strip(),
-                formulas_or_operators_md.strip(),
+                str(exact_preconditions_md).strip(),
+                str(formulas_or_operators_md).strip(),
                 read_depth,
                 support_scope,
-                source_citation.strip(),
+                str(source_citation).strip(),
                 now,
             ),
         )
@@ -181,7 +238,7 @@ def tool_publish_external_literature_card(
         tool_name="publish_external_literature_card",
         question_id=question_id,
         next_step_guidance=f"外藏参考卡 {rid} 已入库（标注为未复验外部参考先验，已精准核销 {len(fulfilled)} 条查新单）。",
-        data={"ref_id": rid, "is_unverified_external": True, "fulfilled_request_ids": fulfilled},
+        data={"outcome": "CARD_PUBLISHED", "ref_id": rid, "is_unverified_external": True, "fulfilled_request_ids": fulfilled},
     )
 
 
@@ -282,15 +339,17 @@ def tool_get_blind_manuscript(
                 }
             )
 
+    rev_spec = int(rev["spec_revision"] or 0) if "spec_revision" in rev.keys() else 0
     return build_tool_receipt(
         conn=conn,
         tool_name="get_blind_manuscript",
         question_id=str(rev["question_id"]),
-        next_step_guidance="请在独立空白盲审沙箱内实跑验证脚本/SymPy/Lean 4，排查 7 类结构漏洞并填写 Evidence Ledger，调 submit_stage1_blind_ledger。",
+        next_step_guidance=f"请按手稿绑定口径 spec_revision=v{rev_spec} 在独立空白盲审沙箱内实跑验证脚本/SymPy/Lean 4，排查 7 类结构漏洞并填写 Evidence Ledger，调 submit_stage1_blind_ledger。",
         data={
             "review_id": review_id,
             "question_id": str(rev["question_id"]),
             "source_type": str(rev["source_type"]),
+            "spec_revision": rev_spec,
             "manuscript_title": str(rev["manuscript_title"]),
             "column_a_snapshot_md": str(rev["column_a_snapshot_md"]),
             "sanitized_code_diff_md": str(rev["sanitized_code_diff_md"]),
@@ -604,14 +663,30 @@ def tool_get_unblinded_manuscript_and_peers(
         ).fetchall()
     ]
 
+    p0_rev_row = conn.execute(
+        "SELECT latest_spec_revision, latest_ruling_summary_md FROM parse0_contract WHERE contract_id = 'active'"
+    ).fetchone()
+    latest_spec_rev = int(p0_rev_row["latest_spec_revision"] or 0) if p0_rev_row else 0
+    latest_ruling_summary = str(p0_rev_row["latest_ruling_summary_md"] or "") if p0_rev_row else ""
+    rev_spec = int(rev["spec_revision"] or 0) if "spec_revision" in rev.keys() else 0
+    spec_outdated = rev_spec < latest_spec_rev
+
     return build_tool_receipt(
         conn=conn,
         tool_name="get_unblinded_manuscript_and_peers",
         question_id=qid,
-        next_step_guidance="请结合 B 栏、同题 Cross-Draft 快照与参考性 FACT_LOG，调 submit_stage2_unblind_verdict 下达终审裁决与精确边界。",
+        next_step_guidance=(
+            f"注意：该手稿绑定旧口径 v{rev_spec} < 最新裁决口径 v{latest_spec_rev}；若成立请标明成立口径（exact_verified_scope_md）且禁标最新 FULL_GOAL！"
+            if spec_outdated
+            else "请结合 B 栏、同题 Cross-Draft 快照与参考性 FACT_LOG，调 submit_stage2_unblind_verdict 下达终审裁决与精确边界。"
+        ),
         data={
             "review_id": review_id,
             "question_id": qid,
+            "spec_revision": rev_spec,
+            "latest_spec_revision": latest_spec_rev,
+            "spec_revision_outdated": spec_outdated,
+            "latest_ruling_summary_md": latest_ruling_summary,
             "column_b_snapshot_md": str(rev["column_b_snapshot_md"]),
             "stage1_ledger": json.loads(rev["stage1_ledger_json"] or "[]"),
             "peer_l3_entries": peer_l3,
@@ -784,6 +859,16 @@ def tool_submit_stage2_unblind_verdict(
             ERR_INVALID_INPUT,
             "防伪完成硬护栏：ACCEPT_NARROWED 缩窄特例或 is_equivalent_reduction=true 伪等价归约严禁标为 FULL_GOAL！请设为 PARTIAL_OR_LEMMA 或 EQUIVALENT_REDUCTION。",
         )
+    p0_rev_row = conn.execute(
+        "SELECT latest_spec_revision FROM parse0_contract WHERE contract_id = 'active'"
+    ).fetchone()
+    latest_spec_rev = int(p0_rev_row["latest_spec_revision"] or 0) if p0_rev_row else 0
+    rev_spec = int(rev["spec_revision"] or 0) if "spec_revision" in rev.keys() else 0
+    if rev_spec < latest_spec_rev and cov_u == "FULL_GOAL":
+        raise FailClosedError(
+            ERR_INVALID_INPUT,
+            f"版本口径防伪完成硬护栏：该手稿绑定旧口径 spec_revision=v{rev_spec} < 最新公开裁决 v{latest_spec_rev}，禁止标为最新 FULL_GOAL！请在 exact_verified_scope_md 标明成立口径（如 v{rev_spec}）并设为 PARTIAL_OR_LEMMA。",
+        )
     clean_title = str(title or "").strip()
     clean_abs = str(abstract_md or "").strip()
     clean_scope = str(exact_verified_scope_md or "").strip()
@@ -909,15 +994,16 @@ def tool_propose_salvaged_lemma(
         raise FailClosedError(ERR_INVALID_INPUT, "title 与 column_a_self_contained_proof_md 不能为空")
 
     rev_id = next_prefixed_id(conn, "review_queue", "review_id", "rev_")
+    node_spec = int(node["spec_revision"] or 0) if "spec_revision" in node.keys() else 0
     now = utc_now_iso()
     with rw_immediate_tx(conn):
         conn.execute(
             """
             INSERT INTO review_queue(
                 review_id, question_id, source_node_id, source_type, proposer_session_id,
-                review_status, manuscript_title, column_a_snapshot_md, column_b_snapshot_md,
+                review_status, manuscript_title, spec_revision, column_a_snapshot_md, column_b_snapshot_md,
                 bound_obs_ids_json, artifact_rel_path, sanitized_code_diff_md, created_at, updated_at
-            ) VALUES (?, ?, ?, 'AUDITOR_SALVAGED_LEMMA', ?, 'STAGE1_BLIND', ?, ?, ?, ?, ?, '', ?, ?)
+            ) VALUES (?, ?, ?, 'AUDITOR_SALVAGED_LEMMA', ?, 'STAGE1_BLIND', ?, ?, ?, ?, ?, ?, '', ?, ?)
             """,
             (
                 rev_id,
@@ -925,6 +1011,7 @@ def tool_propose_salvaged_lemma(
                 source_node_id,
                 str(session_id or f"auditor_{uuid.uuid4().hex[:6]}"),
                 title.strip(),
+                node_spec,
                 column_a_self_contained_proof_md.strip(),
                 str(column_b_scope_notes_md or "").strip(),
                 json.dumps(clean_obs, ensure_ascii=False),

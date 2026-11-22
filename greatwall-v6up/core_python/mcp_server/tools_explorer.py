@@ -41,6 +41,7 @@ from .mcp_core_helpers import (
     next_prefixed_id,
     record_declared_refs,
     record_fact_edge,
+    resolve_effective_context_window,
 )
 
 _FORBIDDEN_TENANT_TABLES = (
@@ -163,7 +164,13 @@ def tool_run_isolated_eval(
         raise FailClosedError(ERR_INVALID_INPUT, f"节点 {node_id!r} 属于 {node['question_id']!r} 而非 {question_id!r}")
 
     cfg = load_runtime_config()
-    clock_sig = compute_clock_signal(int(node["pressure_tokens"] or 0), int(node["first_reflection_unlocked"] or 0), cfg)
+    eff_win = resolve_effective_context_window(conn, node_window=node["effective_context_window"], cfg=cfg)
+    clock_sig = compute_clock_signal(
+        int(node["pressure_tokens"] or 0),
+        int(node["first_reflection_unlocked"] or 0),
+        cfg,
+        effective_context_window=eff_win,
+    )
 
     # 1. 重型作业凭 job_id 幂等取回/执行（按入队冻结快照与原仪器版本运行，仅扣费一次）
     if tier_l == "heavy" and job_id and str(job_id).strip():

@@ -12,8 +12,50 @@
  * @module dsh-greatwall-v6up/read_isolated_sandbox
  */
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { ALL_31_MCP_TOOLS } from './prompts.js'
+
+export const PUBLIC_INPUT_DEFAULT_DIRS = Object.freeze([
+  'source_materials',
+  'problem_pack',
+  'inputs',
+  'data',
+  'rulings',
+  'attachments',
+  '附件',
+])
+
+export const PUBLIC_INPUT_TOP_EXTS = new Set([
+  '.md',
+  '.txt',
+  '.pdf',
+  '.doc',
+  '.docx',
+  '.csv',
+  '.tsv',
+  '.json',
+  '.yaml',
+  '.yml',
+  '.xlsx',
+])
+
+export const FORBIDDEN_PUBLIC_DIR_NAMES = new Set([
+  'worktrees',
+  'evaluators',
+  'final_delivery',
+  'logs',
+  'paper',
+  'simulator',
+  '.git',
+  '.venv',
+  'venv',
+  'node_modules',
+  '__pycache__',
+  '.dsh',
+])
+
+export const READONLY_FS_TOOL_NAMES = new Set(['read', 'glob', 'grep', 'read_image', 'read_file'])
 
 export const PROCESS_MD_FORBIDDEN_RE = /(?:^|[\\/])(?:HANDOFF[^\\/]*|REVIEW[^\\/]*|SUPERVISORY[^\\/]*|LINEAGE_BRIEFING[^\\/]*|.*_(?:AUDIT|CLOSURE|HANDOFF|BRIEFING|VERDICT|REPORT))\.md$/i
 
@@ -40,6 +82,7 @@ export const READONLY_BLOCKED_MCP_TOOLS = new Set([
   'upgrade_instrument_with_calibration',
   'recompute_stage_b_only',
   'update_skill_ledger',
+  'resolve_works_ticket',
   'record_compliance_check',
   'register_saved_graph_query',
 ])
@@ -165,13 +208,13 @@ export function evaluateShellCommandGuard(commandText, opts) {
         return `SANDBOX_VIOLATION: ${role} 严禁在 Shell 中引用受保护外部目录 (${prot})`
       }
     }
-    // 扫描显式绝对路径（Windows 盘符/UNC 与 POSIX 根路径），仅放行本沙箱内路径与常见解释器路径
+    // 扫描显式绝对路径（Windows 盘符/UNC 与 POSIX 根路径），加左边界防误切 https:// URL，仅放行本沙箱内路径与常见解释器路径
     const absRe = process.platform === 'win32'
-      ? /(?:[a-zA-Z]:[\\/]|\\\\)[^\s"'`;|><&()]+/g
+      ? /(?:^|[\s"'`(=,;])((?:[a-zA-Z]:[\\/]|\\\\)[^\s"'`;|><&()]+)/g
       : /(?:^|[\s"'`(=,;])(\/[^\s"'`;|><&()]+)/g
     let m
     while ((m = absRe.exec(cmd)) !== null) {
-      const rawHit = process.platform === 'win32' ? m[0] : m[1]
+      const rawHit = m[1]
       const candidate = resolveCanonicalTarget(rawHit)
       const inOwnSandbox = isInsideRoot(candidate, opts.sandboxCanon)
       const isRuntimeBin = /(?:python(?:\d+(?:\.\d+)*)?(?:\.exe)?|python3|uv(?:\.exe)?|lean(?:\.exe)?|node(?:\.exe)?|\.venv)[\\/]?$/i.test(candidate) ||
@@ -212,6 +255,37 @@ export function createSandboxCallEvaluator(opts) {
     ? (opts.sandboxAbsPath || opts.worktreeAbsPath || '')
     : ((role === 'explorer' || role === 'lineage_companion') && opts.worktreeAbsPath ? opts.worktreeAbsPath : opts.workspaceRoot)
   const sandboxCanon = effectiveSandboxDir ? resolveCanonicalTarget(effectiveSandboxDir) : ''
+
+  // F6: 公开题面、公开输入与《补充裁决文档》统一只读可见（严禁越界到 worktrees/_hidden*/evaluators/final_delivery）
+  const publicDirCanons = [
+    ...PUBLIC_INPUT_DEFAULT_DIRS.map((d) => resolveCanonicalTarget(path.join(opts.workspaceRoot || process.cwd(), d))),
+    ...(Array.isArray(opts.sharedInputPaths) ? opts.sharedInputPaths : [])
+      .filter(Boolean)
+      .map((rel) => resolveCanonicalTarget(rel, opts.workspaceRoot || process.cwd()))
+      .filter((c) => isInsideRoot(c, wsCanon)),
+  ].filter(Boolean)
+
+  // F7: 允许纯只读工具读取 DSH 系统临时溢出文件 os.tmpdir()/dsh-spill-*
+  const dshSpillPrefixCanon = resolveCanonicalTarget(path.join(os.tmpdir(), 'dsh-spill-'))
+
+  const isAllowedDshSpillRead = (canon) => Boolean(dshSpillPrefixCanon && canon && canon.startsWith(dshSpillPrefixCanon))
+
+  const isAllowedPublicRead = (canon) => {
+    if (!canon || !wsCanon || !isInsideRoot(canon, wsCanon)) return false
+    const relFromWs = path.relative(wsCanon, canon)
+    if (!relFromWs || relFromWs.startsWith('..')) return false
+    const parts = relFromWs.split(/[\\/]+/).filter(Boolean)
+    if (parts.some((p) => FORBIDDEN_PUBLIC_DIR_NAMES.has(p.toLowerCase()) || p.toLowerCase().startsWith('_hidden') || p.toLowerCase().startsWith('greatwall.db'))) {
+      return false
+    }
+    if (publicDirCanons.some((pub) => isInsideRoot(canon, pub))) return true
+    // 工作区顶层公开文档文件（如 B题.pdf、补充裁决.md 等）
+    if (parts.length === 1) {
+      const ext = path.extname(parts[0]).toLowerCase()
+      if (PUBLIC_INPUT_TOP_EXTS.has(ext)) return true
+    }
+    return false
+  }
 
   const autoProtected = [
     hiddenCalCanon,
@@ -283,23 +357,32 @@ export function createSandboxCallEvaluator(opts) {
         }
       }
 
+      const isPureReadTool = !isWriteTool && !isShellTool && READONLY_FS_TOOL_NAMES.has(name)
+      const isPublicOrSpillRead = isPureReadTool && (isAllowedPublicRead(canon) || isAllowedDshSpillRead(canon))
+      const isSpillOnlyRead = isPureReadTool && isAllowedDshSpillRead(canon)
+      const worktreeInputsCanon = sandboxCanon ? path.join(sandboxCanon, 'inputs') : ''
+
       if (role === 'explorer' || role === 'lineage_companion') {
-        if (!sandboxCanon || !isInsideRoot(canon, sandboxCanon)) {
-          return `SANDBOX_VIOLATION: ${role} 仅限在配对隔离工作树 (${effectiveSandboxDir}) 内访问，禁止越界 ${pVal}`
+        if (isWriteTool && worktreeInputsCanon && isInsideRoot(canon, worktreeInputsCanon)) {
+          return `SANDBOX_VIOLATION: ${role} 严禁修改只读公开输入挂载目录 (${pVal})`
+        }
+        if ((!sandboxCanon || !isInsideRoot(canon, sandboxCanon)) && !isPublicOrSpillRead) {
+          return `SANDBOX_VIOLATION: ${role} 仅限在配对隔离工作树 (${effectiveSandboxDir}) 与公开只读输入区内访问，禁止越界 ${pVal}`
         }
       } else if (role === 'library_verifier') {
-        if (!sandboxCanon || !isInsideRoot(canon, sandboxCanon)) {
+        // 盲审沙箱已精准拷贝手稿绑定 spec_revision 的 inputs/，严禁直接读取主工作区公开目录（防止旧手稿盲审偷看事后新裁决 rulings/）
+        if ((!sandboxCanon || !isInsideRoot(canon, sandboxCanon)) && !isSpillOnlyRead) {
           return `SANDBOX_VIOLATION: library_verifier 仅限在独立空白盲审沙箱 (${effectiveSandboxDir}) 内只读跑证，禁止越界 ${pVal}`
         }
       } else if (role === 'works_engineer') {
-        if (!isInsideRoot(canon, wsCanon)) {
+        if (!isInsideRoot(canon, wsCanon) && !isPublicOrSpillRead) {
           return `SANDBOX_VIOLATION: works_engineer 仅限在实验工作区内访问，禁止越界 ${pVal}`
         }
         if (isWriteTool && isInsideRoot(canon, worktreesCanon)) {
           return `SANDBOX_VIOLATION: works_engineer 严禁修改探索者分支工作树 (${pVal})`
         }
       } else if (role === 'library_surveyor') {
-        if (!isInsideRoot(canon, wsCanon)) {
+        if (!isInsideRoot(canon, wsCanon) && !isPublicOrSpillRead) {
           return `SANDBOX_VIOLATION: library_surveyor 仅限在实验工作区内只读访问，禁止越界 ${pVal}`
         }
       }

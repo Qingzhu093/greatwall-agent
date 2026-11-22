@@ -60,6 +60,15 @@ def tool_get_supervisory_audit_snapshot(
     conc_alerts = compute_family_concentration_alerts(conn)
     gate_full = check_stage2_closure_gate_data(conn, mode="FULL", human_aborted=False)
 
+    latest_spec_rev = int(p0["latest_spec_revision"] or 0) if (p0 and "latest_spec_revision" in p0.keys()) else 0
+    latest_ruling_summary = str(p0["latest_ruling_summary_md"] or "") if (p0 and "latest_ruling_summary_md" in p0.keys()) else ""
+    active_node_revs = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT node_id, question_id, branch_id, node_status, spec_revision FROM lineage_nodes WHERE node_status IN ('EXPLORING','ACTIVE_REVISING','AWAITING_TRIAGE','PENDING_REVIEW') ORDER BY updated_at DESC LIMIT 30"
+        ).fetchall()
+    ]
+
     return build_tool_receipt(
         conn=conn,
         tool_name="get_supervisory_audit_snapshot",
@@ -68,6 +77,9 @@ def tool_get_supervisory_audit_snapshot(
         data={
             "parse0_signed": bool(p0 and str(p0["human_signed_at"] or "").strip()),
             "stage": str(p0["stage"]) if p0 else "STAGE1_PARSE0",
+            "latest_spec_revision": latest_spec_rev,
+            "latest_ruling_summary_md": latest_ruling_summary,
+            "active_node_spec_revisions": active_node_revs,
             "consecutive_non_l1_handoffs": int(p0["consecutive_non_l1_handoffs"] or 0) if p0 else 0,
             "unhealthy_instruments": unhealthy,
             "ambiguous_spec_alerts": ambiguous_alerts,

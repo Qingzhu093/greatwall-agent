@@ -28,6 +28,7 @@ from .mcp_core_helpers import (
     load_holiday_prompts,
     load_runtime_config,
     record_fact_edge,
+    resolve_effective_context_window,
 )
 
 
@@ -71,6 +72,25 @@ def tool_get_companion_context(
 
     if mode_u == "PRE_SPAWN":
         # 严守隔离铁律：PRE_SPAWN 严禁下发 37% 专属的 L3/L2 馆藏目录卡摘要或全量 dead_ends 列表！
+        active_instruments = [
+            {
+                "instrument_id": str(r["instrument_id"]),
+                "version": int(r["version"]),
+                "question_id": str(r["question_id"]),
+                "instrument_role": str(r["instrument_role"]),
+                "artifact_schema": str(r["artifact_schema"] or "python_run"),
+                "health_status": str(r["health_status"]),
+            }
+            for r in conn.execute(
+                """
+                SELECT instrument_id, version, question_id, instrument_role, artifact_schema, health_status
+                FROM instruments
+                WHERE is_active = 1 AND health_status = 'HEALTHY' AND (question_id = ? OR question_id = 'ALL')
+                ORDER BY instrument_id, version
+                """,
+                (qid,),
+            ).fetchall()
+        ]
         payload: dict[str, Any] = {
             "mode": "PRE_SPAWN",
             "node_id": node_id,
@@ -78,6 +98,7 @@ def tool_get_companion_context(
             "question_id": qid,
             "generation": int(node["generation"]),
             "node_status": str(node["node_status"]),
+            "active_instruments": active_instruments,
             "previous_briefing": dict(prev_briefing) if prev_briefing else None,
             "latest_parent_handoff": (
                 {
@@ -105,7 +126,7 @@ def tool_get_companion_context(
 
     if mode_u == "REFLECT_37":
         cfg = load_runtime_config()
-        win = max(1, int(cfg.get("context_window_tokens", 500000)))
+        win = resolve_effective_context_window(conn, node_window=node["effective_context_window"], cfg=cfg)
         reflect_pct = float(cfg.get("context_reflect_hint_pct", 0.37))
         cur_tokens = int(node["pressure_tokens"] or 0)
         if cur_tokens / float(win) < reflect_pct:
@@ -209,6 +230,9 @@ def tool_get_companion_context(
             "question_id": qid,
             "worktree_abs_path": str(node["worktree_abs_path"]),
             "retained_snapshot_abs_path": node["retained_snapshot_abs_path"],
+            "explorer_will_md": str(node["will_md"] or node["explorer_will_md"] or ""),
+            "pending_handoff_mode": node["pending_handoff_mode"],
+            "pending_handoff_reason": str(node["pending_handoff_reason"] or ""),
             "observations": obs_rows,
             "probe_diagnostic_logs": probes,
             "reflections": json.loads(node["reflections_json"] or "[]"),
@@ -308,7 +332,7 @@ def tool_record_reflection_and_unlock_pull(
         raise FailClosedError(ERR_NOT_FOUND, f"节点 {node_id!r} 不存在")
 
     cfg = load_runtime_config()
-    window = int(cfg.get("context_window_tokens", 500000))
+    window = resolve_effective_context_window(conn, node_window=node["effective_context_window"], cfg=cfg)
     reflect_pct = float(cfg.get("context_reflect_hint_pct", 0.37))
     pressure = int(node["pressure_tokens"] or 0)
     if pressure / float(max(1, window)) < reflect_pct:
@@ -402,15 +426,32 @@ def tool_submit_node_handoff(
     if str(node["branch_id"]) != str(branch_id) or str(node["question_id"]) != str(question_id):
         raise FailClosedError(ERR_AUTH, "branch_id 或 question_id 与节点注册记录不一致")
 
-    # 幂等防重复落库（如 70% 断线恢复防双写）
-    if str(node["node_status"]) in ("AWAITING_TRIAGE", "PENDING_REVIEW", "SEALED", "CLOSED"):
-        return build_tool_receipt(
-            conn=conn,
-            tool_name="submit_node_handoff",
-            question_id=question_id,
-            node_id=node_id,
-            next_step_guidance=f"节点 {node_id} 已于此前完成交接（当前状态 {node['node_status']}），幂等跳过重复写入。",
-            data={"node_id": node_id, "node_status": str(node["node_status"]), "idempotent_skip": True},
+    # 严禁静默吞稿：仅当已交接且提交内容与已落库内容一致时才幂等跳过；
+    # 若节点早已被关停/中止却试图写入截然不同的新成果，显式报错 ERR_LOCKED！
+    cur_status = str(node["node_status"])
+    if cur_status in ("AWAITING_TRIAGE", "PENDING_REVIEW", "BLOCKED_L4B", "SEALED", "CLOSED"):
+        norm_obs = json.dumps([str(o).strip() for o in (obs_ids or []) if str(o).strip()], ensure_ascii=False)
+        same_content = (
+            str(node["mechanism_summary"] or "").strip() == str(mechanism_summary or "").strip()
+            and str(node["evidence_grade"] or "").strip().upper() == str(evidence_grade or "").strip().upper()
+            and str(node["column_a_facts_md"] or "").strip() == str(column_a_facts_md or "").strip()
+            and str(node["column_b_hypothesis_md"] or "").strip() == str(column_b_hypothesis_md or "").strip()
+            and str(node["will_md"] or "").strip() == str(will_md or "").strip()
+            and str(node["candidate_rel_path"] or "").strip() == str(candidate_rel_path or "").strip()
+            and str(node["bound_obs_ids_json"] or "[]") == norm_obs
+        )
+        if same_content:
+            return build_tool_receipt(
+                conn=conn,
+                tool_name="submit_node_handoff",
+                question_id=question_id,
+                node_id=node_id,
+                next_step_guidance=f"节点 {node_id} 已于此前提交相同交接内容（当前状态 {cur_status}），幂等跳过重复写入。",
+                data={"node_id": node_id, "node_status": cur_status, "idempotent_skip": True},
+            )
+        raise FailClosedError(
+            ERR_LOCKED,
+            f"节点 {node_id!r} 已处于终态/锁态 ({cur_status})，拒绝静默覆盖或丢弃新交接成果；请勿在已关闭节点上重复提交，由后勤/编排器在新节点推进。",
         )
 
     now = utc_now_iso()
@@ -427,7 +468,7 @@ def tool_submit_node_handoff(
         )
         with rw_immediate_tx(conn):
             conn.execute(
-                "UPDATE lineage_nodes SET node_status = 'CLOSED', evidence_grade = 'NONE', scratch_log_json = ?, updated_at = ? WHERE node_id = ?",
+                "UPDATE lineage_nodes SET node_status = 'CLOSED', evidence_grade = 'NONE', pending_handoff_mode = NULL, pending_handoff_reason = '', scratch_log_json = ?, updated_at = ? WHERE node_id = ?",
                 (json.dumps(scratch, ensure_ascii=False), now, node_id),
             )
             if tool_pain_point and str(tool_pain_point).strip():

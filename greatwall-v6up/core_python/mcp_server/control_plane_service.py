@@ -45,11 +45,306 @@ from .mcp_core_helpers import (
     load_runtime_config,
     next_prefixed_id,
     record_declared_refs,
+    resolve_effective_context_window,
 )
 
 _SENSITIVE_COMMENT_RE = re.compile(
     r"\b(?:branch|node|session|explorer|author)_[a-zA-Z0-9_-]+\b"
 )
+
+_PUBLIC_INPUT_DEFAULT_DIRS = (
+    "source_materials",
+    "problem_pack",
+    "inputs",
+    "data",
+    "rulings",
+    "attachments",
+    "附件",
+)
+_PUBLIC_INPUT_TOP_EXTS = frozenset(
+    {".md", ".txt", ".pdf", ".doc", ".docx", ".csv", ".tsv", ".json", ".yaml", ".yml", ".xlsx"}
+)
+_FORBIDDEN_SHARED_NAMES = frozenset(
+    {
+        "worktrees",
+        "evaluators",
+        "final_delivery",
+        "logs",
+        "paper",
+        "simulator",
+        ".git",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".dsh",
+        ".pytest_cache",
+        ".mypy_cache",
+    }
+)
+
+
+def _is_forbidden_public_path(rel_parts: tuple[str, ...]) -> bool:
+    for part in rel_parts:
+        low = part.lower()
+        if low in _FORBIDDEN_SHARED_NAMES:
+            return True
+        if low.startswith("_hidden") or low.startswith("greatwall.db"):
+            return True
+    return False
+
+
+def discover_public_input_entries(
+    workspace_root: str,
+    explicit_rel_paths: list[str] | None = None,
+) -> list[str]:
+    """发现工作区公开题面、输入数据与《补充裁决文档》（严格排除 worktrees/_hidden*/evaluators/final_delivery 等隔离目录）。"""
+    ws = Path(os.path.realpath(workspace_root or ""))
+    if not ws.is_dir():
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _add_rel(rel_posix: str) -> None:
+        norm = rel_posix.strip().strip("/")
+        if not norm or norm in seen:
+            return
+        seen.add(norm)
+        found.append(norm)
+
+    # 1. 显式声明的公开输入 / 裁决文档路径
+    for raw in explicit_rel_paths or []:
+        rel_str = str(raw or "").strip().replace("\\", "/")
+        if not rel_str or "\x00" in rel_str:
+            continue
+        try:
+            cand = Path(os.path.realpath(ws / rel_str))
+            rel = cand.relative_to(ws)
+        except Exception:
+            continue
+        if not cand.exists() or not rel.parts or _is_forbidden_public_path(rel.parts):
+            continue
+        _add_rel(rel.as_posix())
+
+    # 2. 自动探测常规公开输入目录与工作区顶层公开文档
+    for dname in _PUBLIC_INPUT_DEFAULT_DIRS:
+        dpath = ws / dname
+        if dpath.is_dir() and not _is_forbidden_public_path((dname,)):
+            _add_rel(dname)
+
+    try:
+        for child in sorted(ws.iterdir(), key=lambda p: p.name.lower()):
+            if not child.is_file():
+                continue
+            if _is_forbidden_public_path((child.name,)):
+                continue
+            if child.suffix.lower() in _PUBLIC_INPUT_TOP_EXTS:
+                _add_rel(child.name)
+    except OSError:
+        pass
+
+    return found
+
+
+def sync_public_inputs_to_worktree(
+    workspace_root: str,
+    target_root: str | Path,
+    explicit_rel_paths: list[str] | None = None,
+    *,
+    rulings_revision_dir: Path | None = None,
+    skip_live_rulings: bool = False,
+) -> list[str]:
+    """将公开题面、公开输入与《补充裁决文档》同步到目标沙箱/工作树的 `inputs/` 目录。"""
+    ws = Path(os.path.realpath(workspace_root or ""))
+    tgt_base = Path(os.path.realpath(str(target_root)))
+    if not ws.is_dir() or not tgt_base.is_dir():
+        return []
+    entries = discover_public_input_entries(str(ws), explicit_rel_paths)
+    inputs_dir = tgt_base / "inputs"
+    mounted: list[str] = []
+
+    if entries or (rulings_revision_dir and rulings_revision_dir.is_dir()):
+        inputs_dir.mkdir(parents=True, exist_ok=True)
+
+    for rel_posix in entries:
+        if skip_live_rulings and (rel_posix == "rulings" or rel_posix.startswith("rulings/")):
+            continue
+        src = ws / rel_posix
+        if not src.exists():
+            continue
+        # 若来源本身就是工作区顶层的 `inputs/`，展开其子项避免出现 `inputs/inputs/...`
+        dst = inputs_dir if rel_posix == "inputs" else (inputs_dir / rel_posix)
+        try:
+            if src.is_dir():
+                for fp in sorted(src.rglob("*")):
+                    if not fp.is_file():
+                        continue
+                    rel_sub = fp.relative_to(src)
+                    if _is_forbidden_public_path(rel_sub.parts):
+                        continue
+                    out_fp = dst / rel_sub
+                    out_fp.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(fp, out_fp)
+                    mounted.append(out_fp.relative_to(tgt_base).as_posix())
+            elif src.is_file():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                mounted.append(dst.relative_to(tgt_base).as_posix())
+        except OSError:
+            continue
+
+    # 若指定历史裁决快照目录（用于旧 spec_revision 手稿盲审），只挂载该版本对应的 rulings/
+    if rulings_revision_dir and rulings_revision_dir.is_dir():
+        dst_rulings = inputs_dir / "rulings"
+        for fp in sorted(rulings_revision_dir.rglob("*")):
+            if not fp.is_file():
+                continue
+            rel_sub = fp.relative_to(rulings_revision_dir)
+            out_fp = dst_rulings / rel_sub
+            out_fp.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(fp, out_fp)
+                mounted.append(out_fp.relative_to(tgt_base).as_posix())
+            except OSError:
+                continue
+
+    return mounted
+
+
+def sync_public_rulings(conn: sqlite3.Connection, *, workspace_root: str) -> dict[str, Any]:
+    """轻量检测工作区 `rulings/` 公开补充裁决文档变动：仅在文件指纹变化时递增 `latest_spec_revision` 并留存版本快照。"""
+    p0 = conn.execute(
+        "SELECT latest_spec_revision, latest_ruling_summary_md, ruling_fingerprint_sha256 FROM parse0_contract WHERE contract_id = 'active'"
+    ).fetchone()
+    if p0 is None:
+        return {"changed": False, "latest_spec_revision": 0, "latest_ruling_summary_md": ""}
+
+    cur_rev = int(p0["latest_spec_revision"] or 0)
+    cur_fp = str(p0["ruling_fingerprint_sha256"] or "")
+    cur_summary = str(p0["latest_ruling_summary_md"] or "")
+
+    ws = Path(os.path.realpath(workspace_root or ""))
+    rulings_dir = ws / "rulings"
+    files: list[Path] = []
+    if rulings_dir.is_dir():
+        files = sorted(
+            (p for p in rulings_dir.rglob("*") if p.is_file() and not _is_forbidden_public_path(p.relative_to(rulings_dir).parts)),
+            key=lambda p: p.relative_to(rulings_dir).as_posix(),
+        )
+
+    if not files and not cur_fp:
+        return {"changed": False, "latest_spec_revision": cur_rev, "latest_ruling_summary_md": cur_summary}
+
+    h = hashlib.sha256()
+    summary_parts: list[str] = []
+    for fp in files:
+        rel = fp.relative_to(rulings_dir).as_posix()
+        file_sha = sha256_file(fp)
+        h.update(f"{rel}:{file_sha}\n".encode("utf-8"))
+        try:
+            snippet = fp.read_text(encoding="utf-8", errors="replace").strip().replace("\r\n", "\n")[:260]
+        except OSError:
+            snippet = ""
+        summary_parts.append(f"- `{rel}`: {snippet}")
+    new_fp = h.hexdigest() if files else ""
+
+    if new_fp == cur_fp:
+        return {"changed": False, "latest_spec_revision": cur_rev, "latest_ruling_summary_md": cur_summary}
+
+    new_rev = cur_rev + 1
+    new_summary = ("\n".join(summary_parts))[:1200] if summary_parts else "(rulings/ 目录已清空)"
+    paths = resolve_storage_paths(workspace_root)
+    rev_snap_dir = paths["ruling_revisions_dir"] / f"v{new_rev}"
+    if rev_snap_dir.exists():
+        shutil.rmtree(rev_snap_dir, ignore_errors=True)
+    rev_snap_dir.mkdir(parents=True, exist_ok=True)
+    for fp in files:
+        rel = fp.relative_to(rulings_dir)
+        dst = rev_snap_dir / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(fp, dst)
+        except OSError:
+            pass
+
+    now = utc_now_iso()
+    with rw_immediate_tx(conn):
+        conn.execute(
+            """
+            UPDATE parse0_contract
+            SET latest_spec_revision = ?, latest_ruling_summary_md = ?, ruling_fingerprint_sha256 = ?, updated_at = ?
+            WHERE contract_id = 'active'
+            """,
+            (new_rev, new_summary, new_fp, now),
+        )
+    return {
+        "changed": True,
+        "latest_spec_revision": new_rev,
+        "latest_ruling_summary_md": new_summary,
+        "ruling_files": [fp.relative_to(rulings_dir).as_posix() for fp in files],
+    }
+
+
+def compute_missing_initial_instruments(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """对比 Parse 0 `initial_instruments_json` 与 `instruments` 活跃表，返回尚未注册激活的初始仪器清单。"""
+    p0 = conn.execute("SELECT initial_instruments_json FROM parse0_contract WHERE contract_id = 'active'").fetchone()
+    if p0 is None:
+        return []
+    try:
+        items = json.loads(p0["initial_instruments_json"] or "[]")
+    except Exception:
+        items = []
+    if not isinstance(items, list) or not items:
+        return []
+    active_rows = conn.execute(
+        "SELECT instrument_id, question_id, instrument_role FROM instruments WHERE is_active = 1"
+    ).fetchall()
+    active_ids = {str(r["instrument_id"]) for r in active_rows}
+    missing: list[dict[str, Any]] = []
+    for raw in items:
+        if isinstance(raw, str):
+            iid = raw.strip()
+            if iid and iid not in active_ids:
+                missing.append({"instrument_id": iid})
+        elif isinstance(raw, dict):
+            iid = str(raw.get("instrument_id") or raw.get("id") or "").strip()
+            if iid:
+                if iid not in active_ids:
+                    missing.append(raw)
+            else:
+                # 未指定 ID 时，要求该子题至少存在 1 台活跃仪器
+                qid = str(raw.get("question_id") or "Q1").strip()
+                role = str(raw.get("instrument_role") or "").strip().upper()
+                matched = any(
+                    str(r["question_id"]) in (qid, "ALL") and (not role or str(r["instrument_role"]) == role)
+                    for r in active_rows
+                )
+                if not matched:
+                    missing.append(raw)
+    return missing
+
+
+def mark_stage1_works_checked(conn: sqlite3.Connection) -> dict[str, Any]:
+    """核验 Stage 1 初始仪器客观就绪状态（全部已激活或初始清单为空）后，原子落标 `stage1_works_checked = 1`。"""
+    p0 = conn.execute("SELECT contract_id, stage1_works_checked FROM parse0_contract WHERE contract_id = 'active'").fetchone()
+    if p0 is None:
+        raise FailClosedError(ERR_NOT_FOUND, "尚未初始化 Parse 0 契约，无法标记 Stage 1 工造司核查完成")
+    missing = compute_missing_initial_instruments(conn)
+    if missing:
+        return {
+            "stage1_works_checked": False,
+            "missing_initial_instruments": missing,
+        }
+    now = utc_now_iso()
+    with rw_immediate_tx(conn):
+        conn.execute(
+            "UPDATE parse0_contract SET stage1_works_checked = 1, updated_at = ? WHERE contract_id = 'active'",
+            (now,),
+        )
+    return {
+        "stage1_works_checked": True,
+        "missing_initial_instruments": [],
+    }
 
 
 def _parse_iso_utc(ts: str) -> datetime | None:
@@ -73,6 +368,7 @@ def init_parse0_contract(
     total_budget: dict[str, Any] | None = None,
     min_commitment_window_sec: int = 0,
     delivery_spec_md: str = "",
+    shared_inputs_rel_paths: list[str] | None = None,
     stage: str | None = None,
     epoch_id: int = 1,
     human_signed_at: str | None = None,
@@ -90,6 +386,7 @@ def init_parse0_contract(
     if not qs:
         raise FailClosedError(ERR_INVALID_INPUT, "Parse 0 第 2 项 subquestions 至少须包含 1 个非空子题标识")
     order_list = [str(q).strip() for q in (question_order or []) if str(q).strip()]
+    clean_shared_inputs = [str(p).strip().replace("\\", "/") for p in (shared_inputs_rel_paths or []) if str(p).strip()]
     now = utc_now_iso()
     signed_ts = str(human_signed_at or now)
     explicit_stage = stage if stage in ("STAGE1_PARSE0", "STAGE2_EVOLVE", "STAGE3_CONSOLIDATE", "CLOSED_VERIFIED") else None
@@ -102,9 +399,9 @@ def init_parse0_contract(
             INSERT INTO parse0_contract(
                 contract_id, goal_and_completion_md, subquestions_json, question_order_json,
                 initial_instruments_json, seed_families_json, total_budget_json,
-                min_commitment_window_sec, delivery_spec_md, human_signed_at,
+                min_commitment_window_sec, delivery_spec_md, shared_inputs_json, human_signed_at,
                 stage, consecutive_non_l1_handoffs, epoch_id, created_at, updated_at
-            ) VALUES ('active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+            ) VALUES ('active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
             ON CONFLICT(contract_id) DO UPDATE SET
                 goal_and_completion_md = excluded.goal_and_completion_md,
                 subquestions_json = excluded.subquestions_json,
@@ -114,6 +411,7 @@ def init_parse0_contract(
                 total_budget_json = excluded.total_budget_json,
                 min_commitment_window_sec = excluded.min_commitment_window_sec,
                 delivery_spec_md = excluded.delivery_spec_md,
+                shared_inputs_json = excluded.shared_inputs_json,
                 human_signed_at = excluded.human_signed_at,
                 {stage_update_sql}
                 epoch_id = excluded.epoch_id,
@@ -128,6 +426,7 @@ def init_parse0_contract(
                 json.dumps(total_budget or {}, ensure_ascii=False),
                 max(0, int(min_commitment_window_sec or 0)),
                 str(delivery_spec_md or ""),
+                json.dumps(clean_shared_inputs, ensure_ascii=False),
                 signed_ts,
                 insert_stage,
                 int(epoch_id or 1),
@@ -149,6 +448,7 @@ def init_parse0_contract(
         "contract_id": "active",
         "subquestions": qs,
         "question_order": order_list,
+        "shared_inputs_rel_paths": clean_shared_inputs,
         "min_commitment_window_sec": max(0, int(min_commitment_window_sec or 0)),
         "stage": eff_stage,
         "human_signed_at": signed_ts,
@@ -193,7 +493,7 @@ def record_pending_handoff(
     explorer_will_md: str = "",
     reason: str = "",
 ) -> dict[str, Any]:
-    """持久化探索者亲笔遗嘱与待伴随交接/抢救标记，确保宿主重启后可从 SQLite 无损接续。"""
+    """持久化探索者亲笔遗嘱（同步写入 will_md 与 explorer_will_md）与待伴随交接/抢救标记，确保宿主重启后从 SQLite 无损接续。"""
     mode_u = str(mode or "HANDOFF_70").strip().upper()
     if mode_u not in ("HANDOFF_70", "CRASH_RECOVERY"):
         raise FailClosedError(ERR_INVALID_INPUT, f"非法 pending_handoff_mode={mode!r}")
@@ -201,42 +501,110 @@ def record_pending_handoff(
     if node is None:
         raise FailClosedError(ERR_NOT_FOUND, f"节点 {node_id!r} 不存在")
     now = utc_now_iso()
+    will_text = str(explorer_will_md or "")
     with rw_immediate_tx(conn):
         conn.execute(
             """
             UPDATE lineage_nodes
-            SET explorer_will_md = ?,
+            SET will_md = CASE WHEN ? != '' THEN ? ELSE will_md END,
+                explorer_will_md = ?,
                 pending_handoff_mode = ?,
                 pending_handoff_reason = ?,
                 updated_at = ?
             WHERE node_id = ?
             """,
-            (str(explorer_will_md or ""), mode_u, str(reason or "")[:500], now, node_id),
+            (will_text, will_text, will_text, mode_u, str(reason or "")[:500], now, node_id),
         )
     return {
         "node_id": node_id,
         "pending_handoff_mode": mode_u,
-        "explorer_will_chars": len(str(explorer_will_md or "")),
+        "explorer_will_chars": len(will_text),
     }
 
 
-def sync_session_pressure(conn: sqlite3.Connection, *, node_id: str, pressure_tokens: int) -> dict[str, Any]:
-    """将宿主 DSH TokenMeter 采样的真实压力水位同步至 SQLite（单一真时钟）。"""
+def sync_session_pressure(
+    conn: sqlite3.Connection,
+    *,
+    node_id: str,
+    pressure_tokens: int,
+    effective_context_window: int | None = None,
+    context_window_tokens: int | None = None,
+) -> dict[str, Any]:
+    """将宿主 DSH TokenMeter 采样的真实压力水位与模型有效窗口 W = min(500k, model_window) 同步至 SQLite，并返回实时 node_status。"""
     row = conn.execute(
-        "SELECT node_id, first_reflection_unlocked FROM lineage_nodes WHERE node_id = ?",
+        "SELECT node_id, node_status, first_reflection_unlocked, effective_context_window FROM lineage_nodes WHERE node_id = ?",
         (node_id,),
     ).fetchone()
     if row is None:
         raise FailClosedError(ERR_NOT_FOUND, f"节点 {node_id!r} 不存在，无法同步 pressure_tokens")
     pt = max(0, int(pressure_tokens))
+    raw_explicit = effective_context_window if effective_context_window is not None else context_window_tokens
+    explicit_win = int(raw_explicit) if (raw_explicit and int(raw_explicit) > 0) else None
+    eff_win = resolve_effective_context_window(
+        conn,
+        node_window=row["effective_context_window"],
+        explicit_window=explicit_win,
+    )
     now = utc_now_iso()
     with rw_immediate_tx(conn):
+        if explicit_win is not None:
+            conn.execute(
+                "UPDATE lineage_nodes SET pressure_tokens = ?, effective_context_window = ?, updated_at = ? WHERE node_id = ?",
+                (pt, eff_win, now, node_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE lineage_nodes SET pressure_tokens = ?, updated_at = ? WHERE node_id = ?",
+                (pt, now, node_id),
+            )
+    sig = compute_clock_signal(pt, int(row["first_reflection_unlocked"] or 0), effective_context_window=eff_win)
+    return {"node_id": node_id, "node_status": str(row["node_status"]), **sig}
+
+
+def abort_lineage_node(
+    conn: sqlite3.Connection,
+    *,
+    node_id: str,
+    reason: str = "ABORTED_BY_CONTROLLER",
+) -> dict[str, Any]:
+    """控制面精准中止指定探索节点：原子落库为 CLOSED 并清空待交接标记，释放槽位且杜绝重派。"""
+    row = conn.execute(
+        "SELECT node_id, question_id, branch_id, node_status, scratch_log_json FROM lineage_nodes WHERE node_id = ?",
+        (node_id,),
+    ).fetchone()
+    if row is None:
+        raise FailClosedError(ERR_NOT_FOUND, f"节点 {node_id!r} 不存在，无法中止")
+    prev_status = str(row["node_status"])
+    now = utc_now_iso()
+    clean_reason = str(reason or "ABORTED_BY_CONTROLLER").strip()[:400]
+    try:
+        scratch = json.loads(row["scratch_log_json"] or "[]")
+        if not isinstance(scratch, list):
+            scratch = []
+    except Exception:
+        scratch = []
+    scratch.append({"at": now, "kind": "ABORT_NODE", "prev_status": prev_status, "reason": clean_reason})
+    with rw_immediate_tx(conn):
         conn.execute(
-            "UPDATE lineage_nodes SET pressure_tokens = ?, updated_at = ? WHERE node_id = ?",
-            (pt, now, node_id),
+            """
+            UPDATE lineage_nodes
+            SET node_status = 'CLOSED',
+                pending_handoff_mode = NULL,
+                pending_handoff_reason = ?,
+                scratch_log_json = ?,
+                updated_at = ?
+            WHERE node_id = ?
+            """,
+            (f"ABORTED_BY_CONTROLLER: {clean_reason}", json.dumps(scratch, ensure_ascii=False), now, node_id),
         )
-    sig = compute_clock_signal(pt, int(row["first_reflection_unlocked"] or 0))
-    return {"node_id": node_id, **sig}
+    return {
+        "node_id": node_id,
+        "question_id": str(row["question_id"]),
+        "branch_id": str(row["branch_id"]),
+        "prev_status": prev_status,
+        "node_status": "CLOSED",
+        "reason": clean_reason,
+    }
 
 
 def safe_resolve_in_worktree(worktree_abs_path: str, rel_path: str) -> Path:
@@ -277,7 +645,7 @@ def backup_retained_candidate_snapshot(
                 shutil.copy2(src, dst)
         else:
             for item in wt.iterdir():
-                if item.name in (".git", "__pycache__", ".venv"):
+                if item.name in (".git", "__pycache__", ".venv", "inputs"):
                     continue
                 dst = snap_dir / item.name
                 if item.is_dir():
@@ -507,6 +875,32 @@ def stage_blind_review_sandbox(
         encoding="utf-8",
     )
     staged_files.append("observations.json")
+
+    # 4. 只读拷入公开题面、公开输入与手稿绑定 `spec_revision` 的《补充裁决文档》至 inputs/
+    #    （若手稿绑定旧口径 vK < latest_spec_revision，挂载历史快照 ruling_revisions/vK/，绝不把事后新裁决混进旧手稿盲审！）
+    try:
+        p0 = conn.execute(
+            "SELECT shared_inputs_json, latest_spec_revision FROM parse0_contract WHERE contract_id = 'active'"
+        ).fetchone()
+        shared_rels = json.loads(p0["shared_inputs_json"] or "[]") if p0 else []
+        latest_spec_rev = int(p0["latest_spec_revision"] or 0) if p0 else 0
+    except Exception:
+        shared_rels = []
+        latest_spec_rev = 0
+    rev_spec = int(rev["spec_revision"] or 0) if "spec_revision" in rev.keys() else 0
+    if rev_spec < latest_spec_rev:
+        hist_dir = paths["ruling_revisions_dir"] / f"v{rev_spec}" if rev_spec > 0 else None
+        mounted_inputs = sync_public_inputs_to_worktree(
+            workspace_root,
+            sandbox_dir,
+            shared_rels,
+            rulings_revision_dir=hist_dir,
+            skip_live_rulings=True,
+        )
+    else:
+        mounted_inputs = sync_public_inputs_to_worktree(workspace_root, sandbox_dir, shared_rels)
+    staged_files.extend(mounted_inputs)
+
     _set_tree_readonly(sandbox_dir, True)
 
     return {"sandbox_abs_path": str(sandbox_dir), "staged_files": staged_files}
@@ -813,8 +1207,11 @@ def check_stage2_closure_gate_data(
 def schedule_control_plane_snapshot(
     conn: sqlite3.Connection,
     max_concurrent_workers: int | None = None,
+    *,
+    workspace_root: str = "",
 ) -> dict[str, Any]:
-    """纯查 SQLite（<50ms）生成两级公平调度快照（严禁在此轮询中动态导入/运行任何 Python 仪器！）。"""
+    """纯查 SQLite（<50ms，零写盘零哈希副作用）生成两级公平调度快照（严禁在此轮询中动态导入/运行任何 Python 仪器！）。"""
+    _ = workspace_root
     cfg = load_runtime_config()
     hard_cap = int(cfg.get("max_concurrent_workers_hard_cap", 10))
     wanted = int(max_concurrent_workers or cfg.get("max_concurrent_workers", 6))
@@ -823,6 +1220,12 @@ def schedule_control_plane_snapshot(
     p0 = conn.execute("SELECT * FROM parse0_contract WHERE contract_id = 'active'").fetchone()
     req_qs = json.loads(p0["subquestions_json"]) if p0 else []
     q_order = json.loads(p0["question_order_json"]) if p0 else []
+    initial_instruments = json.loads(p0["initial_instruments_json"] or "[]") if p0 else []
+    shared_inputs = json.loads(p0["shared_inputs_json"] or "[]") if (p0 and "shared_inputs_json" in p0.keys()) else []
+    stage1_works_checked = bool(int(p0["stage1_works_checked"] or 0)) if (p0 and "stage1_works_checked" in p0.keys()) else False
+    latest_spec_revision = int(p0["latest_spec_revision"] or 0) if (p0 and "latest_spec_revision" in p0.keys()) else 0
+    latest_ruling_summary_md = str(p0["latest_ruling_summary_md"] or "") if (p0 and "latest_ruling_summary_md" in p0.keys()) else ""
+    missing_initial_instruments = compute_missing_initial_instruments(conn) if p0 else []
     goal_md = str(p0["goal_and_completion_md"] or "") if p0 else ""
     stage = str(p0["stage"]) if p0 else "STAGE1_PARSE0"
     non_l1 = int(p0["consecutive_non_l1_handoffs"] or 0) if p0 else 0
@@ -860,8 +1263,9 @@ def schedule_control_plane_snapshot(
             """
             SELECT node_id, question_id, branch_id, family_id, generation, node_status,
                    worktree_abs_path, requires_json, premise_revoked, pressure_tokens,
+                   effective_context_window, spec_revision,
                    first_reflection_unlocked, last_revision_requests_json, lane_assignment,
-                   explorer_will_md, pending_handoff_mode, pending_handoff_reason
+                   will_md, explorer_will_md, pending_handoff_mode, pending_handoff_reason, updated_at
             FROM lineage_nodes
             WHERE node_status IN ('EXPLORING', 'ACTIVE_REVISING')
             ORDER BY created_at ASC
@@ -957,20 +1361,36 @@ def schedule_control_plane_snapshot(
     open_works = [
         dict(r)
         for r in conn.execute(
-            "SELECT ticket_id, question_id, ticket_type, instrument_id, payload_json FROM works_engineering_queue WHERE status = 'OPEN' ORDER BY created_at ASC"
+            "SELECT ticket_id, question_id, ticket_type, instrument_id, payload_json, updated_at FROM works_engineering_queue WHERE status = 'OPEN' ORDER BY created_at ASC"
         ).fetchall()
     ]
     pending_reval = [
         dict(r)
         for r in conn.execute(
-            "SELECT queue_id, obs_id, question_id, target_instrument_id, target_version FROM pending_revalidation_queue WHERE status = 'PENDING' ORDER BY created_at ASC"
+            "SELECT queue_id, obs_id, question_id, target_instrument_id, target_version, updated_at FROM pending_revalidation_queue WHERE status = 'PENDING' ORDER BY created_at ASC"
         ).fetchall()
     ]
     unhealthy_instruments = [
         dict(r)
         for r in conn.execute(
-            "SELECT instrument_id, version, question_id, instrument_role, consecutive_error_count FROM instruments WHERE is_active = 1 AND health_status = 'UNHEALTHY'"
+            "SELECT instrument_id, version, question_id, instrument_role, consecutive_error_count, updated_at FROM instruments WHERE is_active = 1 AND health_status = 'UNHEALTHY'"
         ).fetchall()
+    ]
+    active_instruments = [
+        dict(r)
+        for r in conn.execute(
+            """
+            SELECT instrument_id, version, question_id, instrument_role,
+                   artifact_schema, health_status, default_spec_json, updated_at
+            FROM instruments
+            WHERE is_active = 1
+            ORDER BY instrument_id, version
+            """
+        ).fetchall()
+    ]
+    active_instruments_fingerprint = [
+        f"{r['instrument_id']}:v{r['version']}:{r['health_status']}:{r['updated_at']}"
+        for r in active_instruments
     ]
     ambiguous_alerts = [
         dict(r)
@@ -1031,12 +1451,20 @@ def schedule_control_plane_snapshot(
         "initialized": True,
         "stage": stage,
         "parse0_signed": has_parse0_signed,
+        "stage1_works_checked": stage1_works_checked,
+        "initial_instruments": initial_instruments,
+        "missing_initial_instruments": missing_initial_instruments,
+        "latest_spec_revision": latest_spec_revision,
+        "latest_ruling_summary_md": latest_ruling_summary_md,
         "goal_and_completion_md": goal_md,
         "required_questions": req_qs,
         "question_order": q_order,
+        "shared_inputs_rel_paths": shared_inputs,
         "question_order_status": order_status,
         "questions_needing_branch": questions_needing_branch,
         "external_literature_count": external_lit_count,
+        "active_instruments": active_instruments,
+        "active_instruments_fingerprint": active_instruments_fingerprint,
         "slot_cap": slot_cap,
         "triage_locked_branches": sorted(triage_locked_branches),
         "family_concentration_alerts": family_concentration_alerts,
@@ -1071,12 +1499,20 @@ def uninitialized_schedule_snapshot(max_concurrent_workers: int | None = None) -
         "initialized": False,
         "stage": "STAGE1_PARSE0",
         "parse0_signed": False,
+        "stage1_works_checked": False,
+        "initial_instruments": [],
+        "missing_initial_instruments": [],
+        "latest_spec_revision": 0,
+        "latest_ruling_summary_md": "",
         "goal_and_completion_md": "",
         "required_questions": [],
         "question_order": [],
+        "shared_inputs_rel_paths": [],
         "question_order_status": {},
         "questions_needing_branch": [],
         "external_literature_count": 0,
+        "active_instruments": [],
+        "active_instruments_fingerprint": [],
         "slot_cap": slot_cap,
         "triage_locked_branches": [],
         "family_concentration_alerts": [],

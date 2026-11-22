@@ -250,13 +250,14 @@ export class GreatwallMcpBridge {
     return this._rpc(method, merged, this.resolveControlTimeoutMs(method))
   }
 
-  async dispose() {
-    this._disposed = true
+  /** 关闭当前常驻子进程以释放系统资源（不设 _disposed，后续有 RPC 时按需自动重启）。 */
+  async closeIdleChild() {
     for (const [id, entry] of this._pending.entries()) {
       clearTimeout(entry.timer)
-      entry.reject(new Error('GreatwallMcpBridge disposed'))
+      entry.reject(new Error('GreatwallMcpBridge closed'))
       this._pending.delete(id)
     }
+    this._initPromise = null
     if (this._rl) {
       this._rl.close()
       this._rl = null
@@ -280,5 +281,10 @@ export class GreatwallMcpBridge {
         })
       })
     }
+  }
+
+  async dispose() {
+    this._disposed = true
+    await this.closeIdleChild()
   }
 }

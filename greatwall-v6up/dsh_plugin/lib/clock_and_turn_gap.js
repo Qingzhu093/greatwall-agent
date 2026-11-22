@@ -38,7 +38,9 @@ export function sampleAgentContextPressure(ctx, agent, defaultWindow = 500_000) 
         source = 'sessionProjections.contextPressure'
       }
       if (typeof cp.contextWindow === 'number' && Number.isFinite(cp.contextWindow) && cp.contextWindow > 0) {
-        contextWindow = Math.round(cp.contextWindow)
+        const measured = Math.round(cp.contextWindow)
+        // 取真实模型窗口与显式安全上限的较小值，绝不用 500k 覆盖 272k 模型真实窗口
+        contextWindow = defaultWindow > 0 ? Math.min(defaultWindow, measured) : measured
       }
     }
   } catch {}
@@ -81,16 +83,17 @@ export function evaluateContextClockTrigger({
 }
 
 /**
- * 将当前压力水位同步到 Python SQLite 单一真相时钟字段。
+ * 将当前压力水位与真实有效上下文窗口同步到 Python SQLite 单一真相时钟字段，并带回实时 node_status。
  */
-export async function syncLivePressureToDb(ctx, agent, bridge, workspaceRoot, nodeId) {
+export async function syncLivePressureToDb(ctx, agent, bridge, workspaceRoot, nodeId, defaultWindow = 500_000) {
   if (!nodeId || !bridge) return null
-  const sample = sampleAgentContextPressure(ctx, agent)
+  const sample = sampleAgentContextPressure(ctx, agent, defaultWindow)
   try {
     return await bridge.control('control_plane/sync_pressure', {
       workspace_root: workspaceRoot,
       node_id: nodeId,
       pressure_tokens: sample.pressureTokens,
+      effective_context_window: sample.contextWindow,
     })
   } catch {
     return null
@@ -98,8 +101,8 @@ export async function syncLivePressureToDb(ctx, agent, bridge, workspaceRoot, no
 }
 
 /**
- * 实时追帧观测器：在探索者连续调用原生工具（`read`/`edit`/`pwsh`）期间同步 500k 时钟，
- * 并在纯推导/零仪器场景下照常准时触发 37% 反思与 70% 交接。
+ * 实时追帧观测器：在探索者连续调用原生工具（`read`/`edit`/`pwsh`）期间同步动态真实上下文时钟，
+ * 并在纯推导/零仪器场景下照常准时触发 37% 反思、70% 交接或外部终态中止收束。
  */
 export function installLiveClockObservers({
   rootCtx,
@@ -109,6 +112,7 @@ export function installLiveClockObservers({
   workspaceRoot,
   nodeId = '',
   role,
+  contextWindowTokens = 500_000,
   onNativeThresholdHit,
 }) {
   if (role !== 'explorer' || !nodeId || !bridge) {
@@ -118,14 +122,23 @@ export function installLiveClockObservers({
   let lastTriggerEmitted = ''
 
   const checkAndSync = async (sourceHook) => {
-    const syncRes = await syncLivePressureToDb(rootCtx, agent, bridge, workspaceRoot, nodeId)
-    const sample = sampleAgentContextPressure(rootCtx, agent)
+    const syncRes = await syncLivePressureToDb(rootCtx, agent, bridge, workspaceRoot, nodeId, contextWindowTokens)
+    const sample = sampleAgentContextPressure(rootCtx, agent, contextWindowTokens)
     const rowData = syncRes?.data ?? syncRes ?? {}
+    const nodeStatus = String(rowData.node_status || '')
+    if (nodeStatus && nodeStatus !== 'EXPLORING' && nodeStatus !== 'ACTIVE_REVISING') {
+      if (lastTriggerEmitted !== 'NODE_TERMINATED') {
+        lastTriggerEmitted = 'NODE_TERMINATED'
+        onNativeThresholdHit?.({ trigger: 'NODE_TERMINATED', nodeStatus, sourceHook })
+      }
+      return
+    }
     const unlocked = Boolean(rowData.first_reflection_unlocked)
+    const effWindow = Number(rowData.effective_context_window || rowData.context_window_tokens || sample.contextWindow || contextWindowTokens || 500_000)
 
     const { pressurePct, trigger } = evaluateContextClockTrigger({
       pressureTokens: sample.pressureTokens,
-      contextWindow: sample.contextWindow || 500_000,
+      contextWindow: effWindow,
       firstReflectionUnlocked: unlocked,
     })
 
@@ -197,6 +210,7 @@ export function registerScopedMcpTools({
   role,
   workspaceRoot,
   nodeId = '',
+  contextWindowTokens = 500_000,
   onTurnSignal,
 }) {
   const disposers = []
@@ -219,7 +233,7 @@ export function registerScopedMcpTools({
       },
       async execute(args, exec) {
         if (role === 'explorer' && nodeId) {
-          await syncLivePressureToDb(rootCtx, agent, bridge, workspaceRoot, nodeId)
+          await syncLivePressureToDb(rootCtx, agent, bridge, workspaceRoot, nodeId, contextWindowTokens)
         }
 
         const res = await bridge.callTool(toolName, args, {
@@ -230,7 +244,7 @@ export function registerScopedMcpTools({
 
         if (role === 'explorer' && toolName === 'run_isolated_eval' && res?.ok) {
           if (nodeId) {
-            await syncLivePressureToDb(rootCtx, agent, bridge, workspaceRoot, nodeId)
+            await syncLivePressureToDb(rootCtx, agent, bridge, workspaceRoot, nodeId, contextWindowTokens)
           }
           const trigger = res?.data?.clock_signal?.trigger
           if (trigger === 'REFLECT_37' || trigger === 'HANDOFF_70') {

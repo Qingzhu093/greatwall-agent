@@ -105,10 +105,8 @@ window.__ModuleLoader__.load({
 			const [busy, setBusy] = React.useState(false);
 			const [notice, setNotice] = React.useState("");
 
-			const [targetType, setTargetType] = React.useState("question");
-			const [targetId, setTargetId] = React.useState("Q1");
-			const [interventionAction, setInterventionAction] = React.useState("steer");
-			const [directive, setDirective] = React.useState("");
+			const [abortNodeId, setAbortNodeId] = React.useState("");
+			const [abortReason, setAbortReason] = React.useState("");
 
 			const fetchStatus = React.useCallback(async (wsOverride) => {
 				try {
@@ -156,7 +154,7 @@ window.__ModuleLoader__.load({
 						setNotice("⚠️ " + (json.error || "操作未成功"));
 					} else {
 						setNotice("✅ 已执行：" + action);
-						if (action === "intervene") setDirective("");
+						if (action === "abort_node") { setAbortNodeId(""); setAbortReason(""); }
 						await fetchStatus();
 					}
 				} catch (err) {
@@ -177,6 +175,13 @@ window.__ModuleLoader__.load({
 				? snap.required_questions
 				: Object.keys(orderStatus).length ? Object.keys(orderStatus) : ["Q1"];
 			const ambiguousAlerts = snap.ambiguous_spec_alerts || st.ambiguousSpecAlerts || [];
+			const brokenItems = st.circuitBrokenItems || [];
+			const effWindow = Math.max(1, Number(st.effectiveContextWindow || 500000));
+			const effWindowK = Math.round(effWindow / 1000);
+			const modelLabel = st.modelBinding?.provider && st.modelBinding?.model
+				? `${st.modelBinding.provider}/${st.modelBinding.model}`
+				: "";
+			const specRev = Number(st.latestSpecRevision ?? snap.latest_spec_revision ?? 0);
 			const closureStatus = snap.closure_state?.status || st.closureStatus || "OPEN";
 			const poolState = st.poolState || st.state || "idle";
 			const kernelAlive = st.kernelAlive === true;
@@ -229,6 +234,15 @@ window.__ModuleLoader__.load({
 								style: { borderColor: "rgba(220,38,38,.45)", color: "#dc2626" },
 								children: `🔴 ALERT_AMBIGUOUS_SPEC (${ambiguousAlerts.length})：${ambiguousAlerts[0]?.notes || "存在口径歧义告警（系统按原口径继续不停机）"}`
 							}),
+							brokenItems.length > 0 && jsx("div", {
+								className: "gw-log-line",
+								style: { borderColor: "rgba(217,119,6,.45)", color: "#d97706" },
+								children: `🟠 单项治理熔断 (${brokenItems.length})：${brokenItems.map((b) => b.key).join(", ")}（不连坐其他健康项，resume 可复位）`
+							}),
+							(modelLabel || specRev > 0) && jsx("div", {
+								className: "gw-log-line gw-muted",
+								children: `模型绑定：${modelLabel || "待绑定"} · 有效窗口：${effWindowK}k · 裁决版本：v${specRev}`
+							}),
 							knownWorkspaces.length > 0 && jsxs("div", {
 								className: "gw-form-row",
 								children: [
@@ -261,9 +275,6 @@ window.__ModuleLoader__.load({
 											const blocked = info.unlocked === false;
 											return jsxs("div", {
 												className: "gw-q-item",
-												onClick: () => { setTargetType("question"); setTargetId(qid); },
-												style: { cursor: "pointer" },
-												title: "点击填入下方定向干预目标",
 												children: [
 													jsxs("div", {
 														className: "gw-row",
@@ -287,21 +298,21 @@ window.__ModuleLoader__.load({
 									jsxs("div", {
 										className: "gw-card-title",
 										children: [
-											jsx("span", { children: "节点会话与 500k 压力监视" }),
-											jsx("span", { className: "gw-muted", children: `运行中探索者: ${runningExplorers.length} | 未认领崩溃: ${st.pendingSalvageCount ?? 0}` })
+											jsx("span", { children: `节点会话与自适应窗口 (${effWindowK}k) 压力监视` }),
+											jsx("span", { className: "gw-muted", children: `运行中探索者: ${runningExplorers.length} | 待交接恢复: ${(st.pendingHandoffNodes || []).length}` })
 										]
 									}),
 									allSessions.length === 0
 										? jsx("div", { className: "gw-muted", children: "暂无节点记录（主控 start 后将在此实时显示各探索枝与门控会话）" })
 										: allSessions.slice(0, 12).map((s) => {
 											const tok = Number(s.pressureTokens || 0);
-											const pct = Math.min(100, Math.round((tok / 500000) * 100));
+											const pct = Math.min(100, Math.round((tok / effWindow) * 100));
 											const fillCls = pct >= 70 ? "gw-bar-fill gw-bar-hot" : (pct >= 37 ? "gw-bar-fill gw-bar-warn" : "gw-bar-fill");
 											return jsxs("div", {
 												className: "gw-log-line",
 												style: { cursor: s.nodeId ? "pointer" : "default" },
-												onClick: () => { if (s.nodeId) { setTargetType("node"); setTargetId(s.nodeId); } },
-												title: s.nodeId ? "点击填入该节点 ID 进行纠偏" : "",
+												onClick: () => { if (s.nodeId) setAbortNodeId(s.nodeId); },
+												title: s.nodeId ? "点击填入下方节点 ID 以便确定性中止" : "",
 												children: [
 													jsxs("div", {
 														className: "gw-row",
@@ -314,7 +325,7 @@ window.__ModuleLoader__.load({
 														className: "gw-row gw-muted",
 														children: [
 															jsx("span", { className: "gw-mono", children: `${s.questionId || "-"} ${s.nodeId || s.sessionId.slice(0, 12)}` }),
-															jsx("span", { children: `${Math.round(tok / 1000)}k / 500k (${pct}%)` })
+															jsx("span", { children: `${Math.round(tok / 1000)}k / ${effWindowK}k (${pct}%)` })
 														]
 													}),
 													s.role === "explorer" && jsx("div", {
@@ -330,65 +341,45 @@ window.__ModuleLoader__.load({
 							jsxs("div", {
 								className: "gw-card",
 								children: [
-									jsx("div", { className: "gw-card-title", children: "人工定向干预 / 节点纠偏 (intervene)" }),
+									jsx("div", { className: "gw-card-title", children: "确定性单节点中止 (abort_node)" }),
+									jsx("div", { className: "gw-muted", children: "如需补充题意澄清，请先暂停、将文档放入工作区 rulings/ 目录后点击「恢复」自动升级 spec_revision；如需中止旧口径或失控节点，直接执行下方确定性中止。" }),
 									jsxs("div", {
 										className: "gw-form-row",
 										children: [
-											jsxs("select", {
-												className: "gw-select",
+											jsx("input", {
+												className: "gw-input",
 												style: { flex: 1 },
-												value: targetType,
-												onChange: (e) => setTargetType(e.target.value),
-												children: [
-													jsx("option", { value: "global", children: "全局 (global)" }),
-													jsx("option", { value: "question", children: "子题 (question)" }),
-													jsx("option", { value: "node", children: "节点 (node)" }),
-													jsx("option", { value: "role", children: "角色 (role)" })
-												]
+												value: abortNodeId,
+												onChange: (e) => setAbortNodeId(e.target.value),
+												placeholder: "节点 ID (点击上方节点自动填入)"
 											}),
 											jsx("input", {
 												className: "gw-input",
 												style: { flex: 1 },
-												value: targetId,
-												onChange: (e) => setTargetId(e.target.value),
-												placeholder: "目标ID (如 Q1 / node_q1_001)"
-											}),
-											jsxs("select", {
-												className: "gw-select",
-												style: { flex: 1 },
-												value: interventionAction,
-												onChange: (e) => setInterventionAction(e.target.value),
-												children: [
-													jsx("option", { value: "steer", children: "方向纠偏 (steer)" }),
-													jsx("option", { value: "abort_node", children: "中止节点 (abort_node)" })
-												]
+												value: abortReason,
+												onChange: (e) => setAbortReason(e.target.value),
+												placeholder: "中止原因 (可选)"
 											})
 										]
 									}),
-									jsx("textarea", {
-										className: "gw-textarea",
-										value: directive,
-										onChange: (e) => setDirective(e.target.value),
-										placeholder: "输入要下发给指定子题、分支节点或全局后勤的强制指令…"
-									}),
 									jsx("button", {
 										type: "button",
-										className: "gw-btn gw-btn-primary",
-										disabled: busy || (!directive.trim() && interventionAction !== "abort_node"),
-										onClick: () => void sendControl("intervene", { targetType, targetId, interventionAction, directive }),
-										children: "立即下发纠偏指令"
+										className: "gw-btn gw-btn-danger",
+										disabled: busy || !abortNodeId.trim(),
+										onClick: () => void sendControl("abort_node", { nodeId: abortNodeId.trim(), reason: abortReason.trim() || "UI_ABORT_NODE" }),
+										children: "确定性中止该节点并释槽"
 									})
 								]
 							}),
 							jsxs("div", {
 								className: "gw-card",
 								children: [
-									jsx("div", { className: "gw-card-title", children: "最近干预与调度日志" }),
+									jsx("div", { className: "gw-card-title", children: "最近调度事件日志" }),
 									(tState.recentEvents || []).slice(-6).reverse().map((ev, i) => jsxs("div", {
 										className: "gw-log-line gw-mono",
 										children: [
 											`[${String(ev.at || "").slice(11, 19)}] ${ev.kind || "event"} `,
-											ev.nodeId || ev.questionId || ev.directive || ""
+											ev.nodeId || ev.itemKey || ev.questionId || ""
 										]
 									}, `${ev.at || ""}_${i}`)),
 									(tState.recentEvents || []).length === 0 && jsx("div", { className: "gw-muted", children: "暂无调度事件" })

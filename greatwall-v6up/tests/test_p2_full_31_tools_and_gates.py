@@ -657,7 +657,7 @@ def evaluate(artifact, spec, tier="official"):
         self.assertEqual(init_resp["result"]["serverInfo"]["version"], "3.0.0")
 
         list_resp = mcp.handle_jsonrpc_message({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
-        self.assertEqual(len(list_resp["result"]["tools"]), 31)
+        self.assertEqual(len(list_resp["result"]["tools"]), 32)
 
         snap_resp = mcp.handle_jsonrpc_message({
             "jsonrpc": "2.0",

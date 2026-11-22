@@ -23,16 +23,23 @@ class TestP0ContractsAndCleanroom(unittest.TestCase):
         cfg_path = ROOT_DIR / "core_python" / "config.json"
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
         clk = cfg["session_context_clock"]
-        self.assertEqual(clk["context_window_tokens"], 500000)
+        self.assertEqual(clk["context_window_cap_tokens"], 500000)
         self.assertEqual(clk["min_evals_before_reflection"], 0)
         self.assertEqual(clk["context_reflect_hint_pct"], 0.37)
         self.assertEqual(clk["context_handoff_pct"], 0.70)
+        self.assertFalse(clk["allow_early_voluntary_handoff"])
+        self.assertNotIn("cost_note_enable", clk)
         self.assertTrue(clk["reflection_sequential_turn_boundary"])
         self.assertTrue(clk["handoff_explorer_final_will_turn"])
         self.assertEqual(clk["reflection_max_pointer_hints"], 2)
         self.assertEqual(clk["reflection_max_turns"], 2)
 
         orch = cfg["orchestration_and_eval"]
+        self.assertTrue(orch["require_explicit_model_binding"])
+        self.assertTrue(orch["stage1_always_verify_initial_instruments"])
+        self.assertEqual(orch["governance_item_circuit_breaker_max_stalled_runs"], 2)
+        self.assertTrue(orch["versioned_spec_revision_binding"])
+        self.assertTrue(orch["mount_public_inputs_readonly_into_sandboxes"])
         self.assertTrue(orch["companion_reuse_within_single_node"])
         self.assertTrue(orch["companion_forbid_cross_generation_persistence"])
         self.assertTrue(orch["verifier_isolated_execution_sandbox"])
@@ -102,12 +109,12 @@ class TestP0ContractsAndCleanroom(unittest.TestCase):
             rb = item.get("rollback_pointer", "")
             self.assertTrue((ROOT_DIR / "core_python" / rb).is_file(), f"回滚指针不存在: {rb}")
 
-    def test_31_tools_schema_consistency_and_enums(self) -> None:
+    def test_32_tools_schema_consistency_and_enums(self) -> None:
         defs = mcp.TOOL_DEFINITIONS
-        self.assertEqual(len(defs), 31)
+        self.assertEqual(len(defs), 32)
         def_names = {d["name"] for d in defs}
         self.assertEqual(def_names, set(mcp._TOOL_REGISTRY.keys()))
-        self.assertEqual(def_names, set(helpers.ALL_31_TOOL_NAMES))
+        self.assertEqual(def_names, set(helpers.ALL_TOOL_NAMES))
         union_roles = set().union(*helpers.ALLOWED_TOOLS_BY_ROLE.values())
         self.assertEqual(def_names, union_roles)
 
@@ -120,10 +127,14 @@ class TestP0ContractsAndCleanroom(unittest.TestCase):
 
         # 核对核心枚举与 db_schema 同源
         pub_props = by_name["publish_external_literature_card"]["inputSchema"]["properties"]
+        self.assertEqual(set(pub_props["outcome"]["enum"]), set(db.ALLOWED_SURVEY_OUTCOMES))
         self.assertEqual(set(pub_props["support_scope"]["enum"]), set(db.ALLOWED_SUPPORT_SCOPES))
         self.assertEqual(set(pub_props["read_depth"]["enum"]), set(db.ALLOWED_READ_DEPTHS))
         self.assertEqual(pub_props["abstract_md"]["minLength"], 60)
         self.assertGreaterEqual(pub_props["abstract_md"]["maxLength"], 600)
+
+        res_props = by_name["resolve_works_ticket"]["inputSchema"]["properties"]
+        self.assertEqual(set(res_props["resolution"]["enum"]), set(db.ALLOWED_TICKET_RESOLUTIONS))
 
         eval_props = by_name["run_isolated_eval"]["inputSchema"]["properties"]
         self.assertEqual(set(eval_props["tier"]["enum"]), {"probe", "official", "heavy"})
