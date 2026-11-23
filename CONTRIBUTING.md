@@ -9,7 +9,7 @@
 ## 一、贡献前建议阅读
 
 建议花 10–15 分钟按以下顺序快速对齐上下文：
-1. [`README.md`](./README.md) — 了解项目定位、目录布局与快速自检；
+1. [`README.md`](./README.md) — 了解项目定位、目录布局与 DSH 挂载方式；
 2. [`ARCHITECTURE.md`](./ARCHITECTURE.md) — 了解四大工程划分、32 窄工具与 SQLite 契约、以及 §5 已知技术债；
 3. [`ROADMAP.md`](./ROADMAP.md) — 查看 P0–P3 优先级与当前最需要社区协助的开放方向；
 4. [`REFERENCES.md`](./REFERENCES.md) — 按需查阅对应子系统背后的原论文与开源生态。
@@ -72,39 +72,22 @@ git commit --amend --no-edit -s
 
 ---
 
-## 四、本地开发环境与测试要求
+## 四、本地开发环境
 
-### 1. 基础环境
-- **Python**：`>= 3.11`（控制面内核零第三方强依赖，仅用标准库即可跑通单测）
+- **DeepSeek Harness (DSH)**：`>= 0.2.2-rc.5 < 0.3.0-0`
 - **Node.js**：`>= 22.19.0` 或 `>= 24.0.0`
-- **DeepSeek Harness (DSH)**：`>= 0.2.2-rc.5 < 0.3.0-0`（仅真宿主挂载与 L3 冒烟需要；日常 L1/L2 测试无需启动 DSH、零 API 费用）
-
-### 2. 提交 PR 前请跑通 L1 + L2 零费用测试套件
-
-在仓库根目录执行（Windows 推荐 PowerShell 7 `pwsh`，macOS/Linux 使用 `bash`）：
-
-```bash
-# 1. Python 全量单元测试（契约、SQLite 触发器、隔离执行器、32 工具与回归用例）
-python -m unittest discover -s "./greatwall-v6up/tests" -p "test_*.py" -v
-
-# 2. Node 单元测试 + 零费用假模型全链路沙盘（覆盖正向闭环与故障回归）
-node --test --test-reporter=spec --test-timeout=15000 \
-  "./greatwall-v6up/dsh_plugin/test/v3_control_plane_unit.test.mjs" \
-  "./greatwall-v6up/dsh_plugin/test/fake_llm_pipeline.test.mjs"
-```
-
-也可以直接进入 `greatwall-v6up/dsh_plugin/` 目录执行 `npm test`。
+- **Python**：`>= 3.11`（控制面内核仅依赖 Python 标准库）
 
 ---
 
 ## 五、工程红线与 PR 提交规范
 
 1. **零修改 DSH 原生源码**：插件扩展必须通过 Cordis `inject` 服务与标准接口完成，禁止依赖或修改宿主 `app.asar` 内部私有实现。
-2. **契约变更须保持同源**：若修改 SQLite Schema、32 窄工具参数或角色模板，请同步更新 [`core_python/agents/*.md`](./greatwall-v6up/core_python/agents/)、Schema 校验及对应测试（如有架构级变更，请一并更新 [`ARCHITECTURE.md`](./ARCHITECTURE.md)）。
+2. **契约变更须保持同源**：若修改 SQLite Schema、32 窄工具参数或角色模板，请同步更新 [`core_python/agents/*.md`](./greatwall-v6up/core_python/agents/) 与 Schema 定义（如有架构级变更，请一并更新 [`ARCHITECTURE.md`](./ARCHITECTURE.md)）。
 3. **严禁提交本地私密与运行态脏文件**：请勿将 API Key、个人本机绝对路径、`greatwall.db*`、运行产生的 `worktrees/` 或临时日志提交入仓。
 4. **Commit 与 PR 风格**：
-   - 推荐遵循 [Conventional Commits](https://www.conventionalcommits.org/)（例如 `feat(works): ...`、`fix(orchestrator): ...`、`refactor(mcp): ...`、`docs(readme): ...`、`test(pipeline): ...`）；
-   - PR 描述尽量简洁说清：**改了什么 → 为什么改 → 跑了哪些测试**（如涉及 UI 改动，欢迎附前后对比截图）。
+   - 推荐遵循 [Conventional Commits](https://www.conventionalcommits.org/)（例如 `feat(works): ...`、`fix(orchestrator): ...`、`refactor(mcp): ...`、`docs(readme): ...`）；
+   - PR 描述尽量简洁说清：**改了什么 → 为什么改 → 实际验证情况**（如涉及 UI 改动，欢迎附前后对比截图）。
 
 ---
 

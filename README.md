@@ -48,38 +48,27 @@
 | **[`ARCHITECTURE.md`](./ARCHITECTURE.md)** | 系统设计哲学、四大工程深度拆解、基于真实源码的 32 窄工具与 19 表接口契约、以及 §5 已知技术债与局限 |
 | **[`ROADMAP.md`](./ROADMAP.md)** | 问题清账本与 P0–P3 演进构想（UI 与 `SuperAgent` 主控、深度解耦、容器强沙箱、`Harness²` 工造司进化与双轨知识库、科研标准插座与开放实验议题） |
 | **[`REFERENCES.md`](./REFERENCES.md)** | 全部影响架构或路线图的学术论文、工程博客、开源项目与开放协议完整溯源（严格区分 `✅ 已落地` 与 `🗺️ 路线图规划`，仅附公共链接） |
-| **[`CONTRIBUTING.md`](./CONTRIBUTING.md)** | 开源协作切入指南、Apache 2.0 + DCO 1.1（`git commit -s`）签署流程与本地测试规范 |
+| **[`CONTRIBUTING.md`](./CONTRIBUTING.md)** | 开源协作切入指南、Apache 2.0 + DCO 1.1（`git commit -s`）签署流程与 PR 规范 |
 | [`greatwall-v6up/dsh_plugin/README.md`](./greatwall-v6up/dsh_plugin/README.md) | DSH `0.2.2-rc.5` 插件包迁移说明与 Preset 详情 |
 
 ---
 
-## 快速上手与零费用自检
+## 快速上手
 
 ### 1. 环境依赖
-- **DeepSeek Harness (DSH)**：`>= 0.2.2-rc.5 < 0.3.0-0`（仅真宿主运行需要）
+- **DeepSeek Harness (DSH)**：`>= 0.2.2-rc.5 < 0.3.0-0`
 - **Node.js**：`>= 22.19.0` 或 `>= 24.0.0`
-- **Python**：`>= 3.11`（控制面与核心测试仅依赖 Python 标准库；科研课题按需安装 `numpy` / `scipy` / `sympy` / `lean` 等）
+- **Python**：`>= 3.11`（控制面仅依赖 Python 标准库；科研课题按需安装 `numpy` / `scipy` / `sympy` / `lean` 等）
 
-### 2. 本地零费用自动化验证（无需 API Key、无需启动 DSH）
+### 2. 克隆并挂载至 DSH Profile
 
-克隆仓库后，可直接运行 Python 单元测试与 Node 假模型全链路沙盘验证整套状态机与隔离逻辑：
+先克隆本仓库：
 
 ```bash
 git clone https://github.com/Qingzhu093/greatwall-agent.git
-cd greatwall-agent
-
-# 1. 运行 Python 核心契约、SQLite 触发器、隔离执行器与 32 窄工具回归测试
-python -m unittest discover -s "./greatwall-v6up/tests" -p "test_*.py" -v
-
-# 2. 运行 DSH 插件控制面单测 + 零费用假模型全链路沙盘测试
-node --test --test-reporter=spec --test-timeout=15000 \
-  "./greatwall-v6up/dsh_plugin/test/v3_control_plane_unit.test.mjs" \
-  "./greatwall-v6up/dsh_plugin/test/fake_llm_pipeline.test.mjs"
 ```
 
-### 3. 挂载至 DSH Profile（体验完整插件运行）
-
-在 `~/.dsh/profiles/desktop/package.json`（或对应 Web Profile）中通过本地软链挂载 `greatwall-v6up/dsh_plugin` 并加入 `dsh.profile.bundles`：
+再在 `~/.dsh/profiles/desktop/package.json`（或对应 Web Profile）中通过本地软链挂载 `greatwall-v6up/dsh_plugin` 并加入 `dsh.profile.bundles`：
 
 ```json
 {
