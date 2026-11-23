@@ -1,0 +1,30 @@
+GreatWall Agent (长城)
+Copyright 2026 Qingzhu093 and GreatWall Agent Contributors
+
+This product is licensed under the Apache License, Version 2.0.
+Project repository: https://github.com/Qingzhu093/greatwall-agent
+
+===============================================================================
+Third-Party Materials and Attribution Notices
+===============================================================================
+
+1. The Station (holiday_prompts.yaml)
+   - Source: https://github.com/dualverse-ai/station
+   - Copyright: DualverseAI
+   - License: Apache License, Version 2.0
+   - Usage: The 29 Night Science / Holiday reflection prompts included in
+     `greatwall-v6up/core_python/prompts/holiday_prompts.yaml` (and referenced
+     in prompt documentation) are adapted from `holiday_prompts.yaml` in the
+     `dualverse-ai/station` repository under the Apache License, Version 2.0.
+
+2. Ecosystem Runtime & Standards
+   - The plugin integration layer (`greatwall-v6up/dsh_plugin/`) is built as an
+     external Cordis bundle targeting DeepSeek Harness (DSH):
+     https://github.com/deepseek-ai/deepseek-harness
+   - Tool communication follows the Model Context Protocol (MCP):
+     https://modelcontextprotocol.io
+
+3. Academic & Engineering References
+   - Design inspirations, academic papers, engineering blogs, and open-source
+     projects referenced in this architecture and roadmap are formally credited
+     in `REFERENCES.md`.
