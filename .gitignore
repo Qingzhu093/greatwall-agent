@@ -31,6 +31,9 @@ archive/
 tests/stress_harness/git_lock_repo/
 tests/stress_harness/git_stress_repo/
 
-# OS / IDE metadata
+# OS / IDE / LaTeX temp metadata
 .DS_Store
 Thumbs.db
+.vscode/
+.latex-studio/
+*.synctex*
