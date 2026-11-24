@@ -63,6 +63,7 @@ All 7 roles access **32 single-responsibility narrow tools** strictly via role-w
 | **[`ARCHITECTURE.md`](./ARCHITECTURE.md)** | Design philosophy, deep dive into the 4 pillars, exact contracts for 32 narrow tools & 19 SQLite tables, and §5 known technical debt |
 | **[`ROADMAP.md`](./ROADMAP.md)** | Problem ledger and P0–P3 evolution plans (UI & `SuperAgent` controller, decoupling, container strong sandboxes, `Harness²`, dual-track KB, open research issues) |
 | **[`REFERENCES.md`](./REFERENCES.md)** | Complete bibliography of academic papers, engineering blogs, open-source projects, and open protocols (`✅ Implemented` vs `🗺️ Roadmap`) |
+| **[Round 7 Experimental Report / Paper (PDF)](./docs/round7_report/V6Up_第7轮实机测试科研实验报告.pdf)** | Full empirical report & technical paper (with [LaTeX source](./docs/round7_report/main.tex), [`references.bib`](./docs/round7_report/references.bib), and figures) providing telemetry data, real-run evaluation, and research background |
 | **[`CONTRIBUTING.md`](./CONTRIBUTING.md)** | Contribution guide, Apache 2.0 + DCO 1.1 (`git commit -s`) sign-off requirements, and PR guidelines |
 | [`greatwall-v6up/dsh_plugin/README.md`](./greatwall-v6up/dsh_plugin/README.md) | DSH `0.2.2-rc.5` plugin migration guide and Preset details |
 

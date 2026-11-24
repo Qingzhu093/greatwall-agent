@@ -61,6 +61,7 @@ flowchart LR
 | **[`ARCHITECTURE.md`](./ARCHITECTURE.md)** | 系统设计哲学、四大工程深度拆解、基于真实源码的 32 窄工具与 19 表接口契约、以及 §5 已知技术债与局限 |
 | **[`ROADMAP.md`](./ROADMAP.md)** | 问题清账本与 P0–P3 演进构想（UI 与 `SuperAgent` 主控、深度解耦、容器强沙箱、`Harness²` 工造司进化与双轨知识库、科研标准插座与开放实验议题） |
 | **[`REFERENCES.md`](./REFERENCES.md)** | 全部影响架构或路线图的学术论文、工程博客、开源项目与开放协议完整溯源（严格区分 `✅ 已落地` 与 `🗺️ 路线图规划`，仅附公共链接） |
+| **[第 7 轮实机科研实验报告 (PDF)](./docs/round7_report/V6Up_第7轮实机测试科研实验报告.pdf)** | 系统实证论文与实验报告（含 [LaTeX 源码](./docs/round7_report/main.tex)、[`references.bib`](./docs/round7_report/references.bib) 与高清图表），提供全链路遥测、实机测试数据与背景知识 |
 | **[`CONTRIBUTING.md`](./CONTRIBUTING.md)** | 开源协作切入指南、Apache 2.0 + DCO 1.1（`git commit -s`）签署流程与 PR 规范 |
 | [`greatwall-v6up/dsh_plugin/README.md`](./greatwall-v6up/dsh_plugin/README.md) | DSH `0.2.2-rc.5` 插件包迁移说明与 Preset 详情 |
 
