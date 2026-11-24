@@ -37,11 +37,12 @@
 
 **GreatWall Agent（长城）** 是一套构建在开源 DeepSeek Harness（DSH）插件体系与 Python/SQLite 状态内核之上的**长周期、多学派并发自主科研多智能体实验基座**。它的出发点不是硬编码解决某一道竞赛题，而是尝试把学术界近期在自主科学发现方向上的关键思路——独立学派并发分流、强制元反思、隔离沙箱同行评审、评测工具随同演化、短会话无状态托管——落地为一个可以真实运行、调试和拆改的开源基座。希望利用DSH的开放性，构建出一个兼容不同已有科学工具、持续改进的社区生态。
 
-当前全部可运行源码位于 [`greatwall-v6up/`](./greatwall-v6up/)（总计约 1.8 万行代码，不计测试与文档）：
+当前全部可运行源码位于 [`greatwall-v6up/`](./greatwall-v6up/)（快速模块导航见 [`greatwall-v6up/MODULE_MAP.md`](./greatwall-v6up/MODULE_MAP.md)，总计约 1.8 万行代码，不计测试与文档）：
 
 ```text
 greatwall-v6up/
-├── core_python/                         # Python 3.11+ 单写者真相内核与隔离执行器（~10.8k 行）
+├── MODULE_MAP.md                        # 一页模块地图（职责、红线边界与验收命令）
+├── core_python/                         # Python 3.11+ 单写者真相内核与隔离执行器（~11.0k 行）
 │   ├── config.json                      # 时钟上限、并发槽位、学派分流与熔断阈值配置
 │   ├── agents/                          # 7 类角色的运行态 System Prompt 模板
 │   ├── prompts/holiday_prompts.yaml     # 29 条夜科学元反思启发题库
@@ -50,36 +51,43 @@ greatwall-v6up/
 │   │   ├── isolated_runner.py           # 跨进程隔离执行、四元复合缓存、Stage A 持久化与校准引擎（721 行）
 │   │   └── examples/                    # 异构科研样例（几何反例 / Lean4 桩 / Pareto 仿真）
 │   ├── mcp_server/
+│   │   ├── tool_registry.py             # 32 窄工具单一契约源：7 角色授权、只读/长耗时/收尾集合与 Schema（615 行）
 │   │   ├── db_schema.py                 # 外部隔离路径解析、19 表 + 2 FTS5 + 9 触发器 DDL（967 行）
-│   │   ├── control_plane_service.py     # Single-Writer 事务状态机、快照与 UI 投影（2,702 行）
-│   │   ├── greatwall_core_mcp.py        # stdio JSON-RPC 2.0 入口、32 工具与 15 内部原语分发（842 行）
-│   │   ├── mcp_core_helpers.py          # 统一回执外壳、JIT 路标、脱敏与复合指纹（366 行）
+│   │   ├── greatwall_core_mcp.py        # stdio JSON-RPC 2.0 入口、32 工具与 16 内部原语分发（462 行）
+│   │   ├── mcp_core_helpers.py          # 统一回执外壳、JIT 路标、脱敏与复合指纹（303 行）
 │   │   ├── mcp_schema_docs.py           # 工具 JSON Schema 枚举/约束自动增强（335 行）
+│   │   ├── control_plane/               # Single-Writer 控制面 6 个无环子域（workspace_sync / blind_sandbox /
+│   │   │                                # lifecycle_ops / scheduler_rules / delivery_and_jobs / ui_projection）
+│   │   ├── control_plane_service.py     # 向后兼容薄门面 Re-export（57 行）
 │   │   ├── tools_explorer.py            # explorer 5 个工具实现（934 行）
 │   │   ├── tools_companion.py           # lineage_companion 4 个工具实现（634 行）
 │   │   ├── tools_logistics.py           # logistics_coordinator 5 个工具实现（883 行）
-│   │   ├── tools_library.py             # library_surveyor(3) + library_verifier(5)（1,030 行）
+│   │   ├── tools_surveyor.py            # library_surveyor 3 个工具实现（260 行）
+│   │   ├── tools_verifier.py            # library_verifier 5 个工具实现（780 行；tools_library.py 保留薄门面）
 │   │   ├── tools_works.py               # works_engineer 6 个工具实现（689 行）
 │   │   └── tools_supervisory.py         # supervisory_committee 4 个工具实现（390 行）
 │   └── skills/                          # 主控 SOP 与共享探针台账 SKILL_LEDGER.json
-├── dsh_plugin/                          # DSH (0.2.2-rc.x) Cordis 插件与控制台前端（~7.0k 行）
+├── dsh_plugin/                          # DSH (0.2.2-rc.x) Cordis 插件与控制台前端（~7.3k 行）
 │   ├── package.json & cordis.patch.yml  # Cordis Bundle 注册清单
 │   ├── presets/                         # 6 套子角色专用 DSH Agent Presets
+│   ├── tools/doctor.mjs                 # 环境、Python↔Node 32 工具契约与 DSH 挂载一键自检 CLI
 │   ├── lib/
 │   │   ├── index.js                     # Cordis 注入入口与 greatwall_orchestrate (11 动作) 注册（479 行）
-│   │   ├── orchestrator.js              # 插件编排内核、单待办熔断器与公平并发调度（1,472 行）
-│   │   ├── agent_session_host.js        # ctx.agents.create() 封装与显式模型绑定解析（985 行）
+│   │   ├── orchestrator.js              # 插件编排内核主壳、事件池启停与资源回收（778 行）
+│   │   ├── orchestrator/                # 4 个编排子域（circuit_breaker / dispatch_stage1 / dispatch_stage2 / dispatch_stage3）
+│   │   ├── agent_session_host.js        # ctx.agents.create() 封装、工具白名单与流式运行（747 行）
+│   │   ├── host/model_binding.js        # 显式模型绑定解析、事件流继承、有效窗口与原生工具断言（264 行）
 │   │   ├── pair_lifecycle.js            # 单节点探索者 + 伴随助手暂停续传与交接驱动（547 行）
 │   │   ├── clock_and_turn_gap.js        # TokenMeter 水位采样与 37%/70% 回合间隙控制（276 行）
 │   │   ├── read_isolated_sandbox.js     # 双向隔离路径规范化与 Shell/写操作同步 Guard（486 行）
 │   │   ├── presets.js                   # 6 套角色 Preset 安装与热注册（414 行）
 │   │   ├── prompts.js                   # 7 角色路由表、32 工具白名单与平台 Shell 解析（178 行）
-│   │   ├── mcp_bridge.js                # Node ↔ Python stdio JSON-RPC 2.0 客户端桥接（290 行）
+│   │   ├── mcp_bridge.js                # Node ↔ Python stdio JSON-RPC 2.0 客户端桥接与契约握手（306 行）
 │   │   ├── console_routes.js            # 控制台鉴权 HTTP 路由 /api/greatwall.*（380 行）
-│   │   ├── client.js                    # DSH 右侧栏 React 指挥舱前端原型（1,064 行）
+│   │   ├── client.js                    # DSH 右侧栏 React 指挥舱前端原型（1,064 行，待阶段 2 模块化）
 │   │   └── blackbox_projection.js / fact_log_middleware.js / telemetry.js / skillpack.js
-│   └── test/                            # Node 单测与假模型全链路沙盘测试
-└── tests/                               # Python P0–P4 契约、触发器、执行器与回归测试
+│   └── test/                            # Node 单测、实时契约握手与假模型全链路沙盘测试
+└── tests/                               # Python P0–P4 契约/执行器/回归测试 + test_architecture_contracts.py 防腐门禁
 ```
 
 ---
@@ -178,10 +186,10 @@ greatwall-v6up/
 
 | 工程划分 | 对应逻辑机构 / 角色 | 解决什么问题 | 核心源码模块 |
 |---|---|---|---|
-| **1. 设施工程** | 插件编排内核（Orchestrator）<br>监察委员会（一委：`supervisory_committee`）<br>外围人机接入（Prototype） | 扁平会话拉起与销毁、模型绑定与窗口适配、单待办熔断、版本化裁决同步、双向隔离沙箱、SQLite 单写者真相库、流程合规与终局核签 | [`orchestrator.js`](./greatwall-v6up/dsh_plugin/lib/orchestrator.js)、[`agent_session_host.js`](./greatwall-v6up/dsh_plugin/lib/agent_session_host.js)、[`read_isolated_sandbox.js`](./greatwall-v6up/dsh_plugin/lib/read_isolated_sandbox.js)、[`presets.js`](./greatwall-v6up/dsh_plugin/lib/presets.js)、[`db_schema.py`](./greatwall-v6up/core_python/mcp_server/db_schema.py)、[`control_plane_service.py`](./greatwall-v6up/core_python/mcp_server/control_plane_service.py)、[`tools_supervisory.py`](./greatwall-v6up/core_python/mcp_server/tools_supervisory.py) |
+| **1. 设施工程** | 插件编排内核（Orchestrator）<br>监察委员会（一委：`supervisory_committee`）<br>外围人机接入（Prototype） | 扁平会话拉起与销毁、模型绑定与窗口适配、单待办熔断、版本化裁决同步、双向隔离沙箱、SQLite 单写者真相库、流程合规与终局核签 | [`orchestrator.js`](./greatwall-v6up/dsh_plugin/lib/orchestrator.js) & [`orchestrator/`](./greatwall-v6up/dsh_plugin/lib/orchestrator/)、[`agent_session_host.js`](./greatwall-v6up/dsh_plugin/lib/agent_session_host.js) & [`host/model_binding.js`](./greatwall-v6up/dsh_plugin/lib/host/model_binding.js)、[`read_isolated_sandbox.js`](./greatwall-v6up/dsh_plugin/lib/read_isolated_sandbox.js)、[`presets.js`](./greatwall-v6up/dsh_plugin/lib/presets.js)、[`tool_registry.py`](./greatwall-v6up/core_python/mcp_server/tool_registry.py)、[`db_schema.py`](./greatwall-v6up/core_python/mcp_server/db_schema.py)、[`control_plane/`](./greatwall-v6up/core_python/mcp_server/control_plane/)、[`tools_supervisory.py`](./greatwall-v6up/core_python/mcp_server/tools_supervisory.py) |
 | **2. 仪器科学工程** | 工造司（一部：`works_engineer`） | 科研仪器/诊断探针/计算环境供给、三档同码执行、四态错误隔离（判不了不判负）、四元复合缓存、校准集回归升版与工单闭环 | [`base_instrument.py`](./greatwall-v6up/core_python/evaluators/base_instrument.py)、[`isolated_runner.py`](./greatwall-v6up/core_python/evaluators/isolated_runner.py)、[`tools_works.py`](./greatwall-v6up/core_python/mcp_server/tools_works.py) |
 | **3. 后勤工程** | 后勤工作部（二部：`logistics_coordinator`）<br>一线探索单元（`explorer` ◄─1:1─► `lineage_companion`） | 单节点自适应上下文时钟（`37% / 70%`）、伴随单节点挂起续传、谱系 DAG 与死胡同归档、定额重压缩看板、六类分诊、动态族谱与 `>50%` 无豁免分流、五车道复苏 | [`pair_lifecycle.js`](./greatwall-v6up/dsh_plugin/lib/pair_lifecycle.js)、[`clock_and_turn_gap.js`](./greatwall-v6up/dsh_plugin/lib/clock_and_turn_gap.js)、[`tools_explorer.py`](./greatwall-v6up/core_python/mcp_server/tools_explorer.py)、[`tools_companion.py`](./greatwall-v6up/core_python/mcp_server/tools_companion.py)、[`tools_logistics.py`](./greatwall-v6up/core_python/mcp_server/tools_logistics.py) |
-| **4. 图书馆工程** | 中央图书馆（三部：`library_surveyor` + `library_verifier`） | 外藏 `[R###]` 采编与无解诚实结案、内藏 `L3/L2` 管理、空白沙箱两阶段实测盲审、`Auditor` 异会话打捞、非连坐引用图、Stage 3 五件套与版本绑定终核 | [`tools_library.py`](./greatwall-v6up/core_python/mcp_server/tools_library.py) |
+| **4. 图书馆工程** | 中央图书馆（三部：`library_surveyor` + `library_verifier`） | 外藏 `[R###]` 采编与无解诚实结案、内藏 `L3/L2` 管理、空白沙箱两阶段实测盲审、`Auditor` 异会话打捞、非连坐引用图、Stage 3 五件套与版本绑定终核 | [`tools_surveyor.py`](./greatwall-v6up/core_python/mcp_server/tools_surveyor.py)、[`tools_verifier.py`](./greatwall-v6up/core_python/mcp_server/tools_verifier.py) |
 
 ### 2.3 端到端三阶段科研生命周期（Stage 1–3）
 
@@ -475,8 +483,8 @@ flowchart LR
 
 ### 4.2 编排内核 ↔ Python 真相内核（stdio JSON-RPC 2.0）
 
-- **15 个内部 Single-Writer 控制面原语**（[`greatwall_core_mcp.py`](./greatwall-v6up/core_python/mcp_server/greatwall_core_mcp.py)）：
-  - 启动与配置：`control_plane/init_parse0`、`control_plane/init_epoch`、`control_plane/mark_stage1_works_checked`、`control_plane/sync_public_rulings`；
+- **16 个内部 Single-Writer 控制面原语**（[`greatwall_core_mcp.py`](./greatwall-v6up/core_python/mcp_server/greatwall_core_mcp.py) & [`control_plane/`](./greatwall-v6up/core_python/mcp_server/control_plane/)）：
+  - 启动与配置：`control_plane/init_parse0`、`control_plane/init_epoch`、`control_plane/mark_stage1_works_checked`、`control_plane/sync_public_rulings`、`control_plane/describe_contracts`（只读单源契约快照握手）；
   - 调度与水位：`control_plane/schedule_snapshot`、`control_plane/sync_pressure`、`control_plane/record_pending_handoff`、`control_plane/abort_node`、`control_plane/record_human_stop`；
   - 沙箱、遥测与工单：`control_plane/stage_blind_sandbox`、`control_plane/cleanup_blind_sandbox`、`control_plane/fact_edge`、`control_plane/submit_works_ticket`、`control_plane/recover_heavy_jobs`、`control_plane/ui_inspector`。
 - **统一 MCP 工具回执外壳**：
@@ -498,7 +506,7 @@ flowchart LR
 
 ### 4.3 七大角色 × 32 个窄 MCP 工具精确契约
 
-工具入口强制按会话角色校验白名单（核自 [`greatwall_core_mcp.py`](./greatwall-v6up/core_python/mcp_server/greatwall_core_mcp.py) 与 [`prompts.js`](./greatwall-v6up/dsh_plugin/lib/prompts.js)）：
+工具入口强制按会话角色校验白名单（权威单一契约源位于 [`tool_registry.py`](./greatwall-v6up/core_python/mcp_server/tool_registry.py)，由 [`test_architecture_contracts.py`](./greatwall-v6up/tests/test_architecture_contracts.py) 与 [`doctor.mjs`](./greatwall-v6up/dsh_plugin/tools/doctor.mjs) 强校验与 [`prompts.js`](./greatwall-v6up/dsh_plugin/lib/prompts.js) 及 7 份角色模板 100% 同步）：
 
 | 角色 | 工具名称 | 必填入参 (`required`) | 可选入参 (`optional`) |
 |---|---|---|---|
@@ -555,18 +563,20 @@ flowchart LR
 
 作为 `v0.1-alpha` 早期实验 Demo，本仓库当前到处都是尚未还清的技术债与开放性缺陷，以下全部如实摊开：
 
-1. **数学系背景 + 中层 Vibe Coding 带来的“黑箱与上帝文件”债**  
-   发起者为数学系背景，主要主导顶层构思与机制决策，而 `greatwall-v6up/` 下近 1.8 万行中层代码绝大部分经由 AI 辅助 Vibe Coding 生成，作者对底层实现细节的通盘梳理程度还远远不够。代码库中已堆积多个职责高度混杂的巨型文件：[`control_plane_service.py`](./greatwall-v6up/core_python/mcp_server/control_plane_service.py)（**2,702 行**，把事务、调度快照、沙箱装填、UI 投影揉在一处）、[`orchestrator.js`](./greatwall-v6up/dsh_plugin/lib/orchestrator.js)（**1,472 行**）、[`client.js`](./greatwall-v6up/dsh_plugin/lib/client.js)（**1,064 行**）、[`tools_library.py`](./greatwall-v6up/core_python/mcp_server/tools_library.py)（**1,030 行**）、[`agent_session_host.js`](./greatwall-v6up/dsh_plugin/lib/agent_session_host.js)（**985 行**），同时残留局部脏迹（如 `prompts.js` / `read_isolated_sandbox.js` 仍导出兼容旧名 `ALL_31_MCP_TOOLS`，`db_schema.py` 中 `idx_survey_status` 重复建索引）。
+1. **历史 Vibe Coding 遗留的结构债（后端已首轮解耦，前端与细粒度清理待续）**  
+   发起者为数学系背景，主要主导顶层构思与机制决策，而 `greatwall-v6up/` 下约 1.8 万行中层代码大部分由 AI 辅助生成，早期曾堆积多个千行上帝文件。当前已完成第一阶段零语义漂移结构解耦：[`control_plane_service.py`](./greatwall-v6up/core_python/mcp_server/control_plane_service.py) 已按职责拆分为 [`control_plane/`](./greatwall-v6up/core_python/mcp_server/control_plane/) 下的 6 个无环子域，[`orchestrator.js`](./greatwall-v6up/dsh_plugin/lib/orchestrator.js) 已拆出 4 个 [`orchestrator/`](./greatwall-v6up/dsh_plugin/lib/orchestrator/) 派发与熔断子模块，[`tools_library.py`](./greatwall-v6up/core_python/mcp_server/tools_library.py) 已拆为 [`tools_surveyor.py`](./greatwall-v6up/core_python/mcp_server/tools_surveyor.py) 与 [`tools_verifier.py`](./greatwall-v6up/core_python/mcp_server/tools_verifier.py)，[`agent_session_host.js`](./greatwall-v6up/dsh_plugin/lib/agent_session_host.js) 已拆出 [`host/model_binding.js`](./greatwall-v6up/dsh_plugin/lib/host/model_binding.js)，并补齐 [`tool_registry.py`](./greatwall-v6up/core_python/mcp_server/tool_registry.py) 单一契约源、[`test_architecture_contracts.py`](./greatwall-v6up/tests/test_architecture_contracts.py) 防腐门禁与 [`MODULE_MAP.md`](./greatwall-v6up/MODULE_MAP.md)。但仍留有明显债项：前端指挥舱 [`client.js`](./greatwall-v6up/dsh_plugin/lib/client.js)（**1,064 行**）尚未模块化重构，为保持向后兼容也仍保留 `ALL_31_MCP_TOOLS` 等过渡期导出别名。
 
 2. **多论文拼凑导致的融合不稳与核心假设尚未验证**  
    项目短期内借鉴了十余篇前沿论文与项目机制，概念密度极高、跨模块隐式交互密布，融合后的整体运行稳定性非常差。截至目前的实机测试，绝大部分请求与预算都消耗在控制面与工程事故排查中——**整套多智能体科研制度在零工程事故基线下相对单 Agent 裸跑到底有没有显著净收益，目前仍缺乏干净的受控实验验证。**
 
-3. **整体稳定性不高、易用性差（解耦不足 + System Prompt / Guardrails / Tool Guidance 设计欠佳）**  
-   - **高耦合**：系统模块边界仍不够干净，一处字段或流程微调往往牵动 SQLite DDL、Python MCP Schema、Node 路由表、7 份长 Prompt 模板与测试套件同步修改；
+3. **整体稳定性不高、易用性差（业务流程耦合 + System Prompt / Guardrails / Tool Guidance 设计欠佳）**  
+   - **跨层流程同步成本**：虽然 32 窄工具的名称、角色白名单、只读禁写与长耗时集合已通过 `tool_registry.py`、`control_plane/describe_contracts` 与架构门禁测试闭环防漂移，但新增复杂业务状态字段或阶段跃迁规则时，仍涉及 SQLite DDL、控制面状态机与业务工具多点联动；
    - **提示词与护栏粗糙**：当前 7 套角色的 System Prompt 冗长且格式要求偏刚性，Guardrails 与服务端 `next_step_guidance`（Tool Guidance）设计水平有限，导致系统对基座模型的指令遵循度高度敏感，换用小参数或较弱模型时极易出现参数错位、死循环或状态卡滞。
 
-4. **系统开放性极差（强绑定特定宿主）**  
-   插件控制面深度耦合 `DeepSeek Harness (0.2.2-rc.x)` 的 Cordis 注入服务（`agents / tools / tokenMeter / sessionQuery / agentPresets / connection.fetch`），前端指挥舱 [`client.js`](./greatwall-v6up/dsh_plugin/lib/client.js) 直接依赖 DSH 内部 `window.__ModuleLoader__` 与 `--dsw-*` CSS 变量。目前缺乏抽象的跨宿主运行时适配层，无法独立运行，也难以迁移到其他 Agent Harness。
+4. **与 DSH 生态的工程化融合不足 & 尚未抽象跨宿主运行时适配层**  
+   本项目选择构建在 **DeepSeek Harness（DSH）** 的 Cordis 插件生态之上——设计原则是**绝不侵入修改 DSH 原生工具与宿主正常功能，同时充分利用 DSH 繁荣的插件生态、Preset 体系与原生 UI 能力，以降低分发推广与社区协作门槛**。当前在这方面的局限并非“用了 DSH”，而是两点工程不足：
+   - **对 DSH 原生生态能力挖掘不充分**：例如前端指挥舱 [`client.js`](./greatwall-v6up/dsh_plugin/lib/client.js) 仍停留在无构建链手写原型阶段，直接依赖内部全局加载器 `window.__ModuleLoader__` 与 `--dsw-*` 变量，尚未充分工程化使用 DSH 的标准 UI 原语、插件配置项（Schemastery `Config`）与多槽位交互能力；
+   - **暂缺跨宿主运行时适配层**：插件控制面目前直接调用 DSH Cordis 注入服务（`agents / tools / tokenMeter / sessionQuery / agentPresets / connection.fetch`），尚未抽离面向 ACP 或独立 CLI 的轻量抽象适配层，因此目前无法脱离 DSH 独立运行。
 
 5. **未解的核心科学与运行难题：非标量梯度缺失、算力消耗与收敛性**  
    - **非标量梯度缺失**：纯数学证明、反例构造或开放机理探索缺乏客观标量反馈时如何有效引导搜索，本项目至今没有根本解法；

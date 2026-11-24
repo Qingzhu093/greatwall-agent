@@ -3,13 +3,13 @@
 **English** | [简体中文](./README.md)
 
 > **An open-source multi-agent experimental base for long-horizon, multi-school concurrent autonomous scientific discovery**  
-> **Release Status**: `v0.1.0-alpha.3` (Early Experimental Demo · **Not a production-ready tool**)  
+> **Release Status**: `v0.1.0-alpha.4` (Early Experimental Demo · **Stage 1 backend decoupling, not yet manually code-reviewed** · **Not a production-ready tool**)  
 > **License**: [Apache License 2.0](./LICENSE) + [DCO 1.1](./CONTRIBUTING.md#三许可证与-dcodeveloper-certificate-of-origin签署要求) ｜ **Runtime Stack**: [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) `>= 0.2.2-rc.5` × Python `3.11+` × [MCP](https://modelcontextprotocol.io)
 
 ---
 
 > ⚠️ **Candid Upfront Notice**  
-> This project is currently at a very early **`v0.1.0-alpha.3`** experimental stage. The codebase (~18k LOC) still carries noticeable technical debt, tightly coupled large files, application-level soft-sandbox security limitations, and a rough prototype UI. Moreover, the multi-agent research governance mechanisms have not yet undergone clean controlled ablation experiments under zero engineering-incident baselines (see [`ARCHITECTURE.md §5`](./ARCHITECTURE.md#5-已知技术债与当前局限) for full details).  
+> This project is currently at a very early **`v0.1.0-alpha.4`** experimental stage (note: the Stage 1 structural decoupling changes in `alpha.4` have **not yet been manually reviewed line-by-line**, and have only been verified via automated unit and architecture contract tests). While the backend thousand-line god files have been decomposed, the codebase still carries a rough prototype UI (`client.js` pending modular rewrite), application-level soft-sandbox security limitations, and under-utilized DSH native UI capabilities. Moreover, the multi-agent research governance mechanisms have not yet undergone clean controlled ablation experiments under zero engineering-incident baselines (see [`ARCHITECTURE.md §5`](./ARCHITECTURE.md#5-已知技术债与当前局限) for full details).  
 > We are open-sourcing it now under **Apache 2.0 + DCO** to turn frontier AI for Science multi-agent architectures into a runnable, hackable, and co-evolvable experimental testbed. Dissections, reproductions, critiques, and collaborations are warmly welcomed.
 
 ---
@@ -43,7 +43,7 @@ flowchart LR
 
 Logically, a deterministic external orchestration kernel coordinates a flat check-and-balance governance model (**1 Supervisory Committee + 3 Functional Ministries + Front-line Exploration Units**). In software implementation, it converges into four orthogonal engineering pillars:
 
-| Engineering Pillar | Logical Role / Organ | Core Mechanisms (`v0.1.0-alpha.3` Implemented) |
+| Engineering Pillar | Logical Role / Organ | Core Mechanisms (`v0.1.0-alpha.4` Implemented) |
 | :--- | :--- | :--- |
 | **1. Infrastructure** | Orchestrator Kernel (`Orchestrator`)<br>Supervisory Committee (`supervisory_committee`)<br>Console UI Prototype (`Console UI`) | Rootless flat short-session scheduling (`ctx.agents.create()`); explicit model-binding startup gate; adaptive context window `W = min(500k, model_ctx)`; 2-strike no-progress circuit breaker per todo item; versioned public rulings (`spec_revision`); bidirectional isolation sandboxes; SQLite WAL Single-Writer truth store (19 tables + 2 FTS5 + 3 hard business triggers) |
 | **2. Instrumentation Science** | Works Engineer (`works_engineer`)<br>Isolated Runner (`isolated_runner.py`) | Unified `evaluate(artifact, spec, tier)` 3-tier same-code protocol (`probe / official / heavy`); 4-state physical isolation (`INSTRUMENT_ERROR / INFRA_ERROR` incur zero penalty and auto-open repair tickets); 4-tuple composite caching; self-declared calibration set regression; version-domain comparability & on-demand re-evaluation |
@@ -64,6 +64,7 @@ All 7 roles access **32 single-responsibility narrow tools** strictly via role-w
 | **[`ROADMAP.md`](./ROADMAP.md)** | Problem ledger and P0–P3 evolution plans (UI & `SuperAgent` controller, decoupling, container strong sandboxes, `Harness²`, dual-track KB, open research issues) |
 | **[`REFERENCES.md`](./REFERENCES.md)** | Complete bibliography of academic papers, engineering blogs, open-source projects, and open protocols (`✅ Implemented` vs `🗺️ Roadmap`) |
 | **[`docs/paper_study/README.md`](./docs/paper_study/README.md)** | Frontier Paper Study Archive (37 in-depth Chinese reviews & figures covering the papers, engineering blogs, and official prompts in `REFERENCES.md` for background context) |
+| **[`greatwall-v6up/MODULE_MAP.md`](./greatwall-v6up/MODULE_MAP.md)** | One-page module map (backend domain boundaries, architectural invariants, and verification/doctor commands) |
 | **[`CONTRIBUTING.md`](./CONTRIBUTING.md)** | Contribution guide, Apache 2.0 + DCO 1.1 (`git commit -s`) sign-off requirements, and PR guidelines |
 | [`greatwall-v6up/dsh_plugin/README.md`](./greatwall-v6up/dsh_plugin/README.md) | DSH `0.2.2-rc.5` plugin migration guide and Preset details |
 
@@ -125,9 +126,9 @@ greatwall-agent/
 
 ## Current Limitations (Full List in `ARCHITECTURE.md §5`)
 
-- **Coupling & Large-File Debt**: Several thousand-line modules (e.g., `control_plane_service.py`, `orchestrator.js`, `client.js`) need domain-driven splitting and decoupling.
+- **Frontend & Remaining Refactoring Debt**: Backend thousand-line god files were split with cross-language contract gates in `v0.1.0-alpha.4`, while the cockpit UI prototype (`client.js`) still awaits modular refactoring.
 - **Application-Layer Soft Sandbox**: The current desktop sandbox relies on path normalization and command interception, lacking OS-kernel resource limits and isolation (Docker / WSL2 + cgroups).
-- **Single-Host Coupling & Prototype UI**: Tightly bound to DSH Cordis service APIs, with a rough right-sidebar cockpit and controller UX.
+- **Under-utilized DSH Native Capabilities & Prototype UI**: Built non-intrusively on top of the DSH Cordis plugin ecosystem (without modifying DSH core behavior), yet native DSH UI primitives/config schemas remain under-utilized and no cross-host runtime adapter exists yet.
 - **Controlled Empirical Validation Pending**: Net gains of the multi-agent governance protocol over bare single-agent baselines on open-ended tasks—and gradient guidance for non-scalar scientific problems—remain under active investigation.
 
 ---

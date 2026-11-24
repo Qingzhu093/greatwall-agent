@@ -53,6 +53,8 @@ export class GreatwallMcpBridge {
     this._stderrTail = []
     /** @type {Array<object> | null} */
     this._cachedToolSchemas = null
+    /** @type {Record<string, any> | null} */
+    this._cachedContracts = null
   }
 
   /** 根据工具名与参数（如 tier）解析分层超时毫秒数。 */
@@ -204,7 +206,21 @@ export class GreatwallMcpBridge {
   }
 
   /**
-   * 调用 31 窄工具（剥离模型伪造字段，双通道注入可信宿主 `_meta` 并应用分级超时）。
+   * 拉取 Python 权威单一契约源（`tool_registry.py`）导出的角色工具表、只读拦截表与超时标记。
+   * @param {boolean} [forceRefresh=false]
+   * @returns {Promise<Record<string, any> | null>}
+   */
+  async describeContracts(forceRefresh = false) {
+    if (this._cachedContracts && !forceRefresh) return this._cachedContracts
+    await this.ensureStarted()
+    const res = await this._rpc('control_plane/describe_contracts', {})
+    const data = res?.ok && res?.data ? res.data : null
+    if (data) this._cachedContracts = data
+    return data
+  }
+
+  /**
+   * 调用 32 窄工具（剥离模型伪造字段，双通道注入可信宿主 `_meta` 并应用分级超时）。
    * @param {string} name
    * @param {object} args
    * @param {{ workspaceRoot?: string, role: string, sessionId: string }} trustedCtx

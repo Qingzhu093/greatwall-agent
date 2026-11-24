@@ -1,12 +1,12 @@
 /**
- * 长城 V6-Up (v3.0) 外部无状态异步事件池编排器：
+ * 长城 V6-Up (v3.0) 外部无状态异步事件池编排器主入口。
  *
- * 严格遵循 v3.0 顶层架构与 09 工程说明书（钱学森工程控制论原则：简洁、确定性、单一真源）：
- * 1. 启动强制显式模型绑定拒启门禁（`MISSING_MODEL_BINDING`），同步自适应窗口 `W = min(500k, model_window)` 至宿主机与 SQLite；
- * 2. 纯 SQLite 轮询快照 (`<50ms`) 驱动 Stage 1（含固定统一一次 `works_engineer` 初始核查）-> Stage 2 -> Stage 3 两步联合终核；
- * 3. 单条待办项级 2 次无客观进展熔断器（`GovernanceItemCircuitBreaker`）：按单项跟踪客观指纹，不误杀分步推进项、不连坐同队列其他健康项；
- * 4. 极简确定性人机控制：`pause / resume / stop / human_stop / abort_node`（彻底移除运行时 `steer` 广播与记忆队列）；
- * 5. 单节点伴随暂停续传、70% 硬跑两步交接（SQLite 单源持久化 `will_md`，取消内存双账本）与独立空白盲审沙箱。
+ * 职责划分（子模块位于 `./orchestrator/`）：
+ * - `orchestrator/circuit_breaker.js`：单条待办项熔断器、探索者合法性过滤与客观指纹构造；
+ * - `orchestrator/dispatch_stage1.js`：Stage 1 (Parse 0) 四步初始化派发；
+ * - `orchestrator/dispatch_stage2.js`：Stage 2 待交接恢复、五类治理角色与探索者并发派发；
+ * - `orchestrator/dispatch_stage3.js`：Stage 3 退修重导、盲审终核与监察联合终签派发；
+ * - 本文件：编排器生命周期控制（start / pause / resume / stop / humanStop / abortNode / submitWorksTicket / syncPublicRulings）与极简主循环骨架。
  * @module dsh-greatwall-v6up/orchestrator
  */
 import crypto from 'node:crypto'
@@ -15,173 +15,19 @@ import { loadCoreRuntimeConfig, loadRolePrompts } from './prompts.js'
 import { ensurePresetsInstalled } from './presets.js'
 import { TelemetryCollector } from './telemetry.js'
 import { AgentSessionHost, resolveAuthoritativeModelBinding } from './agent_session_host.js'
+import { disposeNodeCompanion, driveExplorerCompanionPair } from './pair_lifecycle.js'
 import {
-  disposeNodeCompanion,
-  driveExplorerCompanionPair,
-  runHandoffWithCompanion,
-  runPreSpawnBriefingWithCompanion,
-} from './pair_lifecycle.js'
+  GovernanceItemCircuitBreaker,
+  selectDispatchableExplorers,
+} from './orchestrator/circuit_breaker.js'
+import { dispatchStage1Step } from './orchestrator/dispatch_stage1.js'
+import {
+  dispatchPendingHandoffRecoveries,
+  dispatchStage2Step,
+} from './orchestrator/dispatch_stage2.js'
+import { dispatchStage3Step } from './orchestrator/dispatch_stage3.js'
 
-/**
- * 单条待办项级无客观进展熔断器（对齐 09 §2.2 第 6 条）：
- * - 同一条待办项连续 `maxStalledRuns`（默认 2）次被调度后客观指纹毫无变化，才仅挂起该单项；
- * - 若该项取得任何可核验客观进展（指纹变化）或离队，计数立刻归零；
- * - 同队列其他健康待办项完全不受影响；外部状态改变或人工 `resume` 时自动复位。
- */
-export class GovernanceItemCircuitBreaker {
-  constructor(maxStalledRuns = 2) {
-    this.maxStalledRuns = Math.max(1, Number(maxStalledRuns) || 2)
-    /** @type {Map<string, { stalledCount: number, lastFingerprint: string, broken: boolean, brokenAt: string | null }>} */
-    this._items = new Map()
-  }
-
-  /**
-   * 依据最新快照指纹判断某项是否已被熔断；若外部状态变化（指纹不同）则自动复位解除熔断！
-   * @param {string} itemKey
-   * @param {string} currentFingerprint
-   */
-  isBroken(itemKey, currentFingerprint) {
-    const rec = this._items.get(itemKey)
-    if (!rec) return false
-    if (rec.lastFingerprint && currentFingerprint && rec.lastFingerprint !== currentFingerprint) {
-      this._items.delete(itemKey)
-      return false
-    }
-    return rec.broken
-  }
-
-  /**
-   * 在某批待办项执行完毕并拉取新快照后，按单条项逐一评估是否取得客观进展。
-   * @param {Array<{ key: string, beforeFp: string }>} dispatchedItems
-   * @param {Map<string, string>} afterFpMap 仍在队列中的待办项最新指纹表（不在表中表示已出队完成）
-   * @returns {Array<{ key: string, stalledCount: number, newlyBroken: boolean }>}
-   */
-  evaluateBatch(dispatchedItems, afterFpMap) {
-    const results = []
-    for (const { key, beforeFp } of dispatchedItems || []) {
-      if (!afterFpMap.has(key)) {
-        this._items.delete(key)
-        continue
-      }
-      const afterFp = String(afterFpMap.get(key) || '')
-      if (afterFp !== String(beforeFp || '')) {
-        // 虽未出队但已产生可核验客观进展，计数清零绝不误熔断
-        this._items.set(key, {
-          stalledCount: 0,
-          lastFingerprint: afterFp,
-          broken: false,
-          brokenAt: null,
-        })
-        results.push({ key, stalledCount: 0, newlyBroken: false })
-        continue
-      }
-      const prev = this._items.get(key)
-      const nextCount = (prev?.stalledCount || 0) + 1
-      const wasBroken = Boolean(prev?.broken)
-      const nowBroken = nextCount >= this.maxStalledRuns
-      this._items.set(key, {
-        stalledCount: nextCount,
-        lastFingerprint: afterFp,
-        broken: nowBroken,
-        brokenAt: nowBroken ? (prev?.brokenAt || new Date().toISOString()) : null,
-      })
-      results.push({ key, stalledCount: nextCount, newlyBroken: nowBroken && !wasBroken })
-    }
-    return results
-  }
-
-  resetAll() {
-    this._items.clear()
-  }
-
-  getBrokenItems() {
-    const out = []
-    for (const [key, rec] of this._items.entries()) {
-      if (rec.broken) {
-        out.push({ key, stalledCount: rec.stalledCount, brokenAt: rec.brokenAt })
-      }
-    }
-    return out
-  }
-}
-
-/**
- * 纯函数过滤本轮合法可派发的探索者节点（严格实施 `triage_locked_branches` 防抢跑与 `human_stop_active` 拦截，
- * 且遵循无人值守红灯策略：`ambiguous_spec_alerts` 绝不阻塞继续派单）。
- * @param {any} snap
- * @param {Set<string>} runningExplorerIds
- * @param {number} [slotCapOverride]
- */
-export function selectDispatchableExplorers(snap, runningExplorerIds = new Set(), slotCapOverride = null) {
-  if (!snap || snap.human_stop_active || snap.closure_gate?.closure_allowed) return []
-  const slotCap = Math.max(1, Number(slotCapOverride || snap.slot_cap || 6))
-  const lockedBranches = new Set(snap.triage_locked_branches || [])
-  const candidates = []
-  let occupied = runningExplorerIds.size
-  for (const node of snap.explorers_ready_to_run || []) {
-    if (occupied >= slotCap) break
-    if (!node || !node.node_id) continue
-    if (runningExplorerIds.has(node.node_id)) continue
-    if (node.branch_id && lockedBranches.has(node.branch_id)) continue
-    candidates.push(node)
-    occupied += 1
-  }
-  return candidates
-}
-
-/** 为快照中各治理队列的每一条独立待办构造可核验客观指纹映射（严格单条隔离，不受同队列他项进出影响）。 */
-function buildWorksItemFingerprints(snap) {
-  const map = new Map()
-  const instFpById = new Map()
-  for (const s of snap?.active_instruments_fingerprint || []) {
-    const id = String(s || '').split(':', 1)[0]
-    if (id) instFpById.set(id, String(s))
-  }
-  for (const inst of snap?.unhealthy_instruments || []) {
-    const k = `works:inst:${inst.instrument_id}`
-    map.set(k, `inst:v${inst.version}:err=${inst.consecutive_error_count}:${inst.updated_at || ''}`)
-  }
-  for (const t of snap?.open_works_tickets || []) {
-    const k = `works:ticket:${t.ticket_id}`
-    // 仅绑定本工单自身状态及其直接关联的单个 instrument_id，严禁受其他无关仪器变动干扰
-    const boundInstFp = t.instrument_id ? (instFpById.get(String(t.instrument_id)) || '') : ''
-    map.set(k, `tkt:${t.updated_at || ''}:${t.payload_json || ''}|inst=${boundInstFp}`)
-  }
-  for (const rv of snap?.pending_revalidation || []) {
-    const k = `works:reval:${rv.queue_id}`
-    map.set(k, `reval:${rv.obs_id}:v${rv.target_version}:${rv.updated_at || ''}`)
-  }
-  return map
-}
-
-function buildSurveyItemFingerprints(snap) {
-  const map = new Map()
-  for (const r of snap?.pending_surveys || []) {
-    const id = r.req_id || r.request_id
-    if (!id) continue
-    // 仅绑定单条查新单自身状态，严禁被同批其他查新单入卡计数重置计数
-    map.set(`survey:${id}`, `req:${id}:${r.status || 'PENDING'}`)
-  }
-  return map
-}
-
-function buildTriageItemFingerprints(snap) {
-  const map = new Map()
-  for (const n of snap?.awaiting_triage || []) {
-    if (!n?.node_id) continue
-    map.set(`triage:${n.node_id}`, `triage:${n.node_id}:${n.family_id || ''}:${n.evidence_grade || ''}`)
-  }
-  return map
-}
-
-function buildReviewItemFingerprints(snap) {
-  const map = new Map()
-  for (const r of snap?.pending_reviews || []) {
-    if (!r?.review_id) continue
-    map.set(`review:${r.review_id}`, `rev:${r.review_id}:${r.review_status || ''}`)
-  }
-  return map
-}
+export { GovernanceItemCircuitBreaker, selectDispatchableExplorers }
 
 export class GreatwallOrchestrator {
   constructor({
@@ -340,7 +186,7 @@ export class GreatwallOrchestrator {
       }
     }
 
-    // 1. 显式模型绑定硬门禁（F1：未解析到明确 provider/model 一律拒启，绝不跌落未授权默认模型！）
+    // 1. 显式模型绑定硬门禁（未解析到明确 provider/model 一律拒启，绝不跌落未授权默认模型）
     const binding = await this._resolveAndLockModelBinding({
       explicitOptions: agentOptions,
       callerAgent,
@@ -544,9 +390,7 @@ export class GreatwallOrchestrator {
     }
   }
 
-  /**
-   * 主控显式同步工作区 `rulings/` 补充裁决文档（升版 spec_revision 并可选刷新活跃 Worktree），无需暂停重启。
-   */
+  /** 主控显式同步工作区 `rulings/` 补充裁决文档（升版 spec_revision 并可选刷新活跃 Worktree）。 */
   async syncPublicRulings(refreshActiveWorktrees = false) {
     const dbRes = await this.bridge.control('control_plane/sync_public_rulings', {
       workspace_root: this.workspaceRoot,
@@ -840,7 +684,7 @@ export class GreatwallOrchestrator {
       }
       this._syncSlotsToTelemetry(snap.stage)
 
-      // 红灯口径歧义告警：记入遥测留待人类核查，**绝不停摆继续推进原已签口径！**
+      // 红灯口径歧义告警：记入遥测留待人类核查，绝不停摆继续推进原已签口径
       for (const al of snap.ambiguous_spec_alerts || []) {
         if (al?.alert_id && !this._seenAmbiguousAlertIds.has(al.alert_id)) {
           this._seenAmbiguousAlertIds.add(al.alert_id)
@@ -852,565 +696,27 @@ export class GreatwallOrchestrator {
         }
       }
 
-      let dispatchedSomething = false
+      // 0. 待交接/崩溃抢救恢复
+      let dispatchedSomething = dispatchPendingHandoffRecoveries(this, snap, sig)
 
-      // 0. SQLite 单真源待交接/崩溃抢救恢复（彻底取消内存双账本）
-      //    若 pending_handoff_mode === 'HANDOFF_70' 但未落库亲笔遗嘱（will_md/explorer_will_md 均空），降级为 CRASH_RECOVERY 并如实标注原文缺失
-      for (const pnode of snap.pending_handoff_nodes || []) {
-        if (this._runningExplorers.has(pnode.node_id)) continue
-        const recKey = `recover:${pnode.node_id}`
-        const recFp = `${pnode.pending_handoff_mode}:${pnode.updated_at || ''}`
-        if (this._itemBreaker.isBroken(recKey, recFp)) continue
-        const persistedWill = String(pnode.will_md || pnode.explorer_will_md || '').trim()
-        const effMode =
-          pnode.pending_handoff_mode === 'HANDOFF_70' && persistedWill
-            ? 'HANDOFF_70'
-            : 'CRASH_RECOVERY'
-        const effReason =
-          pnode.pending_handoff_mode === 'HANDOFF_70' && !persistedWill
-            ? 'host_restart_before_will_persisted'
-            : (pnode.pending_handoff_reason || 'host_restart_recovery')
-
-        if (this._launchGovTask(`recover_handoff:${pnode.node_id}`, async () => {
-          await runHandoffWithCompanion(this, pnode, {
-            mode: effMode,
-            explorerWillText: persistedWill,
-            interruptReason: effReason,
-            signal: sig,
-          })
-          this._handoffsSinceHeartbeat += 1
-          await this._evaluateBreakerAfterTask(
-            'lineage_companion',
-            [{ key: recKey, beforeFp: recFp }],
-            (nextSnap) => new Map(
-              (nextSnap?.pending_handoff_nodes || []).map((n) => [
-                `recover:${n.node_id}`,
-                `${n.pending_handoff_mode}:${n.updated_at || ''}`,
-              ]),
-            ),
-          )
-        })) {
-          dispatchedSomething = true
-        }
-      }
-
-      // Stage 1: Parse 0 初始化与门禁放行（含固定统一一次 works_engineer 初始核查）
-      if (snap.stage === 'STAGE1_PARSE0') {
-        if (!snap.parse0_signed) {
-          this.telemetry.recordEvent('waiting_parse0_signature', {})
-          await this._waitWakeOrTimeout(500)
-          continue
-        }
-
-        // 1.1 固定统一核查一次 works_engineer（初始仪器非空则逐台就绪；为空则确认无仪器后落标 stage1_works_checked=1）
-        if (!snap.stage1_works_checked) {
-          const missingInsts = snap.missing_initial_instruments || []
-          const stage1WorksItems = missingInsts.length > 0
-            ? missingInsts.map((m, idx) => ({
-                key: `works:stage1:${m.instrument_id || m.id || idx}`,
-                beforeFp: `missing:${JSON.stringify(m)}|insts=${JSON.stringify(snap.active_instruments_fingerprint || [])}`,
-              }))
-            : [{ key: 'works:stage1:empty_check', beforeFp: 'unchecked:empty' }]
-          const activeStage1Items = stage1WorksItems.filter((it) => !this._itemBreaker.isBroken(it.key, it.beforeFp))
-
-          if (activeStage1Items.length > 0) {
-            dispatchedSomething = true
-            await this._launchGovTaskAndAwaitIfSync('stage1:works_check', async () => {
-              await this.spawnAndRunAgent({
-                role: 'works_engineer',
-                uiLabel: missingInsts.length > 0
-                  ? `[科研仪器科] Stage1 初始仪器锻造 (${missingInsts.length}项)`
-                  : '[科研仪器科] Stage1 初始核查确认',
-                shortTransaction: false,
-                signal: sig,
-                taskContextText: `### Parse 0 课题目标\n${snap.goal_and_completion_md || ''}\n### 待就绪初始仪器清单\n${JSON.stringify(missingInsts, null, 2)}`,
-                prompt: missingInsts.length > 0
-                  ? `Stage 1 初始仪器核查：请调用 get_works_engineering_queue(question_id="ALL")，为 Parse 0 声明且尚未激活的初始仪器 ${JSON.stringify(missingInsts)} 逐一编写脚本与校准集并调用 register_question_instrument 完成激活（请优先严格使用声明中的 instrument_id，不要随意增删 inst_ 前缀）。`
-                  : 'Stage 1 统一初始仪器核查：Parse 0 未声明初始仪器（如纯理论/推导课题）。请调用一次 get_works_engineering_queue(question_id="ALL") 确认当前无需锻造初始仪器后直接正常返回，控制面将自动标记 stage1_works_checked=1 推进后续流程。',
-              })
-              // 控制面客观测验全部初始仪器是否已激活（或初始清单为空），达标即落标 stage1_works_checked=1
-              const checkRes = await this.bridge.control('control_plane/mark_stage1_works_checked', {
-                workspace_root: this.workspaceRoot,
-              })
-              if (!checkRes?.data?.stage1_works_checked) {
-                await this._evaluateBreakerAfterTask('works_engineer', activeStage1Items, (nextSnap) => {
-                  const m = new Map()
-                  if (!nextSnap?.stage1_works_checked) {
-                    const rem = nextSnap?.missing_initial_instruments || []
-                    if (rem.length > 0) {
-                      rem.forEach((x, i) => m.set(
-                        `works:stage1:${x.instrument_id || x.id || i}`,
-                        `missing:${JSON.stringify(x)}|insts=${JSON.stringify(nextSnap.active_instruments_fingerprint || [])}`,
-                      ))
-                    } else {
-                      m.set('works:stage1:empty_check', 'unchecked:empty')
-                    }
-                  }
-                  return m
-                })
-              }
-            })
-            continue
-          }
-        }
-
-        // 1.2 外藏文献预建卡
-        if (Number(snap.external_literature_count || 0) === 0) {
-          const s1Key = 'stage1:surveyor'
-          const s1Fp = 'ext_count=0'
-          if (!this._itemBreaker.isBroken(s1Key, s1Fp)) {
-            dispatchedSomething = true
-            await this._launchGovTaskAndAwaitIfSync('stage1:surveyor', async () => {
-              await this.spawnAndRunAgent({
-                role: 'library_surveyor',
-                uiLabel: '[图书馆采编] 开局文献建卡',
-                shortTransaction: false,
-                signal: sig,
-                taskContextText: `### Parse 0 课题目标\n${snap.goal_and_completion_md || ''}`,
-                prompt: `Stage 1 开局外藏建设：请围绕 Parse 0 子题 ${JSON.stringify(snap.required_questions || [])} 的核心机理与背景文献，调研并发布至少 1 张高密度外藏卡片 [R001]（调 publish_external_literature_card；outcome="CARD_PUBLISHED"，support_scope 严格使用 5 项英文枚举之一，read_depth 使用英文枚举，abstract_md 长度 60–1500 字）。成功入库后即可收尾放行编排。`,
-              })
-              await this._evaluateBreakerAfterTask('library_surveyor', [{ key: s1Key, beforeFp: s1Fp }], (nextSnap) => {
-                const m = new Map()
-                if (Number(nextSnap?.external_literature_count || 0) === 0) m.set(s1Key, 'ext_count=0')
-                return m
-              })
-            })
-            continue
-          }
-        }
-
-        // 1.3 后勤按需开枝
-        if (snap.questions_needing_branch?.length > 0) {
-          const branchItems = snap.questions_needing_branch.map((q) => ({ key: `stage1:branch:${q}`, beforeFp: `need:${q}` }))
-          const activeBranchItems = branchItems.filter((it) => !this._itemBreaker.isBroken(it.key, it.beforeFp))
-          if (activeBranchItems.length > 0) {
-            dispatchedSomething = true
-            await this._launchGovTaskAndAwaitIfSync('stage1:logistics_init', async () => {
-              await this.spawnAndRunAgent({
-                role: 'logistics_coordinator',
-                uiLabel: '[后勤总管] 开局按需开枝',
-                shortTransaction: false,
-                signal: sig,
-                taskContextText: `### Parse 0 课题目标\n${snap.goal_and_completion_md || ''}\n### 子题解锁状态\n${JSON.stringify(snap.question_order_status || {}, null, 2)}`,
-                prompt: `Stage 1 初始调度：请先调用 get_logistics_dashboard(question_id="ALL")，按课题本质（纯理论/数值/反例等）为已解锁子题 ${JSON.stringify(snap.questions_needing_branch)} 登记贴合机理的方法学派 (register_method_family) 并按需 fork_branch 开启初始分支（不强制固定学派数，禁止为凑数造伪学派）。`,
-              })
-              await this._evaluateBreakerAfterTask('logistics_coordinator', activeBranchItems, (nextSnap) =>
-                new Map((nextSnap?.questions_needing_branch || []).map((q) => [`stage1:branch:${q}`, `need:${q}`])),
-              )
-            })
-            continue
-          }
-        }
-
-        // 1.4 监察委 Parse 0 门禁放行
-        const gateKey = 'stage1:gate'
-        const gateFp = `stage:${snap.stage}`
-        if (!this._itemBreaker.isBroken(gateKey, gateFp)) {
-          dispatchedSomething = true
-          await this._launchGovTaskAndAwaitIfSync('stage1:gate', async () => {
-            await this.spawnAndRunAgent({
-              role: 'supervisory_committee',
-              uiLabel: '[监察委员会] Parse0 门禁',
-              shortTransaction: false,
-              signal: sig,
-              prompt: '请调用 get_supervisory_audit_snapshot 核验 Parse 0 六项启动表单已签署与开局就绪，调用 record_compliance_check(stage="PARSE0_GATE", status="PASSED", blocking_questions=[], notes="Parse 0 合规放行") 进入 STAGE2_EVOLVE。',
-            })
-            await this._evaluateBreakerAfterTask('supervisory_committee', [{ key: gateKey, beforeFp: gateFp }], (nextSnap) => {
-              const m = new Map()
-              if (nextSnap?.stage === 'STAGE1_PARSE0') m.set(gateKey, `stage:${nextSnap.stage}`)
-              return m
-            })
-          })
-          continue
-        }
-      }
-
-      // Stage 3 两步联合终核与退修闭环状态机
-      if (snap.stage3_revision_pending) {
-        const latestDid = snap.closure_state?.latest_delivery_id || ''
-        const revNotes = snap.closure_state?.verifier_revision_notes || '请修正边界表述与复现一致性'
-        const deliveryMode = snap.closure_state?.delivery_mode || (snap.human_stop_active ? 'PARTIAL_ON_HUMAN_STOP' : 'FULL')
-        const revKey = `stage3:revise:${latestDid}`
-        const revFp = `revise:${latestDid}`
-        if (!this._itemBreaker.isBroken(revKey, revFp)) {
-          if (this._launchGovTask(revKey, async () => {
-            await this.spawnAndRunAgent({
-              role: 'library_surveyor',
-              uiLabel: `[图书馆采编] Stage3 退修重导 ${latestDid}`,
-              shortTransaction: false,
-              signal: sig,
-              taskContextText: `### 盲审终核退修意见 (${latestDid})\n${revNotes}`,
-              prompt: `盲审官已将 Stage 3 交付包 ${latestDid} 退修 (REVISION_REQUESTED)！请逐条核查上述退修意见，调 get_survey_requests(question_id="ALL") 对齐最新 L3 范围与复现节点，修正论文后调用 export_stage3_final_delivery(delivery_mode="${deliveryMode}", ...) 导出全新版本交付包。`,
-            })
-            await this._evaluateBreakerAfterTask('library_surveyor', [{ key: revKey, beforeFp: revFp }], (nextSnap) => {
-              const m = new Map()
-              if (nextSnap?.stage3_revision_pending && nextSnap?.closure_state?.latest_delivery_id === latestDid) {
-                m.set(revKey, revFp)
-              }
-              return m
-            })
-          })) {
-            dispatchedSomething = true
-          }
-        }
-        await this._waitWakeOrTimeout(250)
+      // 1. Stage 1 (Parse 0) 初始化四步
+      const s1 = await dispatchStage1Step(this, snap, sig)
+      if (s1.handled) {
+        if (s1.waitMs) await this._waitWakeOrTimeout(s1.waitMs)
         continue
       }
 
-      if (snap.stage3_final_audit_pending) {
-        const latestDid = snap.closure_state?.latest_delivery_id || ''
-        const auditRevId = `STAGE3_FINAL_AUDIT:${latestDid}`
-        const auditKey = `stage3:final_audit:${latestDid}`
-        const auditFp = `audit:${latestDid}`
-        if (!this._itemBreaker.isBroken(auditKey, auditFp)) {
-          if (this._launchGovTask(auditKey, async () => {
-            const staged = await this.bridge.control('control_plane/stage_blind_sandbox', {
-              workspace_root: this.workspaceRoot,
-              review_id: auditRevId,
-            })
-            const sandboxPath = staged?.data?.sandbox_abs_path || ''
-            try {
-              await this.spawnAndRunAgent({
-                role: 'library_verifier',
-                sessionId: `gw_ver_s3_${crypto.randomUUID().slice(0, 6)}`,
-                sandboxAbsPath: sandboxPath,
-                uiLabel: `[图书馆盲审] Stage3 终稿终核 ${latestDid}`,
-                shortTransaction: true,
-                signal: sig,
-                taskContextText: sandboxPath
-                  ? `### 独立只读终核沙箱（含交付包副本与 verified_l3_scopes.json）\n- sandbox_abs_path: \`${sandboxPath}\``
-                  : '',
-                prompt: `Stage 3 终稿独立核验：请在只读沙箱内对照 verified_l3_scopes.json 审阅 final_delivery/ 副本（版本 ${latestDid}），核对所有引用 [L3-###]/[Obs-###]/[R###] 溯源真实、范围未夸大后，调用 submit_stage2_unblind_verdict(review_id="${auditRevId}", final_verdict="ACCEPT" 或 "REVISE", title="...", abstract_md="...") 落库。`,
-              })
-            } finally {
-              await this.bridge
-                .control('control_plane/cleanup_blind_sandbox', {
-                  workspace_root: this.workspaceRoot,
-                  review_id: auditRevId,
-                })
-                .catch(() => {})
-            }
-            await this._evaluateBreakerAfterTask('library_verifier', [{ key: auditKey, beforeFp: auditFp }], (nextSnap) => {
-              const m = new Map()
-              if (nextSnap?.stage3_final_audit_pending && nextSnap?.closure_state?.latest_delivery_id === latestDid) {
-                m.set(auditKey, auditFp)
-              }
-              return m
-            })
-          })) {
-            dispatchedSomething = true
-          }
-        }
-        await this._waitWakeOrTimeout(250)
+      // 2. Stage 3 两步联合终核与退修闭环
+      const s3 = dispatchStage3Step(this, snap, sig)
+      if (s3.handled) {
+        await this._waitWakeOrTimeout(s3.waitMs || 250)
         continue
       }
 
-      if (snap.stage3_supervisory_sign_pending) {
-        const latestDid = snap.closure_state?.latest_delivery_id || ''
-        const signKey = `stage3:sign:${latestDid}`
-        const signFp = `sign:${latestDid}`
-        if (!this._itemBreaker.isBroken(signKey, signFp)) {
-          if (this._launchGovTask(signKey, async () => {
-            await this.spawnAndRunAgent({
-              role: 'supervisory_committee',
-              uiLabel: `[监察委员会] 联合终签 ${latestDid}`,
-              shortTransaction: false,
-              signal: sig,
-              prompt: `盲审官已完成最新版交付包 (${latestDid}) 独立终核！请调用 get_supervisory_audit_snapshot 确认版本哈希匹配，调用 record_compliance_check(stage="CLOSURE_GATE", status="PASSED", blocking_questions=[], notes="三项版本匹配校验通过，正式结项") 晋升 CLOSED_VERIFIED。`,
-            })
-            await this._evaluateBreakerAfterTask('supervisory_committee', [{ key: signKey, beforeFp: signFp }], (nextSnap) => {
-              const m = new Map()
-              if (nextSnap?.stage3_supervisory_sign_pending && nextSnap?.closure_state?.latest_delivery_id === latestDid) {
-                m.set(signKey, signFp)
-              }
-              return m
-            })
-          })) {
-            dispatchedSomething = true
-          }
-        }
-        await this._waitWakeOrTimeout(250)
-        continue
-      }
-
-      // Stage 2: 1) PRE_SPAWN 同节点伴随写看板并挂起保活（受 slot_cap 约束 + 单节点防自旋熔断）
-      const effSlotCap = Math.max(1, Number(maxConcurrentWorkers || snap.slot_cap || 6))
-      const runningBriefings = [...this._runningGov.keys()].filter((k) => k.startsWith('brief:')).length
-      const readyWaitingCount = (snap.explorers_ready_to_run || []).filter((n) => !this._runningExplorers.has(n.node_id)).length
-      let availBriefSlots = Math.max(0, effSlotCap - this._runningExplorers.size - runningBriefings - readyWaitingCount)
-      for (const node of snap.explorers_needing_briefing || []) {
-        if (availBriefSlots <= 0) break
-        const bKey = `brief:${node.node_id}`
-        const bFp = `brief:${node.node_id}:${node.updated_at || ''}`
-        if (this._itemBreaker.isBroken(bKey, bFp)) continue
-        if (this._launchGovTask(bKey, async () => {
-          await runPreSpawnBriefingWithCompanion(this, node, { signal: sig })
-          await this._evaluateBreakerAfterTask('lineage_companion', [{ key: bKey, beforeFp: bFp }], (nextSnap) =>
-            new Map((nextSnap?.explorers_needing_briefing || []).map((n) => [`brief:${n.node_id}`, `brief:${n.node_id}:${n.updated_at || ''}`])),
-          )
-        })) {
-          dispatchedSomething = true
-          availBriefSlots -= 1
-        }
-      }
-
-      // 2) 外藏查新需求响应（修复 r.req_id 列名 + 单条查新请求级熔断，不连坐健康查新单）
-      const surveyFpMap = buildSurveyItemFingerprints(snap)
-      const activeSurveyItems = []
-      for (const [k, fp] of surveyFpMap.entries()) {
-        if (!this._itemBreaker.isBroken(k, fp)) {
-          activeSurveyItems.push({ key: k, beforeFp: fp, reqId: k.slice('survey:'.length) })
-        }
-      }
-      if (activeSurveyItems.length > 0) {
-        const reqIds = activeSurveyItems.map((it) => it.reqId)
-        if (this._launchGovTask('survey:pending', async () => {
-          await this.spawnAndRunAgent({
-            role: 'library_surveyor',
-            uiLabel: `[图书馆采编] 响应查新 (${reqIds.length}单)`,
-            shortTransaction: false,
-            signal: sig,
-            prompt: `待采编外部文献请求 ${JSON.stringify(reqIds)} 已就绪，请先调 get_survey_requests(question_id="ALL") 查看问题与检索词：若找到真实来源，调 publish_external_literature_card(outcome="CARD_PUBLISHED", ..., fulfilled_request_ids=...) 写入外藏卡片 [R###]；若确认资料客观不存在或违背合规边界，严禁造伪卡，请调 publish_external_literature_card(outcome="UNAVAILABLE_REPORT", question_id=..., fulfilled_request_ids=..., unavailable_reason_md=...) 诚实结案为 CLOSED_UNAVAILABLE。`,
-          })
-          await this._evaluateBreakerAfterTask('library_surveyor', activeSurveyItems, buildSurveyItemFingerprints)
-        })) {
-          dispatchedSomething = true
-        }
-      }
-
-      // 3) 科研仪器科：熔断修复 / 痛点工单 / Stage B 离线重评（按单条待办项独立熔断，不连坐健康工单）
-      const worksFpMap = buildWorksItemFingerprints(snap)
-      const activeWorksItems = []
-      for (const [k, fp] of worksFpMap.entries()) {
-        if (!this._itemBreaker.isBroken(k, fp)) {
-          activeWorksItems.push({ key: k, beforeFp: fp })
-        }
-      }
-      if (activeWorksItems.length > 0) {
-        const unhealthyInsts = (snap.unhealthy_instruments || []).filter(
-          (i) => !this._itemBreaker.isBroken(`works:inst:${i.instrument_id}`, worksFpMap.get(`works:inst:${i.instrument_id}`) || ''),
-        )
-        const activeTickets = (snap.open_works_tickets || []).filter(
-          (t) => !this._itemBreaker.isBroken(`works:ticket:${t.ticket_id}`, worksFpMap.get(`works:ticket:${t.ticket_id}`) || ''),
-        )
-        if (this._launchGovTask('works:queue', async () => {
-          await this.spawnAndRunAgent({
-            role: 'works_engineer',
-            uiLabel: unhealthyInsts.length > 0
-              ? `[科研仪器科] 仪器熔断修复 (${unhealthyInsts.map((i) => i.instrument_id).join(',')})`
-              : `[科研仪器科] 工单与重评 (${activeWorksItems.length}项)`,
-            shortTransaction: false,
-            signal: sig,
-            taskContextText: [
-              unhealthyInsts.length > 0 ? `### 连续报错熔断仪器清单\n${JSON.stringify(unhealthyInsts, null, 2)}` : '',
-              activeTickets.length > 0 ? `### 本次需处置工单 ID 列表\n${JSON.stringify(activeTickets.map((t) => t.ticket_id))}` : '',
-            ].filter(Boolean).join('\n\n'),
-            prompt: '请调用 get_works_engineering_queue(question_id="ALL") 检查熔断仪器、痛点工单与 pending_revalidation 队列：对故障或需升版仪器调用 upgrade_instrument_with_calibration（或 register_question_instrument）；对待重评旧观测调 recompute_stage_b_only；对每条已处理或无需改动的工单必须显式调用 resolve_works_ticket(ticket_id, resolution="RESOLVED"|"WONTFIX"|"DUPLICATE", resolution_note) 结案！',
-          })
-          await this._evaluateBreakerAfterTask('works_engineer', activeWorksItems, buildWorksItemFingerprints)
-        })) {
-          dispatchedSomething = true
-        }
-      }
-
-      // 4) 后勤总管：分诊 AWAITING_TRIAGE + 无豁免聚拢分流 + 已解锁无分支子题派单 + 孤儿盲审返工单续接 + 缺编正交学派补齐（闭环响应监察委 ALERT）
-      const triageFpMap = buildTriageItemFingerprints(snap)
-      const activeTriageItems = []
-      for (const [k, fp] of triageFpMap.entries()) {
-        if (!this._itemBreaker.isBroken(k, fp)) {
-          activeTriageItems.push({ key: k, beforeFp: fp })
-        }
-      }
-      const concAlerts = (snap.family_concentration_alerts || []).filter(
-        (a) => !this._itemBreaker.isBroken(`conc:${a.question_id}:${a.family_id}`, `cnt=${a.branch_count_in_family}/${a.total_active_branches}`),
-      )
-      const needQs = (snap.questions_needing_branch || []).filter(
-        (q) => !this._itemBreaker.isBroken(`need_branch:${q}`, `need:${q}`),
-      )
-      const orphanedRevs = (snap.orphaned_blind_review_revisions || []).filter(
-        (r) => !this._itemBreaker.isBroken(`orphan_rev:${r.review_id}`, `orphan:${r.review_id}:${r.source_node_id}`),
-      )
-      const understaffedQs = (snap.understaffed_questions || []).filter(
-        (u) => !this._itemBreaker.isBroken(
-          `understaffed:${u.question_id}`,
-          `active=${u.active_branch_count}:missing=${(u.missing_active_family_ids || []).join(',')}`,
-        ),
-      )
-      const supAlert = snap.active_supervisory_alert || null
-      const logisticsItems = [
-        ...activeTriageItems,
-        ...concAlerts.map((a) => ({
-          key: `conc:${a.question_id}:${a.family_id}`,
-          beforeFp: `cnt=${a.branch_count_in_family}/${a.total_active_branches}`,
-        })),
-        ...needQs.map((q) => ({ key: `need_branch:${q}`, beforeFp: `need:${q}` })),
-        ...orphanedRevs.map((r) => ({
-          key: `orphan_rev:${r.review_id}`,
-          beforeFp: `orphan:${r.review_id}:${r.source_node_id}`,
-        })),
-        ...understaffedQs.map((u) => ({
-          key: `understaffed:${u.question_id}`,
-          beforeFp: `active=${u.active_branch_count}:missing=${(u.missing_active_family_ids || []).join(',')}`,
-        })),
-      ]
-      if (logisticsItems.length > 0) {
-        const triageCount = activeTriageItems.length
-        const uiActionLabel = triageCount > 0
-          ? `分诊(${triageCount})`
-          : (orphanedRevs.length > 0
-              ? `续接盲审返工(${orphanedRevs.map((r) => r.review_id).join(',')})`
-              : (concAlerts.length > 0
-                  ? '正交分流'
-                  : (understaffedQs.length > 0
-                      ? `补齐正交分支(${understaffedQs.map((u) => u.question_id).join(',')})`
-                      : `派单(${needQs.join(',')})`)))
-        if (this._launchGovTask('logistics:triage', async () => {
-          await this.spawnAndRunAgent({
-            role: 'logistics_coordinator',
-            uiLabel: `[后勤总管] ${uiActionLabel}`,
-            shortTransaction: false,
-            signal: sig,
-            taskContextText: [
-              supAlert ? `### [监察委员会合规告警与纠偏指令] (${supAlert.alert_id})\n${supAlert.notes || ''}` : '',
-              concAlerts.length > 0 ? `### 学派聚拢红线告警 (>=2 且 >50%，无高产豁免)\n${JSON.stringify(concAlerts, null, 2)}` : '',
-              orphanedRevs.length > 0 ? `### 孤儿盲审返工单（原分支已被中止/断代，必须用 fork_branch 继承快照与返工单！）\n${JSON.stringify(orphanedRevs, null, 2)}` : '',
-              understaffedQs.length > 0 ? `### 正交学派断代缺编告警（单线独苗退化，请补齐多 Worktree 并行探索）\n${JSON.stringify(understaffedQs, null, 2)}` : '',
-              snap.latest_spec_revision > 0 ? `### 最新公开裁决版本 v${snap.latest_spec_revision}\n${snap.latest_ruling_summary_md || ''}` : '',
-            ].filter(Boolean).join('\n\n'),
-            prompt: [
-              '请调用 get_logistics_dashboard(question_id="ALL") 查看全卷待分诊节点、方法学派分布、断代分支（stalled_or_aborted_branches）、孤儿盲审返工单（orphaned_blind_review_revisions）、最新公开裁决版本与并发槽位利用率（slot_utilization）：',
-              triageCount > 0 ? `- 现有 ${triageCount} 个节点处于 AWAITING_TRIAGE（其分支已被硬锁禁止抢跑），请逐一调用 triage_node 做出裁决（注意：LEVEL_2 原地修补不得跨学派吞并消灭原正交学派；发现特异新侧面可判 LEVEL_3 / SPAWN_PROTECTED 派生受保护新 Worktree）；` : '',
-              orphanedRevs.length > 0 ? `- 存在 ${orphanedRevs.length} 条孤儿盲审返工单（${orphanedRevs.map((r) => `${r.review_id} -> parent_node_id="${r.source_node_id}", target_family_id="${r.family_id}"`).join('; ')}）：请立即调用 fork_branch(question_id=..., parent_node_id=..., fork_mode="lateral", target_family_id=...) 继承其快照与返工单继续冲刺二次盲审！` : '',
-              understaffedQs.length > 0 ? `- 子题 ${understaffedQs.map((u) => `${u.question_id}(缺编学派: ${(u.missing_active_family_ids || []).join(',')})`).join('; ')} 发生单线独苗退化且有空闲并发槽位：请调用 fork_branch(fork_mode="orthogonal" | "lateral") 补齐缺编正交学派的探索 Worktree！` : '',
-              concAlerts.length > 0 ? `- 触发学派聚拢红线告警（>=2 分支且占比 >50%，严禁高产豁免），请立即登记新正交学派并通过 fork_branch(fork_mode="orthogonal") 分流！` : '',
-              needQs.length > 0 ? `- 子题 ${needQs.join(', ')} 尚无活跃探索分支，请按需开枝。` : '',
-            ].filter(Boolean).join('\n'),
-          })
-          this._handoffsSinceHeartbeat += Math.max(1, triageCount)
-          await this._evaluateBreakerAfterTask('logistics_coordinator', logisticsItems, (nextSnap) => {
-            const m = buildTriageItemFingerprints(nextSnap)
-            for (const a of nextSnap?.family_concentration_alerts || []) {
-              m.set(`conc:${a.question_id}:${a.family_id}`, `cnt=${a.branch_count_in_family}/${a.total_active_branches}`)
-            }
-            for (const q of nextSnap?.questions_needing_branch || []) {
-              m.set(`need_branch:${q}`, `need:${q}`)
-            }
-            for (const r of nextSnap?.orphaned_blind_review_revisions || []) {
-              m.set(`orphan_rev:${r.review_id}`, `orphan:${r.review_id}:${r.source_node_id}`)
-            }
-            for (const u of nextSnap?.understaffed_questions || []) {
-              m.set(`understaffed:${u.question_id}`, `active=${u.active_branch_count}:missing=${(u.missing_active_family_ids || []).join(',')}`)
-            }
-            return m
-          })
-        })) {
-          dispatchedSomething = true
-        }
-      }
-
-      // 5) 图书馆盲审官：独立空白沙箱两阶段盲审（单审稿单独立熔断）
-      const reviewFpMap = buildReviewItemFingerprints(snap)
-      for (const rev of snap.pending_reviews || []) {
-        const rKey = `review:${rev.review_id}`
-        const rFp = reviewFpMap.get(rKey) || `rev:${rev.review_id}:${rev.review_status}`
-        if (this._itemBreaker.isBroken(rKey, rFp)) continue
-        if (this._launchGovTask(rKey, async () => {
-          await this._runBlindReviewWithSandbox(rev, sig)
-          await this._evaluateBreakerAfterTask('library_verifier', [{ key: rKey, beforeFp: rFp }], buildReviewItemFingerprints)
-        })) {
-          dispatchedSomething = true
-        }
-      }
-
-      // 6) 停滞五车道重排
-      if (snap.stagnation_triggered) {
-        const stagKey = 'logistics:stagnation'
-        const stagFp = 'stagnation:1'
-        if (!this._itemBreaker.isBroken(stagKey, stagFp)) {
-          if (this._launchGovTask(stagKey, async () => {
-            await this.spawnAndRunAgent({
-              role: 'logistics_coordinator',
-              uiLabel: '[后勤总管] 停滞五车道重排',
-              shortTransaction: false,
-              signal: sig,
-              prompt: '连续无 L1 产出停滞看门狗已触发！请立即调用 get_logistics_dashboard 与 dispatch_stagnation_five_lanes 执行五车道正交重排。',
-            })
-            await this._evaluateBreakerAfterTask('logistics_coordinator', [{ key: stagKey, beforeFp: stagFp }], (nextSnap) => {
-              const m = new Map()
-              if (nextSnap?.stagnation_triggered) m.set(stagKey, stagFp)
-              return m
-            })
-          })) {
-            dispatchedSomething = true
-          }
-        }
-      }
-
-      // 7) 监察委周期心跳审计（有新交接/分诊/节点中止进展时按频次或 3 分钟节律触发；单线长跑期每 10 分钟保底巡检一次，0 探索者闲置时绝不空转）
-      const nowMs = Date.now()
-      const hasActiveExploration = this._runningExplorers.size > 0
-      if (
-        snap.stage === 'STAGE2_EVOLVE' &&
-        (this._handoffsSinceHeartbeat >= 3 ||
-          (this._handoffsSinceHeartbeat > 0 && this._lastHeartbeatAt > 0 && nowMs - this._lastHeartbeatAt > 180_000) ||
-          (hasActiveExploration && this._lastHeartbeatAt > 0 && nowMs - this._lastHeartbeatAt > 600_000))
-      ) {
-        if (this._launchGovTask('supervisory:heartbeat', async () => {
-          this._handoffsSinceHeartbeat = 0
-          this._lastHeartbeatAt = Date.now()
-          await this.spawnAndRunAgent({
-            role: 'supervisory_committee',
-            uiLabel: '[监察委员会] Stage2 心跳审计',
-            shortTransaction: false,
-            signal: sig,
-            prompt: '执行 STAGE2_HEARTBEAT 周期审计：请调 get_supervisory_audit_snapshot 核对流程合规、watchdog_anomalies（孤儿盲审返工单、单线独苗退化/正交学派缺编、Probe 失败率、仪器熔断）、聚拢告警與最新公开裁决版本；若 watchdog_anomalies 非空请调 record_compliance_check(stage="STAGE2_HEARTBEAT", status="ALERT", blocking_questions=..., notes=...) 触发闭环纠偏，否则调 status="PASSED" 或 "ALERT_AMBIGUOUS_SPEC" 落库。',
-          })
-        })) {
-          dispatchedSomething = true
-        }
-      }
-      if (this._lastHeartbeatAt === 0) this._lastHeartbeatAt = nowMs
-
-      // 8) 检查 Stage 2 结题放行
-      if (
-        snap.closure_gate?.closure_allowed &&
-        snap.stage === 'STAGE2_EVOLVE' &&
-        closureSt === 'OPEN' &&
-        this._runningExplorers.size === 0 &&
-        !this._runningGov.has('stage3:export')
-      ) {
-        const deliveryMode = snap.closure_gate?.mode || (snap.human_stop_active ? 'PARTIAL_ON_HUMAN_STOP' : 'FULL')
-        const expKey = `stage3:export:${deliveryMode}`
-        const expFp = `export:${deliveryMode}:OPEN`
-        if (!this._itemBreaker.isBroken(expKey, expFp)) {
-          dispatchedSomething = true
-          await this._launchGovTaskAndAwaitIfSync('stage3:export', async () => {
-            await this.spawnAndRunAgent({
-              role: 'library_surveyor',
-              uiLabel: `[图书馆采编] Stage3 五件套导出 (${deliveryMode})`,
-              shortTransaction: false,
-              signal: sig,
-              prompt: `Stage 2 结题门禁已放行 (delivery_mode="${deliveryMode}")！请调用 get_survey_requests(question_id="ALL") 获取全卷已审 L3_VERIFIED 列表与溯源信息，严禁混入未过盲审草稿，撰写正式综合论文并调用 export_stage3_final_delivery(delivery_mode="${deliveryMode}", ...) 导出 final_delivery 五件套，进入两步联合终核。`,
-            })
-            await this._evaluateBreakerAfterTask('library_surveyor', [{ key: expKey, beforeFp: expFp }], (nextSnap) => {
-              const m = new Map()
-              if ((nextSnap?.closure_state?.status || 'OPEN') === 'OPEN' && nextSnap?.stage === 'STAGE2_EVOLVE') {
-                m.set(expKey, expFp)
-              }
-              return m
-            })
-          })
-          continue
-        }
-      }
-
-      // 9) 探索者并发派发（严守 triage_locked_branches 防抢跑、human_stop_active 与 closure_gate 收口停新派）
-      const runningIds = new Set(this._runningExplorers.keys())
-      const readyNodes = selectDispatchableExplorers(snap, runningIds, maxConcurrentWorkers)
-      for (const node of readyNodes) {
-        dispatchedSomething = true
-        this._launchExplorerWorker(node, snap, sig)
-      }
+      // 3. Stage 2 治理与并发探索派发
+      const s2 = await dispatchStage2Step(this, snap, sig, maxConcurrentWorkers)
+      if (s2.dispatched) dispatchedSomething = true
+      if (s2.continueImmediate) continue
 
       const hasCoolingGov = [...this._govCooldownUntil.values()].some((until) => until > Date.now())
       if (!dispatchedSomething && this._runningExplorers.size === 0 && this._runningGov.size === 0 && !hasCoolingGov) {

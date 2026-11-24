@@ -1,6 +1,6 @@
 /**
- * V6-Up (v3.0) 七大标准角色契约、31 窄工具角色路由表与平台感知原生工具白名单。
- * 零外部第三方依赖，直接从 ../core_python 权威资产直读。
+ * V6-Up (v3.0) 七大标准角色契约、32 窄工具角色路由表与平台感知原生工具白名单。
+ * 权威单一契约源位于 `core_python/mcp_server/tool_registry.py`；本表由架构门禁测试强制校验 100% 同步。
  * @module dsh-greatwall-v6up/prompts
  */
 import fs from 'node:fs'
@@ -27,7 +27,7 @@ export const ROLE_EFFORT_MAP = Object.freeze({
   supervisory_committee: 'low',
 })
 
-/** 每个角色专属的 3–5 个单一职责窄工具精确白名单（总计 31 个，100% 对齐 agent_kb/05 §0.2）。 */
+/** 每个角色专属的 3–6 个单一职责窄工具精确白名单（总计 32 个，与 `tool_registry.py` 100% 同步）。 */
 export const ROLE_MCP_TOOLS = Object.freeze({
   explorer: Object.freeze([
     'run_isolated_eval',

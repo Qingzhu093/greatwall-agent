@@ -1,4 +1,4 @@
-"""长城 V6-Up (v3.0) MCP 公共核心辅助：配置加载、31 窄工具 RBAC、统一 JSON 回执、时钟信号与夜科学题库解析。"""
+"""长城 V6-Up (v3.0) MCP 公共核心辅助：配置加载、32 窄工具 RBAC、统一 JSON 回执、时钟信号与夜科学题库解析。"""
 
 from __future__ import annotations
 
@@ -20,74 +20,11 @@ from .db_schema import (
     rw_immediate_tx,
     utc_now_iso,
 )
-
-# 7 大角色唯一授权的 31 个单一职责窄工具白名单（v3.0 唯一权威映射，与 agent_kb/05 100% 对齐）
-ALLOWED_TOOLS_BY_ROLE: dict[str, frozenset[str]] = {
-    "explorer": frozenset(
-        {
-            "run_isolated_eval",
-            "query_library_catalog",
-            "get_library_entry",
-            "request_literature_survey",
-            "read_lineage_graph",
-        }
-    ),
-    "lineage_companion": frozenset(
-        {
-            "get_companion_context",
-            "save_lineage_briefing",
-            "record_reflection_and_unlock_pull",
-            "submit_node_handoff",
-        }
-    ),
-    "logistics_coordinator": frozenset(
-        {
-            "get_logistics_dashboard",
-            "register_method_family",
-            "triage_node",
-            "fork_branch",
-            "dispatch_stagnation_five_lanes",
-        }
-    ),
-    "library_surveyor": frozenset(
-        {
-            "get_survey_requests",
-            "publish_external_literature_card",
-            "export_stage3_final_delivery",
-        }
-    ),
-    "library_verifier": frozenset(
-        {
-            "get_blind_manuscript",
-            "submit_stage1_blind_ledger",
-            "get_unblinded_manuscript_and_peers",
-            "submit_stage2_unblind_verdict",
-            "propose_salvaged_lemma",
-        }
-    ),
-    "works_engineer": frozenset(
-        {
-            "get_works_engineering_queue",
-            "register_question_instrument",
-            "upgrade_instrument_with_calibration",
-            "recompute_stage_b_only",
-            "update_skill_ledger",
-            "resolve_works_ticket",
-        }
-    ),
-    "supervisory_committee": frozenset(
-        {
-            "get_supervisory_audit_snapshot",
-            "check_stage2_closure_gate",
-            "record_compliance_check",
-            "register_saved_graph_query",
-        }
-    ),
-}
-
-ALL_TOOL_NAMES: frozenset[str] = frozenset().union(*ALLOWED_TOOLS_BY_ROLE.values())
-# 向后兼容别名（含 resolve_works_ticket 后共 32 个窄工具）
-ALL_31_TOOL_NAMES: frozenset[str] = ALL_TOOL_NAMES
+from .tool_registry import (
+    ALL_31_TOOL_NAMES,
+    ALL_TOOL_NAMES,
+    ALLOWED_TOOLS_BY_ROLE,
+)
 
 _SQL_WRITE_FORBIDDEN_RE = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|ATTACH|DETACH|PRAGMA|VACUUM|REINDEX)\b",

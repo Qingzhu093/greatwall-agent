@@ -28,12 +28,14 @@
   "files": [
     "lib",
     "presets",
+    "tools",
     "locale/*.json",
     "cordis.patch.yml",
     "README.md"
   ],
   "scripts": {
-    "test": "node --test --test-reporter=spec test/*.test.mjs"
+    "test": "node --test --test-reporter=spec test/*.test.mjs",
+    "doctor": "node ./tools/doctor.mjs"
   },
   "dsh": {
     "bundle": {

@@ -10,13 +10,15 @@ import { fileURLToPath } from 'node:url'
 
 import {
   ALL_31_MCP_TOOLS,
+  ALL_MCP_TOOLS,
   CANONICAL_ROLES,
   ROLE_MCP_TOOLS,
+  TURN_CONCLUDING_TOOLS,
   resolvePlatformAllowedTools,
   resolvePlatformShellTool,
 } from '../lib/prompts.js'
 import { PRESET_DEFINITIONS, ROLE_TO_PRESET, buildDeclarativePresetConfigs } from '../lib/presets.js'
-import { createSandboxCallEvaluator } from '../lib/read_isolated_sandbox.js'
+import { READONLY_BLOCKED_MCP_TOOLS, createSandboxCallEvaluator } from '../lib/read_isolated_sandbox.js'
 import {
   evaluateContextClockTrigger,
   sampleAgentContextPressure,
@@ -29,7 +31,7 @@ import {
   resolveAuthoritativeModelBinding,
   resolveEffectiveContextWindow,
 } from '../lib/agent_session_host.js'
-import { GreatwallMcpBridge } from '../lib/mcp_bridge.js'
+import { GreatwallMcpBridge, LONG_RUNNING_MCP_TOOLS } from '../lib/mcp_bridge.js'
 import {
   driveExplorerCompanionPair,
   runPreSpawnBriefingWithCompanion,
@@ -1316,6 +1318,36 @@ test('25. 活跃仪器 default_spec_json.interface_hint 自动渲染进探索者
     assert.ok(capturedTaskCtx.includes('LOCATOR_EVAL'))
     assert.ok(capturedTaskCtx.includes('接口约定: 脚本须向 stdout 输出含 {"error_max": float} 的 JSON'))
   } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('26. GreatwallMcpBridge.describeContracts 实时握手与 Node 静态契约 100% 一致', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_v3_contracts_'))
+  const dataDir = path.join(tmpRoot, 'plugin_data')
+  fs.mkdirSync(dataDir, { recursive: true })
+  const bridge = new GreatwallMcpBridge({
+    corePythonRoot: CORE_PYTHON_ROOT,
+    workspaceRoot: tmpRoot,
+    dataDir,
+    requestTimeoutMs: 15_000,
+  })
+  try {
+    const snap1 = await bridge.describeContracts()
+    const pyAll = Object.values(snap1.role_mcp_tools || {}).flat().sort()
+    assert.equal(snap1.tool_count, 32)
+    assert.deepEqual(pyAll, [...ALL_MCP_TOOLS].sort())
+    assert.deepEqual([...snap1.readonly_blocked_mcp_tools].sort(), [...READONLY_BLOCKED_MCP_TOOLS].sort())
+    assert.deepEqual([...snap1.long_running_mcp_tools].sort(), [...LONG_RUNNING_MCP_TOOLS].sort())
+    assert.deepEqual([...snap1.turn_concluding_tools].sort(), [...TURN_CONCLUDING_TOOLS].sort())
+    for (const role of CANONICAL_ROLES) {
+      assert.deepEqual([...(snap1.role_mcp_tools[role] || [])].sort(), [...ROLE_MCP_TOOLS[role]].sort())
+    }
+    // 二次调用默认走内存缓存返回同一引用
+    const snap2 = await bridge.describeContracts()
+    assert.strictEqual(snap2, snap1)
+  } finally {
+    await bridge.dispose()
     fs.rmSync(tmpRoot, { recursive: true, force: true })
   }
 })

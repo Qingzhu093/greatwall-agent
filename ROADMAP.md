@@ -34,13 +34,13 @@
 
 ## 0. 现状锚点与演进优先级总览
 
-在 [`ARCHITECTURE.md §5`](./ARCHITECTURE.md#5-已知技术债与当前局限) 中，我已经把当前 `v0.1-alpha` 暴露出的技术债全部如实摊开：千行级上帝文件、低解耦、单宿主绑定、软沙箱、简陋原型 UI，以及**整套多智能体科研制度尚未在零工程事故基线下跑出过一次干净的受控对比实验**。
+在 [`ARCHITECTURE.md §5`](./ARCHITECTURE.md#5-已知技术债与当前局限) 中，我已经把当前 `v0.1-alpha` 暴露出的技术债如实摊开：虽然阶段 1 已完成后端千行上帝文件拆解与跨层契约防腐门禁，但依然存在前端原型简陋、软沙箱无资源限额、对 DSH 原生能力挖掘不充分，以及**整套多智能体科研制度尚未在零工程事故基线下跑出过一次干净的受控对比实验**等硬伤。
 
 遵循钱学森《工程控制论》的克制原则，后续演进最忌讳“旧问题还没修稳，又把几篇新论文一口气硬塞进代码库”。因此，本文虽然涵盖了大量从底层止血到前沿探索的构想，但在实际推进上坚持严格的四层优先级节奏：
 
 | 优先级 | 阶段定位 | 核心目标（先立后破，绝不贪大求全） |
 | :---: | :--- | :--- |
-| **P0** | **止血、解耦与干净基线实证** | 补齐容器/资源限额沙箱（杜绝子节点拖死宿主机）；拆解最高耦合的核心底座；在零工程事故下跑通干净的对照实验，先验证长城这套多智能体制度相对单 Agent 裸跑究竟有没有净收益。 |
+| **P0** | **止血、解耦与干净基线实证** | 巩固阶段 1 后端模块化拆解与契约门禁；补齐容器/资源限额沙箱（杜绝子节点拖死宿主机）；在零工程事故下跑通干净的对照实验，先验证长城这套多智能体制度相对单 Agent 裸跑究竟有没有净收益。 |
 | **P1** | **人机体验与底层易用性重构** | 重做 UI 美术与交互；借鉴 DSH `SuperAgent` 重塑鸡肋主控；按脚手架分层重构 `System Prompt / Tool Guidance / Guardrails`；优化探索者执行模式（PTC / `ObservationPack`）与短窗口适配。 |
 | **P2** | **工造司守正升级与双轨知识探索** | 在**完整保留现有工造司全部优势**的前提下，吸收 `Harness²` 思路引入“双信号驱动 + 局部轨迹对比（Mini-Probe）+ 工造司跨课题轻量经验库”，形成工造司层面的工具级 RSI 闭环。 |
 | **P3** | **全面开放生态与前沿开放研究** | 构建“科研标准插座”（MCP / Agent Skills / Plugin / Lean 4 / Biomni / 开源科学技能库）；推进 ACP 与跨宿主适配、异构模型群、全局收敛调度，以及开放 Verifier 真空与后勤群体拓扑的系统性实验。 |
@@ -92,10 +92,10 @@
 
 **整个系统的解耦程度太低，这是目前制约稳定性、迭代速度和社区协作的最大工程病灶。**
 
-现在的代码库虽然在文档上划出了四大工程，但在真实代码里依然存在严重的“牵一发而动全身”：
-- **上帝文件与职责混杂**：[`control_plane_service.py`](./greatwall-v6up/core_python/mcp_server/control_plane_service.py)（2,702 行）把数据库事务、调度快照、盲审沙箱装填和 UI 数据投影揉在一起；[`orchestrator.js`](./greatwall-v6up/dsh_plugin/lib/orchestrator.js)（1,472 行）把事件循环、并发槽位、熔断器、阶段切换与角色路由缠在一起；
-- **跨层隐式强耦合**：一旦微调某个状态字段、工具参数或流程规则，往往必须同时手动修改 SQLite DDL、Python MCP 工具代码、Schema 增强器、Node 编排器路由表、7 份长篇角色 System Prompt 模板以及测试套件——任何一处漏改都会在运行态引爆隐蔽故障；
-- **业务逻辑与宿主胶水层粘连**：状态机推演逻辑与 DSH 特有接口（`ctx.agents`、`tokenMeter`、`sessionQuery`）耦合过深，既难以在脱离 DSH 的环境里做独立演进，也让第三方开发者望而却步。
+现在的代码库虽然在文档上划出了四大工程，但在早期版本里曾存在严重的“牵一发而动全身”（目前阶段 1 已完成后端结构拆解与契约门禁，但中高层解耦仍需持续推进）：
+- **上帝文件拆解进展与剩余项**：原 2,702 行 `control_plane_service.py` 已拆分为 [`control_plane/`](./greatwall-v6up/core_python/mcp_server/control_plane/) 下 6 个无环子域，原 1,472 行 [`orchestrator.js`](./greatwall-v6up/dsh_plugin/lib/orchestrator.js) 已拆出 4 个 [`orchestrator/`](./greatwall-v6up/dsh_plugin/lib/orchestrator/) 子模块，原 1,030 行 `tools_library.py` 已拆分为 `tools_surveyor.py` / `tools_verifier.py`，[`agent_session_host.js`](./greatwall-v6up/dsh_plugin/lib/agent_session_host.js) 已拆出 [`host/model_binding.js`](./greatwall-v6up/dsh_plugin/lib/host/model_binding.js)；但前端 [`client.js`](./greatwall-v6up/dsh_plugin/lib/client.js)（1,064 行）仍待阶段 2 模块化重写；
+- **跨层契约同步与剩余耦合**：32 窄工具的名称、角色白名单、只读禁写与长耗时集合已收口至单一契约源 [`tool_registry.py`](./greatwall-v6up/core_python/mcp_server/tool_registry.py)，并通过 `control_plane/describe_contracts`、[`test_architecture_contracts.py`](./greatwall-v6up/tests/test_architecture_contracts.py) 与 [`tools/doctor.mjs`](./greatwall-v6up/dsh_plugin/tools/doctor.mjs) 实现自动化防腐；但更深层的业务状态字段演进与 7 份长 Prompt 模板之间仍存在较高的手改同步成本；
+- **清晰划分与 DSH 宿主层的协作边界**：我们的原则是**绝不侵入修改 DSH 原生工具与宿主正常功能，同时充分依托 DSH 繁荣的 Cordis 插件生态（Preset、UI 原语、原生工具与生态分发）做好协作与推广**；在此前提下，把纯科研状态机逻辑与宿主胶水层边界划清，既便于第三方开发者在 DSH 插件内顺畅协作，也为未来按需扩展其他运行时留出余地。
 
 **深度解耦的重构目标**，是把整套底座彻底切分成边界干净、契约单一的独立层次：
 
@@ -103,17 +103,17 @@
 flowchart TB
     UX["人机交互层 (独立解耦)\n美观可控的 UI 前端  ×  借鉴 SuperAgent 的人机主控"]
     Runtime["抽象运行时适配层 (Runtime Adapter)\n屏蔽宿主差异：DSH Adapter / ACP Adapter / 独立 CLI"]
-    Core["核心编排与状态内核 (Host-Agnostic)\n纯确定性调度引擎  +  拆分后的模块化石墨状态库 (SQLite)"]
+    Core["核心编排与状态内核 (Host-Agnostic)\n纯确定性调度引擎  +  拆分后的模块化状态库 (SQLite)"]
     Scaffold["解耦的角色脚手架层 (Harness Surface)\n极简 System Prompt / Guardrails / Tool Guidance / 按需 Skills / Scripts"]
     Plug["开放科研插件生态层 (科研标准插座)\nMCP 工具 · Agent Skills · 领域验证器 · 容器沙箱后端"]
 
     UX --> Runtime --> Core --> Scaffold --> Plug
 ```
 
-具体要做的核心拆解包括：
-1. **拆解上帝文件**：将 `control_plane_service.py` 按领域拆分为独立的事务存储、盲审沙箱装填、调度快照投影与 UI 只读视图模块；将 `orchestrator.js` 拆分为纯状态机决策与异步执行调度；
-2. **单一契约源（Single Source of Truth）**：探索用统一的声明式契约生成工具白名单、JSON Schema 文档与部分提示词片段，消除跨 Python / Node / Prompt 手动同步的脆弱性；
-3. **分离“制度骨架”与“角色脚手架”**：让底层状态机只守住极少数硬不变量，把角色行为引导拆成可独立演进、可热替换的轻组件（与 §2.6 和 §3.3 呼应）。
+具体推进路径包括：
+1. **拆解上帝文件（阶段 1 后端已完成，前端 `client.js` 待阶段 2）**：已将 `control_plane_service.py` 拆分为 6 个 `control_plane/` 无环子域、将 `orchestrator.js` 拆出 4 个派发与熔断子模块、将 `tools_library.py` 按角色拆为 `tools_surveyor.py` / `tools_verifier.py`、将 `agent_session_host.js` 拆出 `host/model_binding.js`；下一步聚焦前端模块化重构；
+2. **单一契约源（阶段 1 32 窄工具已收口）**：已建立 `tool_registry.py`、`control_plane/describe_contracts` 与 `test_architecture_contracts.py` 跨层门禁；后续继续推进状态字段与脚手架片段的声明式同步；
+3. **分离“制度骨架”与“角色脚手架”（待推进）**：让底层状态机只守住极少数硬不变量，把角色行为引导拆成可独立演进、可热替换的轻组件（与 §2.6 和 §3.3 呼应）。
 
 ### 2.2 重点方向：科研底座面向更广泛的开放性（“科研标准插座”与多维开放）
 
@@ -130,9 +130,9 @@ flowchart TB
 - 在把底座向真实科研全面开放时，会迎头撞上一个极其前沿且根本的硬骨头：**在开放问题和真实前沿科研中，普遍缺少廉价的 Ground-Truth Verifier，导致科研验证成本极高**（哪怕是写一个可靠的物理仿真校验器、或者人工核对一段几十页的数学推导，成本都远超常规软件单元测试）。
 - 后续不仅需要引入更多元的专用科研验证机制（形式化证明检查器、符号计算交叉验证、多保真仿真对照、统计显著性与复现核验），更需要持续探索**面向开放性问题的科研验证新机制**（例如结合盲审沙箱实跑、多模型对抗审稿与 §3.3 的行为对比思路）——这是整个 AI for Science 领域共同面对的前沿深水区。
 
-#### 3. 宿主与运行时开放（脱离单一 DSH 绑定）
-- 抽离当前强耦合 DSH 内部 API 的胶水层，定义清晰精简的宿主抽象接口（会话创建/续传/销毁、工具拦截、Token 水位采样、工作区文件挂载）；
-- 积极调研并适配 **ACP（Agent Client Protocol）** 等开放标准与 DSH 原生子 Agent 委派能力，让长城既能在 DSH 上跑得更好，未来也能平滑迁移至其他开源 Agent Harness 或独立运行时。
+#### 3. 宿主与运行时开放（深耕 DSH 插件生态 × 预留跨宿主适配）
+- **立足并善用 DSH 繁荣的插件生态**：不侵入修改 DSH 原生工具与正常功能，而是更充分地发挥 DSH Cordis 插件体系、标准 UI 原语、Schemastery 配置项、多槽位扩展与原生子 Agent 委派等架构优势，让 GreatWall 成为 DSH 生态中易于安装、调试和社区推广的标准科研插件；
+- **保持清晰的宿主适配边界**：在用好 DSH 能力的同时，将宿主胶水层收敛到清晰精简的适配接口（会话创建/续传/销毁、工具拦截、Token 水位采样、工作区文件挂载），为后续调研并按需适配 **ACP（Agent Client Protocol）** 等开放标准预留空间。
 
 #### 4. 模型层开放：摆脱单一模型依赖，迈向异构模型群（Heterogeneous LLM Swarm）
 - **现状痛点**：目前整套系统几乎完全基于 **DeepSeek Flash** 实测运行；一旦切换其他厂商的模型，或者试图构建**异构模型群**，立刻会面临工具调用风格迥异、提示词敏感度剧烈波动、成本与速度失衡等一大堆难题；
