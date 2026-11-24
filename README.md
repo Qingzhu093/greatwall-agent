@@ -3,13 +3,13 @@
 [English](./README_EN.md) | **简体中文**
 
 > **面向长周期、多学派并发自主科学发现的开源多智能体实验基座**  
-> **版本状态**：`v0.1.0-alpha.2`（早期实验性 Demo · **非开箱即用的生产工具**）  
+> **版本状态**：`v0.1.0-alpha.3`（早期实验性 Demo · **非开箱即用的生产工具**）  
 > **开源协议**：[Apache License 2.0](./LICENSE) + [DCO 1.1](./CONTRIBUTING.md#三许可证与-dcodeveloper-certificate-of-origin签署要求) ｜ **运行底座**：[DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) `>= 0.2.2-rc.5` × Python `3.11+` × [MCP](https://modelcontextprotocol.io)
 
 ---
 
 > ⚠️ **坦诚的前置说明**  
-> 本项目目前处于非常早期的 **`v0.1.0-alpha.2`** 实验状态，代码库（约 1.8 万行）仍存在明显的技术债、高耦合大文件、应用层软沙箱安全局限与较粗糙的原型 UI，且整套多智能体科研制度尚未在零工程事故基线下完成充分的受控对照实验（详见 [`ARCHITECTURE.md §5`](./ARCHITECTURE.md#5-已知技术债与当前局限)）。  
+> 本项目目前处于非常早期的 **`v0.1.0-alpha.3`** 实验状态，代码库（约 1.8 万行）仍存在明显的技术债、高耦合大文件、应用层软沙箱安全局限与较粗糙的原型 UI，且整套多智能体科研制度尚未在零工程事故基线下完成充分的受控对照实验（详见 [`ARCHITECTURE.md §5`](./ARCHITECTURE.md#5-已知技术债与当前局限)）。  
 > 我们选择现在以 **Apache 2.0 + DCO** 完全开源，是希望把前沿 AI for Science 多智能体架构思路真正做成可运行、可拆改、可共同演进的开放实验基座，欢迎任何拆解、复现、批评与协作。
 
 ---
@@ -43,7 +43,7 @@ flowchart LR
 
 在逻辑治理上，系统由确定性外部编排内核串联扁平制衡的**“一委三部 + 一线探索单元”**；在软件实现上，收口为四个正交的工程模块：
 
-| 工程划分 | 对应逻辑机构 / 角色 | 核心机制（`v0.1.0-alpha.2` 已实现） |
+| 工程划分 | 对应逻辑机构 / 角色 | 核心机制（`v0.1.0-alpha.3` 已实现） |
 | :--- | :--- | :--- |
 | **1. 设施工程** | 插件编排内核 (`Orchestrator`)<br>监察委员会 (`supervisory_committee`)<br>外围人机接入原型 (`Console UI`) | 无 Root 扁平短会话调度（`ctx.agents.create()`）；显式模型绑定拒启门禁；自适应有效窗口 `W = min(500k, 模型窗口)`；单条待办项 2 次无进展熔断；版本化公开裁决 (`spec_revision`)；双向隔离沙箱；SQLite WAL 单写者真相库（19 表 + 2 FTS5 + 3 业务硬触发器） |
 | **2. 仪器科学工程** | 工造司 (`works_engineer`)<br>隔离执行容器 (`isolated_runner.py`) | 统一 `evaluate(artifact, spec, tier)` 三档同码协议（`probe / official / heavy`）；四态物理隔离（`INSTRUMENT_ERROR / INFRA_ERROR` 零处罚、不判负、自动开单熔断）；四元复合缓存；自声明预期校准集回归升版；版本域可比与按需重评 |
@@ -61,7 +61,7 @@ flowchart LR
 | **[`ARCHITECTURE.md`](./ARCHITECTURE.md)** | 系统设计哲学、四大工程深度拆解、基于真实源码的 32 窄工具与 19 表接口契约、以及 §5 已知技术债与局限 |
 | **[`ROADMAP.md`](./ROADMAP.md)** | 问题清账本与 P0–P3 演进构想（UI 与 `SuperAgent` 主控、深度解耦、容器强沙箱、`Harness²` 工造司进化与双轨知识库、科研标准插座与开放实验议题） |
 | **[`REFERENCES.md`](./REFERENCES.md)** | 全部影响架构或路线图的学术论文、工程博客、开源项目与开放协议完整溯源（严格区分 `✅ 已落地` 与 `🗺️ 路线图规划`，仅附公共链接） |
-| **[第 7 轮实机科研实验报告 (PDF)](./docs/round7_report/V6Up_第7轮实机测试科研实验报告.pdf)** | 系统实证论文与实验报告（含 [LaTeX 源码](./docs/round7_report/main.tex)、[`references.bib`](./docs/round7_report/references.bib) 与高清图表），提供全链路遥测、实机测试数据与背景知识 |
+| **[`docs/paper_study/README.md`](./docs/paper_study/README.md)** | 前沿文献与背景知识研读库（37 篇核心论文、工程博客与官方提示词的中文深度精读综述与配图，供协作者快速对齐背景） |
 | **[`CONTRIBUTING.md`](./CONTRIBUTING.md)** | 开源协作切入指南、Apache 2.0 + DCO 1.1（`git commit -s`）签署流程与 PR 规范 |
 | [`greatwall-v6up/dsh_plugin/README.md`](./greatwall-v6up/dsh_plugin/README.md) | DSH `0.2.2-rc.5` 插件包迁移说明与 Preset 详情 |
 

@@ -3,13 +3,13 @@
 **English** | [简体中文](./README.md)
 
 > **An open-source multi-agent experimental base for long-horizon, multi-school concurrent autonomous scientific discovery**  
-> **Release Status**: `v0.1.0-alpha.2` (Early Experimental Demo · **Not a production-ready tool**)  
+> **Release Status**: `v0.1.0-alpha.3` (Early Experimental Demo · **Not a production-ready tool**)  
 > **License**: [Apache License 2.0](./LICENSE) + [DCO 1.1](./CONTRIBUTING.md#三许可证与-dcodeveloper-certificate-of-origin签署要求) ｜ **Runtime Stack**: [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) `>= 0.2.2-rc.5` × Python `3.11+` × [MCP](https://modelcontextprotocol.io)
 
 ---
 
 > ⚠️ **Candid Upfront Notice**  
-> This project is currently at a very early **`v0.1.0-alpha.2`** experimental stage. The codebase (~18k LOC) still carries noticeable technical debt, tightly coupled large files, application-level soft-sandbox security limitations, and a rough prototype UI. Moreover, the multi-agent research governance mechanisms have not yet undergone clean controlled ablation experiments under zero engineering-incident baselines (see [`ARCHITECTURE.md §5`](./ARCHITECTURE.md#5-已知技术债与当前局限) for full details).  
+> This project is currently at a very early **`v0.1.0-alpha.3`** experimental stage. The codebase (~18k LOC) still carries noticeable technical debt, tightly coupled large files, application-level soft-sandbox security limitations, and a rough prototype UI. Moreover, the multi-agent research governance mechanisms have not yet undergone clean controlled ablation experiments under zero engineering-incident baselines (see [`ARCHITECTURE.md §5`](./ARCHITECTURE.md#5-已知技术债与当前局限) for full details).  
 > We are open-sourcing it now under **Apache 2.0 + DCO** to turn frontier AI for Science multi-agent architectures into a runnable, hackable, and co-evolvable experimental testbed. Dissections, reproductions, critiques, and collaborations are warmly welcomed.
 
 ---
@@ -43,7 +43,7 @@ flowchart LR
 
 Logically, a deterministic external orchestration kernel coordinates a flat check-and-balance governance model (**1 Supervisory Committee + 3 Functional Ministries + Front-line Exploration Units**). In software implementation, it converges into four orthogonal engineering pillars:
 
-| Engineering Pillar | Logical Role / Organ | Core Mechanisms (`v0.1.0-alpha.2` Implemented) |
+| Engineering Pillar | Logical Role / Organ | Core Mechanisms (`v0.1.0-alpha.3` Implemented) |
 | :--- | :--- | :--- |
 | **1. Infrastructure** | Orchestrator Kernel (`Orchestrator`)<br>Supervisory Committee (`supervisory_committee`)<br>Console UI Prototype (`Console UI`) | Rootless flat short-session scheduling (`ctx.agents.create()`); explicit model-binding startup gate; adaptive context window `W = min(500k, model_ctx)`; 2-strike no-progress circuit breaker per todo item; versioned public rulings (`spec_revision`); bidirectional isolation sandboxes; SQLite WAL Single-Writer truth store (19 tables + 2 FTS5 + 3 hard business triggers) |
 | **2. Instrumentation Science** | Works Engineer (`works_engineer`)<br>Isolated Runner (`isolated_runner.py`) | Unified `evaluate(artifact, spec, tier)` 3-tier same-code protocol (`probe / official / heavy`); 4-state physical isolation (`INSTRUMENT_ERROR / INFRA_ERROR` incur zero penalty and auto-open repair tickets); 4-tuple composite caching; self-declared calibration set regression; version-domain comparability & on-demand re-evaluation |
@@ -63,7 +63,7 @@ All 7 roles access **32 single-responsibility narrow tools** strictly via role-w
 | **[`ARCHITECTURE.md`](./ARCHITECTURE.md)** | Design philosophy, deep dive into the 4 pillars, exact contracts for 32 narrow tools & 19 SQLite tables, and §5 known technical debt |
 | **[`ROADMAP.md`](./ROADMAP.md)** | Problem ledger and P0–P3 evolution plans (UI & `SuperAgent` controller, decoupling, container strong sandboxes, `Harness²`, dual-track KB, open research issues) |
 | **[`REFERENCES.md`](./REFERENCES.md)** | Complete bibliography of academic papers, engineering blogs, open-source projects, and open protocols (`✅ Implemented` vs `🗺️ Roadmap`) |
-| **[Round 7 Experimental Report / Paper (PDF)](./docs/round7_report/V6Up_第7轮实机测试科研实验报告.pdf)** | Full empirical report & technical paper (with [LaTeX source](./docs/round7_report/main.tex), [`references.bib`](./docs/round7_report/references.bib), and figures) providing telemetry data, real-run evaluation, and research background |
+| **[`docs/paper_study/README.md`](./docs/paper_study/README.md)** | Frontier Paper Study Archive (37 in-depth Chinese reviews & figures covering the papers, engineering blogs, and official prompts in `REFERENCES.md` for background context) |
 | **[`CONTRIBUTING.md`](./CONTRIBUTING.md)** | Contribution guide, Apache 2.0 + DCO 1.1 (`git commit -s`) sign-off requirements, and PR guidelines |
 | [`greatwall-v6up/dsh_plugin/README.md`](./greatwall-v6up/dsh_plugin/README.md) | DSH `0.2.2-rc.5` plugin migration guide and Preset details |
 
