@@ -1,13 +1,15 @@
 # GreatWall Agent（长城）
 
+[English](./README_EN.md) | **简体中文**
+
 > **面向长周期、多学派并发自主科学发现的开源多智能体实验基座**  
-> **版本状态**：`v0.1-alpha`（早期实验性 Demo · **非开箱即用的生产工具**）  
+> **版本状态**：`v0.1.0-alpha.2`（早期实验性 Demo · **非开箱即用的生产工具**）  
 > **开源协议**：[Apache License 2.0](./LICENSE) + [DCO 1.1](./CONTRIBUTING.md#三许可证与-dcodeveloper-certificate-of-origin签署要求) ｜ **运行底座**：[DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) `>= 0.2.2-rc.5` × Python `3.11+` × [MCP](https://modelcontextprotocol.io)
 
 ---
 
 > ⚠️ **坦诚的前置说明**  
-> 本项目目前处于非常早期的 **`v0.1-alpha`** 实验状态，代码库（约 1.8 万行）仍存在明显的技术债、高耦合大文件、应用层软沙箱安全局限与较粗糙的原型 UI，且整套多智能体科研制度尚未在零工程事故基线下完成充分的受控对照实验（详见 [`ARCHITECTURE.md §5`](./ARCHITECTURE.md#5-已知技术债与当前局限)）。  
+> 本项目目前处于非常早期的 **`v0.1.0-alpha.2`** 实验状态，代码库（约 1.8 万行）仍存在明显的技术债、高耦合大文件、应用层软沙箱安全局限与较粗糙的原型 UI，且整套多智能体科研制度尚未在零工程事故基线下完成充分的受控对照实验（详见 [`ARCHITECTURE.md §5`](./ARCHITECTURE.md#5-已知技术债与当前局限)）。  
 > 我们选择现在以 **Apache 2.0 + DCO** 完全开源，是希望把前沿 AI for Science 多智能体架构思路真正做成可运行、可拆改、可共同演进的开放实验基座，欢迎任何拆解、复现、批评与协作。
 
 ---
@@ -26,11 +28,22 @@
 
 ## 系统全景与四大工程
 
-![GreatWall Agent v0.1-alpha 系统架构全景图](./docs/assets/greatwall_architecture.svg)
+![GreatWall Agent 系统架构全景图](./docs/assets/greatwall_architecture.svg)
+
+### 极简科研闭环流程
+
+```mermaid
+flowchart LR
+    A["独思净室 (0–37%)"] --> B["元反思与开放 Pull (37–70%)"]
+    B --> C["亲笔遗嘱与伴随单写 DAG (70%)"]
+    C --> D["工造司三档隔离评测"]
+    D --> E["两阶段盲审与知识库沉淀"]
+    E -. "六类分诊 / 五车道复苏" .-> A
+```
 
 在逻辑治理上，系统由确定性外部编排内核串联扁平制衡的**“一委三部 + 一线探索单元”**；在软件实现上，收口为四个正交的工程模块：
 
-| 工程划分 | 对应逻辑机构 / 角色 | 核心机制（`v0.1-alpha` 已实现） |
+| 工程划分 | 对应逻辑机构 / 角色 | 核心机制（`v0.1.0-alpha.2` 已实现） |
 | :--- | :--- | :--- |
 | **1. 设施工程** | 插件编排内核 (`Orchestrator`)<br>监察委员会 (`supervisory_committee`)<br>外围人机接入原型 (`Console UI`) | 无 Root 扁平短会话调度（`ctx.agents.create()`）；显式模型绑定拒启门禁；自适应有效窗口 `W = min(500k, 模型窗口)`；单条待办项 2 次无进展熔断；版本化公开裁决 (`spec_revision`)；双向隔离沙箱；SQLite WAL 单写者真相库（19 表 + 2 FTS5 + 3 业务硬触发器） |
 | **2. 仪器科学工程** | 工造司 (`works_engineer`)<br>隔离执行容器 (`isolated_runner.py`) | 统一 `evaluate(artifact, spec, tier)` 三档同码协议（`probe / official / heavy`）；四态物理隔离（`INSTRUMENT_ERROR / INFRA_ERROR` 零处罚、不判负、自动开单熔断）；四元复合缓存；自声明预期校准集回归升版；版本域可比与按需重评 |
@@ -92,7 +105,7 @@ git clone https://github.com/Qingzhu093/greatwall-agent.git
 ```text
 greatwall-agent/
 ├── README.md                  # 项目总览与快速入口（本文档）
-├── ARCHITECTURE.md            # v0.1-alpha 系统架构、代码地图、精确契约与已知局限
+├── ARCHITECTURE.md            # v0.1.0-alpha 系统架构、代码地图、精确契约与已知局限
 ├── ROADMAP.md                 # 未解难题、P0–P3 演进方向与开放研究议题
 ├── REFERENCES.md              # 学术论文、工程博客与开源生态完整溯源
 ├── CONTRIBUTING.md            # 贡献指南与 DCO 1.1 签署规约
