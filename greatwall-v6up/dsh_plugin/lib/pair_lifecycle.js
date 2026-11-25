@@ -62,28 +62,16 @@ export function scanLocalWorktreePublicInputs(worktreeAbsPath) {
 }
 
 /** 获取当前节点保活中的同会话伴随句柄（若未保活或已掉线则返回 null）。 */
-function getLiveNodeCompanion(orchestrator, nodeId) {
-  const map = orchestrator._nodeCompanionSessions
-  if (!map || !nodeId) return null
-  const handle = map.get(nodeId)
-  if (!handle) return null
-  if (!orchestrator.liveSessions?.has?.(handle.sessionId)) {
-    map.delete(nodeId)
-    return null
-  }
-  return handle
+function getLiveNodeCompanion(port, nodeId) {
+  if (!port || !nodeId) return null
+  return typeof port.getLiveCompanion === 'function' ? port.getLiveCompanion(nodeId) : null
 }
 
 /** 彻底销毁指定节点的伴随会话句柄（严禁跨代常驻）。 */
-export async function disposeNodeCompanion(orchestrator, nodeId, status = 'completed') {
-  const map = orchestrator._nodeCompanionSessions
-  if (!map || !nodeId) return
-  const handle = map.get(nodeId)
-  map.delete(nodeId)
-  if (handle && typeof handle.dispose === 'function') {
-    try {
-      await handle.dispose(status)
-    } catch {}
+export async function disposeNodeCompanion(port, nodeId, status = 'completed') {
+  if (!port || !nodeId) return
+  if (typeof port.disposeCompanion === 'function') {
+    await port.disposeCompanion(nodeId, status)
   }
 }
 
@@ -91,9 +79,9 @@ export async function disposeNodeCompanion(orchestrator, nodeId, status = 'compl
  * `PRE_SPAWN` 阶段：创建绑定该 `node_id` 的单节点伴随会话并写看板，随后挂起保活（`keepAliveAfterIdle: true`）
  * 以备同一节点的 `REFLECT_37` 与 `HANDOFF_70` 直接续传。
  */
-export async function runPreSpawnBriefingWithCompanion(orchestrator, node, { signal = null } = {}) {
+export async function runPreSpawnBriefingWithCompanion(port, node, { signal = null } = {}) {
   const compSid = `gw_comp_${node.node_id}_${crypto.randomUUID().slice(0, 6)}`
-  const compRes = await orchestrator.spawnAndRunAgent({
+  const compRes = await port.spawnAndRunAgent({
     role: 'lineage_companion',
     sessionId: compSid,
     nodeId: node.node_id,
@@ -106,7 +94,7 @@ export async function runPreSpawnBriefingWithCompanion(orchestrator, node, { sig
     signal,
     prompt: `阶段 PRE_SPAWN：请调用 get_companion_context(branch_id="${node.branch_id}", node_id="${node.node_id}", mode="PRE_SPAWN")，按五段滚动压缩预算 (<=2200字，不直接追加旧看板) 调用 save_lineage_briefing 写入本代初始看板；完成后挂起等待本节点的 37% 诊断与 70% 交接。`,
   })
-  orchestrator._nodeCompanionSessions?.set?.(node.node_id, compRes)
+  port.setLiveCompanion?.(node.node_id, compRes)
   return compRes
 }
 
@@ -144,7 +132,7 @@ ${latestBlackbox}
       signal,
       prompt: r37Prompt,
     })
-    orchestrator._nodeCompanionSessions?.set?.(node.node_id, compHandle)
+    orchestrator.setLiveCompanion?.(node.node_id, compHandle)
     lastCompText = compHandle.lastAssistantText || ''
   }
 
@@ -176,9 +164,9 @@ ${latestBlackbox}
 
   // 以真实工具成功回执或 SQLite 真源为准，严禁假解锁
   let unlocked = hasUnlockedSignal()
-  if (!unlocked && orchestrator.bridge?.control) {
+  if (!unlocked && typeof orchestrator.control === 'function') {
     try {
-      const checkRes = await orchestrator.bridge.control('control_plane/schedule_snapshot', {
+      const checkRes = await orchestrator.control('control_plane/schedule_snapshot', {
         workspace_root: orchestrator.workspaceRoot,
       })
       const allNodes = [
@@ -268,7 +256,13 @@ export async function driveExplorerCompanionPair(
   const publicInputsList = scanLocalWorktreePublicInputs(node.worktree_abs_path)
   const goalMd = snap?.goal_and_completion_md || ''
   const specRev = Number(node.spec_revision ?? snap?.latest_spec_revision ?? 0)
-  const effWindow = Number(orchestrator.host?.effectiveContextWindow || node.effective_context_window || 500_000)
+  const effWindow = Number(
+    (typeof orchestrator.getEffectiveContextWindow === 'function'
+      ? orchestrator.getEffectiveContextWindow()
+      : 0) ||
+      node.effective_context_window ||
+      500_000,
+  )
   const availableInstruments = (snap?.active_instruments || []).filter(
     (inst) =>
       inst &&
@@ -347,7 +341,10 @@ export async function driveExplorerCompanionPair(
    * 立即退场销毁探索者与伴随句柄，绝不占槽续推！
    */
   const checkNodeStillActiveInDb = async () => {
-    if (signal?.aborted || orchestrator._poolState === 'stopped') {
+    const isStopped = typeof orchestrator.isPoolStopped === 'function'
+      ? orchestrator.isPoolStopped()
+      : false
+    if (signal?.aborted || isStopped) {
       terminatedExternally = true
       externalTermReason = 'POOL_STOPPED_OR_ABORTED'
       return false
@@ -357,12 +354,13 @@ export async function driveExplorerCompanionPair(
       externalTermReason = 'NODE_TERMINATED_SIGNAL'
       return false
     }
-    if (!orchestrator.bridge?.control) return true
+    const controlBridge = orchestrator.bridge || (typeof orchestrator.control === 'function' ? { control: orchestrator.control } : null)
+    if (!controlBridge) return true
     try {
       const syncRes = await syncLivePressureToDb(
         orchestrator.ctx,
         expRes.handle?.agent,
-        orchestrator.bridge,
+        controlBridge,
         orchestrator.workspaceRoot,
         node.node_id,
         effWindow,
@@ -372,7 +370,7 @@ export async function driveExplorerCompanionPair(
       if (liveStatus && !ACTIVE_EXPLORE_STATUSES.has(liveStatus)) {
         terminatedExternally = true
         externalTermReason = `DB_NODE_STATUS:${liveStatus}`
-        orchestrator.telemetry?.recordEvent?.('explorer_terminated_by_db_status', {
+        orchestrator.recordEvent?.('explorer_terminated_by_db_status', {
           nodeId: node.node_id,
           nodeStatus: liveStatus,
         })
@@ -455,8 +453,14 @@ export async function driveExplorerCompanionPair(
     }
 
     // 70% 两步清醒交接 · 第一步：切只读 -> 亲笔立遗嘱 -> 必须先持久化至 SQLite will_md，再销毁探索者句柄
+    const callControl = typeof orchestrator.control === 'function'
+      ? (method, params) => orchestrator.control(method, params)
+      : null
     if (!interrupted) {
-      orchestrator.host?.setSessionReadonly?.(expSessionId, true)
+      if (typeof orchestrator.setSessionReadonly !== 'function') {
+        throw new Error('RUNTIME_PORT_CONTRACT_ERROR: 缺少必需的 setSessionReadonly 能力，无法执行 70% 只读遗嘱收官')
+      }
+      orchestrator.setSessionReadonly(expSessionId, true)
       try {
         const willTurn = await orchestrator.continueAliveAgent(
           expSessionId,
@@ -468,9 +472,9 @@ export async function driveExplorerCompanionPair(
       } catch {
         // 收官回合超时时仍保留已有黑匣子供伴随兜底
       }
-      if (orchestrator.bridge?.control) {
+      if (callControl) {
         try {
-          const persistRes = await orchestrator.bridge.control('control_plane/record_pending_handoff', {
+          const persistRes = await callControl('control_plane/record_pending_handoff', {
             workspace_root: orchestrator.workspaceRoot,
             node_id: node.node_id,
             mode: 'HANDOFF_70',
@@ -478,24 +482,24 @@ export async function driveExplorerCompanionPair(
             reason: 'HANDOFF_70',
           })
           if (!persistRes?.ok) {
-            orchestrator.telemetry?.recordEvent?.('pending_handoff_persist_failed', {
+            orchestrator.recordEvent?.('pending_handoff_persist_failed', {
               nodeId: node.node_id,
               mode: 'HANDOFF_70',
               error: persistRes?.error || 'unknown',
             })
           }
         } catch (err) {
-          orchestrator.telemetry?.recordEvent?.('pending_handoff_persist_failed', {
+          orchestrator.recordEvent?.('pending_handoff_persist_failed', {
             nodeId: node.node_id,
             mode: 'HANDOFF_70',
             error: String(err?.message || err),
           })
         }
       }
-    } else if (orchestrator.bridge?.control) {
+    } else if (callControl) {
       // <70% 异常中断：唯一真源直接落 SQLite `pending_handoff_mode='CRASH_RECOVERY'`，取消内存双账本
       try {
-        const persistRes = await orchestrator.bridge.control('control_plane/record_pending_handoff', {
+        const persistRes = await callControl('control_plane/record_pending_handoff', {
           workspace_root: orchestrator.workspaceRoot,
           node_id: node.node_id,
           mode: 'CRASH_RECOVERY',
@@ -503,14 +507,14 @@ export async function driveExplorerCompanionPair(
           reason: interruptReason || 'abnormal_turn_end',
         })
         if (!persistRes?.ok) {
-          orchestrator.telemetry?.recordEvent?.('pending_handoff_persist_failed', {
+          orchestrator.recordEvent?.('pending_handoff_persist_failed', {
             nodeId: node.node_id,
             mode: 'CRASH_RECOVERY',
             error: persistRes?.error || 'unknown',
           })
         }
       } catch (err) {
-        orchestrator.telemetry?.recordEvent?.('pending_handoff_persist_failed', {
+        orchestrator.recordEvent?.('pending_handoff_persist_failed', {
           nodeId: node.node_id,
           mode: 'CRASH_RECOVERY',
           error: String(err?.message || err),
@@ -518,10 +522,11 @@ export async function driveExplorerCompanionPair(
       }
     }
   } finally {
-    await orchestrator.host?.archiveSession?.(expSessionId, expRes.handle?.agent?.session)
+    // 由 expRes.dispose 统一按 RC5 顺序：先 handle.dispose() 解除活跃占用，再调用原生 archiveSession 并写入真实归档状态
     await expRes.dispose(
       terminatedExternally ? 'terminated_external' : (interrupted ? 'interrupted_unclaimed' : 'completed'),
       terminatedExternally ? { kind: 'terminated_external', reason: externalTermReason } : expRes.turnEndReason,
+      { archive: true },
     )
     if (terminatedExternally || interrupted) {
       await disposeNodeCompanion(
@@ -543,5 +548,5 @@ export async function driveExplorerCompanionPair(
     explorerWillText,
     signal,
   })
-  orchestrator._handoffsSinceHeartbeat += 1
+  orchestrator.recordHandoffCompleted?.(1)
 }

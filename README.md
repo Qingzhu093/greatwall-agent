@@ -3,14 +3,15 @@
 [English](./README_EN.md) | **简体中文**
 
 > **面向长周期、多学派并发自主科学发现的开源多智能体实验基座**  
-> **版本状态**：`v0.1.0-alpha.4`（早期实验性 Demo · **阶段 1 后端解耦版本，尚未经过人工代码审阅** · **非开箱即用的生产工具**）  
+> **版本状态**：`v0.2.0-alpha.1`（重大底座重构版本 · **DSH `0.2.2-rc.5` 原生深度适配 × 双池并发 × 单写者强一致** · **非开箱即用的生产工具**）  
 > **开源协议**：[Apache License 2.0](./LICENSE) + [DCO 1.1](./CONTRIBUTING.md#三许可证与-dcodeveloper-certificate-of-origin签署要求) ｜ **运行底座**：[DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) `>= 0.2.2-rc.5` × Python `3.11+` × [MCP](https://modelcontextprotocol.io)
 
 ---
 
 > ⚠️ **坦诚的前置说明**  
-> 本项目目前处于非常早期的 **`v0.1.0-alpha.4`** 实验状态（注：`alpha.4` 阶段 1 后端解耦代码**尚未经过作者人工逐行审阅**，仅通过自动化单元与架构门禁测试）。虽然后端核心千行文件已完成首轮拆解，但代码库仍存在前端原型简陋（`client.js` 待重构）、应用层软沙箱安全局限、对 DSH 原生能力利用不足等债务，且整套多智能体科研制度尚未在零工程事故基线下完成充分的受控对照实验（详见 [`ARCHITECTURE.md §5`](./ARCHITECTURE.md#5-已知技术债与当前局限)）。  
-> 我们选择现在以 **Apache 2.0 + DCO** 完全开源，是希望把前沿 AI for Science 多智能体架构思路真正做成可运行、可拆改、可共同演进的开放实验基座，欢迎任何拆解、复现、批评与协作。
+> 本项目目前处于 **`v0.2.0-alpha.1`** 重大重构演进阶段：本版本围绕 **DSH `0.2.2-rc.5` 原生能力对齐、后端并发读写解耦与数据强一致性、端到端真取消、单源 Preset 收敛与跨 `cwd` 对话直达** 完成了第二轮系统性底层手术，并已通过全量自动化回归（Python `54/54`、Node `39/39`、Doctor `7/7`）及真实 RC5 CLI + DeepSeek Flash 主控与子会话工具调用实测。  
+> 同时我们仍坦诚保留以下现状边界：前端右侧栏指挥舱（`client.js`）视觉与模块化重写尚未完成，桌面端直跑仍属应用层软沙箱，且整套多智能体科研制度尚未在零工程事故基线下完成充分的受控对照实验（详见 [`ARCHITECTURE.md §5`](./ARCHITECTURE.md#5-已知技术债与当前局限)）。  
+> 我们以 **Apache 2.0 + DCO** 完全开源，希望把前沿 AI for Science 多智能体架构思路真正做成可运行、可拆改、可共同演进的开放实验基座，欢迎任何拆解、复现、批评与协作。
 
 ---
 
@@ -43,12 +44,12 @@ flowchart LR
 
 在逻辑治理上，系统由确定性外部编排内核串联扁平制衡的**“一委三部 + 一线探索单元”**；在软件实现上，收口为四个正交的工程模块：
 
-| 工程划分 | 对应逻辑机构 / 角色 | 核心机制（`v0.1.0-alpha.4` 已实现） |
+| 工程划分 | 对应逻辑机构 / 角色 | 核心机制（`v0.2.0-alpha.1` 已实现） |
 | :--- | :--- | :--- |
-| **1. 设施工程** | 插件编排内核 (`Orchestrator`)<br>监察委员会 (`supervisory_committee`)<br>外围人机接入原型 (`Console UI`) | 无 Root 扁平短会话调度（`ctx.agents.create()`）；显式模型绑定拒启门禁；自适应有效窗口 `W = min(500k, 模型窗口)`；单条待办项 2 次无进展熔断；版本化公开裁决 (`spec_revision`)；双向隔离沙箱；SQLite WAL 单写者真相库（19 表 + 2 FTS5 + 3 业务硬触发器） |
-| **2. 仪器科学工程** | 工造司 (`works_engineer`)<br>隔离执行容器 (`isolated_runner.py`) | 统一 `evaluate(artifact, spec, tier)` 三档同码协议（`probe / official / heavy`）；四态物理隔离（`INSTRUMENT_ERROR / INFRA_ERROR` 零处罚、不判负、自动开单熔断）；四元复合缓存；自声明预期校准集回归升版；版本域可比与按需重评 |
+| **1. 设施工程** | 插件编排内核 (`Orchestrator`)<br>统一控制面 (`ControlService`)<br>监察委员会 (`supervisory_committee`)<br>外围人机接入原型 (`Console UI`) | 无 Root 扁平短会话调度（`ctx.agents.create()`）；**双池并发（快控制路径与慢计算隔离）+ `$/cancelRequest` 端到端真取消**；**并发纯只读连接 + 进程级单写者大闸**；**DSH RC5 严格 JSON Schema 子集适配与 Standard Schema v1 `Config` 装载**；单源 `cordis.patch.yml` Preset 与异步全量卸载回收；显式模型绑定拒启门禁；自适应有效窗口 `W = min(500k, 模型窗口)`；单条待办项 2 次无进展熔断；版本化公开裁决 (`spec_revision`)；双向隔离沙箱与**跨 `cwd` 会话原生直达**；SQLite WAL 真相库（19 表 + 2 FTS5 + 3 业务硬触发器） |
+| **2. 仪器科学工程** | 工造司 (`works_engineer`)<br>隔离执行容器 (`isolated_runner.py`) | 统一 `evaluate(artifact, spec, tier)` 三档同码协议（`probe / official / heavy`）；四态物理隔离（`INSTRUMENT_ERROR / INFRA_ERROR` 零处罚、不判负、自动开单熔断）；四元复合缓存；**独占暂存 + 事务内原子领号（零并发撞号与串写）**；自声明预期校准集回归升版；**在途旧观测升版自动入待重评队列**与版本域按需重评（`recompute_stage_b_only`） |
 | **3. 后勤工程** | 后勤工作部 (`logistics_coordinator`)<br>探索者 (`explorer`) ◄─1:1─► 伴随 (`lineage_companion`) | 单节点同会话伴随暂停续传（不跨代常驻）；`0–37%` 独思净室（锁内藏、开外藏 `[R###]`）→ `37%` 情报型元反思与 29 题夜科学解锁 → `37–70%` 开放 Pull → `70%` 先持久化亲笔《科研遗嘱》再伴随单写 DAG；`<=2200` 字定额重压缩看板 + 全量 `lineage_dead_ends`；六类分诊、`>50%` 无豁免学派分流与五车道复苏 |
-| **4. 图书馆工程** | 外藏采编 (`library_surveyor`)<br>沙箱实测盲审 (`library_verifier`) | 外藏 `[R###]`（含无解查新 `UNAVAILABLE_REPORT` 诚实结案不伪造文献卡）与内藏 `L3/L2` 物理分表；四轨可核验送审准入；独立空白临时沙箱跑证两阶段盲审（`STAGE1_BLIND` 不可逆锁账本 → `STAGE2_UNBLIND` 三态分流）；`Auditor` 异会话打捞；默认 `MOTIVATING_REF` 非连坐引用；Stage 3 五件套导出与 `(delivery_id, delivery_sha256)` 绑定两步终核 |
+| **4. 图书馆工程** | 外藏采编 (`library_surveyor`)<br>沙箱实测盲审 (`library_verifier`) | 外藏 `[R###]`（含无解查新 `UNAVAILABLE_REPORT` 诚实结案不伪造文献卡）与内藏 `L3/L2` 物理分表；四轨可核验送审准入；**盲审空白沙箱四重 Fail-Closed 硬隔离**与两阶段盲审（`STAGE1_BLIND` 不可逆锁账本 → `STAGE2_UNBLIND` 三态分流）；`Auditor` 异会话打捞；默认 `MOTIVATING_REF` 非连坐引用；Stage 3 五件套原子导出、失败目录锁内回滚与 `(delivery_id, delivery_sha256)` 事务级绑定两步终核（严防“审 A 放 B”） |
 
 全系统 7 大角色通过 **MCP (`stdio JSON-RPC 2.0`)** 按岗位白名单严格挂载 **32 个单一职责窄工具**，并坚持“工作区磁盘零过程 `.md` 公文”，所有过程状态统一落库。
 
@@ -107,7 +108,7 @@ git clone https://github.com/Qingzhu093/greatwall-agent.git
 ```text
 greatwall-agent/
 ├── README.md                  # 项目总览与快速入口（本文档）
-├── ARCHITECTURE.md            # v0.1.0-alpha 系统架构、代码地图、精确契约与已知局限
+├── ARCHITECTURE.md            # v0.2.0-alpha.1 系统架构、代码地图、精确契约与已知局限
 ├── ROADMAP.md                 # 未解难题、P0–P3 演进方向与开放研究议题
 ├── REFERENCES.md              # 学术论文、工程博客与开源生态完整溯源
 ├── CONTRIBUTING.md            # 贡献指南与 DCO 1.1 签署规约
@@ -123,9 +124,9 @@ greatwall-agent/
 
 ## 当前主要局限（完整清单见 `ARCHITECTURE.md §5`）
 
-- **前端与剩余解耦债务**：后端千行上帝文件已在 `v0.1.0-alpha.4` 完成首轮无损拆解并建立跨语言契约门禁，但前端指挥舱原型（`client.js`）尚未模块化重构；
+- **前端 UI 原型待重构**：后端解耦、DSH RC5 原生适配与并发强一致性底座已在 `v0.2.0-alpha.1` 完成两轮系统重构，但前端指挥舱原型（`client.js`）仍为无构建链手写 JSX，视觉与交互体验尚待模块化重写；
 - **应用层软沙箱局限**：当前桌面直跑沙箱依赖路径规范化与命令拦截，尚无 Docker / WSL2 + cgroups 的 OS 内核级资源限额与强隔离；
-- **DSH 生态能力利用不足与简陋原型 UI**：原则上坚持不侵入修改 DSH 正常功能、依托 DSH 插件生态推广协作，但对 DSH 原生 UI 原语与配置能力的工程化利用仍很粗糙，也尚未抽离跨宿主适配层；
+- **桌面全流程长跑与静态配置发现待补齐**：`v0.2.0-alpha.1` 已在真实 RC5 CLI + DeepSeek Flash 下验证主控与子会话工具调用，但完整 DSH Desktop 长时间课题实跑仍待验收；此外当前零依赖 Standard Schema v1 `Config` 支持运行时校验与 YAML 配置，尚未接入原生 Schemastery 供 `--dump-config-schema` 静态投影；
 - **核心科研假设尚待干净对照实证**：多智能体制度相比单 Agent 裸跑在开放科研任务上的净收益、以及非标量科学任务的梯度引导难题，仍在持续验证探索中。
 
 ---

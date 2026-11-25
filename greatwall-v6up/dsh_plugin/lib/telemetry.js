@@ -92,9 +92,12 @@ export class TelemetryCollector {
     questionId = '',
     nodeId = '',
     branchId = '',
+    reviewId = '',
+    deliveryId = '',
     worktreeAbsPath = '',
     sandboxAbsPath = '',
     workspaceRoot = '',
+    crossCwd = false,
     shortTransaction = true,
     title = '',
   }) {
@@ -104,9 +107,12 @@ export class TelemetryCollector {
       questionId,
       nodeId,
       branchId,
+      reviewId,
+      deliveryId,
       worktreeAbsPath,
       sandboxAbsPath,
       workspaceRoot: workspaceRoot || this.workspaceRoot,
+      crossCwd: Boolean(crossCwd),
       shortTransaction: Boolean(shortTransaction),
       readonly: false,
       title,
@@ -116,13 +122,21 @@ export class TelemetryCollector {
       pressureTokens: 0,
       turnEndReason: null,
       archived: false,
+      archiveError: null,
     }
     const c = (this.state.countersByRole[role] ||= { total: 0, abnormalEnds: 0, archived: 0 })
     c.total += 1
     this.flush()
   }
 
-  recordSessionEnd({ sessionId, status = 'completed', turnEndReason = null, pressureTokens = null, archived = false }) {
+  recordSessionEnd({
+    sessionId,
+    status = 'completed',
+    turnEndReason = null,
+    pressureTokens = null,
+    archived = false,
+    archiveError = null,
+  }) {
     const rec = this.state.sessions[sessionId]
     if (!rec) return
     rec.status = status
@@ -130,7 +144,13 @@ export class TelemetryCollector {
     if (turnEndReason !== null) rec.turnEndReason = turnEndReason
     if (typeof pressureTokens === 'number') rec.pressureTokens = pressureTokens
     const wasArchived = Boolean(rec.archived)
-    if (archived) rec.archived = true
+    if (archived) {
+      rec.archived = true
+      rec.archiveError = null
+    } else if (archiveError) {
+      rec.archived = false
+      rec.archiveError = String(archiveError)
+    }
     const c = (this.state.countersByRole[rec.role] ||= { total: 0, abnormalEnds: 0, archived: 0 })
     if (status === 'interrupted_unclaimed' || status === 'error') {
       c.abnormalEnds += 1
@@ -145,11 +165,22 @@ export class TelemetryCollector {
     const rec = this.state.sessions[sessionId]
     if (rec) {
       if (readonly) rec.readonly = true
+      rec.archiveError = null
       if (!rec.archived) {
         rec.archived = true
         const c = this.state.countersByRole[rec.role]
         if (c) c.archived += 1
       }
+      this.flush()
+    }
+  }
+
+  markArchiveFailed(sessionId, errorMessage = '') {
+    const rec = this.state.sessions[sessionId]
+    if (rec) {
+      rec.readonly = true
+      rec.archived = false
+      rec.archiveError = String(errorMessage || '宿主归档调用失败')
       this.flush()
     }
   }

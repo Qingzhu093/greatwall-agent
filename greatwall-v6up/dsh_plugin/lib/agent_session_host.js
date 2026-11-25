@@ -9,23 +9,17 @@
  * @module dsh-greatwall-v6up/agent_session_host
  */
 import crypto from 'node:crypto'
+import fs from 'node:fs'
 import path from 'node:path'
 import {
   CANONICAL_ROLES,
   ROLE_EFFORT_MAP,
-  ROLE_MCP_TOOLS,
   formatNodeSessionTitle,
-  resolvePlatformAllowedTools,
 } from './prompts.js'
-import { ROLE_TO_PRESET, registerPresetsOnRegistry } from './presets.js'
-import { installRoleSandboxGuard } from './read_isolated_sandbox.js'
-import { installFactLogMiddleware } from './fact_log_middleware.js'
-import {
-  installLiveClockObservers,
-  registerScopedMcpTools,
-  syncLivePressureToDb,
-} from './clock_and_turn_gap.js'
+import { ROLE_TO_PRESET } from './presets.js'
+import { syncLivePressureToDb } from './clock_and_turn_gap.js'
 import { buildBlackboxTrajectorySummary } from './blackbox_projection.js'
+import { mountCapabilitiesOnAgentSession } from './host/capability_mount.js'
 import {
   assertRequiredNativeTools,
   createAbortGraceRace,
@@ -139,13 +133,41 @@ export class AgentSessionHost {
     return Boolean(ident && (ident.readonly === true || (ident.shortTransaction === true && ident.archived === true)))
   }
 
-  async attachAndNameSession(session, title) {
-    if (!session?.id) return
+  _canonicalizeForWorkspaceMatch(targetPath) {
+    if (!targetPath) return ''
+    let resolved = path.resolve(String(targetPath))
     try {
-      const reg = typeof this.ctx?.get === 'function' ? this.ctx.get('workspaceRegistry') : this.ctx?.workspaceRegistry
-      const ws = await reg?.resolveByPath?.(this.workspaceRoot)
-      await ws?.attachSession?.(session.id)
+      resolved = fs.realpathSync(resolved)
     } catch {}
+    const norm = path.normalize(resolved)
+    return process.platform === 'win32' ? norm.toLowerCase() : norm
+  }
+
+  _isCrossCwd(sessionCwd) {
+    if (!sessionCwd) return false
+    return this._canonicalizeForWorkspaceMatch(sessionCwd) !== this._canonicalizeForWorkspaceMatch(this.workspaceRoot)
+  }
+
+  async attachAndNameSession(session, title, { crossCwd = null } = {}) {
+    if (!session?.id) return
+    const sessionCwd = session?.header?.cwd || ''
+    const isCross = crossCwd !== null ? Boolean(crossCwd) : this._isCrossCwd(sessionCwd)
+    // RC5 dsh-workspace 严格校验 realpathNormalize(header.cwd) === workspace.path；跨 cwd 子会话预期跳过 attachSession，
+    // 同目录会话挂载失败则明确记遥测，不再静默吞错。
+    if (!isCross) {
+      try {
+        const reg = typeof this.ctx?.get === 'function' ? this.ctx.get('workspaceRegistry') : this.ctx?.workspaceRegistry
+        const ws = await reg?.resolveByPath?.(this.workspaceRoot)
+        if (ws && typeof ws.attachSession === 'function') {
+          await ws.attachSession(session.id)
+        }
+      } catch (err) {
+        this.telemetry?.recordEvent?.('session_attach_error', {
+          sessionId: session.id,
+          error: String(err?.message || err),
+        })
+      }
+    }
     if (title) {
       try {
         const titleSvc = typeof this.ctx?.get === 'function' ? this.ctx.get('sessionTitle') : this.ctx?.sessionTitle
@@ -159,153 +181,45 @@ export class AgentSessionHost {
   }
 
   async archiveSession(sessionId, _session = null) {
-    if (!this.autoArchiveShortTx || !sessionId) return
+    if (!this.autoArchiveShortTx || !sessionId) return { archived: false, skipped: true }
+    const reg = typeof this.ctx?.get === 'function' ? this.ctx.get('workspaceRegistry') : this.ctx?.workspaceRegistry
+    if (!reg || typeof reg.archiveSession !== 'function') {
+      return { archived: false, skipped: true, reason: 'no_workspace_registry' }
+    }
     try {
-      const reg = typeof this.ctx?.get === 'function' ? this.ctx.get('workspaceRegistry') : this.ctx?.workspaceRegistry
-      await reg?.archiveSession?.(sessionId)
-    } catch {}
+      // RC5 dsh-workspace.archiveSession 操作全局归档集，同目录与跨 cwd 子会话均直接调用原生归档
+      await reg.archiveSession(sessionId)
+    } catch (err) {
+      const msg = String(err?.message || err)
+      try {
+        this.telemetry?.markArchiveFailed?.(sessionId, msg)
+        this.telemetry?.recordEvent?.('session_archive_failed', { sessionId, error: msg })
+      } catch {}
+      return { archived: false, error: msg }
+    }
     try {
-      this.telemetry.markArchived(sessionId, { readonly: true })
+      this.telemetry?.markArchived?.(sessionId, { readonly: true })
     } catch {}
+    return { archived: true }
   }
 
-  mountCapabilitiesOnAgent(
-    agentCtx,
-    agent,
-    {
-      role,
-      nodeId = '',
-      cwd = '',
-      sandboxAbsPath = '',
-      toolSchemas = [],
-      taskContextText = '',
-      readonly = false,
-      cleanupFns = [],
-      turnSignals = [],
-      onNativeThresholdHit = null,
-    },
-  ) {
-    const allowNative = readonly
-      ? (role === 'logistics_coordinator' || role === 'supervisory_committee' ? [] : ['read', 'glob', 'grep'])
-      : resolvePlatformAllowedTools(role, process.platform)
-    const mcpToolNames = readonly ? [] : (ROLE_MCP_TOOLS[role] || [])
-
-    if (typeof agentCtx.tools?.presentAs === 'function') {
-      cleanupFns.push(agentCtx.tools.presentAs('native'))
-    }
-
-    const inherited = agentCtx.tools?.schemas?.(agent)?.map((s) => s.name) || []
-    if (inherited.length > 0) {
-      if (allowNative.length === 0) {
-        agentCtx.tools.restrict({ deny: inherited })
-      } else {
-        const allowSet = new Set(allowNative)
-        const matchedAllow = inherited.filter((n) => allowSet.has(n))
-        if (matchedAllow.length > 0) {
-          agentCtx.tools.restrict({ allow: matchedAllow })
-        } else {
-          agentCtx.tools.restrict({ deny: inherited })
-        }
-      }
-    }
-
-    const effWorktree = (role === 'explorer' || role === 'lineage_companion') && cwd ? path.resolve(cwd) : this.workspaceRoot
-    const effSandbox = role === 'library_verifier' && sandboxAbsPath ? path.resolve(sandboxAbsPath) : ''
-    this._sessionReadonlyFlags.set(agent.id, Boolean(readonly))
-
-    cleanupFns.push(
-      installRoleSandboxGuard(agentCtx, {
-        role,
-        sessionId: agent.id,
-        nodeId,
+  mountCapabilitiesOnAgent(agentCtx, agent, mountOpts) {
+    return mountCapabilitiesOnAgentSession(
+      {
+        rootCtx: this.ctx,
+        bridge: this.bridge,
         workspaceRoot: this.workspaceRoot,
-        worktreeAbsPath: effWorktree,
-        sandboxAbsPath: effSandbox,
+        rolePrompts: this.rolePrompts,
         protectedDirs: this.protectedDirs,
         sharedInputPaths: this.sharedInputPaths,
-        readonly: () => Boolean(readonly) || this.isSessionReadonly(agent.id),
-        bridge: this.bridge,
-      }),
+        effectiveContextWindow: this.effectiveContextWindow,
+        setSessionReadonly: (sid, flag) => this.setSessionReadonly(sid, flag),
+        isSessionReadonly: (sid) => this.isSessionReadonly(sid),
+      },
+      agentCtx,
+      agent,
+      mountOpts,
     )
-
-    cleanupFns.push(
-      installFactLogMiddleware(agentCtx, {
-        workspaceRoot: this.workspaceRoot,
-        role,
-        sessionId: agent.id,
-        nodeId,
-        bridge: this.bridge,
-      }),
-    )
-
-    cleanupFns.push(
-      installLiveClockObservers({
-        rootCtx: this.ctx,
-        agentCtx,
-        agent,
-        bridge: this.bridge,
-        workspaceRoot: this.workspaceRoot,
-        nodeId,
-        role,
-        contextWindowTokens: this.effectiveContextWindow,
-        onNativeThresholdHit,
-      }),
-    )
-
-    const rolePromptText = this.rolePrompts[role] || `# Role: ${role}`
-    cleanupFns.push(
-      agentCtx.systemPrompt.section({
-        name: `greatwall:contract:${role}`,
-        order: 10,
-        text: rolePromptText,
-        interpolate: false,
-      }),
-    )
-
-    if (taskContextText) {
-      cleanupFns.push(
-        agentCtx.systemPrompt.context({
-          name: `greatwall:task:${agent.id}`,
-          order: 20,
-          text: taskContextText,
-          required: true,
-          interpolate: false,
-        }),
-      )
-    }
-
-    cleanupFns.push(
-      agentCtx.on('system-prompt/assemble', async (assembly, _assembleCtx, next) => {
-        const out = await next()
-        if (Array.isArray(out?.sections)) {
-          // 严格白名单：仅保留 harness:identity、本插件 greatwall:* 角色契约与本 Preset 自带 tool-* 说明，挡住全局第三方插件 section 污染
-          out.sections = out.sections.filter((sec) => {
-            const nm = String(sec?.name || '')
-            if (nm === 'tool-fs:guidance') return false
-            return nm === 'harness:identity' || nm.startsWith('greatwall:') || nm.startsWith('tool-')
-          })
-        }
-        return out
-      }),
-    )
-
-    if (mcpToolNames.length > 0 && toolSchemas.length > 0) {
-      cleanupFns.push(
-        registerScopedMcpTools({
-          rootCtx: this.ctx,
-          agentCtx,
-          agent,
-          bridge: this.bridge,
-          toolSchemas,
-          allowedToolNames: mcpToolNames,
-          role,
-          workspaceRoot: this.workspaceRoot,
-          nodeId,
-          contextWindowTokens: this.effectiveContextWindow,
-          onTurnSignal: (sig) => turnSignals.push(sig),
-        }),
-      )
-    }
   }
 
   async _resolveSafeReasoningEffort(targetEffort, provider, model) {
@@ -447,6 +361,8 @@ export class AgentSessionHost {
     nodeId = '',
     branchId = '',
     questionId = '',
+    reviewId = '',
+    deliveryId = '',
     cwd = '',
     sandboxAbsPath = '',
     taskContextText = '',
@@ -475,7 +391,10 @@ export class AgentSessionHost {
     const effSid = sessionId || `gw_${role}_${crypto.randomUUID().slice(0, 8)}`
     const effWorktree = (role === 'explorer' || role === 'lineage_companion') && cwd ? path.resolve(cwd) : this.workspaceRoot
     const effSandbox = role === 'library_verifier' && sandboxAbsPath ? path.resolve(sandboxAbsPath) : ''
-    const metaCwd = role === 'library_verifier' && effSandbox
+    if (role === 'library_verifier' && !effSandbox) {
+      throw new Error('BLIND_SANDBOX_REQUIRED: library_verifier 必须挂载独立空白盲审沙箱 sandboxAbsPath，禁止回退主工作区！')
+    }
+    const metaCwd = role === 'library_verifier'
       ? effSandbox
       : ((role === 'explorer' || role === 'lineage_companion') ? effWorktree : this.workspaceRoot)
 
@@ -506,12 +425,8 @@ export class AgentSessionHost {
       try {
         resolved = await agentPresetsSvc.resolve(targetPreset)
       } catch {}
-      if (!resolved && typeof agentPresetsSvc.register === 'function') {
-        await registerPresetsOnRegistry(this.ctx, agentPresetsSvc, { targetId: targetPreset })
-        resolved = await agentPresetsSvc.resolve(targetPreset)
-      }
       if (!resolved) {
-        throw new Error(`角色 ${role} 所需的 Agent Preset "${targetPreset}" 无法在 agentPresets 中解析，禁止裸奔启动。`)
+        throw new Error(`角色 ${role} 所需的 Agent Preset "${targetPreset}" 无法在 agentPresets 中解析（请确认插件入口已装配或 cordis.patch.yml 已生效）。`)
       }
       if (resolved.broken) {
         throw new Error(`角色 ${role} 所需的 Agent Preset "${targetPreset}" 损坏 (${resolved.broken})，请检查 Cordis 插件声明。`)
@@ -562,20 +477,24 @@ export class AgentSessionHost {
     const handle = await this.ctx.agents.create(createOpts)
     liveHandleRef = handle
     this._inheritParentPermissionState(handle?.agent?.session)
+    const crossCwd = this._isCrossCwd(metaCwd)
     this.telemetry.recordSessionStart({
       sessionId: effSid,
       role,
       questionId,
       nodeId,
       branchId,
+      reviewId,
+      deliveryId,
       worktreeAbsPath: effWorktree,
       sandboxAbsPath: effSandbox,
       workspaceRoot: this.workspaceRoot,
+      crossCwd,
       shortTransaction,
       title: sessionTitle,
     })
 
-    await this.attachAndNameSession(handle.agent.session, sessionTitle)
+    await this.attachAndNameSession(handle.agent.session, sessionTitle, { crossCwd })
 
     if (!shortTransaction && ['logistics_coordinator', 'works_engineer', 'library_surveyor', 'supervisory_committee'].includes(role)) {
       const prevSid = this._latestGovernanceSessions.get(role)
@@ -586,17 +505,15 @@ export class AgentSessionHost {
     }
 
     let disposed = false
-    const shouldArchive = archiveOnComplete ?? shortTransaction
-    const disposeAll = async (statusLabel = 'completed', reasonObj = null) => {
+    const defaultShouldArchive = archiveOnComplete ?? shortTransaction
+    const disposeAll = async (statusLabel = 'completed', reasonObj = null, { archive = null } = {}) => {
       if (disposed) return
       disposed = true
       this.liveSessions.delete(effSid)
       this._sessionReadonlyFlags.delete(effSid)
       this._setupHandledAgentIds.delete(effSid)
       const sessionRef = handle?.agent?.session
-      if (shouldArchive) {
-        await this.archiveSession(effSid, sessionRef)
-      }
+      // 1. 先释放活跃会话句柄与挂载钩子（RC5 dsh-workspace 禁止归档仍处于活跃状态的会话）
       try {
         await handle.dispose()
       } catch {}
@@ -605,11 +522,18 @@ export class AgentSessionHost {
           await fn()
         } catch {}
       }
+      // 2. 释放完毕后再执行原生归档，并将真实归档结果（而非期望值）写入遥测
+      const wantArchive = archive !== null ? Boolean(archive) : Boolean(defaultShouldArchive)
+      let archRes = { archived: false, error: null }
+      if (wantArchive) {
+        archRes = await this.archiveSession(effSid, sessionRef)
+      }
       this.telemetry.recordSessionEnd({
         sessionId: effSid,
         status: statusLabel,
         turnEndReason: reasonObj,
-        archived: shouldArchive,
+        archived: Boolean(archRes?.archived),
+        archiveError: archRes?.error || null,
       })
     }
 
@@ -685,7 +609,7 @@ export class AgentSessionHost {
       blackboxSummary,
       lastAssistantText,
       handle: keepAliveAfterIdle ? handle : null,
-      dispose: (st, rs) => disposeAll(st, rs),
+      dispose: (st, rs, opts) => disposeAll(st, rs, opts),
     }
   }
 

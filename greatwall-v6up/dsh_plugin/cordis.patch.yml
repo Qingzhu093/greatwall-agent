@@ -1,17 +1,10 @@
-# dsh-greatwall-v6up v3.0 Cordis Bundle 声明（DSH 0.2.2-rc.5）
+# dsh-greatwall-v6up v3.0 Cordis Bundle 声明（DSH 0.2.2-rc.5 唯一权威 Preset 来源）
 # - 通过 `@deepseek-ai/dsh-agent-preset` 正式注册 6 套长城子角色独立预设（零 standard/ptc/compaction 污染）
-# - 保留桌面用户默认 preset (`standard`/`ptc` 等) 原能力不变，绝不覆盖主控配置
+# - 统一挂载 RC5 原生工具执行器 `@deepseek-ai/dsh-tool-executor-native`（替代已弃用的 dsh-agent-tool-presentation）
+# - 移除硬编码插件 config 覆盖块，所有用户可调参数由插件标准 Config 默认值托管
 - insert:
     - id: greatwall-v6up
       name: 'dsh-greatwall-v6up'
-      config:
-        contextWindowTokens: 500000
-        reflectPct: 0.37
-        handoffPct: 0.70
-        maxConcurrentWorkers: 6
-        hardCapWorkers: 10
-        autoRecordFactLog: true
-        enableSandboxGuard: true
 
     - id: preset-greatwall-explorer
       name: '@deepseek-ai/dsh-agent-preset'
@@ -27,6 +20,8 @@
               prefix: 'You are a GreatWall V6-Up scientific explorer operating strictly inside your assigned branch worktree.'
               complete: false
               includeRuntimeContext: false
+          - id: tool-executor-native
+            name: '@deepseek-ai/dsh-tool-executor-native'
           - id: tool-fs
             name: '@deepseek-ai/dsh-tool-fs'
             config:
@@ -56,6 +51,8 @@
               prefix: 'You are a GreatWall V6-Up Library Verifier executing two-stage blind verification inside an isolated blank sandbox.'
               complete: false
               includeRuntimeContext: false
+          - id: tool-executor-native
+            name: '@deepseek-ai/dsh-tool-executor-native'
           - id: tool-fs
             name: '@deepseek-ai/dsh-tool-fs'
             config:
@@ -87,6 +84,8 @@
               prefix: 'You are a GreatWall V6-Up Lineage Companion managing bounded briefing, 37% expert diagnosis, and objective two-column handoff.'
               complete: false
               includeRuntimeContext: false
+          - id: tool-executor-native
+            name: '@deepseek-ai/dsh-tool-executor-native'
           - id: tool-fs
             name: '@deepseek-ai/dsh-tool-fs'
             config:
@@ -112,6 +111,8 @@
               prefix: 'You are a GreatWall V6-Up Works Engineer forging domain-agnostic verification instruments, calibration suites, and shared probes.'
               complete: false
               includeRuntimeContext: false
+          - id: tool-executor-native
+            name: '@deepseek-ai/dsh-tool-executor-native'
           - id: tool-fs
             name: '@deepseek-ai/dsh-tool-fs'
             config:
@@ -141,6 +142,8 @@
               prefix: 'You are a GreatWall V6-Up Library Surveyor managing external literature cards and Stage 3 delivery synthesis.'
               complete: false
               includeRuntimeContext: false
+          - id: tool-executor-native
+            name: '@deepseek-ai/dsh-tool-executor-native'
           - id: tool-fs
             name: '@deepseek-ai/dsh-tool-fs'
             config:
@@ -171,3 +174,5 @@
               prefix: 'You are a GreatWall V6-Up DB-only governance role operating exclusively via narrow SQLite MCP tools.'
               complete: false
               includeRuntimeContext: false
+          - id: tool-executor-native
+            name: '@deepseek-ai/dsh-tool-executor-native'

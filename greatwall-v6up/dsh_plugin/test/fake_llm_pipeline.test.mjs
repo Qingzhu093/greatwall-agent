@@ -650,6 +650,8 @@ test('L2 剧本 2：第五轮全故障回归（缺绑定拒启、无解查新不
     assert.equal(brfRes.ok, true, JSON.stringify(brfRes))
 
     let worksRuns = 0
+    let worksRunsAfterResume = 0
+    let resumedAfterAbort = false
     let surveyorRuns = 0
     let expTurns = 0
     let orchRef = null
@@ -671,6 +673,7 @@ test('L2 剧本 2：第五轮全故障回归（缺绑定拒启、无解查新不
         }
         if (sid.startsWith('gw_works_engineer_')) {
           worksRuns += 1
+          if (resumedAfterAbort) worksRunsAfterResume += 1
           const q = await api.callTool('get_works_engineering_queue', { question_id: 'ALL' })
           for (const t of q.data.engineering_tickets || []) {
             if (t.status === 'OPEN' && String(t.payload_json || '').includes('HEALTHY_TICKET_CAN_RESOLVE')) {
@@ -705,6 +708,7 @@ test('L2 剧本 2：第五轮全故障回归（缺绑定拒启、无解查新不
             await orchRef.abortNode(nid, 'SWITCH_TO_RULING_V1')
             assert.equal(api.isCancelled(), true, 'abortNode 应向 DSH 发送有效取消原因')
             await orchRef.resumeBackground()
+            resumedAfterAbort = true
           }
           return '探索者一轮结束'
         }
@@ -732,7 +736,11 @@ test('L2 剧本 2：第五轮全故障回归（缺绑定拒启、无解查新不
     assert.equal(surveyorRuns, 1, '无解查新单结案后绝不再重复唤醒馆员')
     assert.equal(st.snapshot.external_literature_count, 0, '无解查新严禁造伪 [R###] 卡！')
     assert.equal(st.snapshot.pending_surveys.length, 0, '无解查新单必须离开 PENDING 队列')
-    assert.equal(worksRuns, 2, '停滞工单连续 2 次无进展必须单条熔断停止拉起工造司（第 1 次结案了健康工单，再跑满 2 次无进展熔断卡死工单）')
+    // resumeBackground() 按设计会复位熔断器计数；并发调度下工造司可能在 resume 前跑 1 次（复位后再跑 2 次=3）或全部在 resume 后跑 2 次熔断（=2）
+    assert.ok(
+      worksRunsAfterResume <= 2 && worksRuns >= 2 && worksRuns <= 3,
+      `停滞工单在 resume 复位后最多再跑 2 次即应单条熔断止血，实得 worksRuns=${worksRuns}, afterResume=${worksRunsAfterResume}`,
+    )
     assert.equal(st.snapshot.open_works_tickets.length, 1, '健康工单已结案，仅剩卡死工单留在 OPEN 且已被单条熔断')
     assert.ok(st.circuitBrokenItems.some((b) => b.key.startsWith('works:ticket:')), '控制面状态必须显式暴露单待办熔断告警')
     assert.equal(expTurns, 1, 'abortNode 后在线探索者必须在下轮前立刻退槽，严禁僵尸续推！')

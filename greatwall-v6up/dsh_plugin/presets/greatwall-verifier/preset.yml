@@ -1,3 +1,0 @@
-name: 长城 · 隔离沙箱盲审官 (Verifier)
-description: 独立空白盲审沙箱跑证预设（只读 fs + 平台 Shell，禁写/禁 DB/禁外网）
-order: 51

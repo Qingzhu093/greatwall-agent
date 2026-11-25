@@ -472,20 +472,22 @@ def tool_submit_stage2_unblind_verdict(
 
     now = utc_now_iso()
 
-    # 分支 1：Stage 3 绑定版本终核模式（防“审 A 放 B”）
+    # 分支 1：Stage 3 绑定版本终核模式（防“审 A 放 B”——核对与落签严格处于同一单写者事务与版本条件内）
     if str(review_id).startswith("STAGE3_FINAL_AUDIT:"):
         target_did = str(review_id).split(":", 1)[1].strip()
-        closure = conn.execute("SELECT * FROM project_closure_state WHERE id = 1").fetchone()
-        if closure is None or str(closure["status"]) != "DELIVERY_EXPORTED":
-            raise FailClosedError(ERR_LOCKED, "当前项目不处于 DELIVERY_EXPORTED 状态")
-        if not target_did or target_did != str(closure["latest_delivery_id"] or ""):
-            raise FailClosedError(
-                ERR_CONFLICT,
-                f"终核落签拦截：审定版本 {target_did!r} != 当前最新导出版本 {closure['latest_delivery_id']!r}（已过期）",
-            )
         if fv in ("ACCEPT", "ACCEPT_NARROWED"):
             with rw_immediate_tx(conn):
-                conn.execute(
+                closure = conn.execute("SELECT * FROM project_closure_state WHERE id = 1").fetchone()
+                if closure is None or str(closure["status"]) != "DELIVERY_EXPORTED":
+                    raise FailClosedError(ERR_LOCKED, "当前项目不处于 DELIVERY_EXPORTED 状态")
+                latest_did = str(closure["latest_delivery_id"] or "")
+                latest_sha = str(closure["latest_delivery_sha256"] or "")
+                if not target_did or target_did != latest_did:
+                    raise FailClosedError(
+                        ERR_CONFLICT,
+                        f"终核落签拦截：审定版本 {target_did!r} != 当前最新导出版本 {latest_did!r}（已过期）",
+                    )
+                cur = conn.execute(
                     """
                     UPDATE project_closure_state
                     SET verifier_audited_delivery_id = ?,
@@ -493,9 +495,14 @@ def tool_submit_stage2_unblind_verdict(
                         verifier_final_audit_passed = 1,
                         updated_at = ?
                     WHERE id = 1
+                      AND status = 'DELIVERY_EXPORTED'
+                      AND latest_delivery_id = ?
+                      AND latest_delivery_sha256 = ?
                     """,
-                    (target_did, str(closure["latest_delivery_sha256"]), now),
+                    (target_did, latest_sha, now, target_did, latest_sha),
                 )
+                if cur.rowcount != 1:
+                    raise FailClosedError(ERR_CONFLICT, f"终核落签版本冲突：{target_did!r} 已被新交付版本覆盖")
             return build_tool_receipt(
                 conn=conn,
                 tool_name="submit_stage2_unblind_verdict",
@@ -504,14 +511,23 @@ def tool_submit_stage2_unblind_verdict(
                 data={
                     "mode": "STAGE3_FINAL_AUDIT",
                     "delivery_id": target_did,
-                    "delivery_sha256": str(closure["latest_delivery_sha256"]),
+                    "delivery_sha256": latest_sha,
                     "verifier_final_audit_passed": True,
                 },
             )
-        # REVISE / REFUTED 退回馆员修正并重导：切换 status='REVISION_REQUESTED' 阻断审稿器死循环重审同一稿
+        # REVISE / REFUTED 退回馆员修正并重导：同样在单写者事务内绑定 target_did 条件更新
         rev_notes = "; ".join(str(x) for x in (revision_requests or []) if str(x).strip()) or str(abstract_md or "请修正边界表述与复现一致性")
         with rw_immediate_tx(conn):
-            conn.execute(
+            closure = conn.execute("SELECT * FROM project_closure_state WHERE id = 1").fetchone()
+            if closure is None or str(closure["status"]) != "DELIVERY_EXPORTED":
+                raise FailClosedError(ERR_LOCKED, "当前项目不处于 DELIVERY_EXPORTED 状态")
+            latest_did = str(closure["latest_delivery_id"] or "")
+            if not target_did or target_did != latest_did:
+                raise FailClosedError(
+                    ERR_CONFLICT,
+                    f"终核退修拦截：审定版本 {target_did!r} != 当前最新导出版本 {latest_did!r}（已过期）",
+                )
+            cur = conn.execute(
                 """
                 UPDATE project_closure_state
                 SET status = 'REVISION_REQUESTED',
@@ -519,9 +535,13 @@ def tool_submit_stage2_unblind_verdict(
                     verifier_revision_notes = ?,
                     updated_at = ?
                 WHERE id = 1
+                  AND status = 'DELIVERY_EXPORTED'
+                  AND latest_delivery_id = ?
                 """,
-                (rev_notes[:2000], now),
+                (rev_notes[:2000], now, target_did),
             )
+            if cur.rowcount != 1:
+                raise FailClosedError(ERR_CONFLICT, f"终核退修版本冲突：{target_did!r} 状态已变更")
         return build_tool_receipt(
             conn=conn,
             tool_name="submit_stage2_unblind_verdict",

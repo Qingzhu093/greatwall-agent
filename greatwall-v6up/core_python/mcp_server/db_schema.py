@@ -16,6 +16,7 @@ import hashlib
 import os
 import re
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -852,42 +853,22 @@ def init_database_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def open_rw_connection(db_path: str | Path, *, init_schema: bool = True) -> sqlite3.Connection:
-    p = Path(db_path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(p), timeout=30.0, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-    conn.execute("PRAGMA busy_timeout=30000;")
-    if init_schema:
-        init_database_schema(conn)
-    return conn
+from .db_runtime import (
+    open_ro_connection,
+    open_rw_connection_with_init,
+    reset_initialized_db_cache,
+    ro_consistent_tx,
+    rw_immediate_tx,
+)
 
 
-def open_ro_connection(db_path: str | Path) -> sqlite3.Connection:
-    p = Path(db_path)
-    uri = f"file:{p.as_posix()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=15.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA query_only=ON;")
-    return conn
-
-
-@contextmanager
-def rw_immediate_tx(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """Single-Writer SQLite `BEGIN IMMEDIATE` 独占写事务上下文管理器（支持嵌套透传）。"""
-    if conn.in_transaction:
-        yield conn
-        return
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        yield conn
-        conn.execute("COMMIT")
-    except Exception:
-        if conn.in_transaction:
-            conn.execute("ROLLBACK")
-        raise
+def open_rw_connection(db_path: str | Path, *, init_schema: bool = True, force_init: bool = False) -> sqlite3.Connection:
+    return open_rw_connection_with_init(
+        db_path,
+        init_fn=init_database_schema,
+        init_schema=init_schema,
+        force_init=force_init,
+    )
 
 
 def sanitize_fts5_query(raw_query: str) -> str:

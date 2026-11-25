@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ..evaluators.isolated_runner import (
+    RequestCancelledError,
     run_calibration_suite,
     run_stage_b_revaluation,
     sha256_file,
@@ -128,6 +129,7 @@ def tool_register_question_instrument(
     artifact_schema: str = "python_run",
     plugin_protocol_version: str = "v3",
     default_spec: dict[str, Any] | None = None,
+    cancel_event: Any = None,
 ) -> dict[str, Any]:
     """注册新科研仪器：VERDICT 强跑独立校准集（100% 匹配自声明预期），PROBE/ENV 可免校准集。"""
     enforce_role_tool_permission(conn, caller_role, "register_question_instrument", session_id=session_id)
@@ -163,6 +165,7 @@ def tool_register_question_instrument(
             calibration_suite_path=cal_abs,
             workspace_root=workspace_root,
             artifact_schema=artifact_schema,
+            cancel_event=cancel_event,
         )
         if not cal_report.get("passed"):
             raise FailClosedError(
@@ -171,9 +174,13 @@ def tool_register_question_instrument(
             )
 
     now = utc_now_iso()
-    frozen_snap = _freeze_instrument_snapshot(workspace_root, iid, 1, inst_abs, inst_sha)
     spec_json = json.dumps(default_spec if isinstance(default_spec, dict) else {}, ensure_ascii=False)
     with rw_immediate_tx(conn):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RequestCancelledError(f"仪器注册 {iid!r} 已取消，拒绝入库")
+        if conn.execute("SELECT 1 FROM instruments WHERE instrument_id = ? LIMIT 1", (iid,)).fetchone() is not None:
+            raise FailClosedError(ERR_CONFLICT, f"仪器 {iid!r} 已被并发注册，请走 upgrade_instrument_with_calibration")
+        frozen_snap = _freeze_instrument_snapshot(workspace_root, iid, 1, inst_abs, inst_sha)
         conn.execute(
             """
             INSERT INTO instruments(
@@ -228,6 +235,7 @@ def tool_upgrade_instrument_with_calibration(
     calibration_suite_rel_path: str,
     artifact_schema: str | None = None,
     default_spec: dict[str, Any] | None = None,
+    cancel_event: Any = None,
 ) -> dict[str, Any]:
     """校准集回归驱动仪器升版（100% 过校准即直接升版，支持同步更新 artifact_schema 与 default_spec，仅局部将该仪器旧观测入待重评队列，绝零误杀他题）。"""
     enforce_role_tool_permission(conn, caller_role, "upgrade_instrument_with_calibration", session_id=session_id)
@@ -258,6 +266,7 @@ def tool_upgrade_instrument_with_calibration(
         calibration_suite_path=cal_abs,
         workspace_root=workspace_root,
         artifact_schema=art_schema,
+        cancel_event=cancel_event,
     )
     if not cal_report.get("passed"):
         raise FailClosedError(
@@ -266,12 +275,18 @@ def tool_upgrade_instrument_with_calibration(
         )
 
     new_sha = sha256_file(new_abs)
-    new_ver = int(cur["version"]) + 1
-    frozen_snap = _freeze_instrument_snapshot(workspace_root, instrument_id, new_ver, new_abs, new_sha)
     now = utc_now_iso()
     queued_obs: list[str] = []
 
     with rw_immediate_tx(conn):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RequestCancelledError(f"仪器升版 {instrument_id!r} 已取消，拒绝升版入库")
+        max_row = conn.execute(
+            "SELECT MAX(version) AS max_ver FROM instruments WHERE instrument_id = ?",
+            (instrument_id,),
+        ).fetchone()
+        new_ver = int(max_row["max_ver"] or cur["version"]) + 1
+        frozen_snap = _freeze_instrument_snapshot(workspace_root, instrument_id, new_ver, new_abs, new_sha)
         conn.execute(
             "UPDATE instruments SET is_active = 0, updated_at = ? WHERE instrument_id = ? AND is_active = 1",
             (now, instrument_id),
@@ -377,8 +392,9 @@ def tool_recompute_stage_b_only(
     session_id: str,
     obs_id: str,
     question_id: str,
+    cancel_event: Any = None,
 ) -> dict[str, Any]:
-    """诚实重评：永久保留旧 [Obs###] 不覆盖，成功则生成绑定新版的新 [Obs###] 并结案队列；缺字段诚实标 INCOMPATIBLE。"""
+    """诚实重评：永久保留旧 [Obs###] 不覆盖，成功则生成绑定新版的新 [Obs###] 并按精确 target_version 结案队列；缺字段诚实标 INCOMPATIBLE。"""
     enforce_role_tool_permission(conn, caller_role, "recompute_stage_b_only", session_id=session_id)
     obs = conn.execute("SELECT * FROM observations WHERE obs_id = ?", (obs_id,)).fetchone()
     if obs is None:
@@ -432,7 +448,8 @@ def tool_recompute_stage_b_only(
     spec = json.loads(obs["spec_json"] or "{}")
     if not isinstance(spec, dict):
         spec = {}
-    spec["instrument_version"] = int(new_inst["version"])
+    run_ver = int(new_inst["version"])
+    spec["instrument_version"] = run_ver
 
     reval = run_stage_b_revaluation(
         instrument_path=inst_abs,
@@ -440,37 +457,57 @@ def tool_recompute_stage_b_only(
         stage_a_output_path=stage_a_path,
         spec=spec,
         tier=str(obs["tier"]),
+        cancel_event=cancel_event,
     )
     now = utc_now_iso()
     target_queue_id = str(pending_q["queue_id"]) if pending_q is not None else None
 
-    # 严格区分：① 旧产物缺字段/结构不兼容 -> 诚实标 INCOMPATIBLE；② 新版仪器自身故障 (非 schema 不兼容的 INSTRUMENT_ERROR / INFRA_ERROR) -> 保留队列不甩锅给历史证据！
+    # 严格区分：① 旧产物缺字段/结构不兼容 -> 诚实标 INCOMPATIBLE；② 新版仪器自身故障 -> 保留队列不甩锅给历史证据！
     if reval.get("incompatible"):
+        superseded_by_newer = False
         with rw_immediate_tx(conn):
-            conn.execute(
-                "UPDATE observations SET obs_status = 'INCOMPATIBLE', details_text = ?, updated_at = ? WHERE obs_id = ?",
-                (f"[INCOMPATIBLE] {reval.get('details', '')}", now, obs_id),
-            )
+            if cancel_event is not None and cancel_event.is_set():
+                raise RequestCancelledError(f"Stage B 重评 {obs_id!r} 已取消，拒绝落库")
+            active_inst = conn.execute(
+                "SELECT version FROM instruments WHERE instrument_id = ? AND is_active = 1 ORDER BY version DESC LIMIT 1",
+                (inst_id,),
+            ).fetchone()
+            active_ver = int(active_inst["version"]) if active_inst is not None else run_ver
             if target_queue_id:
-                conn.execute(
-                    "UPDATE pending_revalidation_queue SET status = 'INCOMPATIBLE', updated_at = ? WHERE queue_id = ?",
-                    (now, target_queue_id),
+                cur_q = conn.execute(
+                    """
+                    UPDATE pending_revalidation_queue
+                    SET status = 'INCOMPATIBLE', updated_at = ?
+                    WHERE queue_id = ? AND target_version = ? AND status = 'PENDING'
+                    """,
+                    (now, target_queue_id, run_ver),
                 )
+                superseded_by_newer = cur_q.rowcount == 0 and active_ver > run_ver
             else:
                 conn.execute(
                     "UPDATE pending_revalidation_queue SET status = 'INCOMPATIBLE', updated_at = ? WHERE obs_id = ? AND target_version = ? AND status = 'PENDING'",
-                    (now, obs_id, int(new_inst["version"])),
+                    (now, obs_id, run_ver),
+                )
+                superseded_by_newer = active_ver > run_ver
+            if not superseded_by_newer:
+                conn.execute(
+                    "UPDATE observations SET obs_status = 'INCOMPATIBLE', details_text = ?, updated_at = ? WHERE obs_id = ?",
+                    (f"[INCOMPATIBLE] {reval.get('details', '')}", now, obs_id),
                 )
         return build_tool_receipt(
             conn=conn,
             tool_name="recompute_stage_b_only",
             question_id=question_id,
-            next_step_guidance=f"旧观测 {obs_id} 缺少新版仪器 {inst_id} v{new_inst['version']} 所需字段，已诚实标记为 INCOMPATIBLE 并结案对应重评队列。",
+            next_step_guidance=(
+                f"重评期间仪器 {inst_id} 已升版至更高版本，旧 v{run_ver} 不兼容结果未误关新版待重评队列。"
+                if superseded_by_newer
+                else f"旧观测 {obs_id} 缺少新版仪器 {inst_id} v{run_ver} 所需字段，已诚实标记为 INCOMPATIBLE 并结案对应重评队列。"
+            ),
             data={
                 "old_obs_id": obs_id,
                 "new_obs_id": None,
-                "status": "INCOMPATIBLE",
-                "target_version": int(new_inst["version"]),
+                "status": "SUPERSEDED_BY_NEWER_INSTRUMENT" if superseded_by_newer else "INCOMPATIBLE",
+                "target_version": run_ver,
                 "details": str(reval.get("details") or ""),
             },
         )
@@ -480,24 +517,52 @@ def tool_recompute_stage_b_only(
             conn=conn,
             tool_name="recompute_stage_b_only",
             question_id=question_id,
-            next_step_guidance=f"新版仪器 {inst_id} v{new_inst['version']} 自身运行时故障（{reval.get('status')}），未误判旧观测 {obs_id} 为 INCOMPATIBLE，请先修复仪器后重试重评。",
+            next_step_guidance=f"新版仪器 {inst_id} v{run_ver} 自身运行时故障（{reval.get('status')}），未误判旧观测 {obs_id} 为 INCOMPATIBLE，请先修复仪器后重试重评。",
             data={
                 "old_obs_id": obs_id,
                 "new_obs_id": None,
                 "status": str(reval.get("status")),
-                "target_version": int(new_inst["version"]),
+                "target_version": run_ver,
                 "details": str(reval.get("details") or ""),
             },
         )
 
-    # 重评成功：永久保留旧 [Obs###] (置 SUPERSEDED_REVALIDATED)，并新增一条绑定新版仪器的新 [Obs###]！
-    new_obs_id = next_prefixed_id(conn, "observations", "obs_id", "Obs-")
-    new_obs_status = str(reval["obs_status"])
+    # 重评成功：在单写者事务内统一分配新 Obs 编号、检查并发升版、按精确 target_version 结案队列！
+    raw_new_obs_status = str(reval["obs_status"])
+    stale_due_to_upgrade = False
+    active_ver = run_ver
     with rw_immediate_tx(conn):
-        conn.execute(
-            "UPDATE observations SET obs_status = 'SUPERSEDED_REVALIDATED', updated_at = ? WHERE obs_id = ?",
-            (now, obs_id),
+        if cancel_event is not None and cancel_event.is_set():
+            raise RequestCancelledError(f"Stage B 重评 {obs_id!r} 已取消，拒绝入库")
+        active_inst = conn.execute(
+            "SELECT version FROM instruments WHERE instrument_id = ? AND is_active = 1 ORDER BY version DESC LIMIT 1",
+            (inst_id,),
+        ).fetchone()
+        active_ver = int(active_inst["version"]) if active_inst is not None else run_ver
+        stale_due_to_upgrade = active_ver > run_ver and raw_new_obs_status in (
+            "VALID_PASS",
+            "MEASURED_REJECTION",
+            "VALID_UNDECIDED",
         )
+        # 若原 obs_id 已有指向更新版本 active_ver 的 PENDING 队列，说明本条 run_ver 结果一出生就已被取代：
+        # 直接记为 SUPERSEDED_REVALIDATED，绝不制造无待办的 PENDING_REVALIDATION 孤儿观测！
+        still_pending = (
+            conn.execute(
+                """
+                SELECT 1 FROM pending_revalidation_queue
+                WHERE obs_id = ? AND target_instrument_id = ? AND target_version = ? AND status = 'PENDING'
+                LIMIT 1
+                """,
+                (obs_id, inst_id, active_ver),
+            ).fetchone()
+            if stale_due_to_upgrade
+            else None
+        )
+        if stale_due_to_upgrade:
+            new_obs_status = "SUPERSEDED_REVALIDATED" if still_pending is not None else "PENDING_REVALIDATION"
+        else:
+            new_obs_status = raw_new_obs_status
+        new_obs_id = next_prefixed_id(conn, "observations", "obs_id", "Obs-")
         conn.execute(
             """
             INSERT INTO observations(
@@ -513,7 +578,7 @@ def tool_recompute_stage_b_only(
                 str(obs["branch_id"]),
                 str(obs["node_id"]),
                 inst_id,
-                int(new_inst["version"]),
+                run_ver,
                 str(obs["tier"]),
                 str(obs["candidate_entry_sha256"]),
                 str(obs["tools_dir_sha256"]),
@@ -532,27 +597,57 @@ def tool_recompute_stage_b_only(
         )
         if target_queue_id:
             conn.execute(
-                "UPDATE pending_revalidation_queue SET status = 'DONE', updated_at = ? WHERE queue_id = ?",
-                (now, target_queue_id),
+                """
+                UPDATE pending_revalidation_queue
+                SET status = 'DONE', updated_at = ?
+                WHERE queue_id = ? AND target_version = ? AND status = 'PENDING'
+                """,
+                (now, target_queue_id, run_ver),
             )
         else:
             conn.execute(
-                "UPDATE pending_revalidation_queue SET status = 'DONE', updated_at = ? WHERE obs_id = ? AND target_version = ? AND status = 'PENDING'",
-                (now, obs_id, int(new_inst["version"])),
+                """
+                UPDATE pending_revalidation_queue
+                SET status = 'DONE', updated_at = ?
+                WHERE obs_id = ? AND target_version = ? AND status = 'PENDING'
+                """,
+                (now, obs_id, run_ver),
+            )
+
+        if not stale_due_to_upgrade:
+            conn.execute(
+                "UPDATE observations SET obs_status = 'SUPERSEDED_REVALIDATED', updated_at = ? WHERE obs_id = ?",
+                (now, obs_id),
+            )
+        elif still_pending is None:
+            # 仅当不存在指向 active_ver 的待办时，才给标记为 PENDING_REVALIDATION 的 new_obs_id 补挂对应待办（1:1 严格配对）
+            conn.execute(
+                """
+                INSERT INTO pending_revalidation_queue(
+                    queue_id, obs_id, question_id, target_instrument_id, target_version, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?)
+                """,
+                (f"reval_{uuid.uuid4().hex[:10]}", new_obs_id, question_id, inst_id, active_ver, now, now),
             )
 
     return build_tool_receipt(
         conn=conn,
         tool_name="recompute_stage_b_only",
         question_id=question_id,
-        next_step_guidance=f"已免重跑 Stage A 完成重评：旧收据 {obs_id} 保留为 SUPERSEDED_REVALIDATED，已生成绑定 v{new_inst['version']} 的新收据 {new_obs_id} ({new_obs_status})。",
+        next_step_guidance=(
+            f"重评期间仪器 {inst_id} 已升至 v{active_ver}：已记录绑定 v{run_ver} 的历史收据 {new_obs_id} (PENDING_REVALIDATION)，并保留指向 v{active_ver} 的待重评队列。"
+            if stale_due_to_upgrade
+            else f"已免重跑 Stage A 完成重评：旧收据 {obs_id} 保留为 SUPERSEDED_REVALIDATED，已生成绑定 v{run_ver} 的新收据 {new_obs_id} ({new_obs_status})。"
+        ),
         data={
             "old_obs_id": obs_id,
-            "old_obs_status": "SUPERSEDED_REVALIDATED",
+            "old_obs_status": str(obs["obs_status"]) if stale_due_to_upgrade else "SUPERSEDED_REVALIDATED",
             "new_obs_id": new_obs_id,
             "new_obs_status": new_obs_status,
             "instrument_id": inst_id,
-            "instrument_version": int(new_inst["version"]),
+            "instrument_version": run_ver,
+            "active_instrument_version": active_ver,
+            "stale_due_to_upgrade": stale_due_to_upgrade,
             "tracks": reval.get("tracks") or {},
             "details": str(reval.get("details") or ""),
         },
@@ -577,6 +672,16 @@ def tool_update_skill_ledger(
     sid = str(skill_id or "").strip()
     if not _SKILL_ID_RE.match(sid):
         raise FailClosedError(ERR_INVALID_INPUT, f"skill_id 必须匹配 ^[a-z0-9_]+$（无空格连字符）：{skill_id!r}")
+    ver_int = int(version)
+    succ_int = int(raw_success_count)
+    fail_int = int(raw_failure_count)
+    if ver_int < 1:
+        raise FailClosedError(ERR_INVALID_INPUT, f"version 必须 >= 1，实收 {version!r}")
+    if succ_int < 0 or fail_int < 0:
+        raise FailClosedError(
+            ERR_INVALID_INPUT,
+            f"raw_success_count 与 raw_failure_count 必须 >= 0，实收 ({raw_success_count!r}, {raw_failure_count!r})",
+        )
 
     art_abs = _resolve_ws_or_core_file(workspace_root, verified_artifact_rel_path)
     if art_abs.stat().st_size <= 0:

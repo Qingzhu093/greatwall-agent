@@ -14,6 +14,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "main": "./lib/index.js",
+  "icon": "./icon.svg",
   "engines": {
     "node": "^22.19.0 || >=24.0.0",
     "dsh": ">=0.2.2-rc.5 <0.3.0-0"
@@ -22,13 +23,15 @@
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
+    "./icon": "./icon.svg",
+    "./icon.svg": "./icon.svg",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json"
   },
   "files": [
     "lib",
-    "presets",
     "tools",
+    "icon.svg",
     "locale/*.json",
     "cordis.patch.yml",
     "README.md"

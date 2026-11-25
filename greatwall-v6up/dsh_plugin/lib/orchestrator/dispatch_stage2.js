@@ -10,6 +10,8 @@
  * 7. 监察委周期心跳审计；
  * 8. Stage 2 结题门禁放行与 Stage 3 导出；
  * 9. 探索者并发槽位派发。
+ *
+ * 严格只依赖窄能力端口 `DispatchRuntimePort`，零 `._` 私有字段访问，可脱离真实宿主独立单测。
  * @module dsh-greatwall-v6up/orchestrator/dispatch_stage2
  */
 import {
@@ -26,18 +28,18 @@ import {
 
 /**
  * 0. SQLite 单真源待交接/崩溃抢救恢复（彻底取消内存双账本）。
- * @param {any} orch
+ * @param {any} port DispatchRuntimePort
  * @param {any} snap
  * @param {AbortSignal} sig
  * @returns {boolean}
  */
-export function dispatchPendingHandoffRecoveries(orch, snap, sig) {
+export function dispatchPendingHandoffRecoveries(port, snap, sig) {
   let dispatchedSomething = false
   for (const pnode of snap.pending_handoff_nodes || []) {
-    if (orch._runningExplorers.has(pnode.node_id)) continue
+    if (port.isExplorerRunning(pnode.node_id)) continue
     const recKey = `recover:${pnode.node_id}`
     const recFp = `${pnode.pending_handoff_mode}:${pnode.updated_at || ''}`
-    if (orch._itemBreaker.isBroken(recKey, recFp)) continue
+    if (port.isBreakerOpen(recKey, recFp)) continue
     const persistedWill = String(pnode.will_md || pnode.explorer_will_md || '').trim()
     const effMode =
       pnode.pending_handoff_mode === 'HANDOFF_70' && persistedWill
@@ -48,15 +50,15 @@ export function dispatchPendingHandoffRecoveries(orch, snap, sig) {
         ? 'host_restart_before_will_persisted'
         : (pnode.pending_handoff_reason || 'host_restart_recovery')
 
-    if (orch._launchGovTask(`recover_handoff:${pnode.node_id}`, async () => {
-      await runHandoffWithCompanion(orch, pnode, {
+    if (port.launchGovTask(`recover_handoff:${pnode.node_id}`, async () => {
+      await runHandoffWithCompanion(port, pnode, {
         mode: effMode,
         explorerWillText: persistedWill,
         interruptReason: effReason,
         signal: sig,
       })
-      orch._handoffsSinceHeartbeat += 1
-      await orch._evaluateBreakerAfterTask(
+      port.recordHandoffCompleted(1)
+      await port.evaluateBreakerAfterTask(
         'lineage_companion',
         [{ key: recKey, beforeFp: recFp }],
         (nextSnap) => new Map(
@@ -75,29 +77,26 @@ export function dispatchPendingHandoffRecoveries(orch, snap, sig) {
 
 /**
  * 执行一轮 Stage 2 治理与探索并发派发。
- * @param {any} orch
+ * @param {any} port DispatchRuntimePort
  * @param {any} snap
  * @param {AbortSignal} sig
  * @param {number | null} maxConcurrentWorkers
  * @returns {Promise<{ dispatched: boolean, continueImmediate?: boolean }>}
  */
-export async function dispatchStage2Step(orch, snap, sig, maxConcurrentWorkers = null) {
+export async function dispatchStage2Step(port, snap, sig, maxConcurrentWorkers = null) {
   let dispatchedSomething = false
   const closureSt = snap?.closure_state?.status || 'OPEN'
 
   // 1) PRE_SPAWN 同节点伴随写看板并挂起保活（受 slot_cap 约束 + 单节点防自旋熔断）
-  const effSlotCap = Math.max(1, Number(maxConcurrentWorkers || snap.slot_cap || 6))
-  const runningBriefings = [...orch._runningGov.keys()].filter((k) => k.startsWith('brief:')).length
-  const readyWaitingCount = (snap.explorers_ready_to_run || []).filter((n) => !orch._runningExplorers.has(n.node_id)).length
-  let availBriefSlots = Math.max(0, effSlotCap - orch._runningExplorers.size - runningBriefings - readyWaitingCount)
+  let availBriefSlots = port.getAvailableBriefSlots(snap, maxConcurrentWorkers)
   for (const node of snap.explorers_needing_briefing || []) {
     if (availBriefSlots <= 0) break
     const bKey = `brief:${node.node_id}`
     const bFp = `brief:${node.node_id}:${node.updated_at || ''}`
-    if (orch._itemBreaker.isBroken(bKey, bFp)) continue
-    if (orch._launchGovTask(bKey, async () => {
-      await runPreSpawnBriefingWithCompanion(orch, node, { signal: sig })
-      await orch._evaluateBreakerAfterTask('lineage_companion', [{ key: bKey, beforeFp: bFp }], (nextSnap) =>
+    if (port.isBreakerOpen(bKey, bFp)) continue
+    if (port.launchGovTask(bKey, async () => {
+      await runPreSpawnBriefingWithCompanion(port, node, { signal: sig })
+      await port.evaluateBreakerAfterTask('lineage_companion', [{ key: bKey, beforeFp: bFp }], (nextSnap) =>
         new Map((nextSnap?.explorers_needing_briefing || []).map((n) => [`brief:${n.node_id}`, `brief:${n.node_id}:${n.updated_at || ''}`])),
       )
     })) {
@@ -110,21 +109,21 @@ export async function dispatchStage2Step(orch, snap, sig, maxConcurrentWorkers =
   const surveyFpMap = buildSurveyItemFingerprints(snap)
   const activeSurveyItems = []
   for (const [k, fp] of surveyFpMap.entries()) {
-    if (!orch._itemBreaker.isBroken(k, fp)) {
+    if (!port.isBreakerOpen(k, fp)) {
       activeSurveyItems.push({ key: k, beforeFp: fp, reqId: k.slice('survey:'.length) })
     }
   }
   if (activeSurveyItems.length > 0) {
     const reqIds = activeSurveyItems.map((it) => it.reqId)
-    if (orch._launchGovTask('survey:pending', async () => {
-      await orch.spawnAndRunAgent({
+    if (port.launchGovTask('survey:pending', async () => {
+      await port.spawnAndRunAgent({
         role: 'library_surveyor',
         uiLabel: `[图书馆采编] 响应查新 (${reqIds.length}单)`,
         shortTransaction: false,
         signal: sig,
         prompt: `待采编外部文献请求 ${JSON.stringify(reqIds)} 已就绪，请先调 get_survey_requests(question_id="ALL") 查看问题与检索词：若找到真实来源，调 publish_external_literature_card(outcome="CARD_PUBLISHED", ..., fulfilled_request_ids=...) 写入外藏卡片 [R###]；若确认资料客观不存在或违背合规边界，严禁造伪卡，请调 publish_external_literature_card(outcome="UNAVAILABLE_REPORT", question_id=..., fulfilled_request_ids=..., unavailable_reason_md=...) 诚实结案为 CLOSED_UNAVAILABLE。`,
       })
-      await orch._evaluateBreakerAfterTask('library_surveyor', activeSurveyItems, buildSurveyItemFingerprints)
+      await port.evaluateBreakerAfterTask('library_surveyor', activeSurveyItems, buildSurveyItemFingerprints)
     })) {
       dispatchedSomething = true
     }
@@ -134,19 +133,19 @@ export async function dispatchStage2Step(orch, snap, sig, maxConcurrentWorkers =
   const worksFpMap = buildWorksItemFingerprints(snap)
   const activeWorksItems = []
   for (const [k, fp] of worksFpMap.entries()) {
-    if (!orch._itemBreaker.isBroken(k, fp)) {
+    if (!port.isBreakerOpen(k, fp)) {
       activeWorksItems.push({ key: k, beforeFp: fp })
     }
   }
   if (activeWorksItems.length > 0) {
     const unhealthyInsts = (snap.unhealthy_instruments || []).filter(
-      (i) => !orch._itemBreaker.isBroken(`works:inst:${i.instrument_id}`, worksFpMap.get(`works:inst:${i.instrument_id}`) || ''),
+      (i) => !port.isBreakerOpen(`works:inst:${i.instrument_id}`, worksFpMap.get(`works:inst:${i.instrument_id}`) || ''),
     )
     const activeTickets = (snap.open_works_tickets || []).filter(
-      (t) => !orch._itemBreaker.isBroken(`works:ticket:${t.ticket_id}`, worksFpMap.get(`works:ticket:${t.ticket_id}`) || ''),
+      (t) => !port.isBreakerOpen(`works:ticket:${t.ticket_id}`, worksFpMap.get(`works:ticket:${t.ticket_id}`) || ''),
     )
-    if (orch._launchGovTask('works:queue', async () => {
-      await orch.spawnAndRunAgent({
+    if (port.launchGovTask('works:queue', async () => {
+      await port.spawnAndRunAgent({
         role: 'works_engineer',
         uiLabel: unhealthyInsts.length > 0
           ? `[科研仪器科] 仪器熔断修复 (${unhealthyInsts.map((i) => i.instrument_id).join(',')})`
@@ -159,7 +158,7 @@ export async function dispatchStage2Step(orch, snap, sig, maxConcurrentWorkers =
         ].filter(Boolean).join('\n\n'),
         prompt: '请调用 get_works_engineering_queue(question_id="ALL") 检查熔断仪器、痛点工单与 pending_revalidation 队列：对故障或需升版仪器调用 upgrade_instrument_with_calibration（或 register_question_instrument）；对待重评旧观测调 recompute_stage_b_only；对每条已处理或无需改动的工单必须显式调用 resolve_works_ticket(ticket_id, resolution="RESOLVED"|"WONTFIX"|"DUPLICATE", resolution_note) 结案！',
       })
-      await orch._evaluateBreakerAfterTask('works_engineer', activeWorksItems, buildWorksItemFingerprints)
+      await port.evaluateBreakerAfterTask('works_engineer', activeWorksItems, buildWorksItemFingerprints)
     })) {
       dispatchedSomething = true
     }
@@ -169,21 +168,21 @@ export async function dispatchStage2Step(orch, snap, sig, maxConcurrentWorkers =
   const triageFpMap = buildTriageItemFingerprints(snap)
   const activeTriageItems = []
   for (const [k, fp] of triageFpMap.entries()) {
-    if (!orch._itemBreaker.isBroken(k, fp)) {
+    if (!port.isBreakerOpen(k, fp)) {
       activeTriageItems.push({ key: k, beforeFp: fp })
     }
   }
   const concAlerts = (snap.family_concentration_alerts || []).filter(
-    (a) => !orch._itemBreaker.isBroken(`conc:${a.question_id}:${a.family_id}`, `cnt=${a.branch_count_in_family}/${a.total_active_branches}`),
+    (a) => !port.isBreakerOpen(`conc:${a.question_id}:${a.family_id}`, `cnt=${a.branch_count_in_family}/${a.total_active_branches}`),
   )
   const needQs = (snap.questions_needing_branch || []).filter(
-    (q) => !orch._itemBreaker.isBroken(`need_branch:${q}`, `need:${q}`),
+    (q) => !port.isBreakerOpen(`need_branch:${q}`, `need:${q}`),
   )
   const orphanedRevs = (snap.orphaned_blind_review_revisions || []).filter(
-    (r) => !orch._itemBreaker.isBroken(`orphan_rev:${r.review_id}`, `orphan:${r.review_id}:${r.source_node_id}`),
+    (r) => !port.isBreakerOpen(`orphan_rev:${r.review_id}`, `orphan:${r.review_id}:${r.source_node_id}`),
   )
   const understaffedQs = (snap.understaffed_questions || []).filter(
-    (u) => !orch._itemBreaker.isBroken(
+    (u) => !port.isBreakerOpen(
       `understaffed:${u.question_id}`,
       `active=${u.active_branch_count}:missing=${(u.missing_active_family_ids || []).join(',')}`,
     ),
@@ -216,8 +215,8 @@ export async function dispatchStage2Step(orch, snap, sig, maxConcurrentWorkers =
               : (understaffedQs.length > 0
                   ? `补齐正交分支(${understaffedQs.map((u) => u.question_id).join(',')})`
                   : `派单(${needQs.join(',')})`)))
-    if (orch._launchGovTask('logistics:triage', async () => {
-      await orch.spawnAndRunAgent({
+    if (port.launchGovTask('logistics:triage', async () => {
+      await port.spawnAndRunAgent({
         role: 'logistics_coordinator',
         uiLabel: `[后勤总管] ${uiActionLabel}`,
         shortTransaction: false,
@@ -238,8 +237,8 @@ export async function dispatchStage2Step(orch, snap, sig, maxConcurrentWorkers =
           needQs.length > 0 ? `- 子题 ${needQs.join(', ')} 尚无活跃探索分支，请按需开枝。` : '',
         ].filter(Boolean).join('\n'),
       })
-      orch._handoffsSinceHeartbeat += Math.max(1, triageCount)
-      await orch._evaluateBreakerAfterTask('logistics_coordinator', logisticsItems, (nextSnap) => {
+      port.recordHandoffCompleted(Math.max(1, triageCount))
+      await port.evaluateBreakerAfterTask('logistics_coordinator', logisticsItems, (nextSnap) => {
         const m = buildTriageItemFingerprints(nextSnap)
         for (const a of nextSnap?.family_concentration_alerts || []) {
           m.set(`conc:${a.question_id}:${a.family_id}`, `cnt=${a.branch_count_in_family}/${a.total_active_branches}`)
@@ -265,10 +264,10 @@ export async function dispatchStage2Step(orch, snap, sig, maxConcurrentWorkers =
   for (const rev of snap.pending_reviews || []) {
     const rKey = `review:${rev.review_id}`
     const rFp = reviewFpMap.get(rKey) || `rev:${rev.review_id}:${rev.review_status}`
-    if (orch._itemBreaker.isBroken(rKey, rFp)) continue
-    if (orch._launchGovTask(rKey, async () => {
-      await orch._runBlindReviewWithSandbox(rev, sig)
-      await orch._evaluateBreakerAfterTask('library_verifier', [{ key: rKey, beforeFp: rFp }], buildReviewItemFingerprints)
+    if (port.isBreakerOpen(rKey, rFp)) continue
+    if (port.launchGovTask(rKey, async () => {
+      await port.runBlindReview(rev, sig)
+      await port.evaluateBreakerAfterTask('library_verifier', [{ key: rKey, beforeFp: rFp }], buildReviewItemFingerprints)
     })) {
       dispatchedSomething = true
     }
@@ -278,16 +277,16 @@ export async function dispatchStage2Step(orch, snap, sig, maxConcurrentWorkers =
   if (snap.stagnation_triggered) {
     const stagKey = 'logistics:stagnation'
     const stagFp = 'stagnation:1'
-    if (!orch._itemBreaker.isBroken(stagKey, stagFp)) {
-      if (orch._launchGovTask(stagKey, async () => {
-        await orch.spawnAndRunAgent({
+    if (!port.isBreakerOpen(stagKey, stagFp)) {
+      if (port.launchGovTask(stagKey, async () => {
+        await port.spawnAndRunAgent({
           role: 'logistics_coordinator',
           uiLabel: '[后勤总管] 停滞五车道重排',
           shortTransaction: false,
           signal: sig,
           prompt: '连续无 L1 产出停滞看门狗已触发！请立即调用 get_logistics_dashboard 与 dispatch_stagnation_five_lanes 执行五车道正交重排。',
         })
-        await orch._evaluateBreakerAfterTask('logistics_coordinator', [{ key: stagKey, beforeFp: stagFp }], (nextSnap) => {
+        await port.evaluateBreakerAfterTask('logistics_coordinator', [{ key: stagKey, beforeFp: stagFp }], (nextSnap) => {
           const m = new Map()
           if (nextSnap?.stagnation_triggered) m.set(stagKey, stagFp)
           return m
@@ -298,19 +297,12 @@ export async function dispatchStage2Step(orch, snap, sig, maxConcurrentWorkers =
     }
   }
 
-  // 7) 监察委周期心跳审计（有新交接/分诊/节点中止进展时按频次或 3 分钟节律触发；单线长跑期每 10 分钟保底巡检一次，0 探索者闲置时绝不空转）
+  // 7) 监察委周期心跳审计
   const nowMs = Date.now()
-  const hasActiveExploration = orch._runningExplorers.size > 0
-  if (
-    snap.stage === 'STAGE2_EVOLVE' &&
-    (orch._handoffsSinceHeartbeat >= 3 ||
-      (orch._handoffsSinceHeartbeat > 0 && orch._lastHeartbeatAt > 0 && nowMs - orch._lastHeartbeatAt > 180_000) ||
-      (hasActiveExploration && orch._lastHeartbeatAt > 0 && nowMs - orch._lastHeartbeatAt > 600_000))
-  ) {
-    if (orch._launchGovTask('supervisory:heartbeat', async () => {
-      orch._handoffsSinceHeartbeat = 0
-      orch._lastHeartbeatAt = Date.now()
-      await orch.spawnAndRunAgent({
+  if (snap.stage === 'STAGE2_EVOLVE' && port.shouldTriggerHeartbeat(nowMs)) {
+    if (port.launchGovTask('supervisory:heartbeat', async () => {
+      port.markHeartbeatFired(Date.now())
+      await port.spawnAndRunAgent({
         role: 'supervisory_committee',
         uiLabel: '[监察委员会] Stage2 心跳审计',
         shortTransaction: false,
@@ -321,30 +313,30 @@ export async function dispatchStage2Step(orch, snap, sig, maxConcurrentWorkers =
       dispatchedSomething = true
     }
   }
-  if (orch._lastHeartbeatAt === 0) orch._lastHeartbeatAt = nowMs
+  port.initHeartbeatClockIfNeeded(nowMs)
 
   // 8) 检查 Stage 2 结题放行
   if (
     snap.closure_gate?.closure_allowed &&
     snap.stage === 'STAGE2_EVOLVE' &&
     closureSt === 'OPEN' &&
-    orch._runningExplorers.size === 0 &&
-    !orch._runningGov.has('stage3:export')
+    port.getRunningExplorerCount() === 0 &&
+    !port.isGovTaskRunning('stage3:export')
   ) {
     const deliveryMode = snap.closure_gate?.mode || (snap.human_stop_active ? 'PARTIAL_ON_HUMAN_STOP' : 'FULL')
     const expKey = `stage3:export:${deliveryMode}`
     const expFp = `export:${deliveryMode}:OPEN`
-    if (!orch._itemBreaker.isBroken(expKey, expFp)) {
+    if (!port.isBreakerOpen(expKey, expFp)) {
       dispatchedSomething = true
-      await orch._launchGovTaskAndAwaitIfSync('stage3:export', async () => {
-        await orch.spawnAndRunAgent({
+      await port.launchGovTaskAndAwait('stage3:export', async () => {
+        await port.spawnAndRunAgent({
           role: 'library_surveyor',
           uiLabel: `[图书馆采编] Stage3 五件套导出 (${deliveryMode})`,
           shortTransaction: false,
           signal: sig,
           prompt: `Stage 2 结题门禁已放行 (delivery_mode="${deliveryMode}")！请调用 get_survey_requests(question_id="ALL") 获取全卷已审 L3_VERIFIED 列表与溯源信息，严禁混入未过盲审草稿，撰写正式综合论文并调用 export_stage3_final_delivery(delivery_mode="${deliveryMode}", ...) 导出 final_delivery 五件套，进入两步联合终核。`,
         })
-        await orch._evaluateBreakerAfterTask('library_surveyor', [{ key: expKey, beforeFp: expFp }], (nextSnap) => {
+        await port.evaluateBreakerAfterTask('library_surveyor', [{ key: expKey, beforeFp: expFp }], (nextSnap) => {
           const m = new Map()
           if ((nextSnap?.closure_state?.status || 'OPEN') === 'OPEN' && nextSnap?.stage === 'STAGE2_EVOLVE') {
             m.set(expKey, expFp)
@@ -357,11 +349,11 @@ export async function dispatchStage2Step(orch, snap, sig, maxConcurrentWorkers =
   }
 
   // 9) 探索者并发派发（严守 triage_locked_branches 防抢跑、human_stop_active 与 closure_gate 收口停新派）
-  const runningIds = new Set(orch._runningExplorers.keys())
+  const runningIds = port.getRunningExplorerIds()
   const readyNodes = selectDispatchableExplorers(snap, runningIds, maxConcurrentWorkers)
   for (const node of readyNodes) {
     dispatchedSomething = true
-    orch._launchExplorerWorker(node, snap, sig)
+    port.launchExplorer(node, snap, sig)
   }
 
   return { dispatched: dispatchedSomething }

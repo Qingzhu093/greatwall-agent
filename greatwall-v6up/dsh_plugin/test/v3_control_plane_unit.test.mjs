@@ -17,7 +17,7 @@ import {
   resolvePlatformAllowedTools,
   resolvePlatformShellTool,
 } from '../lib/prompts.js'
-import { PRESET_DEFINITIONS, ROLE_TO_PRESET, buildDeclarativePresetConfigs } from '../lib/presets.js'
+import { ROLE_TO_PRESET, buildDeclarativePresetConfigs } from '../lib/presets.js'
 import { READONLY_BLOCKED_MCP_TOOLS, createSandboxCallEvaluator } from '../lib/read_isolated_sandbox.js'
 import {
   evaluateContextClockTrigger,
@@ -42,7 +42,16 @@ import {
   selectDispatchableExplorers,
 } from '../lib/orchestrator.js'
 import { TelemetryCollector } from '../lib/telemetry.js'
-import { pickController } from '../lib/console_routes.js'
+import { extractGovernanceSessions, pickController, registerGreatwallConsoleRoutes } from '../lib/console_routes.js'
+import { Config, resolvePluginConfig } from '../lib/config.js'
+import { GreatwallControlService } from '../lib/control_service.js'
+import { dispatchStage1Step } from '../lib/orchestrator/dispatch_stage1.js'
+import { dispatchStage2Step } from '../lib/orchestrator/dispatch_stage2.js'
+import { dispatchStage3Step } from '../lib/orchestrator/dispatch_stage3.js'
+import { Config as PluginConfig, apply as applyPlugin } from '../lib/index.js'
+import { STRIPPED_CONSTRAINT_KEYS, normalizeSchemaForDsh } from '../lib/bridge/dsh_schema_adapter.js'
+import { assertValidBlindSandboxResult } from '../lib/orchestrator/runtime_port.js'
+import { registerScopedMcpTools } from '../lib/clock_and_turn_gap.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CORE_PYTHON_ROOT = path.resolve(__dirname, '..', '..', 'core_python')
@@ -101,8 +110,9 @@ test('1. 6套Preset、角色路由与平台感知原生工具白名单', () => {
   assert.ok(ROLE_MCP_TOOLS.works_engineer.includes('upgrade_instrument_with_calibration'))
   assert.ok(ROLE_MCP_TOOLS.works_engineer.includes('resolve_works_ticket'))
 
-  // 7 角色全映射到 6 套职责极净 Preset
-  const presets = Object.keys(PRESET_DEFINITIONS)
+  // 7 角色全映射到 6 套职责极净单源 Preset（直接派生自 cordis.patch.yml）
+  const winDefsList = buildDeclarativePresetConfigs('win32')
+  const presets = winDefsList.map((d) => d.id)
   assert.equal(presets.length, 6)
   for (const role of CANONICAL_ROLES) {
     assert.ok(presets.includes(ROLE_TO_PRESET[role]), `角色 ${role} 映射缺失`)
@@ -112,11 +122,6 @@ test('1. 6套Preset、角色路由与平台感知原生工具白名单', () => {
   assert.equal(ROLE_TO_PRESET.library_verifier, 'greatwall-verifier')
   assert.equal(ROLE_TO_PRESET.library_surveyor, 'greatwall-surveyor')
 
-  // 严禁 {{cwd}} 模板变量
-  for (const [id, def] of Object.entries(PRESET_DEFINITIONS)) {
-    assert.ok(!def.cordisYml.includes('{{cwd}}'), `Preset ${id} 不可包含 {{cwd}}`)
-  }
-
   // 平台感知 Shell 工具与平权矩阵
   assert.equal(resolvePlatformShellTool('win32'), 'pwsh')
   assert.equal(resolvePlatformShellTool('linux'), 'bash')
@@ -125,13 +130,19 @@ test('1. 6套Preset、角色路由与平台感知原生工具白名单', () => {
   assert.deepEqual(resolvePlatformAllowedTools('library_verifier', 'win32'), ['read', 'glob', 'grep', 'pwsh'])
   assert.deepEqual(resolvePlatformAllowedTools('library_verifier', 'linux'), ['read', 'glob', 'grep', 'bash'])
 
-  // 声明式 Preset 插件校验：verifier 有只读 fs + 平台 shell，db-only 仅 persona
-  const winDefs = Object.fromEntries(buildDeclarativePresetConfigs('win32').map((d) => [d.id, d]))
+  // 声明式 Preset 插件校验：6 套均挂载 RC5 tool-executor-native；verifier 有只读 fs + 平台 shell，db-only 仅 persona + native executor
+  const winDefs = Object.fromEntries(winDefsList.map((d) => [d.id, d]))
+  for (const def of winDefsList) {
+    assert.ok(
+      def.plugins.some((p) => p.name === '@deepseek-ai/dsh-tool-executor-native'),
+      `Preset ${def.id} 必须挂载 @deepseek-ai/dsh-tool-executor-native`,
+    )
+  }
   const verPlugins = winDefs['greatwall-verifier'].plugins
   assert.equal(verPlugins.find((p) => p.id === 'tool-fs')?.config?.write, false)
   assert.equal(verPlugins.find((p) => p.id === 'tool-pwsh')?.disabled, false)
   assert.equal(verPlugins.find((p) => p.id === 'tool-bash')?.disabled, true)
-  assert.deepEqual(winDefs['greatwall-db-only'].plugins.map((p) => p.id), ['persona'])
+  assert.deepEqual(winDefs['greatwall-db-only'].plugins.map((p) => p.id), ['persona', 'tool-executor-native'])
 })
 
 test('2. 平台感知原生工具挂载强断言 (assertRequiredNativeTools)', () => {
@@ -281,22 +292,31 @@ test('6. pair_lifecycle 单节点同会话伴随暂停续传与 70% 两步清醒
     const liveSessions = new Map()
     const disposedIds = []
 
+    const compMap = new Map()
     const fakeOrch = {
       liveSessions,
-      _nodeCompanionSessions: new Map(),
+      _nodeCompanionSessions: compMap,
       _pendingSalvageNodes: new Map(),
       _handoffsSinceHeartbeat: 0,
-      host: {
-        setSessionReadonly(sid, flag) {
-          readonlyStates.set(sid, flag)
-          events.push({ type: 'setReadonly', sid, flag })
-        },
-        async archiveSession(sid) {
-          events.push({ type: 'archive', sid })
-        },
+      getLiveCompanion(nid) {
+        const h = compMap.get(nid)
+        if (!h || !liveSessions.has(h.sessionId)) { compMap.delete(nid); return null }
+        return h
       },
-      _formatInterventionsForTarget: () => '',
-      _appendInterventions: (t) => t,
+      setLiveCompanion(nid, h) { compMap.set(nid, h) },
+      async disposeCompanion(nid, st) {
+        const h = compMap.get(nid)
+        compMap.delete(nid)
+        if (h?.dispose) await h.dispose(st)
+      },
+      recordHandoffCompleted(delta = 1) { fakeOrch._handoffsSinceHeartbeat += delta },
+      setSessionReadonly(sid, flag) {
+        readonlyStates.set(sid, flag)
+        events.push({ type: 'setReadonly', sid, flag })
+      },
+      async archiveSession(sid) {
+        events.push({ type: 'archive', sid })
+      },
       async spawnAndRunAgent(opts) {
         const sid = opts.sessionId || `s_${opts.role}_${events.length}`
         events.push({ type: 'spawn', role: opts.role, sid, keepAlive: opts.keepAliveAfterIdle })
@@ -410,26 +430,34 @@ test('8. 无阈值绝不跳过 37% 提前交接 + 70% 只读禁写/评测 MCP + 
     const sequence = []
     const liveSessions = new Map()
 
+    const compMap = new Map()
     const fakeOrch = {
       workspaceRoot: tmpRoot,
       liveSessions,
-      _nodeCompanionSessions: new Map(),
+      _nodeCompanionSessions: compMap,
       _pendingSalvageNodes: new Map(),
       _handoffsSinceHeartbeat: 0,
-      bridge: {
-        async control(method, params) {
-          persistedCalls.push({ method, params })
-          return { ok: true }
-        },
+      getLiveCompanion(nid) {
+        const h = compMap.get(nid)
+        if (!h || !liveSessions.has(h.sessionId)) { compMap.delete(nid); return null }
+        return h
       },
-      host: {
-        setSessionReadonly(sid, flag) {
-          sequence.push(`setReadonly:${flag}`)
-        },
-        async archiveSession() {},
+      setLiveCompanion(nid, h) { compMap.set(nid, h) },
+      async disposeCompanion(nid, st) {
+        const h = compMap.get(nid)
+        compMap.delete(nid)
+        if (h?.dispose) await h.dispose(st)
       },
-      _formatInterventionsForTarget: () => '',
-      _appendInterventions: (t) => t,
+      recordHandoffCompleted(delta = 1) { fakeOrch._handoffsSinceHeartbeat += delta },
+      async control(method, params) {
+        persistedCalls.push({ method, params })
+        return { ok: true }
+      },
+      setSessionReadonly(sid, flag) {
+        sequence.push(`setReadonly:${flag}`)
+      },
+      async archiveSession() {},
+      recordEvent() {},
       async spawnAndRunAgent(opts) {
         const sid = opts.sessionId || `s_${opts.role}`
         if (opts.role === 'explorer') {
@@ -503,6 +531,10 @@ test('9. console_routes 写操作严格校验目标工作区，严禁兜底误�
   // 写控制操作（stop / human_stop / intervene）显式指定 wsA 但仅运行 wsB 时，必须返回 null 拒绝误杀！
   const writeFound = pickController({ activeControllersByWs: map, reqWorkspaceRoot: wsA, allowFallback: false })
   assert.equal(writeFound, null)
+
+  // Phase 2A 收紧：写控制操作未指定工作区且无 sessionCwd 时，即使只有 1 个控制器也严禁隐式回退！
+  const writeNoTarget = pickController({ activeControllersByWs: map, reqWorkspaceRoot: '', sessionCwd: '', allowFallback: false })
+  assert.equal(writeNoTarget, null)
 })
 
 test('10. 不跑到 70% 不停工（>8 轮续推不强切）+ 37% 未真解锁时不谎称解锁', async () => {
@@ -521,27 +553,34 @@ test('10. 不跑到 70% 不停工（>8 轮续推不强切）+ 37% 未真解锁�
     let expTurn = 0
     const explorerPrompts = []
     const liveSessions = new Map()
+    const compMap = new Map()
     const fakeOrch = {
       workspaceRoot: tmpRoot,
       liveSessions,
-      _nodeCompanionSessions: new Map(),
+      _nodeCompanionSessions: compMap,
       _pendingSalvageNodes: new Map(),
       _handoffsSinceHeartbeat: 0,
-      telemetry: { recordEvent() {} },
-      bridge: {
-        async control(method) {
-          if (method === 'control_plane/schedule_snapshot') {
-            return { ok: true, data: { explorers_ready_to_run: [{ node_id: 'n_long', reflect_unlocked: false }] } }
-          }
-          return { ok: true }
-        },
+      getLiveCompanion(nid) {
+        const h = compMap.get(nid)
+        if (!h || !liveSessions.has(h.sessionId)) { compMap.delete(nid); return null }
+        return h
       },
-      host: {
-        setSessionReadonly() {},
-        async archiveSession() {},
+      setLiveCompanion(nid, h) { compMap.set(nid, h) },
+      async disposeCompanion(nid, st) {
+        const h = compMap.get(nid)
+        compMap.delete(nid)
+        if (h?.dispose) await h.dispose(st)
       },
-      _formatInterventionsForTarget: () => '',
-      _appendInterventions: (t) => t,
+      recordHandoffCompleted(delta = 1) { fakeOrch._handoffsSinceHeartbeat += delta },
+      recordEvent() {},
+      async control(method) {
+        if (method === 'control_plane/schedule_snapshot') {
+          return { ok: true, data: { explorers_ready_to_run: [{ node_id: 'n_long', reflect_unlocked: false }] } }
+        }
+        return { ok: true }
+      },
+      setSessionReadonly() {},
+      async archiveSession() {},
       async spawnAndRunAgent(opts) {
         const sid = opts.sessionId || `s_${opts.role}`
         if (opts.role === 'explorer') expTurn += 1
@@ -956,12 +995,24 @@ test('20. 防僵尸探索者核查：DB 节点置 CLOSED 后下一轮立即停�
     }
     liveSessions.set('comp_z_1', { role: 'lineage_companion' })
 
+    const compMap = new Map([['n_zombie', compHandle]])
     const fakeOrch = {
       workspaceRoot: tmpRoot,
-      _poolState: 'running',
+      poolState: 'running',
       liveSessions,
-      _nodeCompanionSessions: new Map([['n_zombie', compHandle]]),
+      _nodeCompanionSessions: compMap,
       _handoffsSinceHeartbeat: 0,
+      isPoolStopped: () => false,
+      getLiveCompanion(nid) {
+        const h = compMap.get(nid)
+        if (!h || !liveSessions.has(h.sessionId)) { compMap.delete(nid); return null }
+        return h
+      },
+      async disposeCompanion(nid, st) {
+        const h = compMap.get(nid)
+        compMap.delete(nid)
+        if (h?.dispose) await h.dispose(st)
+      },
       telemetry: { recordEvent() {} },
       bridge: {
         async control(method) {
@@ -1137,27 +1188,25 @@ test('22. 子会话自动继承父会话 permissionPresets / sandbox/mode（根�
   assert.ok(childEvents.some((e) => e.type === 'approval/policy' && e.data.policy === 'never'))
 })
 
-test('23. 4处Preset定义100%对齐 complete:false + AgentSessionHost 白名单防全局污染且保留 required 上下文', async () => {
-  // 1) JS 声明式 Preset
-  for (const def of buildDeclarativePresetConfigs('win32')) {
+test('23. 单源 Preset 100%对齐 complete:false + RC5 native executor + AgentSessionHost 白名单防全局污染', async () => {
+  // 1) 单源 cordis.patch.yml 派生的 6 套声明式 Preset
+  const defs = buildDeclarativePresetConfigs('win32')
+  assert.equal(defs.length, 6)
+  for (const def of defs) {
     const persona = def.plugins.find((p) => p.id === 'persona')
     assert.equal(persona?.config?.complete, false, `${def.id} declarative persona 必须为 complete:false`)
     assert.equal(persona?.config?.includeRuntimeContext, false, `${def.id} 必须保持 includeRuntimeContext:false`)
+    assert.ok(
+      def.plugins.some((p) => p.name === '@deepseek-ai/dsh-tool-executor-native'),
+      `${def.id} 必须挂载 RC5 @deepseek-ai/dsh-tool-executor-native`,
+    )
   }
-  // 2) PRESET_DEFINITIONS YAML 模板
-  for (const [id, def] of Object.entries(PRESET_DEFINITIONS)) {
-    assert.ok(def.cordisYml.includes('complete: false'), `${id} PRESET_DEFINITIONS 必须含 complete: false`)
-    assert.ok(!def.cordisYml.includes('complete: true'), `${id} PRESET_DEFINITIONS 严禁残留 complete: true`)
-  }
-  // 3) cordis.patch.yml 与 dsh_plugin/presets/*/agent.cordis.yml
+  // 2) cordis.patch.yml 权威文本不残留 complete: true、{{cwd}} 或假配置覆盖块，且已清理旧 presets/ 目录
   const patchYml = fs.readFileSync(path.resolve(__dirname, '..', 'cordis.patch.yml'), 'utf8')
   assert.ok(!patchYml.includes('complete: true'), 'cordis.patch.yml 严禁残留 complete: true')
-  for (const id of Object.keys(PRESET_DEFINITIONS)) {
-    const pFile = path.resolve(__dirname, '..', 'presets', id, 'agent.cordis.yml')
-    const txt = fs.readFileSync(pFile, 'utf8')
-    assert.ok(txt.includes('complete: false'), `${pFile} 必须含 complete: false`)
-    assert.ok(!txt.includes('complete: true'), `${pFile} 严禁残留 complete: true`)
-  }
+  assert.ok(!patchYml.includes('{{cwd}}'), 'cordis.patch.yml 严禁包含 {{cwd}}')
+  assert.ok(!patchYml.includes('reflectPct:'), 'cordis.patch.yml 不应包含未消费的假配置项 reflectPct')
+  assert.equal(fs.existsSync(path.resolve(__dirname, '..', 'presets')), false, '冗余旧 presets/ 目录应已清理')
 
   // 4) AgentSessionHost 注册 interpolate:false + required:true 及 assemble 白名单防第三方插件污染
   const regSections = []
@@ -1266,18 +1315,15 @@ test('25. 活跃仪器 default_spec_json.interface_hint 自动渲染进探索者
     let capturedTaskCtx = ''
     const fakeOrch = {
       workspaceRoot: tmpRoot,
-      _poolState: 'running',
-      liveSessions: new Map(),
-      _nodeCompanionSessions: new Map(),
-      _handoffsSinceHeartbeat: 0,
-      telemetry: { recordEvent() {} },
-      bridge: {
-        async control(method) {
-          if (method === 'control_plane/sync_pressure') return { ok: true, data: { node_status: 'CLOSED' } }
-          return { ok: true }
-        },
+      isPoolStopped: () => false,
+      getEffectiveContextWindow: () => 500_000,
+      recordEvent() {},
+      async control(method) {
+        if (method === 'control_plane/sync_pressure') return { ok: true, data: { node_status: 'CLOSED' } }
+        return { ok: true }
       },
-      host: { effectiveContextWindow: 500_000, setSessionReadonly() {}, async archiveSession() {} },
+      setSessionReadonly() {},
+      async archiveSession() {},
       async spawnAndRunAgent(opts) {
         capturedTaskCtx = opts.taskContextText || ''
         return {
@@ -1348,6 +1394,603 @@ test('26. GreatwallMcpBridge.describeContracts 实时握手与 Node 静态契约
     assert.strictEqual(snap2, snap1)
   } finally {
     await bridge.dispose()
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('27. Phase 1 真解耦验证：纯 Fake DispatchRuntimePort 脱离真实宿主独立单测 Stage 1/2/3 派发', async () => {
+  const launchedGov = []
+  const launchedExplorers = []
+  const spawnedRoles = []
+  const events = []
+
+  const makeFakePort = (overrides = {}) => ({
+    workspaceRoot: '/tmp/fake_ws',
+    isBreakerOpen: () => false,
+    launchGovTask(key, runner) {
+      launchedGov.push(key)
+      void Promise.resolve().then(runner)
+      return true
+    },
+    async launchGovTaskAndAwait(key, runner) {
+      launchedGov.push(key)
+      await runner()
+    },
+    async evaluateBreakerAfterTask() {},
+    isExplorerRunning: () => false,
+    getRunningExplorerCount: () => 0,
+    getRunningExplorerIds: () => new Set(),
+    getAvailableBriefSlots: () => 2,
+    isGovTaskRunning: () => false,
+    launchExplorer(node) {
+      launchedExplorers.push(node.node_id)
+    },
+    async runBlindReview() {},
+    recordHandoffCompleted() {},
+    shouldTriggerHeartbeat: () => false,
+    markHeartbeatFired() {},
+    initHeartbeatClockIfNeeded() {},
+    async spawnAndRunAgent(opts) {
+      spawnedRoles.push(opts.role)
+      return { sessionId: 's_fake', turnSignals: [], nativeThresholds: [], isAbnormalEnd: false }
+    },
+    async control() {
+      return { ok: true, data: { stage1_works_checked: true, sandbox_abs_path: '/tmp/fake_sandbox' } }
+    },
+    recordEvent(name, detail) {
+      events.push({ name, detail })
+    },
+    ...overrides,
+  })
+
+  const sig = new AbortController().signal
+  // 1) Stage 1 未签 Parse 0 -> 等待签名事件
+  const r1 = await dispatchStage1Step(makeFakePort(), { stage: 'STAGE1_PARSE0', parse0_signed: false }, sig)
+  assert.equal(r1.handled, true)
+  assert.equal(events[0]?.name, 'waiting_parse0_signature')
+
+  // 2) Stage 2 探索者派发（脱离真实 orchestrator 与 DSH 宿主）
+  const r2 = await dispatchStage2Step(
+    makeFakePort(),
+    {
+      stage: 'STAGE2_EVOLVE',
+      slot_cap: 4,
+      closure_state: { status: 'OPEN' },
+      explorers_ready_to_run: [{ node_id: 'n_fake_1', branch_id: 'b_1' }],
+    },
+    sig,
+  )
+  assert.equal(r2.dispatched, true)
+  assert.deepEqual(launchedExplorers, ['n_fake_1'])
+
+  // 3) Stage 3 终签派发
+  const r3 = dispatchStage3Step(
+    makeFakePort(),
+    {
+      stage3_supervisory_sign_pending: true,
+      closure_state: { latest_delivery_id: 'deliv_001' },
+    },
+    sig,
+  )
+  assert.equal(r3.handled, true)
+  assert.equal(r3.dispatched, true)
+  assert.ok(launchedGov.includes('stage3:sign:deliv_001'))
+})
+
+test('28. Phase 1 正本清源：真接线 Config 过滤、控制服务并发互斥与插件卸载全清理', async () => {
+  // 1) resolvePluginConfig 剔除假旋钮，仅保留真接线配置
+  const resolved = resolvePluginConfig(
+    {
+      pythonBin: 'python3',
+      requestTimeoutMs: 45_000,
+      longToolTimeoutMs: 180_000,
+      reflectPct: 0.99,
+      enableSandboxGuard: false,
+      defaultAgentOptions: { provider: 'deepseek-account', model: 'deepseek-flash', junk: 123 },
+    },
+    CORE_PYTHON_ROOT,
+  )
+  assert.equal(resolved.pythonBin, 'python3')
+  assert.equal(resolved.requestTimeoutMs, 45_000)
+  assert.equal(resolved.longToolTimeoutMs, 180_000)
+  assert.equal('reflectPct' in resolved, false)
+  assert.equal('enableSandboxGuard' in resolved, false)
+  assert.deepEqual(resolved.defaultAgentOptions, { provider: 'deepseek-account', model: 'deepseek-flash' })
+
+  // 2) apply(ctx) 卸载时必须完整释放 tool / skill / route / preset / controller
+  const disposed = []
+  let effectCleanup = null
+  const fakeCtx = {
+    logger: () => ({ info() {}, warn() {} }),
+    get(svcName) {
+      if (svcName === 'skills') {
+        return {
+          register: ({ name }) => () => disposed.push(`skill:${name}`),
+        }
+      }
+      return null
+    },
+    inject(deps, cb) {
+      if (deps.includes('agentPresets')) {
+        const fakePresets = {
+          resolve: async () => null,
+          register: async (def) => () => disposed.push(`preset:${def.id}`),
+        }
+        const cbCleanup = cb({ agentPresets: fakePresets, get: () => fakePresets })
+        return () => {
+          disposed.push('presetInjectDisposed')
+          cbCleanup?.()
+        }
+      }
+      return () => disposed.push(`inject:${deps.join(',')}`)
+    },
+    tools: {
+      register: ({ name }) => () => disposed.push(`tool:${name}`),
+    },
+    provide() {},
+    set() {},
+    effect(fn) {
+      effectCleanup = fn()
+    },
+  }
+  const api = applyPlugin(fakeCtx, { corePythonRoot: CORE_PYTHON_ROOT })
+  assert.ok(api.controlService instanceof GreatwallControlService)
+  assert.equal(typeof effectCleanup, 'function')
+  // 等待异步 preset 注册完成
+  await new Promise((r) => setTimeout(r, 20))
+  effectCleanup()
+  await new Promise((r) => setTimeout(r, 20))
+  assert.ok(disposed.includes('tool:greatwall_orchestrate'), '主控工具必须被注销')
+  assert.ok(disposed.includes('presetInjectDisposed'), 'Preset inject 句柄必须被释放')
+  assert.ok(disposed.some((d) => d.startsWith('skill:')), 'Skill 注册句柄必须被释放')
+})
+
+test('29. Phase 2A 盲审隔离四重 Fail-Closed：staging 失败/空路径/回退主目录一律拒启', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_p2_blind_'))
+  try {
+    // 1) assertValidBlindSandboxResult 拦截 ok:false / 空路径 / 指向主工作区 / 不存在目录
+    assert.throws(() => assertValidBlindSandboxResult({ ok: false, error: 'boom' }, 'rev_1', tmpRoot), /BLIND_SANDBOX_STAGE_FAILED/)
+    assert.throws(() => assertValidBlindSandboxResult({ ok: true, data: { sandbox_abs_path: '' } }, 'rev_1', tmpRoot), /BLIND_SANDBOX_STAGE_FAILED/)
+    assert.throws(() => assertValidBlindSandboxResult({ ok: true, data: { sandbox_abs_path: tmpRoot } }, 'rev_1', tmpRoot), /BLIND_SANDBOX_ISOLATION_VIOLATION/)
+    assert.throws(() => assertValidBlindSandboxResult({ ok: true, data: { sandbox_abs_path: path.join(tmpRoot, 'missing_sb') } }, 'rev_1', tmpRoot), /BLIND_SANDBOX_MISSING/)
+
+    // 2) AgentSessionHost 缺 sandboxAbsPath 时直接拒启 library_verifier
+    const host = new AgentSessionHost({
+      ctx: { agents: { create: async () => { throw new Error('should not be called') } } },
+      bridge: { listTools: async () => [] },
+      workspaceRoot: tmpRoot,
+      rolePrompts: {},
+      telemetry: { recordEvent() {} },
+    })
+    await assert.rejects(
+      () => host.spawnAndRunAgent({ role: 'library_verifier', prompt: 'audit', sandboxAbsPath: '' }),
+      /BLIND_SANDBOX_REQUIRED/,
+    )
+
+    // 3) read_isolated_sandbox 对缺 sandboxAbsPath 的盲审官直接 Fail-Closed 拦截所有原生工具
+    const evalVerEmpty = createSandboxCallEvaluator({ role: 'library_verifier', workspaceRoot: tmpRoot, sandboxAbsPath: '' })
+    assert.match(String(evalVerEmpty({ name: 'read', arguments: { file_path: 'a.txt' } })), /缺少有效独立盲审沙箱路径/)
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('30. Phase 2A+2B Bridge spawn error 防崩、AbortSignal 真取消与工具错误语义二分', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_p2_bridge_'))
+  try {
+    // 1) 不存在的 pythonBin 必须返回可捕获 Error，绝不引发未捕获 ChildProcess error 崩溃进程
+    const badBridge = new GreatwallMcpBridge({
+      corePythonRoot: CORE_PYTHON_ROOT,
+      workspaceRoot: tmpRoot,
+      pythonBin: 'definitely_nonexistent_greatwall_python_bin_xyz_999',
+      requestTimeoutMs: 5000,
+    })
+    await assert.rejects(() => badBridge.ensureStarted(), /Python MCP 进程启动失败/)
+    await badBridge.dispose()
+
+    // 2) 基础设施异常在 registerScopedMcpTools 中直接 throw 给 DSH 管线；业务 {ok:false} 保留结构化收据返回
+    const registered = new Map()
+    const fakeAgentCtx = {
+      tools: {
+        register(spec) {
+          registered.set(spec.name, spec)
+          return () => registered.delete(spec.name)
+        },
+      },
+    }
+    let nextMode = 'infra_throw'
+    registerScopedMcpTools({
+      rootCtx: {},
+      agentCtx: fakeAgentCtx,
+      agent: { id: 'a1', session: { id: 'a1' } },
+      bridge: {
+        resolveToolTimeoutMs: () => 120_000,
+        async callTool(_name, _args, ctx) {
+          assert.ok(ctx.signal, 'exec.signal 必须透传到 bridge.callTool')
+          if (nextMode === 'infra_throw') {
+            const e = new Error('MCP 请求超时')
+            e.code = 'MCP_TIMEOUT'
+            throw e
+          }
+          return { ok: false, error_code: 'ERR_LOCKED', error: '未解锁内藏' }
+        },
+      },
+      toolSchemas: [{ name: 'query_library_catalog', description: 'q', inputSchema: { type: 'object', properties: {} } }],
+      allowedToolNames: ['query_library_catalog'],
+      role: 'explorer',
+      workspaceRoot: tmpRoot,
+    })
+
+    const toolSpec = registered.get('query_library_catalog')
+    assert.equal(toolSpec.timeoutMs, 120_000, '工具定义必须声明协作 timeoutMs')
+    const ac = new AbortController()
+    await assert.rejects(() => toolSpec.execute({}, { signal: ac.signal, concludeTurn() {} }), /MCP 请求超时/)
+
+    nextMode = 'biz_reject'
+    const bizRes = await toolSpec.execute({}, { signal: ac.signal, concludeTurn() {} })
+    assert.equal(bizRes.ok, false)
+    assert.equal(bizRes.error_code, 'ERR_LOCKED')
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('31. Phase 2B RC5 严格 JSON Schema 适配：遍历全量 32 工具 100% 合规 + 重叠联合 Fail-Closed', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_p2_schema_'))
+  const bridge = new GreatwallMcpBridge({
+    corePythonRoot: CORE_PYTHON_ROOT,
+    workspaceRoot: tmpRoot,
+    dataDir: path.join(tmpRoot, 'data'),
+  })
+
+  // 严格镜像 RC5 packages/core/tools/src/json-schema.ts 的核心校验器不变量
+  const assertRc5StrictSchema = (node, p = '$') => {
+    assert.equal(typeof node, 'object', `${p} 须为对象`)
+    assert.ok(!Array.isArray(node.type), `${p} 禁止数组联合 type=${JSON.stringify(node.type)}`)
+    for (const k of STRIPPED_CONSTRAINT_KEYS) {
+      assert.equal(node[k], undefined, `${p} 残留 RC5 禁止关键字 ${k}`)
+    }
+    if (node.oneOf !== undefined) {
+      assert.ok(Array.isArray(node.oneOf) && node.oneOf.length >= 2, `${p} oneOf 须为 >=2 项数组`)
+      for (const bad of ['type', 'enum', 'items', 'properties', 'required']) {
+        assert.equal(node[bad], undefined, `${p} oneOf 同层严禁并存 ${bad}（RC5 ONE_OF_SIBLING_KEYWORDS）`)
+      }
+      node.oneOf.forEach((b, i) => assertRc5StrictSchema(b, `${p}.oneOf[${i}]`))
+      return
+    }
+    if (Array.isArray(node.enum)) {
+      assert.ok(!node.enum.includes(null), `${p} enum 不可包含 null`)
+    }
+    if (node.type === 'object' && node.properties) {
+      for (const [k, v] of Object.entries(node.properties)) {
+        assertRc5StrictSchema(v, `${p}.properties.${k}`)
+      }
+    }
+    if (node.type === 'array') {
+      assert.ok(node.items && typeof node.items === 'object', `${p} array 须声明 items`)
+      assertRc5StrictSchema(node.items, `${p}.items`)
+    }
+  }
+
+  try {
+    const tools = await bridge.listTools()
+    assert.equal(tools.length, 32)
+    for (const t of tools) {
+      const adapted = normalizeSchemaForDsh(t.inputSchema, { toolName: t.name })
+      assertRc5StrictSchema(adapted, t.name)
+    }
+
+    // 精确验证 GPT 点名的两个棘手字段：read_depth (enum 进分支) 与 fulfilled_request_ids (items 进分支)
+    const pub = tools.find((t) => t.name === 'publish_external_literature_card')
+    const normPub = normalizeSchemaForDsh(pub.inputSchema, { toolName: pub.name })
+    const rd = normPub.properties.read_depth
+    assert.equal(rd.enum, undefined)
+    assert.ok(Array.isArray(rd.oneOf[0].enum) && rd.oneOf[0].type === 'string' && !rd.oneOf[0].enum.includes(null))
+    const fr = normPub.properties.fulfilled_request_ids
+    assert.equal(fr.items, undefined)
+    assert.deepEqual(fr.oneOf[0], { type: 'array', items: { type: 'string' } })
+
+    // 精确验证 l3_entry_kind (原 enum 含 null) 已移入分支且去除 null
+    const s2 = tools.find((t) => t.name === 'submit_stage2_unblind_verdict')
+    const normS2 = normalizeSchemaForDsh(s2.inputSchema, { toolName: s2.name })
+    assert.ok(!normS2.properties.l3_entry_kind.oneOf[0].enum.includes(null))
+
+    // 重叠联合类型 ["integer", "number"] 必须 Fail-Closed 抛错并指明工具名与字段路径
+    assert.throws(
+      () => normalizeSchemaForDsh({ type: 'object', properties: { x: { type: ['integer', 'number'] } } }, { toolName: 'bad_tool' }),
+      /bad_tool:\$\.properties\.x/,
+    )
+  } finally {
+    await bridge.dispose()
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('32. Phase 3 跨 cwd 挂载口径、归档防误标与盲审官会话直达元数据', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_p3_sess_'))
+  const wsDir = path.join(tmpRoot, 'ws')
+  const wtDir = path.join(wsDir, 'worktrees', 'b_1')
+  fs.mkdirSync(wtDir, { recursive: true })
+  try {
+    const attachedIds = []
+    let failArchive = false
+    const telemetry = new TelemetryCollector({ workspaceRoot: wsDir, dataDir: path.join(tmpRoot, 'data') })
+    const host = new AgentSessionHost({
+      ctx: {
+        get(name) {
+          if (name === 'workspaceRegistry') {
+            return {
+              resolveByPath: async () => ({
+                attachSession: async (sid) => attachedIds.push(sid),
+              }),
+              archiveSession: async (sid) => {
+                if (failArchive) throw new Error('workspace archive denied')
+                return sid
+              },
+            }
+          }
+          return null
+        },
+      },
+      bridge: { listTools: async () => [] },
+      workspaceRoot: wsDir,
+      rolePrompts: {},
+      telemetry,
+    })
+
+    // 1) 同目录治理会话正常调用 attachSession；跨 cwd 探索者预期跳过不报错
+    await host.attachAndNameSession({ id: 'sess_same', header: { cwd: wsDir } }, '同目录治理')
+    await host.attachAndNameSession({ id: 'sess_cross', header: { cwd: wtDir } }, '跨目录探索者')
+    assert.deepEqual(attachedIds, ['sess_same'])
+
+    // 2) archiveSession 宿主抛错时绝不误标 archived=true，而是如实记录 archiveError
+    telemetry.recordSessionStart({ sessionId: 'sess_same', role: 'logistics_coordinator', crossCwd: false })
+    failArchive = true
+    const failRes = await host.archiveSession('sess_same')
+    assert.equal(failRes.archived, false)
+    assert.equal(telemetry.state.sessions.sess_same.archived, false)
+    assert.match(String(telemetry.state.sessions.sess_same.archiveError), /denied/)
+
+    // 宿主归档成功后正确置位 archived=true 并清错
+    failArchive = false
+    const okRes = await host.archiveSession('sess_same')
+    assert.equal(okRes.archived, true)
+    assert.equal(telemetry.state.sessions.sess_same.archived, true)
+    assert.equal(telemetry.state.sessions.sess_same.archiveError, null)
+
+    // 3) 盲审官即使未传 nodeId，extractGovernanceSessions 也必须完整返回并携带 reviewId / deliveryId
+    telemetry.recordSessionStart({
+      sessionId: 'gw_ver_rev_009',
+      role: 'library_verifier',
+      questionId: 'Q1',
+      reviewId: 'rev_009',
+      deliveryId: 'deliv_001',
+      crossCwd: true,
+      title: '[图书馆盲审] Q1 rev_009',
+    })
+    const govs = extractGovernanceSessions(telemetry.state)
+    const ver = govs.find((g) => g.sessionId === 'gw_ver_rev_009')
+    assert.ok(ver, 'governanceSessions 必须包含无 nodeId 的盲审官会话')
+    assert.equal(ver.reviewId, 'rev_009')
+    assert.equal(ver.deliveryId, 'deliv_001')
+    assert.equal(ver.crossCwd, true)
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('33. RC5 Cordis 4.1.0 Standard Schema v1 Config 装载校验（零崩溃、填默认值、拒非法类型）', () => {
+  assert.strictEqual(PluginConfig, Config)
+  assert.equal(Config['~standard']?.version, 1)
+  assert.equal(typeof Config['~standard']?.validate, 'function')
+
+  // 1) 空配置自动填充全部默认值
+  const emptyRes = Config['~standard'].validate(undefined)
+  assert.equal(emptyRes.issues, undefined)
+  assert.equal(emptyRes.value.requestTimeoutMs, 60_000)
+  assert.equal(emptyRes.value.longToolTimeoutMs, 300_000)
+  assert.deepEqual(emptyRes.value.defaultAgentOptions, {})
+
+  // 2) 合法配置清洗与 longToolTimeoutMs >= requestTimeoutMs 保底
+  const okRes = Config['~standard'].validate({
+    pythonBin: '  python3  ',
+    requestTimeoutMs: 90_000,
+    longToolTimeoutMs: 30_000,
+    defaultAgentOptions: { provider: 'deepseek-account', model: 'deepseek-flash' },
+  })
+  assert.equal(okRes.issues, undefined)
+  assert.equal(okRes.value.pythonBin, 'python3')
+  assert.equal(okRes.value.requestTimeoutMs, 90_000)
+  assert.equal(okRes.value.longToolTimeoutMs, 90_000)
+
+  // 3) 非法类型返回 issues 供 Cordis 抛出 ValidationError，绝不放行
+  const badRes = Config['~standard'].validate({ requestTimeoutMs: 'not-a-number', pythonBin: 123 })
+  assert.ok(Array.isArray(badRes.issues) && badRes.issues.length >= 2)
+})
+
+test('34. initEpoch 兼容旧别名且 init_parse0 失败绝不污染 sharedInputPaths（空数组可正确清空）', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_p3_init_'))
+  try {
+    const svc = new GreatwallControlService({
+      ctx: {},
+      config: resolvePluginConfig({ corePythonRoot: CORE_PYTHON_ROOT, dataDir: path.join(tmpRoot, 'data') }, CORE_PYTHON_ROOT),
+    })
+    const ctrl = svc.createSessionController({ workspaceRoot: tmpRoot })
+    const sent = []
+    let nextResp = { ok: true, data: { shared_inputs_rel_paths: ['inputs/a.txt'] } }
+    ctrl.bridge.control = async (method, params) => {
+      sent.push({ method, params })
+      return nextResp
+    }
+
+    // 1) 旧别名 initEpoch({ goalMd, requiredQuestions, sharedInputsRelPaths }) 完整保留参数
+    const r1 = await ctrl.initEpoch({
+      goalMd: '# Old Alias Goal',
+      requiredQuestions: ['Q1', 'Q2'],
+      sharedInputsRelPaths: ['inputs/a.txt'],
+    })
+    assert.equal(r1.ok, true)
+    assert.equal(sent[0].params.goal_and_completion_md, '# Old Alias Goal')
+    assert.deepEqual(sent[0].params.subquestions, ['Q1', 'Q2'])
+    assert.deepEqual(ctrl.orchestrator.host.sharedInputPaths, ['inputs/a.txt'])
+
+    // 2) 服务端返回 ok:false 时严禁覆盖现有 sharedInputPaths
+    nextResp = { ok: false, error: 'PARSE0_INVALID' }
+    const r2 = await ctrl.initEpoch({
+      goalMd: '# Bad Update',
+      requiredQuestions: ['Q1'],
+      sharedInputsRelPaths: ['inputs/bad.txt'],
+    })
+    assert.equal(r2.ok, false)
+    assert.deepEqual(ctrl.orchestrator.host.sharedInputPaths, ['inputs/a.txt'])
+
+    // 3) 服务端返回 ok:true 且传空数组时正确清空旧值
+    nextResp = { ok: true, data: { shared_inputs_rel_paths: [] } }
+    const r3 = await ctrl.initEpoch({ goalMd: '# Clear Shared', requiredQuestions: ['Q1'], sharedInputsRelPaths: [] })
+    assert.equal(r3.ok, true)
+    assert.deepEqual(ctrl.orchestrator.host.sharedInputPaths, [])
+
+    await svc.disposeAll()
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('35. spawnAndRunAgent 收尾顺序：先 dispose 再原生归档（含跨 cwd），归档失败绝不覆写 archived=true', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_p3_endorder_'))
+  const wsDir = path.join(tmpRoot, 'ws')
+  const wtDir = path.join(wsDir, 'worktrees', 'b_cross')
+  fs.mkdirSync(wtDir, { recursive: true })
+  try {
+    const order = []
+    let failArchive = true
+    const telemetry = new TelemetryCollector({ workspaceRoot: wsDir, dataDir: path.join(tmpRoot, 'data') })
+    const host = new AgentSessionHost({
+      ctx: {
+        get(name) {
+          if (name === 'workspaceRegistry') {
+            return {
+              resolveByPath: async () => ({ attachSession: async () => {} }),
+              archiveSession: async (sid) => {
+                order.push(`archive:${sid}`)
+                if (failArchive) throw new Error('archive_refused')
+              },
+            }
+          }
+          return null
+        },
+        agents: {
+          async create(opts) {
+            return {
+              agent: {
+                id: opts.sessionId,
+                session: { id: opts.sessionId, header: { cwd: opts.meta?.cwd || wsDir }, snapshotEvents: () => [] },
+                followup() {},
+                async whenIdle() {},
+              },
+              async dispose() {
+                order.push(`dispose:${opts.sessionId}`)
+              },
+            }
+          },
+        },
+      },
+      bridge: { listTools: async () => [] },
+      workspaceRoot: wsDir,
+      rolePrompts: {},
+      telemetry,
+    })
+
+    // 1) 归档失败场景：必须先 dispose 再 archive，且 recordSessionEnd 绝不把 archived 改写成 true！
+    await host.spawnAndRunAgent({
+      role: 'explorer',
+      sessionId: 'exp_cross_fail',
+      cwd: wtDir,
+      prompt: 'hi',
+      shortTransaction: true,
+      archiveOnComplete: true,
+    })
+    assert.deepEqual(order, ['dispose:exp_cross_fail', 'archive:exp_cross_fail'])
+    assert.equal(telemetry.state.sessions.exp_cross_fail.archived, false)
+    assert.match(String(telemetry.state.sessions.exp_cross_fail.archiveError), /archive_refused/)
+
+    // 2) 跨 cwd 归档成功场景：同样调用原生 workspaceRegistry.archiveSession 并记 archived=true
+    failArchive = false
+    order.length = 0
+    await host.spawnAndRunAgent({
+      role: 'explorer',
+      sessionId: 'exp_cross_ok',
+      cwd: wtDir,
+      prompt: 'hi',
+      shortTransaction: true,
+      archiveOnComplete: true,
+    })
+    assert.deepEqual(order, ['dispose:exp_cross_ok', 'archive:exp_cross_ok'])
+    assert.equal(telemetry.state.sessions.exp_cross_ok.archived, true)
+    assert.equal(telemetry.state.sessions.exp_cross_ok.archiveError, null)
+    await host.disposeAllSessions()
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('36. 读路由显式指定工作区 A 绝不回退显示 B + Schema 裸 array 缺 items 严格 Fail-Closed', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_p3_readiso_'))
+  const wsA = path.join(tmpRoot, 'ws_a')
+  const wsB = path.join(tmpRoot, 'ws_b')
+  const dataDir = path.join(tmpRoot, 'data')
+  fs.mkdirSync(wsA, { recursive: true })
+  fs.mkdirSync(wsB, { recursive: true })
+  try {
+    // 为 wsB 落盘一份历史遥测，同时挂一个 wsB 在线控制器
+    const telB = new TelemetryCollector({ workspaceRoot: wsB, dataDir })
+    telB.setOrchestratorState('running', 'STAGE2_EVOLVE')
+    const activeByWs = new Map([
+      [
+        path.resolve(wsB).toLowerCase(),
+        {
+          workspaceRoot: wsB,
+          bridge: { control: async () => ({ ok: true, data: {} }) },
+          orchestrator: {
+            getPoolState: () => 'running',
+            getControlStatus: async () => ({ state: 'running', stage: 'STAGE2_EVOLVE' }),
+            telemetry: telB,
+          },
+        },
+      ],
+    ])
+
+    const routes = new Map()
+    const fakeCtx = {
+      get: (k) => (k === 'connection' ? { fetch: { register: (def) => { routes.set(def.path, def); return () => routes.delete(def.path) } } } : null),
+    }
+    const disposeRoutes = registerGreatwallConsoleRoutes(fakeCtx, {
+      activeControllersByWs: activeByWs,
+      corePythonRoot: CORE_PYTHON_ROOT,
+      dataDir,
+    })
+    try {
+      const statusRoute = routes.get('/api/greatwall.status')
+      const resp = await statusRoute.fetch(new Request(`http://localhost/api/greatwall.status?workspaceRoot=${encodeURIComponent(wsA)}`))
+      const json = await resp.json()
+      assert.equal(json.ok, true)
+      assert.equal(path.resolve(json.workspaceRoot), path.resolve(wsA), '显式请求 wsA 时返回工作区必须仍是 wsA')
+      assert.equal(json.source, 'empty', 'wsA 无控制器且无磁盘数据时必须返回 empty，严禁偷显示 wsB！')
+      assert.equal(json.telemetryState, null)
+    } finally {
+      disposeRoutes()
+    }
+
+    // 裸 array 缺 items 必须 Fail-Closed 抛错（不再悄悄补 { type: 'string' }）
+    assert.throws(
+      () => normalizeSchemaForDsh({ type: 'object', properties: { arr: { type: 'array' } } }, { toolName: 'bad_arr_tool' }),
+      /bad_arr_tool:\$\.properties\.arr/,
+    )
+    assert.throws(
+      () => normalizeSchemaForDsh({ type: 'object', properties: { arr: { type: ['array', 'null'] } } }, { toolName: 'bad_null_arr' }),
+      /bad_null_arr:\$\.properties\.arr/,
+    )
+  } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true })
   }
 })

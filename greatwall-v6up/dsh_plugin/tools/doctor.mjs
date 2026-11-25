@@ -22,7 +22,7 @@ import {
   ROLE_MCP_TOOLS,
   TURN_CONCLUDING_TOOLS,
 } from '../lib/prompts.js'
-import { ROLE_TO_PRESET } from '../lib/presets.js'
+import { BUNDLE_PATCH_PATH, ROLE_TO_PRESET, loadBundlePresetConfigs } from '../lib/presets.js'
 import { READONLY_BLOCKED_MCP_TOOLS } from '../lib/read_isolated_sandbox.js'
 import { LONG_RUNNING_MCP_TOOLS } from '../lib/mcp_bridge.js'
 
@@ -217,22 +217,52 @@ function checkToolContractsSync(pySnapshot) {
 /** @returns {CheckItem} */
 function checkPresetsIntegrity() {
   const presetIds = [...new Set(Object.values(ROLE_TO_PRESET))].sort()
-  const missingFiles = []
-  for (const pid of presetIds) {
-    for (const fname of ['preset.yml', 'agent.cordis.yml']) {
-      const full = path.join(PLUGIN_ROOT, 'presets', pid, fname)
-      if (!fs.existsSync(full)) missingFiles.push(`${pid}/${fname}`)
+  if (!fs.existsSync(BUNDLE_PATCH_PATH)) {
+    return {
+      id: 'presets_integrity',
+      title: '6 套子角色 DSH Preset 单源声明 (cordis.patch.yml)',
+      status: 'error',
+      required: true,
+      detail: `缺少权威 Bundle 声明文件: ${BUNDLE_PATCH_PATH}`,
     }
   }
-  const ok = presetIds.length === 6 && missingFiles.length === 0
+  let declared = []
+  try {
+    declared = loadBundlePresetConfigs(process.platform, BUNDLE_PATCH_PATH)
+  } catch (err) {
+    return {
+      id: 'presets_integrity',
+      title: '6 套子角色 DSH Preset 单源声明 (cordis.patch.yml)',
+      status: 'error',
+      required: true,
+      detail: `解析 cordis.patch.yml 失败: ${err?.message || err}`,
+    }
+  }
+  const byId = new Map(declared.map((p) => [p.id, p]))
+  const issues = []
+  for (const pid of presetIds) {
+    const def = byId.get(pid)
+    if (!def) {
+      issues.push(`缺失 Preset: ${pid}`)
+      continue
+    }
+    const pluginNames = new Set((def.plugins || []).map((p) => p.name))
+    if (!pluginNames.has('@deepseek-ai/dsh-persona')) {
+      issues.push(`${pid} 缺少 @deepseek-ai/dsh-persona`)
+    }
+    if (!pluginNames.has('@deepseek-ai/dsh-tool-executor-native')) {
+      issues.push(`${pid} 缺少 @deepseek-ai/dsh-tool-executor-native`)
+    }
+  }
+  const ok = presetIds.length === 6 && declared.length === 6 && issues.length === 0
   return {
     id: 'presets_integrity',
-    title: '6 套子角色 DSH Preset 声明文件',
+    title: '6 套子角色 DSH Preset 单源声明 (cordis.patch.yml)',
     status: ok ? 'ok' : 'error',
     required: true,
     detail: ok
-      ? `6 套 Preset 齐全 (${presetIds.join(', ')})`
-      : `Preset 文件缺失: ${missingFiles.join(', ')}`,
+      ? `6 套单源 Preset 齐全且均对齐 RC5 native executor (${presetIds.join(', ')})`
+      : `Preset 声明异常: ${issues.join('; ')}`,
   }
 }
 

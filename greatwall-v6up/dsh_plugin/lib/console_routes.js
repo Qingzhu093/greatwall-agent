@@ -69,13 +69,16 @@ export function pickController({ activeControllersByWs, reqWorkspaceRoot = '', s
     if (foundCwd) return foundCwd
   }
   if (!allowFallback) {
-    return activeControllersByWs.size === 1 ? activeControllersByWs.values().next().value : null
+    return null
   }
   if (activeControllersByWs.size === 1) {
     return activeControllersByWs.values().next().value
   }
   for (const ctrl of activeControllersByWs.values()) {
-    if (ctrl?.orchestrator?._poolState === 'running') return ctrl
+    const state = typeof ctrl?.orchestrator?.getPoolState === 'function'
+      ? ctrl.orchestrator.getPoolState()
+      : ctrl?.orchestrator?.poolState
+    if (state === 'running') return ctrl
   }
   return activeControllersByWs.values().next().value || null
 }
@@ -115,15 +118,51 @@ async function extractNodeConversations(ctx, telemetryState, selectedNodeId) {
       startedAt: s.startedAt || null,
       endedAt: s.endedAt || null,
       pressureTokens: Number(s.pressureTokens || 0),
+      crossCwd: Boolean(s.crossCwd),
+      archived: Boolean(s.archived),
+      archiveError: s.archiveError || null,
       traceText,
     })
   }
   return out
 }
 
+/**
+ * 提取全部治理与盲审会话列表（含未绑定 nodeId 的 library_verifier，关联 reviewId/deliveryId 供前端一键直达原生对话）。
+ */
+export function extractGovernanceSessions(telemetryState) {
+  if (!telemetryState?.sessions) return []
+  return Object.values(telemetryState.sessions)
+    .filter((s) => s && s.sessionId && s.role !== 'explorer')
+    .sort((a, b) => String(b.startedAt || '').localeCompare(String(a.startedAt || '')))
+    .slice(0, 40)
+    .map((s) => ({
+      sessionId: String(s.sessionId),
+      role: s.role || 'unknown',
+      title: s.title || s.role || String(s.sessionId),
+      status: s.status || 'completed',
+      questionId: s.questionId || '',
+      nodeId: s.nodeId || '',
+      reviewId: s.reviewId || '',
+      deliveryId: s.deliveryId || '',
+      crossCwd: Boolean(s.crossCwd),
+      archived: Boolean(s.archived),
+      archiveError: s.archiveError || null,
+      startedAt: s.startedAt || null,
+      endedAt: s.endedAt || null,
+    }))
+}
+
 export function registerGreatwallConsoleRoutes(
   ctx,
-  { activeControllersByWs, corePythonRoot = DEFAULT_CORE_PYTHON_ROOT, dataDir = '', pythonBin = '', logger = console },
+  {
+    activeControllersByWs,
+    controlService = null,
+    corePythonRoot = DEFAULT_CORE_PYTHON_ROOT,
+    dataDir = '',
+    pythonBin = '',
+    logger = console,
+  },
 ) {
   if (!ctx) return () => {}
 
@@ -163,10 +202,12 @@ export function registerGreatwallConsoleRoutes(
           const selectedFileRel = (url.searchParams.get('selectedFile') || '').trim()
           const sessionCwd = resolveSessionCwd(connCtx, sessionId)
 
+          // 显式指定了 workspaceRoot 时严格按该工作区读取，禁止回退显示其他在线工作区或历史 diskList[0]！
           const ctrl = pickController({
             activeControllersByWs,
             reqWorkspaceRoot: reqWs,
             sessionCwd,
+            allowFallback: !reqWs,
           })
           const diskList = scanKnownTelemetryFiles(dataDir)
           const knownWorkspaces = [
@@ -174,6 +215,7 @@ export function registerGreatwallConsoleRoutes(
               ...Array.from(activeControllersByWs.values()).map((c) => c.workspaceRoot),
               ...diskList.map((d) => String(d.data.workspaceRoot)),
               ...(sessionCwd ? [sessionCwd] : []),
+              ...(reqWs ? [path.resolve(reqWs)] : []),
             ]),
           ]
 
@@ -191,6 +233,7 @@ export function registerGreatwallConsoleRoutes(
             } catch {}
             const activeNid = selectedNodeId || inspector?.selected_node_detail?.node_id || ''
             const nodeConversations = await extractNodeConversations(connCtx, tState, activeNid)
+            const governanceSessions = extractGovernanceSessions(tState)
             return Response.json(
               {
                 ok: true,
@@ -200,6 +243,7 @@ export function registerGreatwallConsoleRoutes(
                 status,
                 inspector,
                 nodeConversations,
+                governanceSessions,
                 telemetryState: {
                   orchestratorState: tState.orchestratorState || status.state,
                   stage: tState.stage || status.stage,
@@ -214,14 +258,18 @@ export function registerGreatwallConsoleRoutes(
             )
           }
 
-          const fallbackWs = reqWs || sessionCwd || diskList[0]?.data?.workspaceRoot || ''
-          const diskData = readDiskTelemetry(fallbackWs, dataDir) || diskList[0]?.data || null
+          const targetWs = reqWs
+            ? path.resolve(reqWs)
+            : (sessionCwd || diskList[0]?.data?.workspaceRoot || '')
+          const diskData = reqWs
+            ? readDiskTelemetry(targetWs, dataDir)
+            : (readDiskTelemetry(targetWs, dataDir) || diskList[0]?.data || null)
           let inspector = null
-          if (fallbackWs) {
+          if (targetWs) {
             try {
-              const roBridge = getOrCreateReadonlyBridge(fallbackWs)
+              const roBridge = getOrCreateReadonlyBridge(targetWs)
               const inspRes = await roBridge.control('control_plane/ui_inspector', {
-                workspace_root: fallbackWs,
+                workspace_root: targetWs,
                 selected_node_id: selectedNodeId || null,
                 selected_worktree_rel_file: selectedFileRel || null,
               })
@@ -230,15 +278,17 @@ export function registerGreatwallConsoleRoutes(
           }
           const activeNid = selectedNodeId || inspector?.selected_node_detail?.node_id || ''
           const nodeConversations = await extractNodeConversations(connCtx, diskData, activeNid)
+          const governanceSessions = extractGovernanceSessions(diskData)
           const snap = inspector?.snapshot || null
           return Response.json(
             {
               ok: true,
               source: diskData || snap?.initialized ? 'disk_telemetry' : 'empty',
-              workspaceRoot: fallbackWs,
+              workspaceRoot: targetWs,
               knownWorkspaces,
               inspector,
               nodeConversations,
+              governanceSessions,
               status: diskData || snap
                 ? {
                     poolState: diskData?.orchestratorState || 'archived',
@@ -276,13 +326,22 @@ export function registerGreatwallConsoleRoutes(
           const sessionId = String(body?.sessionId || '').trim()
           const sessionCwd = resolveSessionCwd(connCtx, sessionId)
 
+          if (!controlService || typeof controlService.execute !== 'function') {
+            return Response.json(
+              { ok: false, error: '插件控制服务未就绪，无法处理控制台写操作。' },
+              { status: 500 },
+            )
+          }
+
           const ctrl = pickController({
             activeControllersByWs,
             reqWorkspaceRoot: reqWs,
             sessionCwd,
             allowFallback: false,
           })
-          if (!ctrl) {
+          // 仅 action === 'init' 且显式指定目标工作区时允许自动创建控制器；其余写操作无匹配控制器一律 409 拒绝
+          const resolvedInitWs = action === 'init' ? (reqWs || sessionCwd) : ''
+          if (!ctrl && !resolvedInitWs) {
             return Response.json(
               {
                 ok: false,
@@ -294,46 +353,19 @@ export function registerGreatwallConsoleRoutes(
             )
           }
 
-          if (action === 'pause') {
-            return Response.json({ ok: true, action, ...(ctrl.orchestrator.pauseBackground()) })
-          }
-          if (action === 'resume') {
-            return Response.json({ ok: true, action, ...(await ctrl.orchestrator.resumeBackground()) })
-          }
-          if (action === 'stop') {
-            const stopRes = await ctrl.orchestrator.stopBackground('UI_CONSOLE_STOP')
-            await ctrl.bridge?.closeIdleChild?.()
-            return Response.json({ ok: true, action, ...stopRes })
-          }
-          if (action === 'human_stop') {
-            return Response.json({
-              ok: true,
-              action,
-              ...(await ctrl.orchestrator.humanStop(String(body?.note || body?.reason || 'UI_CONSOLE_HUMAN_STOP'))),
-            })
-          }
-          if (action === 'abort_node') {
-            const res = await ctrl.orchestrator.abortNode(
-              String(body?.nodeId || body?.node_id || body?.targetId || ''),
-              String(body?.reason || 'UI_CONSOLE_ABORT_NODE'),
-            )
-            return Response.json({ ok: Boolean(res?.aborted), action, ...res })
-          }
-          if (action === 'submit_works_ticket') {
-            const res = await ctrl.orchestrator.submitWorksTicket({
-              questionId: String(body?.questionId || body?.question_id || 'ALL'),
-              ticketType: String(body?.ticketType || body?.ticket_type || 'INSTRUMENT_ERROR'),
-              instrumentId: body?.instrumentId || body?.instrument_id || null,
-              description: String(body?.description || body?.reason || ''),
-              source: String(body?.source || 'ui_console'),
-            })
-            return Response.json({ ok: Boolean(res?.submitted), action, ...res })
-          }
-          if (action === 'sync_rulings') {
-            const res = await ctrl.orchestrator.syncPublicRulings(Boolean(body?.refreshActiveWorktrees || body?.refresh_active_worktrees))
-            return Response.json({ ok: Boolean(res?.synced), action, ...res })
-          }
-          return Response.json({ ok: false, error: `不支持的控制台动作: ${action}` }, { status: 400 })
+          const res = await controlService.execute({
+            caller: 'human_ui',
+            action,
+            workspaceRoot: ctrl ? ctrl.workspaceRoot : path.resolve(resolvedInitWs),
+            controller: ctrl || null,
+            payload: body,
+          })
+          const errText = String(res?.error || '')
+          const statusCode =
+            res?.ok === false && (errText.includes('无权') || errText.includes('未知 action'))
+              ? 400
+              : 200
+          return Response.json(res, { status: statusCode })
         } catch (err) {
           logger.warn?.('[dsh-greatwall-v6up] /api/greatwall.control error:', err?.message || err)
           return Response.json({ ok: false, error: String(err?.message || err) }, { status: 500 })

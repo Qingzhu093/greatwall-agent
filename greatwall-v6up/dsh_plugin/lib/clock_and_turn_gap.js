@@ -10,6 +10,7 @@
  * @module dsh-greatwall-v6up/clock_and_turn_gap
  */
 import { TURN_CONCLUDING_TOOLS } from './prompts.js'
+import { normalizeSchemaForDsh } from './bridge/dsh_schema_adapter.js'
 
 /**
  * 采样指定 Agent Session 当前上下文 Token 压力水位。
@@ -85,17 +86,33 @@ export function evaluateContextClockTrigger({
 /**
  * 将当前压力水位与真实有效上下文窗口同步到 Python SQLite 单一真相时钟字段，并带回实时 node_status。
  */
-export async function syncLivePressureToDb(ctx, agent, bridge, workspaceRoot, nodeId, defaultWindow = 500_000) {
+export async function syncLivePressureToDb(
+  ctx,
+  agent,
+  bridge,
+  workspaceRoot,
+  nodeId,
+  defaultWindow = 500_000,
+  { signal = null } = {},
+) {
   if (!nodeId || !bridge) return null
+  if (signal?.aborted) return null
   const sample = sampleAgentContextPressure(ctx, agent, defaultWindow)
   try {
-    return await bridge.control('control_plane/sync_pressure', {
-      workspace_root: workspaceRoot,
-      node_id: nodeId,
-      pressure_tokens: sample.pressureTokens,
-      effective_context_window: sample.contextWindow,
-    })
-  } catch {
+    return await bridge.control(
+      'control_plane/sync_pressure',
+      {
+        workspace_root: workspaceRoot,
+        node_id: nodeId,
+        pressure_tokens: sample.pressureTokens,
+        effective_context_window: sample.contextWindow,
+      },
+      { signal },
+    )
+  } catch (err) {
+    if (signal?.aborted || err?.name === 'AbortError' || err?.code === 'ABORT_ERR') {
+      throw err
+    }
     return null
   }
 }
@@ -221,10 +238,20 @@ export function registerScopedMcpTools({
     const schemaDef = schemaByName.get(toolName)
     if (!schemaDef) continue
 
+    const normalizedParams = normalizeSchemaForDsh(
+      schemaDef.inputSchema || { type: 'object', properties: {} },
+      { toolName },
+    )
+    // DSH 工具定义级协作超时 >= 内层 bridge 分级最大合法超时，避免外层误杀合法 official/heavy 计算
+    const declaredTimeoutMs = typeof bridge?.resolveToolTimeoutMs === 'function'
+      ? bridge.resolveToolTimeoutMs(toolName, { tier: 'heavy' })
+      : 60_000
+
     const disposeTool = agentCtx.tools.register({
       name: toolName,
       description: String(schemaDef.description || `Greatwall MCP tool: ${toolName}`),
-      parameters: schemaDef.inputSchema || { type: 'object', properties: {} },
+      parameters: normalizedParams,
+      timeoutMs: declaredTimeoutMs,
       output: {
         schema: { type: 'object', additionalProperties: true },
         render(_args, value) {
@@ -232,19 +259,31 @@ export function registerScopedMcpTools({
         },
       },
       async execute(args, exec) {
+        const execSignal = exec?.signal || null
         if (role === 'explorer' && nodeId) {
-          await syncLivePressureToDb(rootCtx, agent, bridge, workspaceRoot, nodeId, contextWindowTokens)
+          await syncLivePressureToDb(rootCtx, agent, bridge, workspaceRoot, nodeId, contextWindowTokens, {
+            signal: execSignal,
+          })
         }
 
+        // 基础设施/RPC/取消/超时故障由 bridge.callTool 直接 throw，交由 DSH 管线如实记录工具失败；
+        // 科研/制度返回（{ ok: false, error_code, ... }）保留为结构化 JSON 收据供模型消费自纠。
         const res = await bridge.callTool(toolName, args, {
           workspaceRoot,
           role,
           sessionId: agent.id,
+          signal: execSignal,
         })
+
+        if (!res || typeof res !== 'object') {
+          throw new Error(`MCP 工具 ${toolName} 返回非法非对象响应`)
+        }
 
         if (role === 'explorer' && toolName === 'run_isolated_eval' && res?.ok) {
           if (nodeId) {
-            await syncLivePressureToDb(rootCtx, agent, bridge, workspaceRoot, nodeId, contextWindowTokens)
+            await syncLivePressureToDb(rootCtx, agent, bridge, workspaceRoot, nodeId, contextWindowTokens, {
+              signal: execSignal,
+            })
           }
           const trigger = res?.data?.clock_signal?.trigger
           if (trigger === 'REFLECT_37' || trigger === 'HANDOFF_70') {
@@ -260,7 +299,7 @@ export function registerScopedMcpTools({
           }
         }
 
-        return res && typeof res === 'object' ? res : { ok: false, error: 'Invalid MCP tool response' }
+        return res
       },
     })
     disposers.push(disposeTool)

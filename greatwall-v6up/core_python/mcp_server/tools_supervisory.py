@@ -260,74 +260,111 @@ def tool_record_compliance_check(
     now = utc_now_iso()
     p0 = conn.execute("SELECT * FROM parse0_contract WHERE contract_id = 'active'").fetchone()
 
+    alert_id = f"ca_{uuid.uuid4().hex[:10]}"
     if st_u == "PARSE0_GATE" and stat_u == "PASSED":
-        if p0 is None or not str(p0["human_signed_at"] or "").strip() or not str(p0["goal_and_completion_md"] or "").strip():
-            raise FailClosedError(ERR_LOCKED, "PARSE0_GATE 阻断：尚未签署包含非空目标与完成判据的 Parse 0 六项启动表单")
         with rw_immediate_tx(conn):
+            p0 = conn.execute("SELECT * FROM parse0_contract WHERE contract_id = 'active'").fetchone()
+            if p0 is None or not str(p0["human_signed_at"] or "").strip() or not str(p0["goal_and_completion_md"] or "").strip():
+                raise FailClosedError(ERR_LOCKED, "PARSE0_GATE 阻断：尚未签署包含非空目标与完成判据的 Parse 0 六项启动表单")
             conn.execute(
                 "UPDATE parse0_contract SET stage = 'STAGE2_EVOLVE', updated_at = ? WHERE contract_id = 'active'",
                 (now,),
             )
+            conn.execute(
+                """
+                INSERT INTO compliance_alerts(alert_id, stage, status, blocking_questions_json, notes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    alert_id,
+                    st_u,
+                    stat_u,
+                    json.dumps([str(q) for q in (blocking_questions or [])], ensure_ascii=False),
+                    str(notes or "").strip(),
+                    now,
+                ),
+            )
 
     elif st_u == "CLOSURE_GATE" and stat_u == "PASSED":
-        closure = conn.execute("SELECT * FROM project_closure_state WHERE id = 1").fetchone()
-        if closure is None or str(closure["status"]) != "DELIVERY_EXPORTED":
-            raise FailClosedError(
-                ERR_LOCKED,
-                f"CLOSURE_GATE 硬拦截：当前 project_closure_state={closure['status'] if closure else None!r}，必须先导出五件套至 DELIVERY_EXPORTED",
-            )
-        latest_did = str(closure["latest_delivery_id"] or "")
-        latest_sha = str(closure["latest_delivery_sha256"] or "")
-        aud_did = str(closure["verifier_audited_delivery_id"] or "")
-        aud_sha = str(closure["verifier_audited_delivery_sha256"] or "")
-        aud_pass = int(closure["verifier_final_audit_passed"] or 0)
-        if not (aud_pass == 1 and latest_did and aud_did == latest_did and aud_sha == latest_sha):
-            raise FailClosedError(
-                ERR_LOCKED,
-                f"CLOSURE_GATE 版本绑定硬拦截（防审 A 放 B）：盲审终核记录 (passed={aud_pass}, id={aud_did!r}, sha={aud_sha[:10]!r}) "
-                f"与当前最新导出版本 (id={latest_did!r}, sha={latest_sha[:10]!r}) 不匹配！请先由 library_verifier 完成 STAGE3_FINAL_AUDIT:{latest_did}。",
-            )
-        # 实时重算磁盘 final_delivery/ 整包 SHA-256，防终核后磁盘文件被篡改或缺失
-        if workspace_root:
-            delivery_dir = Path(os.path.realpath(workspace_root)) / "final_delivery"
-            if not delivery_dir.is_dir():
-                raise FailClosedError(ERR_LOCKED, f"CLOSURE_GATE 硬拦截：交付目录 {delivery_dir} 不存在！")
-            live_sha = compute_delivery_dir_sha256(delivery_dir)
-            if live_sha != latest_sha:
+        # 严格单写者原子签发：在写锁内部核对版本绑定、实时重算磁盘 SHA-256 并带条件提交，物理杜绝并发“审 A 放 B”！
+        with rw_immediate_tx(conn):
+            closure = conn.execute("SELECT * FROM project_closure_state WHERE id = 1").fetchone()
+            if closure is None or str(closure["status"]) != "DELIVERY_EXPORTED":
                 raise FailClosedError(
                     ERR_LOCKED,
-                    f"CLOSURE_GATE 磁盘完整性硬拦截（交付包内容已变化）：磁盘实时 SHA-256 ({live_sha[:12]}) != 审定绑定 SHA-256 ({latest_sha[:12]})，必须重新导出并重走终核！",
+                    f"CLOSURE_GATE 硬拦截：当前 project_closure_state={closure['status'] if closure else None!r}，必须先导出五件套至 DELIVERY_EXPORTED",
                 )
-        with rw_immediate_tx(conn):
-            conn.execute(
+            latest_did = str(closure["latest_delivery_id"] or "")
+            latest_sha = str(closure["latest_delivery_sha256"] or "")
+            aud_did = str(closure["verifier_audited_delivery_id"] or "")
+            aud_sha = str(closure["verifier_audited_delivery_sha256"] or "")
+            aud_pass = int(closure["verifier_final_audit_passed"] or 0)
+            if not (aud_pass == 1 and latest_did and aud_did == latest_did and aud_sha == latest_sha):
+                raise FailClosedError(
+                    ERR_LOCKED,
+                    f"CLOSURE_GATE 版本绑定硬拦截（防审 A 放 B）：盲审终核记录 (passed={aud_pass}, id={aud_did!r}, sha={aud_sha[:10]!r}) "
+                    f"与当前最新导出版本 (id={latest_did!r}, sha={latest_sha[:10]!r}) 不匹配！请先由 library_verifier 完成 STAGE3_FINAL_AUDIT:{latest_did}。",
+                )
+            if workspace_root:
+                delivery_dir = Path(os.path.realpath(workspace_root)) / "final_delivery"
+                if not delivery_dir.is_dir():
+                    raise FailClosedError(ERR_LOCKED, f"CLOSURE_GATE 硬拦截：交付目录 {delivery_dir} 不存在！")
+                live_sha = compute_delivery_dir_sha256(delivery_dir)
+                if live_sha != latest_sha:
+                    raise FailClosedError(
+                        ERR_LOCKED,
+                        f"CLOSURE_GATE 磁盘完整性硬拦截（交付包内容已变化）：磁盘实时 SHA-256 ({live_sha[:12]}) != 审定绑定 SHA-256 ({latest_sha[:12]})，必须重新导出并重走终核！",
+                    )
+            cur = conn.execute(
                 """
                 UPDATE project_closure_state
                 SET status = 'CLOSED_VERIFIED', supervisory_signed_at = ?, updated_at = ?
                 WHERE id = 1
+                  AND status = 'DELIVERY_EXPORTED'
+                  AND latest_delivery_id = ?
+                  AND latest_delivery_sha256 = ?
+                  AND verifier_final_audit_passed = 1
+                  AND verifier_audited_delivery_id = ?
+                  AND verifier_audited_delivery_sha256 = ?
                 """,
-                (now, now),
+                (now, now, latest_did, latest_sha, latest_did, latest_sha),
             )
+            if cur.rowcount != 1:
+                raise FailClosedError(ERR_LOCKED, "CLOSURE_GATE 并发版本冲突：交付状态已变更，请重新核验最新交付版本。")
             conn.execute(
                 "UPDATE parse0_contract SET stage = 'CLOSED_VERIFIED', updated_at = ? WHERE contract_id = 'active'",
                 (now,),
             )
-
-    alert_id = f"ca_{uuid.uuid4().hex[:10]}"
-    with rw_immediate_tx(conn):
-        conn.execute(
-            """
-            INSERT INTO compliance_alerts(alert_id, stage, status, blocking_questions_json, notes, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                alert_id,
-                st_u,
-                stat_u,
-                json.dumps([str(q) for q in (blocking_questions or [])], ensure_ascii=False),
-                str(notes or "").strip(),
-                now,
-            ),
-        )
+            conn.execute(
+                """
+                INSERT INTO compliance_alerts(alert_id, stage, status, blocking_questions_json, notes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    alert_id,
+                    st_u,
+                    stat_u,
+                    json.dumps([str(q) for q in (blocking_questions or [])], ensure_ascii=False),
+                    str(notes or "").strip(),
+                    now,
+                ),
+            )
+    else:
+        with rw_immediate_tx(conn):
+            conn.execute(
+                """
+                INSERT INTO compliance_alerts(alert_id, stage, status, blocking_questions_json, notes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    alert_id,
+                    st_u,
+                    stat_u,
+                    json.dumps([str(q) for q in (blocking_questions or [])], ensure_ascii=False),
+                    str(notes or "").strip(),
+                    now,
+                ),
+            )
 
     guidance = (
         "已写入 ALERT_AMBIGUOUS_SPEC 红灯告警留待人类核查；无人值守总线继续按原已签口径运行不停机。"

@@ -59,12 +59,43 @@ window.__ModuleLoader__.load({
 			".gw-log-line{font-size:11px;padding:5px 7px;border-radius:6px;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l4)}"
 		].join("");
 
-		if (typeof document !== "undefined" && !document.querySelector('style[data-plugin-css="dsh-greatwall-v6up/console"]')) {
+		const WS_STORAGE_KEY = "dsh-greatwall-v6up:selectedWs";
+
+		function readPersistedWs() {
+			try {
+				return typeof window !== "undefined" && window.sessionStorage
+					? String(window.sessionStorage.getItem(WS_STORAGE_KEY) || "")
+					: "";
+			} catch {
+				return "";
+			}
+		}
+
+		function persistSelectedWs(ws) {
+			try {
+				if (typeof window !== "undefined" && window.sessionStorage && ws) {
+					window.sessionStorage.setItem(WS_STORAGE_KEY, String(ws));
+				}
+			} catch {}
+		}
+
+		function mountConsoleStyles() {
+			if (typeof document === "undefined") return () => {};
+			const existing = document.querySelector('style[data-plugin-css="dsh-greatwall-v6up/console"]');
+			if (existing) {
+				existing.textContent = CSS_TEXT;
+				return () => {
+					try { existing.remove(); } catch {}
+				};
+			}
 			const tag = document.createElement("style");
 			tag.dataset.plugin = TAB_ID;
 			tag.dataset.pluginCss = "dsh-greatwall-v6up/console";
 			tag.textContent = CSS_TEXT;
 			document.head.appendChild(tag);
+			return () => {
+				try { tag.remove(); } catch {}
+			};
 		}
 
 		function GreatwallGlyph({ size = 16, className }) {
@@ -111,12 +142,48 @@ window.__ModuleLoader__.load({
 			return "gw-console-badge";
 		}
 
-		function GreatwallConsoleBody({ sessionId }) {
+		function GreatwallConsoleBody({ sessionId, getUiWorkspace }) {
 			const [payload, setPayload] = React.useState(null);
 			const [loading, setLoading] = React.useState(true);
-			const [selectedWs, setSelectedWs] = React.useState("");
+			const [selectedWs, setSelectedWs] = React.useState(() => readPersistedWs());
 			const [busy, setBusy] = React.useState(false);
 			const [notice, setNotice] = React.useState("");
+
+			const updateSelectedWs = React.useCallback((nextWs) => {
+				const clean = String(nextWs || "").trim();
+				setSelectedWs(clean);
+				if (clean) persistSelectedWs(clean);
+			}, []);
+
+			const openNativeSession = React.useCallback(async (targetSid, { status = "", archived = false, archiveError = "", label = "", workspaceRoot = "" } = {}) => {
+				const sid = String(targetSid || "").trim();
+				if (!sid) {
+					setNotice("⚠️ 该条目暂无可打开的会话 ID。");
+					return;
+				}
+				const boundWs = workspaceRoot || selectedWs || payload?.workspaceRoot || "";
+				if (boundWs) persistSelectedWs(boundWs);
+				const uiWs = typeof getUiWorkspace === "function" ? getUiWorkspace() : null;
+				if (!uiWs || typeof uiWs.openSession !== "function") {
+					setNotice(`⚠️ 当前 DSH 宿主未提供 uiWorkspace.openSession，无法直接跳转会话 ${sid}。`);
+					return;
+				}
+				try {
+					await uiWs.openSession(sid);
+					const isRunning = String(status || "").toLowerCase() === "running";
+					if (isRunning) {
+						setNotice(`💬 已打开运行中会话（实时增量）：${label || sid}`);
+					} else if (archived) {
+						setNotice(`📦 已打开已归档会话：${label || sid}`);
+					} else if (archiveError) {
+						setNotice(`📄 已打开已结束会话（未归档：${archiveError}）：${label || sid}`);
+					} else {
+						setNotice(`📄 已打开已结束会话：${label || sid}`);
+					}
+				} catch (err) {
+					setNotice(`⚠️ 无法打开会话 ${sid}：${String(err?.message || err)}`);
+				}
+			}, [getUiWorkspace, selectedWs, payload?.workspaceRoot]);
 
 			const [activeTab, setActiveTab] = React.useState("flow"); // "flow" | "docs" | "worktree" | "gov"
 			const [docSubTab, setDocSubTab] = React.useState("briefing"); // "briefing" | "reflect37" | "handoff70" | "chat" | "obs"
@@ -141,7 +208,7 @@ window.__ModuleLoader__.load({
 					const data = await res.json();
 					if (data && data.ok) {
 						setPayload(data);
-						if (!wsVal && data.workspaceRoot) setSelectedWs(data.workspaceRoot);
+						if (!wsVal && data.workspaceRoot) updateSelectedWs(data.workspaceRoot);
 						const detailNid = data.inspector?.selected_node_detail?.node_id || "";
 						if (!nidVal && detailNid) setSelectedNodeId(detailNid);
 					}
@@ -216,7 +283,20 @@ window.__ModuleLoader__.load({
 			const tState = payload?.telemetryState || {};
 			const sessionsMap = tState.sessions || {};
 			const allSessions = Object.values(sessionsMap).sort((a, b) => String(b.startedAt || "").localeCompare(String(a.startedAt || "")));
-			const govSessions = allSessions.filter((s) => s.role !== "explorer");
+			const govSessions = Array.isArray(payload?.governanceSessions) && payload.governanceSessions.length > 0
+				? payload.governanceSessions
+				: allSessions.filter((s) => s.role !== "explorer");
+			const latestNodeSessionByRole = {};
+			const verifierSessionByReviewId = {};
+			for (const s of allSessions) {
+				if (s?.nodeId && (s.role === "explorer" || s.role === "lineage_companion")) {
+					const k = `${s.nodeId}:${s.role}`;
+					if (!latestNodeSessionByRole[k]) latestNodeSessionByRole[k] = s;
+				}
+				if (s?.role === "library_verifier" && s.reviewId && !verifierSessionByReviewId[s.reviewId]) {
+					verifierSessionByReviewId[s.reviewId] = s;
+				}
+			}
 
 			const isLiveController = payload?.source === "live_controller";
 			const poolState = st.poolState || st.state || (isLiveController ? "idle" : "archived");
@@ -342,7 +422,7 @@ window.__ModuleLoader__.load({
 										className: "gw-select",
 										value: selectedWs || payload?.workspaceRoot || "",
 										onChange: (e) => {
-											setSelectedWs(e.target.value);
+											updateSelectedWs(e.target.value);
 											setSelectedNodeId("");
 											setSelectedFileRel("");
 											void fetchStatus(e.target.value, "", "");
@@ -505,6 +585,8 @@ window.__ModuleLoader__.load({
 																	const pct = Math.min(100, Number(nd.pressure_pct || 0));
 																	const fillCls = pct >= 70 ? "gw-bar-fill gw-bar-hot" : (pct >= 37 ? "gw-bar-fill gw-bar-warn" : "gw-bar-fill");
 																	const obsIds = nd.bound_obs_ids || [];
+																	const expSess = latestNodeSessionByRole[`${nd.node_id}:explorer`] || null;
+																	const compSess = latestNodeSessionByRole[`${nd.node_id}:lineage_companion`] || null;
 																	return jsxs("div", {
 																		className: `gw-node-card ${isSel ? "gw-node-selected" : ""}`,
 																		onClick: () => handleSelectNode(nd.node_id),
@@ -551,7 +633,7 @@ window.__ModuleLoader__.load({
 																				]
 																			}),
 																			jsxs("div", {
-																				className: "gw-row",
+																				className: "gw-console-actions",
 																				style: { marginTop: 2 },
 																				children: [
 																					jsx("button", {
@@ -565,6 +647,24 @@ window.__ModuleLoader__.load({
 																						className: "gw-btn",
 																						onClick: (e) => { e.stopPropagation(); handleSelectNode(nd.node_id); setActiveTab("worktree"); },
 																						children: "📂 浏览 Worktree 代码"
+																					}),
+																					expSess && jsx("button", {
+																						type: "button",
+																						className: "gw-btn",
+																						onClick: (e) => {
+																							e.stopPropagation();
+																							void openNativeSession(expSess.sessionId, { status: expSess.status, archived: expSess.archived, archiveError: expSess.archiveError, workspaceRoot: expSess.workspaceRoot, label: expSess.title || `探索者 ${nd.node_id}` });
+																						},
+																						children: "💬 探索者对话"
+																					}),
+																					compSess && jsx("button", {
+																						type: "button",
+																						className: "gw-btn",
+																						onClick: (e) => {
+																							e.stopPropagation();
+																							void openNativeSession(compSess.sessionId, { status: compSess.status, archived: compSess.archived, archiveError: compSess.archiveError, workspaceRoot: compSess.workspaceRoot, label: compSess.title || `伴随 ${nd.node_id}` });
+																						},
+																						children: "💬 伴随对话"
 																					})
 																				]
 																			})
@@ -631,16 +731,28 @@ window.__ModuleLoader__.load({
 														className: "gw-row",
 														children: [
 															jsx("strong", { children: s.title || s.role }),
-															jsx("span", { className: stateBadgeClass(s.status), children: s.status })
+															jsxs("div", {
+																style: { display: "flex", alignItems: "center", gap: 4 },
+																children: [
+																	jsx("span", { className: stateBadgeClass(s.status), children: s.status }),
+																	jsx("button", {
+																		type: "button",
+																		className: "gw-btn gw-btn-primary",
+																		onClick: () => void openNativeSession(s.sessionId, { status: s.status, archived: s.archived, archiveError: s.archiveError, workspaceRoot: s.workspaceRoot, label: s.title || s.role }),
+																		children: "打开对话"
+																	})
+																]
+															})
 														]
 													}),
 													jsxs("div", {
 														className: "gw-row gw-muted gw-mono",
 														children: [
-															jsx("span", { children: s.sessionId }),
+															jsx("span", { children: `${s.sessionId}${s.reviewId ? ` · ${s.reviewId}` : ""}${s.deliveryId ? ` · ${s.deliveryId}` : ""}` }),
 															jsx("span", { children: String(s.startedAt || "").slice(11, 19) })
 														]
-													})
+													}),
+													s.archiveError && jsx("div", { className: "gw-muted", style: { color: "#d97706" }, children: `归档提示：${s.archiveError}` })
 												]
 											}, s.sessionId))
 										]
@@ -831,7 +943,18 @@ window.__ModuleLoader__.load({
 																		className: "gw-row",
 																		children: [
 																			jsx("strong", { children: `${c.title} (${c.role})` }),
-																			jsx("span", { className: stateBadgeClass(c.status), children: `${c.status} · ${Math.round((c.pressureTokens || 0) / 1000)}k` })
+																			jsxs("div", {
+																				style: { display: "flex", alignItems: "center", gap: 4 },
+																				children: [
+																					jsx("span", { className: stateBadgeClass(c.status), children: `${c.status} · ${Math.round((c.pressureTokens || 0) / 1000)}k` }),
+																					jsx("button", {
+																						type: "button",
+																						className: "gw-btn gw-btn-primary",
+																						onClick: () => void openNativeSession(c.sessionId, { status: c.status, archived: c.archived, archiveError: c.archiveError, label: `${c.title} (${c.role})` }),
+																						children: "打开对话"
+																					})
+																				]
+																			})
 																		]
 																	}),
 																	jsx("div", { className: "gw-muted gw-mono", children: `sessionId: ${c.sessionId}` }),
@@ -956,7 +1079,9 @@ window.__ModuleLoader__.load({
 											jsx("div", { className: "gw-card-title", children: `⚖️ 中央图书馆·隔离沙箱盲审账本 (${reviewsList.length})` }),
 											reviewsList.length === 0
 												? jsx("div", { className: "gw-muted", children: "暂无盲审记录" })
-												: reviewsList.map((rv) => jsxs("div", {
+												: reviewsList.map((rv) => {
+													const verSess = verifierSessionByReviewId[rv.review_id] || null;
+													return jsxs("div", {
 													className: "gw-log-line",
 													style: { display: "flex", flexDirection: "column", gap: 5 },
 													children: [
@@ -964,7 +1089,18 @@ window.__ModuleLoader__.load({
 															className: "gw-row",
 															children: [
 																jsx("strong", { children: `${rv.review_id} (${rv.question_id} · 源节点 ${rv.source_node_id} · v${rv.spec_revision ?? 0})` }),
-																jsx("span", { className: stateBadgeClass(rv.final_verdict || rv.review_status), children: rv.final_verdict || rv.review_status })
+																jsxs("div", {
+																	style: { display: "flex", alignItems: "center", gap: 4 },
+																	children: [
+																		jsx("span", { className: stateBadgeClass(rv.final_verdict || rv.review_status), children: rv.final_verdict || rv.review_status }),
+																		verSess && jsx("button", {
+																			type: "button",
+																			className: "gw-btn gw-btn-primary",
+																			onClick: () => void openNativeSession(verSess.sessionId, { status: verSess.status, archived: verSess.archived, archiveError: verSess.archiveError, workspaceRoot: verSess.workspaceRoot, label: verSess.title || `盲审 ${rv.review_id}` }),
+																			children: "打开盲审对话"
+																		})
+																	]
+																})
 															]
 														}),
 														jsx("div", { children: `手稿标题：${rv.manuscript_title}` }),
@@ -977,7 +1113,7 @@ window.__ModuleLoader__.load({
 															children: `【Stage 1 盲审实测核验账本】\n${rv.stage1_ledger_json}`
 														})
 													]
-												}, rv.review_id))
+												}, rv.review_id); })
 										]
 									}),
 
@@ -1033,6 +1169,20 @@ window.__ModuleLoader__.load({
 		const inject = ["slots", "sidebarRightTabs"];
 
 		function apply(ctx) {
+			ctx.effect(() => mountConsoleStyles(), "greatwall-console: inject styles");
+
+			const getUiWorkspace = () => {
+				try {
+					return (typeof ctx?.get === "function" ? ctx.get("uiWorkspace") : null)
+						|| (typeof ctx?.root?.get === "function" ? ctx.root.get("uiWorkspace") : null)
+						|| ctx?.uiWorkspace
+						|| null;
+				} catch {
+					return null;
+				}
+			};
+			const BoundConsoleBody = (props) => jsx(GreatwallConsoleBody, { ...props, getUiWorkspace });
+
 			ctx.effect(() => ctx.sidebarRightTabs.register({
 				id: TAB_ID,
 				kind: TAB_KIND,
@@ -1041,7 +1191,7 @@ window.__ModuleLoader__.load({
 				guide: [{
 					order: 15,
 					title: () => "长城科研指挥舱",
-					description: () => "谱系 DAG Flow・五段看板与37%元反思・跨cwd探索者透视・Worktree源码",
+					description: () => "谱系 DAG Flow・五段看板与37%元反思・跨cwd探索者/伴随/盲审直达・Worktree源码",
 					icon: GreatwallGlyph
 				}]
 			}), "greatwall-console: register tab type");
@@ -1049,7 +1199,7 @@ window.__ModuleLoader__.load({
 			ctx.effect(() => ctx.slots.inject("sidebar.right.pane.tab", () => ctx.slots.register({
 				name: "sidebar.right.pane.tab",
 				key: TAB_ID
-			}, GreatwallConsoleBody)), "greatwall-console: tab body");
+			}, BoundConsoleBody)), "greatwall-console: tab body");
 
 			ctx.effect(() => ctx.slots.inject("sidebar.right.pane.tab.title", () => ctx.slots.register({
 				name: "sidebar.right.pane.tab.title",

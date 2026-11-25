@@ -77,9 +77,10 @@ export function loadSkillLedger(skillsDir) {
 export function registerSkillPack(service, skills, options = {}) {
   const registered = []
   const failed = []
+  const disposers = []
   for (const skill of skills) {
     try {
-      service.register({
+      const handle = service.register({
         name: skill.name,
         description: skill.description,
         content: skill.content,
@@ -91,10 +92,26 @@ export function registerSkillPack(service, skills, options = {}) {
         },
         ...(skill.whenToUse ? { whenToUse: skill.whenToUse } : {}),
       })
+      if (typeof handle === 'function') {
+        disposers.push(handle)
+      } else if (handle && typeof handle.dispose === 'function') {
+        disposers.push(() => handle.dispose())
+      }
       registered.push(skill.name)
     } catch (error) {
       failed.push({ name: skill.name, message: String(error?.message ?? error) })
     }
   }
-  return { registered, failed }
+  return {
+    registered,
+    failed,
+    disposers,
+    disposeAll() {
+      for (const fn of disposers.splice(0)) {
+        try {
+          fn()
+        } catch {}
+      }
+    },
+  }
 }

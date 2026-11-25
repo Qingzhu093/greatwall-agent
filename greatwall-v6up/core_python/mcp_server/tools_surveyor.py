@@ -235,6 +235,7 @@ def tool_export_stage3_final_delivery(
     selected_l3_ids_by_question: dict[str, list[str]],
     remaining_gaps_by_question: dict[str, str],
     reproduction_candidate_nodes: list[str],
+    cancel_event: Any = None,
 ) -> dict[str, Any]:
     """导出 Stage 3 五件套（生成确定性 delivery_id/sha256，重置终核状态置 DELIVERY_EXPORTED 等待两步联合终核）。"""
     enforce_role_tool_permission(conn, caller_role, "export_stage3_final_delivery", session_id=session_id)
@@ -246,6 +247,7 @@ def tool_export_stage3_final_delivery(
         selected_l3_ids_by_question=selected_l3_ids_by_question,
         remaining_gaps_by_question=remaining_gaps_by_question,
         reproduction_candidate_nodes=reproduction_candidate_nodes,
+        cancel_event=cancel_event,
     )
     return build_tool_receipt(
         conn=conn,

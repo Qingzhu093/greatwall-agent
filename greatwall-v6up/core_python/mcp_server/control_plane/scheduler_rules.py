@@ -1,6 +1,6 @@
 """控制面子域 4：纯规则并发调度快照、分支前置校验、学派聚拢告警、拓扑健康与终局门禁。
 
-后续阶段引入“子题达标收敛止盈与动态算力配额”等全局调度规则时，应优先演进本模块。
+底层纯只读 SQL 汇总已拆分至 `snapshot_queries.py`，本模块专注纯调度规则计算与快照组装。
 """
 
 from __future__ import annotations
@@ -15,13 +15,20 @@ from ..db_schema import (
     ERR_INVALID_INPUT,
     FailClosedError,
 )
-from ..mcp_core_helpers import (
-    load_runtime_config,
-    resolve_effective_context_window,
-)
+from ..mcp_core_helpers import load_runtime_config
 from .lifecycle_ops import (
     _parse_iso_utc,
     compute_missing_initial_instruments,
+)
+from .snapshot_queries import (
+    fetch_active_branch_family_rows,
+    fetch_active_parse0_row,
+    fetch_closure_gate_raw_data,
+    fetch_closure_state_row,
+    fetch_l3_counts_by_question,
+    fetch_parse0_subquestions_and_order,
+    fetch_snapshot_queues_and_tables,
+    fetch_topology_raw_data,
 )
 
 
@@ -64,32 +71,8 @@ def check_branch_requires_satisfied(conn: sqlite3.Connection, requires_list: lis
 
 def get_question_order_status(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
     """计算可选全局策略题序 `question_order` 解锁态（默认空 = 全子题并发推进）。"""
-    p0 = conn.execute("SELECT subquestions_json, question_order_json FROM parse0_contract WHERE contract_id = 'active'").fetchone()
-    req_qs = json.loads(p0["subquestions_json"]) if p0 else ["Q1"]
-    q_order = json.loads(p0["question_order_json"]) if p0 else []
-
-    full_l3_counts = {
-        str(r["question_id"]): int(r["cnt"] or 0)
-        for r in conn.execute(
-            """
-            SELECT question_id, COUNT(*) AS cnt
-            FROM internal_research_ledger
-            WHERE ledger_type = 'L3_VERIFIED' AND is_active = 1 AND goal_coverage = 'FULL_GOAL'
-            GROUP BY question_id
-            """
-        ).fetchall()
-    }
-    any_l3_counts = {
-        str(r["question_id"]): int(r["cnt"] or 0)
-        for r in conn.execute(
-            """
-            SELECT question_id, COUNT(*) AS cnt
-            FROM internal_research_ledger
-            WHERE ledger_type = 'L3_VERIFIED' AND is_active = 1
-            GROUP BY question_id
-            """
-        ).fetchall()
-    }
+    req_qs, q_order = fetch_parse0_subquestions_and_order(conn)
+    full_l3_counts, any_l3_counts = fetch_l3_counts_by_question(conn)
 
     status_map: dict[str, dict[str, Any]] = {}
     for q in req_qs:
@@ -114,16 +97,7 @@ def compute_family_concentration_alerts(conn: sqlite3.Connection) -> list[dict[s
     min_branches = int(cfg.get("family_concentration_min_branches_in_family", 2))
     share_threshold = float(cfg.get("family_concentration_share_threshold", 0.50))
 
-    # 统计每个子题每个活跃分支（取每分支最新状态处于 EXPLORING/ACTIVE_REVISING/AWAITING_TRIAGE/PENDING_REVIEW 的活跃脉）
-    rows = conn.execute(
-        """
-        SELECT question_id, branch_id, family_id
-        FROM lineage_nodes
-        WHERE node_status IN ('EXPLORING', 'ACTIVE_REVISING', 'AWAITING_TRIAGE', 'PENDING_REVIEW')
-        GROUP BY question_id, branch_id
-        """
-    ).fetchall()
-
+    rows = fetch_active_branch_family_rows(conn)
     by_q: dict[str, dict[str, set[str]]] = {}
     for r in rows:
         q = str(r["question_id"])
@@ -159,122 +133,39 @@ def compute_topology_and_revision_health(
     question_filter: str = "ALL",
     slot_cap: int | None = None,
 ) -> dict[str, Any]:
-    """纯查 SQLite (<15ms) 计算全卷或指定子题的 Worktree 拓扑健康度、断代分支、孤儿盲审返工单与缺编正交学派。
-
-    消除第六轮暴露的四大治理盲区：
-    1. 断代分支（`stalled_or_aborted_branches`）：最新节点为 `CLOSED`（含被 `abort_node` 中止）且所在子题尚未取得 `FULL_GOAL L3`；
-    2. 孤儿盲审返工单（`orphaned_blind_review_revisions`）：盲审判了 `REVISE`（`CLOSED_REVISE`）要求定向返工，但原分支被中止或断代、当前无活跃节点承接；
-    3. 缺编正交学派与单线独苗退化（`understaffed_questions`）：子题已注册 >=2 个 `ACTIVE` 学派且有空闲槽位，但在跑活跃学派数 < min(2, 已登记活跃学派数)；
-    4. 并发槽位利用率（`slot_utilization`）：`active_branches_count` / `slot_cap` / `free_slots`。
-    """
+    """纯查 SQLite (<15ms) 计算全卷或指定子题的 Worktree 拓扑健康度、断代分支、孤儿盲审返工单与缺编正交学派。"""
     cfg = load_runtime_config()
     eff_slot_cap = int(slot_cap or cfg.get("max_concurrent_workers", 6))
     qf = str(question_filter or "ALL").strip()
     order_status = get_question_order_status(conn)
 
-    # 1. 已注册方法学派
-    if qf.upper() == "ALL":
-        fam_rows = conn.execute("SELECT * FROM method_families ORDER BY question_id, family_id").fetchall()
-    else:
-        fam_rows = conn.execute(
-            "SELECT * FROM method_families WHERE question_id = ? ORDER BY family_id",
-            (qf,),
-        ).fetchall()
+    raw = fetch_topology_raw_data(conn, question_filter=qf)
+    fam_rows = raw["fam_rows"]
+    all_nodes = raw["all_nodes"]
+    rev_rows = raw["rev_rows"]
+    total_live_branches = raw["total_live_branches"]
+    reviewed_source_nodes = raw["reviewed_source_nodes"]
 
     active_families_by_q: dict[str, list[str]] = {}
     for fr in fam_rows:
         if str(fr["family_status"] or "ACTIVE") == "ACTIVE":
             active_families_by_q.setdefault(str(fr["question_id"]), []).append(str(fr["family_id"]))
 
-    # 2. 按 branch_id 聚合每条分支的最新一代节点状态
-    if qf.upper() == "ALL":
-        all_nodes = conn.execute(
-            """
-            SELECT node_id, question_id, branch_id, family_id, parent_node_id, generation,
-                   spec_revision, node_status, worktree_abs_path, retained_snapshot_abs_path,
-                   mechanism_summary, evidence_grade, candidate_rel_path, revise_count,
-                   inplace_repair_count, last_revision_requests_json, pending_handoff_reason,
-                   pressure_tokens, effective_context_window, first_reflection_unlocked,
-                   created_at, updated_at
-            FROM lineage_nodes
-            ORDER BY generation ASC, created_at ASC
-            """
-        ).fetchall()
-    else:
-        all_nodes = conn.execute(
-            """
-            SELECT node_id, question_id, branch_id, family_id, parent_node_id, generation,
-                   spec_revision, node_status, worktree_abs_path, retained_snapshot_abs_path,
-                   mechanism_summary, evidence_grade, candidate_rel_path, revise_count,
-                   inplace_repair_count, last_revision_requests_json, pending_handoff_reason,
-                   pressure_tokens, effective_context_window, first_reflection_unlocked,
-                   created_at, updated_at
-            FROM lineage_nodes
-            WHERE question_id = ?
-            ORDER BY generation ASC, created_at ASC
-            """,
-            (qf,),
-        ).fetchall()
-
     latest_by_branch: dict[str, dict[str, Any]] = {}
     branch_has_live_node: set[str] = set()
     live_statuses = ("EXPLORING", "ACTIVE_REVISING", "AWAITING_TRIAGE", "PENDING_REVIEW")
-    for r in all_nodes:
-        d = dict(r)
+    for d in all_nodes:
         bid = str(d["branch_id"])
         latest_by_branch[bid] = d
         if str(d["node_status"]) in live_statuses:
             branch_has_live_node.add(bid)
 
-    # 统计总活跃探索分支槽位（全卷口径）
-    total_live_branches = int(
-        conn.execute(
-            """
-            SELECT COUNT(DISTINCT branch_id) AS cnt
-            FROM lineage_nodes
-            WHERE node_status IN ('EXPLORING', 'ACTIVE_REVISING', 'AWAITING_TRIAGE', 'PENDING_REVIEW')
-            """
-        ).fetchone()["cnt"]
-        or 0
-    )
     free_slots = max(0, eff_slot_cap - total_live_branches)
 
-    # 3. 检索所有 CLOSED_REVISE 盲审单，判断是否已被后续活跃分支承接
-    if qf.upper() == "ALL":
-        rev_rows = conn.execute(
-            """
-            SELECT r.review_id, r.question_id, r.source_node_id, r.manuscript_title,
-                   r.final_verdict, r.revision_requests_json, r.updated_at,
-                   n.branch_id, n.family_id, n.retained_snapshot_abs_path, n.worktree_abs_path
-            FROM review_queue r
-            LEFT JOIN lineage_nodes n ON n.node_id = r.source_node_id
-            WHERE r.review_status = 'CLOSED_REVISE'
-            ORDER BY r.updated_at DESC
-            """
-        ).fetchall()
-    else:
-        rev_rows = conn.execute(
-            """
-            SELECT r.review_id, r.question_id, r.source_node_id, r.manuscript_title,
-                   r.final_verdict, r.revision_requests_json, r.updated_at,
-                   n.branch_id, n.family_id, n.retained_snapshot_abs_path, n.worktree_abs_path
-            FROM review_queue r
-            LEFT JOIN lineage_nodes n ON n.node_id = r.source_node_id
-            WHERE r.review_status = 'CLOSED_REVISE' AND r.question_id = ?
-            ORDER BY r.updated_at DESC
-            """,
-            (qf,),
-        ).fetchall()
-
-    # 判断某个 source_node_id 是否已有后代节点送过新盲审或正处于活跃态
     active_parent_ids = {
         str(r["parent_node_id"])
         for r in all_nodes
         if r["parent_node_id"] and str(r["node_status"]) in live_statuses
-    }
-    reviewed_source_nodes = {
-        str(r["source_node_id"])
-        for r in conn.execute("SELECT source_node_id FROM review_queue").fetchall()
     }
 
     orphaned_revisions: list[dict[str, Any]] = []
@@ -287,7 +178,6 @@ def compute_topology_and_revision_health(
         src_nid = str(rr["source_node_id"])
         if rbid in branch_has_live_node or src_nid in active_parent_ids:
             continue
-        # 检查是否有后代节点已经重新送审
         descendant_resubmitted = any(
             str(n["parent_node_id"] or "") == src_nid and str(n["node_id"]) in reviewed_source_nodes
             for n in all_nodes
@@ -318,7 +208,6 @@ def compute_topology_and_revision_health(
         if rbid:
             orphaned_by_branch[rbid] = item
 
-    # 4. 整理断代/被中止分支列表
     stalled_branches: list[dict[str, Any]] = []
     live_families_by_q: dict[str, set[str]] = {}
     live_branches_by_q: dict[str, list[str]] = {}
@@ -356,7 +245,6 @@ def compute_topology_and_revision_health(
                 }
             )
 
-    # 5. 检查各解锁子题是否存在“正交学派缺编 / 单线独苗退化”
     understaffed_questions: list[dict[str, Any]] = []
     check_qs = sorted(active_families_by_q.keys()) if qf.upper() == "ALL" else [qf]
     for q in check_qs:
@@ -367,7 +255,6 @@ def compute_topology_and_revision_health(
         live_fams = sorted(live_families_by_q.get(q, set()))
         missing_fams = [f for f in reg_fams if f not in live_fams]
         live_b_list = live_branches_by_q.get(q, [])
-        # 当注册了 >=2 个活跃学派，但当前在跑分支数退化为 <=1（独苗或全空），且有空闲槽位时告警
         is_degenerated = len(reg_fams) >= 2 and len(live_b_list) < min(2, len(reg_fams)) and free_slots > 0
         if missing_fams and (is_degenerated or len(live_b_list) == 0):
             understaffed_questions.append(
@@ -405,7 +292,16 @@ def check_stage2_closure_gate_data(
     if eff_mode not in ALLOWED_DELIVERY_MODES:
         raise FailClosedError(ERR_INVALID_INPUT, f"非法结题模式 mode={mode!r}，仅允许 {sorted(ALLOWED_DELIVERY_MODES)}")
 
-    p0 = conn.execute("SELECT * FROM parse0_contract WHERE contract_id = 'active'").fetchone()
+    raw = fetch_closure_gate_raw_data(conn)
+    p0 = raw["p0"]
+    closure = raw["closure"]
+    full_counts = raw["full_counts"]
+    all_l3_counts = raw["all_l3_counts"]
+    pending_reval = raw["pending_reval"]
+    pending_reviews = raw["pending_reviews"]
+    used_handoffs = raw["used_handoffs"]
+    used_official_evals = raw["used_official_evals"]
+
     req_qs = json.loads(p0["subquestions_json"]) if p0 else []
     min_window_sec = int(p0["min_commitment_window_sec"] or 0) if p0 else 0
     signed_dt = _parse_iso_utc(str(p0["human_signed_at"])) if p0 else None
@@ -413,61 +309,13 @@ def check_stage2_closure_gate_data(
     if signed_dt is not None:
         elapsed_sec = max(0.0, (datetime.now(timezone.utc) - signed_dt).total_seconds())
 
-    closure = conn.execute("SELECT * FROM project_closure_state WHERE id = 1").fetchone()
     human_stop_ts = str(closure["human_stop_requested_at"] or "").strip() if closure else ""
-
-    full_rows = conn.execute(
-        """
-        SELECT question_id, COUNT(*) AS cnt
-        FROM internal_research_ledger
-        WHERE ledger_type = 'L3_VERIFIED' AND is_active = 1 AND goal_coverage = 'FULL_GOAL'
-        GROUP BY question_id
-        """
-    ).fetchall()
-    full_counts = {str(r["question_id"]): int(r["cnt"] or 0) for r in full_rows}
-
-    all_l3_rows = conn.execute(
-        """
-        SELECT question_id, COUNT(*) AS cnt
-        FROM internal_research_ledger
-        WHERE ledger_type = 'L3_VERIFIED' AND is_active = 1
-        GROUP BY question_id
-        """
-    ).fetchall()
-    all_l3_counts = {str(r["question_id"]): int(r["cnt"] or 0) for r in all_l3_rows}
-
     blocking_qs = [q for q in req_qs if full_counts.get(q, 0) < 1]
-    pending_reval = conn.execute(
-        "SELECT queue_id, obs_id, question_id FROM pending_revalidation_queue WHERE status = 'PENDING'"
-    ).fetchall()
-    pending_reviews = conn.execute(
-        "SELECT review_id, question_id, review_status FROM review_queue WHERE review_status IN ('STAGE1_BLIND', 'STAGE2_UNBLIND')"
-    ).fetchall()
-
     window_satisfied = elapsed_sec >= float(min_window_sec)
-    # 计算总预算耗尽状态（依据 Parse 0 total_budget_json 配置的上限，未配置默认不视为耗尽）
+
     total_budget = json.loads(p0["total_budget_json"] or "{}") if p0 else {}
     if not isinstance(total_budget, dict):
         total_budget = {}
-    used_handoffs = int(
-        conn.execute(
-            """
-            SELECT COUNT(*) AS cnt FROM lineage_nodes
-            WHERE node_status IN ('AWAITING_TRIAGE','PENDING_REVIEW','BLOCKED_L4B','SEALED','CLOSED')
-               OR (column_a_facts_md IS NOT NULL AND TRIM(column_a_facts_md) != '')
-            """
-        ).fetchone()["cnt"]
-        or 0
-    )
-    used_official_evals = int(
-        conn.execute(
-            """
-            SELECT COUNT(*) AS cnt FROM observations
-            WHERE tier IN ('official','heavy') AND revalidated_from_obs_id IS NULL
-            """
-        ).fetchone()["cnt"]
-        or 0
-    )
     max_handoffs = total_budget.get("max_total_handoffs")
     max_evals = total_budget.get("max_official_evals")
     max_wall_clock = total_budget.get("max_wall_clock_sec")
@@ -483,7 +331,6 @@ def check_stage2_closure_gate_data(
     gate_code = "GATE_BLOCKED"
 
     if eff_mode == "PARTIAL_ON_HUMAN_STOP" or human_aborted:
-        # 严格校验控制面真实写入的 human_stop_requested_at，绝不轻信 Agent 伪造 human_aborted=true！
         if not human_stop_ts:
             closure_allowed = False
             gate_code = "HUMAN_STOP_NOT_RECORDED"
@@ -500,7 +347,7 @@ def check_stage2_closure_gate_data(
         else:
             closure_allowed = True
             gate_code = "GATE_PASSED_PARTIAL_BUDGET"
-    else:  # FULL
+    else:
         if not req_qs:
             closure_allowed = False
             gate_code = "GATE_BLOCKED_NO_CONTRACT"
@@ -528,8 +375,8 @@ def check_stage2_closure_gate_data(
         "budget_exhausted": budget_exhausted,
         "budget_usage": {"used_handoffs": used_handoffs, "used_official_evals": used_official_evals, "limits": total_budget},
         "human_stop_requested_at": human_stop_ts or None,
-        "pending_reviews": [dict(r) for r in pending_reviews],
-        "pending_revalidation": [dict(r) for r in pending_reval],
+        "pending_reviews": pending_reviews,
+        "pending_revalidation": pending_reval,
     }
 
 
@@ -539,29 +386,28 @@ def schedule_control_plane_snapshot(
     *,
     workspace_root: str = "",
 ) -> dict[str, Any]:
-    """纯查 SQLite（<50ms，零写盘零哈希副作用）生成两级公平调度快照（严禁在此轮询中动态导入/运行任何 Python 仪器！）。"""
+    """纯查 SQLite（<50ms，零写盘零哈希副作用）生成两级公平调度快照。"""
     _ = workspace_root
     cfg = load_runtime_config()
     hard_cap = int(cfg.get("max_concurrent_workers_hard_cap", 10))
     wanted = int(max_concurrent_workers or cfg.get("max_concurrent_workers", 6))
     slot_cap = max(1, min(hard_cap, wanted))
 
-    p0 = conn.execute("SELECT * FROM parse0_contract WHERE contract_id = 'active'").fetchone()
+    p0 = fetch_active_parse0_row(conn)
     req_qs = json.loads(p0["subquestions_json"]) if p0 else []
     q_order = json.loads(p0["question_order_json"]) if p0 else []
     initial_instruments = json.loads(p0["initial_instruments_json"] or "[]") if p0 else []
-    shared_inputs = json.loads(p0["shared_inputs_json"] or "[]") if (p0 and "shared_inputs_json" in p0.keys()) else []
-    stage1_works_checked = bool(int(p0["stage1_works_checked"] or 0)) if (p0 and "stage1_works_checked" in p0.keys()) else False
-    latest_spec_revision = int(p0["latest_spec_revision"] or 0) if (p0 and "latest_spec_revision" in p0.keys()) else 0
-    latest_ruling_summary_md = str(p0["latest_ruling_summary_md"] or "") if (p0 and "latest_ruling_summary_md" in p0.keys()) else ""
+    shared_inputs = json.loads(p0.get("shared_inputs_json") or "[]") if p0 else []
+    stage1_works_checked = bool(int(p0.get("stage1_works_checked") or 0)) if p0 else False
+    latest_spec_revision = int(p0.get("latest_spec_revision") or 0) if p0 else 0
+    latest_ruling_summary_md = str(p0.get("latest_ruling_summary_md") or "") if p0 else ""
     missing_initial_instruments = compute_missing_initial_instruments(conn) if p0 else []
     goal_md = str(p0["goal_and_completion_md"] or "") if p0 else ""
     stage = str(p0["stage"]) if p0 else "STAGE1_PARSE0"
     non_l1 = int(p0["consecutive_non_l1_handoffs"] or 0) if p0 else 0
     has_parse0_signed = bool(p0 and str(p0["human_signed_at"] or "").strip() and goal_md.strip())
 
-    closure_row = conn.execute("SELECT * FROM project_closure_state WHERE id = 1").fetchone()
-    closure_state = dict(closure_row) if closure_row else {
+    closure_state = fetch_closure_state_row(conn) or {
         "status": "OPEN",
         "verifier_final_audit_passed": 0,
         "human_stop_requested_at": None,
@@ -569,59 +415,13 @@ def schedule_control_plane_snapshot(
         "latest_delivery_sha256": None,
     }
     human_stop_active = bool(closure_state.get("human_stop_requested_at"))
-
     order_status = get_question_order_status(conn)
 
-    # 查询待分诊分支集合（AWAITING_TRIAGE 硬锁：同分支有待分诊节点时严禁抢跑启动下代）
-    awaiting_triage = [
-        dict(r)
-        for r in conn.execute(
-            """
-            SELECT node_id, question_id, branch_id, family_id, evidence_grade, mechanism_summary
-            FROM lineage_nodes
-            WHERE node_status = 'AWAITING_TRIAGE'
-            ORDER BY updated_at ASC
-            """
-        ).fetchall()
-    ]
+    qdata = fetch_snapshot_queues_and_tables(conn)
+    awaiting_triage = qdata["awaiting_triage"]
     triage_locked_branches = {str(r["branch_id"]) for r in awaiting_triage}
-
-    active_nodes = [
-        dict(r)
-        for r in conn.execute(
-            """
-            SELECT node_id, question_id, branch_id, family_id, generation, node_status,
-                   worktree_abs_path, requires_json, premise_revoked, pressure_tokens,
-                   effective_context_window, spec_revision,
-                   first_reflection_unlocked, last_revision_requests_json, lane_assignment,
-                   will_md, explorer_will_md, pending_handoff_mode, pending_handoff_reason, updated_at
-            FROM lineage_nodes
-            WHERE node_status IN ('EXPLORING', 'ACTIVE_REVISING')
-            ORDER BY created_at ASC
-            """
-        ).fetchall()
-    ]
-
-    # 批量取回各节点最新一条五段看板正文并格式化为 briefing_snapshot_md（确保探索者 100% 收到正文）
-    latest_briefings: dict[str, str] = {}
-    for br in conn.execute(
-        """
-        SELECT node_id, sec1_mechanism, sec2_verified_baseline, sec3_bottleneck,
-               sec4_dead_ends, sec5_immediate_will, created_at
-        FROM lineage_briefings
-        ORDER BY created_at ASC
-        """
-    ).fetchall():
-        bnid = str(br["node_id"])
-        latest_briefings[bnid] = "\n\n".join(
-            [
-                f"#### 1. 核心机制\n{br['sec1_mechanism']}",
-                f"#### 2. 已证实基线与返工要求\n{br['sec2_verified_baseline']}",
-                f"#### 3. 当前瓶颈\n{br['sec3_bottleneck']}",
-                f"#### 4. 关键死胡同\n{br['sec4_dead_ends']}",
-                f"#### 5. 本代首要遗嘱 (Immediate Will)\n{br['sec5_immediate_will']}",
-            ]
-        )
+    active_nodes = qdata["active_nodes"]
+    latest_briefings = qdata["latest_briefings"]
 
     need_briefing: list[dict[str, Any]] = []
     ready_to_run: list[dict[str, Any]] = []
@@ -632,18 +432,14 @@ def schedule_control_plane_snapshot(
         nid = str(node["node_id"])
         bid = str(node["branch_id"])
         qid = str(node["question_id"])
-        # 若探索者已写完遗嘱或异常中断等待伴随落库，归入待伴随恢复队列，严禁重复派发探索者
         if node.get("pending_handoff_mode"):
             pending_handoff_nodes.append(node)
             continue
-        # AWAITING_TRIAGE 同分支防抢跑硬锁
         if bid in triage_locked_branches:
             continue
-        # 策略题序未解锁
         if not order_status.get(qid, {}).get("unlocked", True):
             blocked_by_requires.append({**node, "blocked_reason": "question_order_locked"})
             continue
-        # 分支级确定性 requires（仅锁本分支）
         reqs = json.loads(node.get("requires_json") or "[]")
         sat, unmet = check_branch_requires_satisfied(conn, reqs)
         if not sat:
@@ -654,7 +450,6 @@ def schedule_control_plane_snapshot(
         else:
             ready_to_run.append({**node, "briefing_snapshot_md": latest_briefings[nid]})
 
-    # 两级公平排序：先按子题活跃数均衡，再在子题内按学派活跃数均衡
     q_counts: dict[str, int] = {}
     qf_counts: dict[tuple[str, str], int] = {}
     for r in ready_to_run:
@@ -670,84 +465,23 @@ def schedule_control_plane_snapshot(
         )
     )
 
-    blind_reviews = [
-        dict(r)
-        for r in conn.execute(
-            """
-            SELECT review_id, question_id, source_node_id, source_type, review_status, proposer_session_id
-            FROM review_queue
-            WHERE review_status IN ('STAGE1_BLIND', 'STAGE2_UNBLIND')
-            ORDER BY created_at ASC
-            """
-        ).fetchall()
-    ]
-    pending_surveys = [
-        dict(r)
-        for r in conn.execute(
-            "SELECT req_id, question_id, node_id, topic_query, reason FROM survey_requests WHERE status = 'PENDING' ORDER BY created_at ASC"
-        ).fetchall()
-    ]
-    open_works = [
-        dict(r)
-        for r in conn.execute(
-            "SELECT ticket_id, question_id, ticket_type, instrument_id, payload_json, updated_at FROM works_engineering_queue WHERE status = 'OPEN' ORDER BY created_at ASC"
-        ).fetchall()
-    ]
-    pending_reval = [
-        dict(r)
-        for r in conn.execute(
-            "SELECT queue_id, obs_id, question_id, target_instrument_id, target_version, updated_at FROM pending_revalidation_queue WHERE status = 'PENDING' ORDER BY created_at ASC"
-        ).fetchall()
-    ]
-    unhealthy_instruments = [
-        dict(r)
-        for r in conn.execute(
-            "SELECT instrument_id, version, question_id, instrument_role, consecutive_error_count, updated_at FROM instruments WHERE is_active = 1 AND health_status = 'UNHEALTHY'"
-        ).fetchall()
-    ]
-    active_instruments = [
-        dict(r)
-        for r in conn.execute(
-            """
-            SELECT instrument_id, version, question_id, instrument_role,
-                   artifact_schema, health_status, default_spec_json, updated_at
-            FROM instruments
-            WHERE is_active = 1
-            ORDER BY instrument_id, version
-            """
-        ).fetchall()
-    ]
+    blind_reviews = qdata["blind_reviews"]
+    active_instruments = qdata["active_instruments"]
     active_instruments_fingerprint = [
         f"{r['instrument_id']}:v{r['version']}:{r['health_status']}:{r['updated_at']}"
         for r in active_instruments
     ]
-    ambiguous_alerts = [
-        dict(r)
-        for r in conn.execute(
-            "SELECT alert_id, stage, notes, created_at FROM compliance_alerts WHERE status = 'ALERT_AMBIGUOUS_SPEC' ORDER BY created_at DESC LIMIT 10"
-        ).fetchall()
-    ]
-    external_lit_count = int(conn.execute("SELECT COUNT(*) AS cnt FROM external_literature_cards").fetchone()["cnt"] or 0)
     family_concentration_alerts = compute_family_concentration_alerts(conn)
     topology_health = compute_topology_and_revision_health(conn, question_filter="ALL", slot_cap=slot_cap)
     orphaned_revisions = topology_health.get("orphaned_blind_review_revisions") or []
     understaffed_questions = topology_health.get("understaffed_questions") or []
     stalled_branches = topology_health.get("stalled_or_aborted_branches") or []
 
-    # 读取最近一条监察委 STAGE2_HEARTBEAT 合规告警（若状态为 ALERT，用于闭环唤醒后勤/工造司）
-    latest_hb_row = conn.execute(
-        """
-        SELECT alert_id, stage, status, blocking_questions_json, notes, created_at
-        FROM compliance_alerts
-        WHERE stage = 'STAGE2_HEARTBEAT'
-        ORDER BY created_at DESC LIMIT 1
-        """
-    ).fetchone()
+    latest_hb_row = qdata["latest_hb_row"]
     active_supervisory_alert: dict[str, Any] | None = None
     if latest_hb_row is not None and str(latest_hb_row["status"]).upper() == "ALERT":
-        active_supervisory_alert = dict(latest_hb_row)
+        active_supervisory_alert = latest_hb_row
 
-    # 判断已解锁但既无 FULL_GOAL L3 也无在研/待分诊/待盲审节点的子题
     in_flight_qs = {
         *(str(r["question_id"]) for r in active_nodes),
         *(str(r["question_id"]) for r in awaiting_triage),
@@ -760,7 +494,6 @@ def schedule_control_plane_snapshot(
         and q not in in_flight_qs
     ]
 
-    # Stage 3 两步联合终核待办检测（DELIVERY_EXPORTED 且尚未通过匹配当前版本的终核）
     latest_did = str(closure_state.get("latest_delivery_id") or "")
     latest_sha = str(closure_state.get("latest_delivery_sha256") or "")
     audited_did = str(closure_state.get("verifier_audited_delivery_id") or "")
@@ -813,17 +546,17 @@ def schedule_control_plane_snapshot(
         "stalled_or_aborted_branches": stalled_branches,
         "slot_utilization": topology_health.get("slot_utilization") or {"active_branches_count": 0, "slot_cap": slot_cap, "free_slots": slot_cap},
         "active_supervisory_alert": active_supervisory_alert,
-        "external_literature_count": external_lit_count,
+        "external_literature_count": qdata["external_lit_count"],
         "active_instruments": active_instruments,
         "active_instruments_fingerprint": active_instruments_fingerprint,
         "slot_cap": slot_cap,
         "triage_locked_branches": sorted(triage_locked_branches),
         "family_concentration_alerts": family_concentration_alerts,
-        "ambiguous_spec_alerts": ambiguous_alerts,
-        "unhealthy_instruments": unhealthy_instruments,
-        "pending_surveys": pending_surveys,
-        "open_works_tickets": open_works,
-        "pending_revalidation": pending_reval,
+        "ambiguous_spec_alerts": qdata["ambiguous_alerts"],
+        "unhealthy_instruments": qdata["unhealthy_instruments"],
+        "pending_surveys": qdata["pending_surveys"],
+        "open_works_tickets": qdata["open_works"],
+        "pending_revalidation": qdata["pending_reval"],
         "awaiting_triage": awaiting_triage,
         "pending_reviews": blind_reviews,
         "pending_handoff_nodes": pending_handoff_nodes,
@@ -907,4 +640,3 @@ def uninitialized_schedule_snapshot(max_concurrent_workers: int | None = None) -
         "stage3_final_audit_pending": False,
         "stage3_supervisory_sign_pending": False,
     }
-

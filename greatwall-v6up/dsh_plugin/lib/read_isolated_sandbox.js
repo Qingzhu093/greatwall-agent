@@ -353,6 +353,11 @@ export function createSandboxCallEvaluator(opts) {
       return `SANDBOX_VIOLATION: ${role} 为纯 DB 治理角色（0 原生工具），禁止调用原生工具 ${name}`
     }
 
+    // 盲审官缺失有效隔离沙箱时绝对 Fail-Closed，严禁回退主工作区
+    if (role === 'library_verifier' && !sandboxCanon) {
+      return `SANDBOX_VIOLATION: library_verifier 缺少有效独立盲审沙箱路径，禁止调用原生工具 ${name} 以防越界访问主工作区`
+    }
+
     // 禁写过程 .md 公文 + 严禁只读角色修改磁盘
     if (isWriteTool) {
       if (role === 'library_surveyor' || role === 'lineage_companion' || role === 'library_verifier') {

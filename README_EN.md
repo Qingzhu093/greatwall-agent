@@ -3,14 +3,15 @@
 **English** | [简体中文](./README.md)
 
 > **An open-source multi-agent experimental base for long-horizon, multi-school concurrent autonomous scientific discovery**  
-> **Release Status**: `v0.1.0-alpha.4` (Early Experimental Demo · **Stage 1 backend decoupling, not yet manually code-reviewed** · **Not a production-ready tool**)  
+> **Release Status**: `v0.2.0-alpha.1` (Major Core Refactor · **Native DSH `0.2.2-rc.5` Alignment × Dual-Pool Concurrency × Single-Writer Consistency** · **Not a production-ready tool**)  
 > **License**: [Apache License 2.0](./LICENSE) + [DCO 1.1](./CONTRIBUTING.md#三许可证与-dcodeveloper-certificate-of-origin签署要求) ｜ **Runtime Stack**: [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) `>= 0.2.2-rc.5` × Python `3.11+` × [MCP](https://modelcontextprotocol.io)
 
 ---
 
 > ⚠️ **Candid Upfront Notice**  
-> This project is currently at a very early **`v0.1.0-alpha.4`** experimental stage (note: the Stage 1 structural decoupling changes in `alpha.4` have **not yet been manually reviewed line-by-line**, and have only been verified via automated unit and architecture contract tests). While the backend thousand-line god files have been decomposed, the codebase still carries a rough prototype UI (`client.js` pending modular rewrite), application-level soft-sandbox security limitations, and under-utilized DSH native UI capabilities. Moreover, the multi-agent research governance mechanisms have not yet undergone clean controlled ablation experiments under zero engineering-incident baselines (see [`ARCHITECTURE.md §5`](./ARCHITECTURE.md#5-已知技术债与当前局限) for full details).  
-> We are open-sourcing it now under **Apache 2.0 + DCO** to turn frontier AI for Science multi-agent architectures into a runnable, hackable, and co-evolvable experimental testbed. Dissections, reproductions, critiques, and collaborations are warmly welcomed.
+> This project is now at **`v0.2.0-alpha.1`**, a major architectural and runtime refactor focused on **deep DSH `0.2.2-rc.5` native alignment, concurrent read/compute decoupling with strict Single-Writer consistency, end-to-end `$/cancelRequest` process-tree cancellation, single-source Preset consolidation, and cross-`cwd` native session opening**. It passes the full automated suite (Python `54/54`, Node `39/39`, Doctor `7/7`) and live smoke verification on real DSH RC5 CLI + DeepSeek Flash (both primary orchestration and sub-agent tool execution).  
+> Key limitations remain candidly documented: the right-sidebar cockpit prototype (`client.js`) still awaits modular UX/visual redesign, desktop sandboxing remains application-level, and the multi-agent research governance mechanisms have not yet undergone clean controlled ablation experiments under zero engineering-incident baselines (see [`ARCHITECTURE.md §5`](./ARCHITECTURE.md#5-已知技术债与当前局限)).  
+> We open-source it under **Apache 2.0 + DCO** to turn frontier AI for Science multi-agent architectures into a runnable, hackable, and co-evolvable experimental testbed. Dissections, reproductions, critiques, and collaborations are warmly welcomed.
 
 ---
 
@@ -43,12 +44,12 @@ flowchart LR
 
 Logically, a deterministic external orchestration kernel coordinates a flat check-and-balance governance model (**1 Supervisory Committee + 3 Functional Ministries + Front-line Exploration Units**). In software implementation, it converges into four orthogonal engineering pillars:
 
-| Engineering Pillar | Logical Role / Organ | Core Mechanisms (`v0.1.0-alpha.4` Implemented) |
+| Engineering Pillar | Logical Role / Organ | Core Mechanisms (`v0.2.0-alpha.1` Implemented) |
 | :--- | :--- | :--- |
-| **1. Infrastructure** | Orchestrator Kernel (`Orchestrator`)<br>Supervisory Committee (`supervisory_committee`)<br>Console UI Prototype (`Console UI`) | Rootless flat short-session scheduling (`ctx.agents.create()`); explicit model-binding startup gate; adaptive context window `W = min(500k, model_ctx)`; 2-strike no-progress circuit breaker per todo item; versioned public rulings (`spec_revision`); bidirectional isolation sandboxes; SQLite WAL Single-Writer truth store (19 tables + 2 FTS5 + 3 hard business triggers) |
-| **2. Instrumentation Science** | Works Engineer (`works_engineer`)<br>Isolated Runner (`isolated_runner.py`) | Unified `evaluate(artifact, spec, tier)` 3-tier same-code protocol (`probe / official / heavy`); 4-state physical isolation (`INSTRUMENT_ERROR / INFRA_ERROR` incur zero penalty and auto-open repair tickets); 4-tuple composite caching; self-declared calibration set regression; version-domain comparability & on-demand re-evaluation |
+| **1. Infrastructure** | Orchestrator Kernel (`Orchestrator`)<br>Unified Control Service (`ControlService`)<br>Supervisory Committee (`supervisory_committee`)<br>Console UI Prototype (`Console UI`) | Rootless flat short-session scheduling (`ctx.agents.create()`); **dual-pool concurrency (fast control vs. slow compute) + end-to-end `$/cancelRequest` cancellation**; **true read-only connections + process-level Single-Writer lock**; **DSH RC5 strict JSON Schema subset adapter & Standard Schema v1 `Config` validation**; single-source `cordis.patch.yml` Presets & awaited async plugin teardown; explicit model-binding startup gate; adaptive context window `W = min(500k, model_ctx)`; 2-strike no-progress circuit breaker per todo item; versioned public rulings (`spec_revision`); bidirectional isolation sandboxes & **native cross-`cwd` session opening**; SQLite WAL truth store (19 tables + 2 FTS5 + 3 hard business triggers) |
+| **2. Instrumentation Science** | Works Engineer (`works_engineer`)<br>Isolated Runner (`isolated_runner.py`) | Unified `evaluate(artifact, spec, tier)` 3-tier same-code protocol (`probe / official / heavy`); 4-state physical isolation (`INSTRUMENT_ERROR / INFRA_ERROR` incur zero penalty and auto-open repair tickets); 4-tuple composite caching; **per-request isolated staging & in-transaction ID allocation (zero collision/overwrite)**; self-declared calibration set regression; **auto-queuing of in-flight legacy observations on instrument upgrade** & version-safe Stage B re-evaluation (`recompute_stage_b_only`) |
 | **3. Logistics** | Logistics Coordinator (`logistics_coordinator`)<br>Explorer (`explorer`) ◄─1:1─► Companion (`lineage_companion`) | Single-node same-session companion pause/resume (non-cross-generation); `0–37%` solo cleanroom (internal archive locked, external `[R###]` open) → `37%` intelligence-driven meta-reflection & 29-question Night Science unlock → `37–70%` open Pull → `70%` handwritten *Research Will* before companion single-writes DAG; `<=2200`-char fixed-quota re-compressed board + full `lineage_dead_ends`; 6-type triage, `>50%` mandatory school divergence & 5-lane recovery |
-| **4. Library** | External Surveyor (`library_surveyor`)<br>Sandbox Blind Verifier (`library_verifier`) | External `[R###]` (including honest `UNAVAILABLE_REPORT` closure without fabricating cards) & internal `L3/L2` physical table split; 4-track verifiable submission gate; 2-stage blind review in clean ephemeral sandbox (`STAGE1_BLIND` irreversible ledger lock → `STAGE2_UNBLIND` 3-state routing); cross-session `Auditor` salvage; non-guilt-by-association `MOTIVATING_REF` citations; Stage 3 5-artifact export & `(delivery_id, delivery_sha256)` two-step final check |
+| **4. Library** | External Surveyor (`library_surveyor`)<br>Sandbox Blind Verifier (`library_verifier`) | External `[R###]` (including honest `UNAVAILABLE_REPORT` closure without fabricating cards) & internal `L3/L2` physical table split; 4-track verifiable submission gate; **4-layer Fail-Closed ephemeral blind sandbox** & 2-stage blind review (`STAGE1_BLIND` irreversible ledger lock → `STAGE2_UNBLIND` 3-state routing); cross-session `Auditor` salvage; non-guilt-by-association `MOTIVATING_REF` citations; Stage 3 atomic 5-artifact export with locked rollback & transactional `(delivery_id, delivery_sha256)` two-step sign-off |
 
 All 7 roles access **32 single-responsibility narrow tools** strictly via role-whitelisted **MCP (`stdio JSON-RPC 2.0`)**, enforcing zero intermediate `.md` clutter in the workspace—all process state is persisted in the Single-Writer SQLite store.
 
@@ -110,7 +111,7 @@ Mount `greatwall-v6up/dsh_plugin` via a local link in `~/.dsh/profiles/desktop/p
 greatwall-agent/
 ├── README.md                  # Chinese overview & quick entry
 ├── README_EN.md               # English overview & quick entry (this file)
-├── ARCHITECTURE.md            # v0.1.0-alpha architecture, code map, exact contracts & known limitations
+├── ARCHITECTURE.md            # v0.2.0-alpha.1 architecture, code map, exact contracts & known limitations
 ├── ROADMAP.md                 # Open problems, P0–P3 evolution roadmap & research questions
 ├── REFERENCES.md              # Academic papers, engineering blogs & open-source references
 ├── CONTRIBUTING.md            # Contribution guidelines & DCO 1.1 sign-off rules
@@ -126,9 +127,9 @@ greatwall-agent/
 
 ## Current Limitations (Full List in `ARCHITECTURE.md §5`)
 
-- **Frontend & Remaining Refactoring Debt**: Backend thousand-line god files were split with cross-language contract gates in `v0.1.0-alpha.4`, while the cockpit UI prototype (`client.js`) still awaits modular refactoring.
+- **Frontend UI Prototype Pending Rewrite**: Backend decoupling, DSH RC5 native alignment, and concurrent Single-Writer consistency landed in `v0.2.0-alpha.1`, while the no-build cockpit UI prototype (`client.js`) still awaits modular UX and visual redesign.
 - **Application-Layer Soft Sandbox**: The current desktop sandbox relies on path normalization and command interception, lacking OS-kernel resource limits and isolation (Docker / WSL2 + cgroups).
-- **Under-utilized DSH Native Capabilities & Prototype UI**: Built non-intrusively on top of the DSH Cordis plugin ecosystem (without modifying DSH core behavior), yet native DSH UI primitives/config schemas remain under-utilized and no cross-host runtime adapter exists yet.
+- **Full Desktop Soak Test & Static Schema Dump Pending**: Live RC5 CLI + DeepSeek Flash orchestration and sub-agent tool execution are verified, while full DSH Desktop long-run soak validation remains ahead. The zero-dependency Standard Schema v1 `Config` validates YAML configs at runtime, but is not yet a native Schemastery graph for `--dump-config-schema`.
 - **Controlled Empirical Validation Pending**: Net gains of the multi-agent governance protocol over bare single-agent baselines on open-ended tasks—and gradient guidance for non-scalar scientific problems—remain under active investigation.
 
 ---

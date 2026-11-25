@@ -86,11 +86,11 @@ def _materialize_cached_obs_for_node(
     if str(cached["node_id"]) == str(node_id):
         return src_obs_id, None
 
-    new_obs_id = next_prefixed_id(conn, "observations", "obs_id", "Obs-")
     reuse_prefix = f"[CACHE_REUSED_FROM {src_obs_id}] "
     base_details = str(cached["details_text"] or "")
     merged_details = base_details if base_details.startswith("[CACHE_REUSED_FROM ") else (reuse_prefix + base_details)
     with rw_immediate_tx(conn):
+        new_obs_id = next_prefixed_id(conn, "observations", "obs_id", "Obs-")
         conn.execute(
             """
             INSERT INTO observations(
@@ -146,6 +146,7 @@ def tool_run_isolated_eval(
     linguistic_prediction: str,
     declared_refs: list[str] | None = None,
     job_id: str | None = None,
+    cancel_event: Any = None,
 ) -> dict[str, Any]:
     """统一三档仪器调用：probe（诊断不记 Obs）/ official（受控凭证）/ heavy（冻结现场异步幂等取回）。"""
     enforce_role_tool_permission(conn, caller_role, "run_isolated_eval", session_id=session_id, node_id=node_id)
@@ -174,7 +175,12 @@ def tool_run_isolated_eval(
 
     # 1. 重型作业凭 job_id 幂等取回/执行（按入队冻结快照与原仪器版本运行，仅扣费一次）
     if tier_l == "heavy" and job_id and str(job_id).strip():
-        jres = execute_heavy_async_job(conn, workspace_root=workspace_root, job_id=str(job_id).strip())
+        jres = execute_heavy_async_job(
+            conn,
+            workspace_root=workspace_root,
+            job_id=str(job_id).strip(),
+            cancel_event=cancel_event,
+        )
         return build_tool_receipt(
             conn=conn,
             tool_name="run_isolated_eval",
@@ -373,7 +379,7 @@ def tool_run_isolated_eval(
             },
         )
 
-    # 3. probe 档：只写 probe_diagnostic_logs，绝不污染 observations
+    # 3. probe 档：只写 probe_diagnostic_logs，绝不污染 observations（透传 cancel_event，并在写锁内领号+复核取消）
     if tier_l == "probe":
         res = run_isolated_instrument(
             instrument_path=inst_abs,
@@ -384,9 +390,12 @@ def tool_run_isolated_eval(
             artifact_schema=str(inst["artifact_schema"]),
             worktree_root=worktree_abs,
             persist_stage_a_path=None,
+            cancel_event=cancel_event,
         )
-        probe_id = next_prefixed_id(conn, "probe_diagnostic_logs", "probe_id", "probe_")
         with rw_immediate_tx(conn):
+            if cancel_event is not None and cancel_event.is_set():
+                raise FailClosedError(ERR_LOCKED, "probe 诊断请求已取消，未写入诊断日志")
+            probe_id = next_prefixed_id(conn, "probe_diagnostic_logs", "probe_id", "probe_")
             conn.execute(
                 """
                 INSERT INTO probe_diagnostic_logs(probe_id, node_id, question_id, instrument_id, instrument_version, status, tracks_json, details_text, created_at)
@@ -482,72 +491,121 @@ def tool_run_isolated_eval(
             },
         )
 
-    obs_id = next_prefixed_id(conn, "observations", "obs_id", "Obs-")
-    stage_a_persist = str(paths["eval_artifacts_dir"] / obs_id / "stage_a_output.json")
-    res = run_isolated_instrument(
-        instrument_path=inst_abs,
-        instrument_role=str(inst["instrument_role"]),
-        artifact_path=art_abs,
-        spec=spec,
-        tier="official",
-        artifact_schema=str(inst["artifact_schema"]),
-        worktree_root=worktree_abs,
-        persist_stage_a_path=stage_a_persist,
-    )
-    obs_status = str(res["obs_status"])
-    # 故障穿透：任何错误态（CANDIDATE_ERROR / INSTRUMENT_ERROR / INFRA_ERROR）绝不写 cache_key 进永久缓存！
-    stored_cache_key = cache_key if res["status"] == "OK" else ""
+    # 先写入请求独占暂存路径运行仪器，严禁在 BEGIN IMMEDIATE 之前分配 obs_id 或写入最终目录（防并发产物串写）
+    staging_root = paths["eval_artifacts_dir"] / "_staging" / f"off_{uuid.uuid4().hex[:12]}"
+    staging_stage_a = staging_root / "stage_a_output.json"
+    try:
+        res = run_isolated_instrument(
+            instrument_path=inst_abs,
+            instrument_role=str(inst["instrument_role"]),
+            artifact_path=art_abs,
+            spec=spec,
+            tier="official",
+            artifact_schema=str(inst["artifact_schema"]),
+            worktree_root=worktree_abs,
+            persist_stage_a_path=str(staging_stage_a),
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            raise FailClosedError(ERR_LOCKED, "正式评测请求已取消，已丢弃暂存产物未落库")
 
-    circuit_broken = False
-    with rw_immediate_tx(conn):
-        conn.execute(
-            """
-            INSERT INTO observations(
-                obs_id, question_id, branch_id, node_id, instrument_id, instrument_version, tier,
-                candidate_entry_sha256, tools_dir_sha256, spec_sha256, instrument_sha256, cache_key,
-                stage_a_artifact_path, obs_status, tracks_json, details_text, linguistic_prediction,
-                spec_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'official', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                obs_id,
-                question_id,
-                str(node["branch_id"]),
-                node_id,
-                instrument_id,
-                int(inst["version"]),
-                cand_sha,
-                tools_sha,
-                spec_sha,
-                inst_sha,
-                stored_cache_key,
-                stage_a_persist if Path(stage_a_persist).is_file() else None,
-                obs_status,
-                json.dumps(res.get("tracks") or {}, ensure_ascii=False),
-                str(res.get("details") or ""),
-                pred,
-                json.dumps(spec, ensure_ascii=False),
-                now,
-                now,
-            ),
-        )
-        # 声明引用默认以 MOTIVATING_REF 写入（防全军连坐）
-        record_declared_refs(
-            conn,
-            source_id=obs_id,
-            declared_refs=declared_refs,
-            session_id=session_id,
-            default_edge_type=str(cfg.get("default_declared_ref_edge_type", "MOTIVATING_REF")),
-        )
-        if res["status"] == "INSTRUMENT_ERROR":
-            circuit_broken = _handle_instrument_error_ticket(
-                conn, question_id, instrument_id, int(inst["version"]), str(res["details"]), now, cfg
-            )
-        elif res["status"] in ("OK", "CANDIDATE_ERROR"):
-            conn.execute(
-                "UPDATE instruments SET consecutive_error_count = 0, updated_at = ? WHERE instrument_id = ? AND version = ?",
-                (now, instrument_id, int(inst["version"])),
-            )
+        obs_status = str(res["obs_status"])
+        # 故障穿透：任何错误态（CANDIDATE_ERROR / INSTRUMENT_ERROR / INFRA_ERROR）绝不写 cache_key 进永久缓存！
+        stored_cache_key = cache_key if res["status"] == "OK" else ""
+
+        circuit_broken = False
+        obs_id = ""
+        final_stage_a_path: str | None = None
+        stale_reval_target_ver: int | None = None
+        with rw_immediate_tx(conn):
+            # 取得单写者大闸后再次核验取消信号，封死“等写锁期间被取消仍落库”的最后窗口
+            if cancel_event is not None and cancel_event.is_set():
+                raise FailClosedError(ERR_LOCKED, "正式评测请求已取消，已丢弃暂存产物未落库")
+
+            # 检查并发期间仪器是否已升版：若已升版，诚实保留原运行版本号并自动挂入重评队列
+            active_inst_row = conn.execute(
+                "SELECT version FROM instruments WHERE instrument_id = ? AND is_active = 1 ORDER BY version DESC LIMIT 1",
+                (instrument_id,),
+            ).fetchone()
+            if (
+                active_inst_row is not None
+                and int(active_inst_row["version"]) > int(inst["version"])
+                and obs_status in ("VALID_PASS", "MEASURED_REJECTION", "VALID_UNDECIDED")
+            ):
+                stale_reval_target_ver = int(active_inst_row["version"])
+                obs_status = "PENDING_REVALIDATION"
+                stored_cache_key = ""
+
+            obs_id = next_prefixed_id(conn, "observations", "obs_id", "Obs-")
+            final_stage_a = paths["eval_artifacts_dir"] / obs_id / "stage_a_output.json"
+            if staging_stage_a.is_file():
+                final_stage_a.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(staging_stage_a), str(final_stage_a))
+                final_stage_a_path = str(final_stage_a)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO observations(
+                        obs_id, question_id, branch_id, node_id, instrument_id, instrument_version, tier,
+                        candidate_entry_sha256, tools_dir_sha256, spec_sha256, instrument_sha256, cache_key,
+                        stage_a_artifact_path, obs_status, tracks_json, details_text, linguistic_prediction,
+                        spec_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'official', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        obs_id,
+                        question_id,
+                        str(node["branch_id"]),
+                        node_id,
+                        instrument_id,
+                        int(inst["version"]),
+                        cand_sha,
+                        tools_sha,
+                        spec_sha,
+                        inst_sha,
+                        stored_cache_key,
+                        final_stage_a_path,
+                        obs_status,
+                        json.dumps(res.get("tracks") or {}, ensure_ascii=False),
+                        str(res.get("details") or ""),
+                        pred,
+                        json.dumps(spec, ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
+                if stale_reval_target_ver is not None:
+                    conn.execute(
+                        """
+                        INSERT INTO pending_revalidation_queue(
+                            queue_id, obs_id, question_id, target_instrument_id, target_version, status, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?)
+                        """,
+                        (f"reval_{uuid.uuid4().hex[:10]}", obs_id, question_id, instrument_id, stale_reval_target_ver, now, now),
+                    )
+                # 声明引用默认以 MOTIVATING_REF 写入（防全军连坐）
+                record_declared_refs(
+                    conn,
+                    source_id=obs_id,
+                    declared_refs=declared_refs,
+                    session_id=session_id,
+                    default_edge_type=str(cfg.get("default_declared_ref_edge_type", "MOTIVATING_REF")),
+                )
+                if res["status"] == "INSTRUMENT_ERROR":
+                    circuit_broken = _handle_instrument_error_ticket(
+                        conn, question_id, instrument_id, int(inst["version"]), str(res["details"]), now, cfg
+                    )
+                elif res["status"] in ("OK", "CANDIDATE_ERROR"):
+                    conn.execute(
+                        "UPDATE instruments SET consecutive_error_count = 0, updated_at = ? WHERE instrument_id = ? AND version = ?",
+                        (now, instrument_id, int(inst["version"])),
+                    )
+            except Exception:
+                if final_stage_a_path:
+                    shutil.rmtree(Path(final_stage_a_path).parent, ignore_errors=True)
+                raise
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
 
     if res["status"] in ("INSTRUMENT_ERROR", "INFRA_ERROR"):
         guidance = (

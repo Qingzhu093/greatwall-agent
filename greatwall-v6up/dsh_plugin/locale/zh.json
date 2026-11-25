@@ -1,6 +1,14 @@
 {
-  "plugin": {
-    "name": "长城 Agent V6-Up (v2.2)",
-    "description": "DSH 0.2.2-rc.5 原生 External Orchestrator × Python Single-Writer 31 窄工具科研共同体插件"
+  "meta": {
+    "title": "长城科研共同体 (GreatWall V6-Up)",
+    "description": "面向长周期自主科学发现的 DSH 0.2.2-rc.5 外部编排插件：双向沙箱隔离、SQLite 单写者科研内核与多角色协同求解。"
+  },
+  "config": {
+    "corePythonRoot": "Python 内核根目录（可选）",
+    "pythonBin": "Python 可执行文件路径（可选）",
+    "dataDir": "数据持久化目录（可选）",
+    "requestTimeoutMs": "常规 RPC 超时（毫秒）",
+    "longToolTimeoutMs": "长耗时评测与导出超时（毫秒）",
+    "defaultAgentOptions": "子会话默认模型配置（可选）"
   }
 }

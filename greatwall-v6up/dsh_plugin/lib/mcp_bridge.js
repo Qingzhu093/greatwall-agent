@@ -1,7 +1,9 @@
 /**
  * 持久化 Single-Writer Python MCP 桥接客户端（Stdio JSON-RPC 2.0 / NDJSON，v3.0）。
- * 维护单个长期常驻的 `python -u -m core_python.mcp_server.greatwall_core_mcp` 子进程，
- * 确保 SQLite WAL 写入经统一排队无并发锁冲突，并支持常规 / 长计算分级 RPC 超时。
+ *
+ * - 维护常驻的 `python -u -m core_python.mcp_server.greatwall_core_mcp` 子进程；
+ * - 全故障收口：监听 `spawn error`、`stdin error`、`exit`、超时与 `AbortSignal`，每条请求严格单次结算；
+ * - 端到端真取消：当 `signal` 触发或超时时立即向 Python 发送 `$/cancelRequest` 通知，避免僵尸算力与幽灵写入。
  * @module dsh-greatwall-v6up/mcp_bridge
  */
 import { spawn } from 'node:child_process'
@@ -20,6 +22,13 @@ export const LONG_RUNNING_MCP_TOOLS = Object.freeze(new Set([
 export const LONG_RUNNING_CONTROL_METHODS = Object.freeze(new Set([
   'control_plane/recover_heavy_jobs',
 ]))
+
+function createAbortError(message = 'MCP 请求已取消') {
+  const err = new Error(message)
+  err.name = 'AbortError'
+  err.code = 'ABORT_ERR'
+  return err
+}
 
 export class GreatwallMcpBridge {
   /**
@@ -45,7 +54,7 @@ export class GreatwallMcpBridge {
     /** @type {ReturnType<typeof createInterface> | null} */
     this._rl = null
     this._nextId = 1
-    /** @type {Map<number, { resolve: Function, reject: Function, timer: NodeJS.Timeout }>} */
+    /** @type {Map<number, { settle: (err: any, val?: any) => void, child: any }>} */
     this._pending = new Map()
     /** @type {Promise<void> | null} */
     this._initPromise = null
@@ -74,6 +83,33 @@ export class GreatwallMcpBridge {
       return Math.max(this.requestTimeoutMs, this.longToolTimeoutMs)
     }
     return this.requestTimeoutMs
+  }
+
+  _rejectPendingForChild(child, err) {
+    for (const [id, entry] of [...this._pending.entries()]) {
+      if (!child || entry.child === child) {
+        entry.settle(err)
+      }
+    }
+  }
+
+  _detachChild(child) {
+    if (this._proc === child) {
+      this._proc = null
+      if (this._rl) {
+        try { this._rl.close() } catch {}
+        this._rl = null
+      }
+      this._initPromise = null
+    }
+  }
+
+  _sendCancelNotification(id, child = this._proc) {
+    if (!child || child.killed || !child.stdin?.writable) return
+    try {
+      const payload = JSON.stringify({ jsonrpc: '2.0', method: '$/cancelRequest', params: { id } }) + '\n'
+      child.stdin.write(payload, 'utf8', () => {})
+    } catch {}
   }
 
   async ensureStarted() {
@@ -118,6 +154,19 @@ export class GreatwallMcpBridge {
     this._proc = child
     this._stderrTail = []
 
+    child.on('error', (spawnErr) => {
+      const err = new Error(`Python MCP 进程启动失败 (${this.pythonBin}): ${spawnErr?.message || spawnErr}`)
+      err.code = spawnErr?.code || 'MCP_SPAWN_ERROR'
+      this._rejectPendingForChild(child, err)
+      this._detachChild(child)
+    })
+
+    child.stdin.on('error', (stdinErr) => {
+      const err = new Error(`Python MCP stdin 管道写入异常: ${stdinErr?.message || stdinErr}`)
+      err.code = stdinErr?.code || 'MCP_STDIN_ERROR'
+      this._rejectPendingForChild(child, err)
+    })
+
     child.stderr.on('data', (chunk) => {
       const text = chunk.toString('utf8')
       this._stderrTail.push(text)
@@ -139,29 +188,21 @@ export class GreatwallMcpBridge {
       if (typeof id !== 'number') return
       const entry = this._pending.get(id)
       if (!entry) return
-      this._pending.delete(id)
-      clearTimeout(entry.timer)
       if (msg.error) {
         const err = new Error(String(msg.error?.message ?? 'MCP JSON-RPC Error'))
         err.code = msg.error?.code
-        entry.reject(err)
+        entry.settle(err)
       } else {
-        entry.resolve(msg.result)
+        entry.settle(null, msg.result)
       }
     })
 
     child.on('exit', (code, signal) => {
       const stderrSummary = this._stderrTail.join('').slice(-600)
-      for (const [id, entry] of this._pending.entries()) {
-        clearTimeout(entry.timer)
-        entry.reject(new Error(`Python MCP 进程退出 (code=${code}, signal=${signal}): ${stderrSummary}`))
-        this._pending.delete(id)
-      }
-      if (this._proc === child) {
-        this._proc = null
-        this._rl = null
-        this._initPromise = null
-      }
+      const err = new Error(`Python MCP 进程退出 (code=${code}, signal=${signal}): ${stderrSummary}`)
+      err.code = 'MCP_PROCESS_EXITED'
+      this._rejectPendingForChild(child, err)
+      this._detachChild(child)
     })
 
     await this._rpc('initialize', {})
@@ -171,27 +212,63 @@ export class GreatwallMcpBridge {
    * @param {string} method
    * @param {object} params
    * @param {number} [timeoutMs]
+   * @param {{ signal?: AbortSignal | null }} [opts]
    * @returns {Promise<any>}
    */
-  async _rpc(method, params, timeoutMs = this.requestTimeoutMs) {
-    if (!this._proc || !this._proc.stdin.writable) {
+  async _rpc(method, params, timeoutMs = this.requestTimeoutMs, { signal = null } = {}) {
+    if (signal?.aborted) {
+      throw createAbortError(`MCP 请求在发送前已取消 (${method})`)
+    }
+    const child = this._proc
+    if (!child || !child.stdin?.writable) {
       throw new Error('Python MCP 管道不可写')
     }
     const id = this._nextId++
     const payload = JSON.stringify({ jsonrpc: '2.0', id, method, params: params ?? {} }) + '\n'
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      let settled = false
+      let timer = null
+
+      const onAbort = () => {
+        this._sendCancelNotification(id, child)
+        settle(createAbortError(`MCP 请求已取消 (${method})`))
+      }
+
+      const settle = (err, val) => {
+        if (settled) return
+        settled = true
         this._pending.delete(id)
-        reject(new Error(`MCP 请求超时 (${method}, ${timeoutMs}ms)`))
-      }, timeoutMs)
-      this._pending.set(id, { resolve, reject, timer })
-      this._proc.stdin.write(payload, 'utf8', (writeErr) => {
-        if (writeErr) {
-          this._pending.delete(id)
-          clearTimeout(timer)
-          reject(writeErr)
+        if (timer) clearTimeout(timer)
+        if (signal) {
+          try { signal.removeEventListener('abort', onAbort) } catch {}
         }
-      })
+        if (err) reject(err)
+        else resolve(val)
+      }
+
+      timer = setTimeout(() => {
+        this._sendCancelNotification(id, child)
+        const err = new Error(`MCP 请求超时 (${method}, ${timeoutMs}ms)`)
+        err.code = 'MCP_TIMEOUT'
+        settle(err)
+      }, timeoutMs)
+
+      if (signal) {
+        if (signal.aborted) {
+          onAbort()
+          return
+        }
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
+
+      this._pending.set(id, { settle, child })
+      try {
+        child.stdin.write(payload, 'utf8', (writeErr) => {
+          if (writeErr) settle(writeErr)
+        })
+      } catch (syncErr) {
+        settle(syncErr)
+      }
     })
   }
 
@@ -220,12 +297,15 @@ export class GreatwallMcpBridge {
   }
 
   /**
-   * 调用 32 窄工具（剥离模型伪造字段，双通道注入可信宿主 `_meta` 并应用分级超时）。
+   * 调用 32 窄工具（剥离模型伪造字段，双通道注入可信宿主 `_meta` 并应用分级超时与取消信号）。
    * @param {string} name
    * @param {object} args
-   * @param {{ workspaceRoot?: string, role: string, sessionId: string }} trustedCtx
+   * @param {{ workspaceRoot?: string, role: string, sessionId: string, signal?: AbortSignal | null }} trustedCtx
    */
   async callTool(name, args, trustedCtx) {
+    if (trustedCtx?.signal?.aborted) {
+      throw createAbortError(`工具 ${name} 调用前已取消`)
+    }
     await this.ensureStarted()
     const cleanArgs = args && typeof args === 'object' ? { ...args } : {}
     delete cleanArgs._meta
@@ -240,7 +320,12 @@ export class GreatwallMcpBridge {
       session_id: trustedCtx.sessionId,
     }
     const timeoutMs = this.resolveToolTimeoutMs(name, cleanArgs)
-    const rpcRes = await this._rpc('tools/call', { name, arguments: { ...cleanArgs, _meta: meta }, _meta: meta }, timeoutMs)
+    const rpcRes = await this._rpc(
+      'tools/call',
+      { name, arguments: { ...cleanArgs, _meta: meta }, _meta: meta },
+      timeoutMs,
+      { signal: trustedCtx?.signal || null },
+    )
     const textBlock = Array.isArray(rpcRes?.content) ? rpcRes.content.find((c) => c?.type === 'text') : null
     if (textBlock && typeof textBlock.text === 'string') {
       try {
@@ -254,28 +339,31 @@ export class GreatwallMcpBridge {
 
   /**
    * 调用 Single-Writer 内部控制面原语（非模型工具）。
-   * @param {'control_plane/init_parse0'|'control_plane/init_epoch'|'control_plane/schedule_snapshot'|'control_plane/sync_pressure'|'control_plane/record_human_stop'|'control_plane/stage_blind_sandbox'|'control_plane/cleanup_blind_sandbox'|'control_plane/recover_heavy_jobs'|'control_plane/fact_edge'} method
+   * @param {string} method
    * @param {object} [params]
+   * @param {{ signal?: AbortSignal | null, timeoutMs?: number }} [opts]
    */
-  async control(method, params = {}) {
+  async control(method, params = {}, opts = {}) {
+    if (opts?.signal?.aborted) {
+      throw createAbortError(`控制面调用 ${method} 在发送前已取消`)
+    }
     await this.ensureStarted()
     const merged = {
       workspace_root: this.workspaceRoot,
       ...(params && typeof params === 'object' ? params : {}),
     }
-    return this._rpc(method, merged, this.resolveControlTimeoutMs(method))
+    const timeoutMs = Number(opts?.timeoutMs || 0) || this.resolveControlTimeoutMs(method)
+    return this._rpc(method, merged, timeoutMs, { signal: opts?.signal || null })
   }
 
   /** 关闭当前常驻子进程以释放系统资源（不设 _disposed，后续有 RPC 时按需自动重启）。 */
   async closeIdleChild() {
-    for (const [id, entry] of this._pending.entries()) {
-      clearTimeout(entry.timer)
-      entry.reject(new Error('GreatwallMcpBridge closed'))
-      this._pending.delete(id)
-    }
+    const closeErr = new Error('GreatwallMcpBridge closed')
+    closeErr.code = 'MCP_BRIDGE_CLOSED'
+    this._rejectPendingForChild(null, closeErr)
     this._initPromise = null
     if (this._rl) {
-      this._rl.close()
+      try { this._rl.close() } catch {}
       this._rl = null
     }
     if (this._proc) {

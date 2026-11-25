@@ -142,8 +142,12 @@ class TestP0ContractsAndCleanroom(unittest.TestCase):
     def test_dsh_package_json_v3_files_whitelist(self) -> None:
         pkg = json.loads((ROOT_DIR / "dsh_plugin" / "package.json").read_text(encoding="utf-8"))
         self.assertEqual(pkg["version"], "3.0.0")
-        self.assertIn("presets", pkg.get("files", []))
-        self.assertIn("lib", pkg.get("files", []))
+        files = pkg.get("files", [])
+        self.assertIn("lib", files)
+        self.assertIn("cordis.patch.yml", files)
+        self.assertIn("icon.svg", files)
+        self.assertNotIn("presets", files)
+        self.assertEqual(pkg.get("icon"), "./icon.svg")
 
     def test_core_python_cleanroom_no_v22_overfitting_tokens(self) -> None:
         forbidden = (

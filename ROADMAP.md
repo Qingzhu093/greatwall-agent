@@ -1,7 +1,7 @@
 # GreatWall Agent 演进路线图：未解难题、前沿想法与开放研究议题（ROADMAP）
 
-> **版本基线**：接续 [`ARCHITECTURE.md`](./ARCHITECTURE.md)（`v0.1-alpha` · **Apache 2.0 + DCO**）  
-> **文档定位**：本文与其说是一份按季度排期的产品路线图，不如说是一份坦诚的 **Problems, Ideas & Open Questions（问题清账本与演进构想池）**。`v0.1-alpha` 目前只是一个极度不成熟的早期实验 Demo，浑身上下都是尚未解决的工程硬伤与悬而未决的科研假设。本文不画商业大饼，也不承诺一定能在某个时间点全部做完，而是把“现在究竟卡在哪里、哪些方向值得认真投入、哪些新论文值得吸收（同时绝不能丢掉现有优点）”如实摊开，既作为后续迭代的坐标，也方便对这个方向感兴趣的开源协作者直接找到切入点。
+> **版本基线**：接续 [`ARCHITECTURE.md`](./ARCHITECTURE.md)（`v0.2.0-alpha.1` · **Apache 2.0 + DCO**）  
+> **文档定位**：本文与其说是一份按季度排期的产品路线图，不如说是一份坦诚的 **Problems, Ideas & Open Questions（问题清账本与演进构想池）**。`v0.2.0-alpha.1` 已完成后端两轮深度解耦、DSH `0.2.2-rc.5` 原生适配与并发强一致性底座重构，但整体仍处于早期实验阶段，仍存在前端原型简陋、软沙箱局限与科研假设待实证等关键硬伤。本文不画商业大饼，也不承诺一定能在某个时间点全部做完，而是把“现在究竟卡在哪里、哪些方向值得认真投入、哪些新论文值得吸收（同时绝不能丢掉现有优点）”如实摊开，既作为后续迭代的坐标，也方便对这个方向感兴趣的开源协作者直接找到切入点。
 
 ---
 
@@ -34,13 +34,13 @@
 
 ## 0. 现状锚点与演进优先级总览
 
-在 [`ARCHITECTURE.md §5`](./ARCHITECTURE.md#5-已知技术债与当前局限) 中，我已经把当前 `v0.1-alpha` 暴露出的技术债如实摊开：虽然阶段 1 已完成后端千行上帝文件拆解与跨层契约防腐门禁，但依然存在前端原型简陋、软沙箱无资源限额、对 DSH 原生能力挖掘不充分，以及**整套多智能体科研制度尚未在零工程事故基线下跑出过一次干净的受控对比实验**等硬伤。
+在 [`ARCHITECTURE.md §5`](./ARCHITECTURE.md#5-已知技术债与当前局限) 中，我已经把当前 `v0.2.0-alpha.1` 的进展与遗留技术债如实摊开：虽然前两轮底座重构已完成后端无环模块化拆解、DSH `0.2.2-rc.5` 原生深度适配（单源 Preset、Standard Schema v1 Config、严格 Schema 子集适配、异步全量卸载、跨 `cwd` 原生对话直达）、双池并发防队头阻塞、端到端真取消与单写者强一致性闭环，但依然存在前端原型简陋、软沙箱无资源限额，以及**整套多智能体科研制度尚未在零工程事故基线下跑出过一次干净的受控对比实验**等硬伤。
 
 遵循钱学森《工程控制论》的克制原则，后续演进最忌讳“旧问题还没修稳，又把几篇新论文一口气硬塞进代码库”。因此，本文虽然涵盖了大量从底层止血到前沿探索的构想，但在实际推进上坚持严格的四层优先级节奏：
 
 | 优先级 | 阶段定位 | 核心目标（先立后破，绝不贪大求全） |
 | :---: | :--- | :--- |
-| **P0** | **止血、解耦与干净基线实证** | 巩固阶段 1 后端模块化拆解与契约门禁；补齐容器/资源限额沙箱（杜绝子节点拖死宿主机）；在零工程事故下跑通干净的对照实验，先验证长城这套多智能体制度相对单 Agent 裸跑究竟有没有净收益。 |
+| **P0** | **底座稳态验收、容器沙箱与干净基线实证** | 在 `v0.2.0-alpha.1` 已落地的后端解耦、RC5 并发底座与单写者强一致基础上，完成真实 DSH Desktop 端到端长跑验收；补齐容器/资源限额沙箱（杜绝子节点拖死宿主机）；在零工程事故下跑通干净的对照实验，先验证长城这套多智能体制度相对单 Agent 裸跑究竟有没有净收益。 |
 | **P1** | **人机体验与底层易用性重构** | 重做 UI 美术与交互；借鉴 DSH `SuperAgent` 重塑鸡肋主控；按脚手架分层重构 `System Prompt / Tool Guidance / Guardrails`；优化探索者执行模式（PTC / `ObservationPack`）与短窗口适配。 |
 | **P2** | **工造司守正升级与双轨知识探索** | 在**完整保留现有工造司全部优势**的前提下，吸收 `Harness²` 思路引入“双信号驱动 + 局部轨迹对比（Mini-Probe）+ 工造司跨课题轻量经验库”，形成工造司层面的工具级 RSI 闭环。 |
 | **P3** | **全面开放生态与前沿开放研究** | 构建“科研标准插座”（MCP / Agent Skills / Plugin / Lean 4 / Biomni / 开源科学技能库）；推进 ACP 与跨宿主适配、异构模型群、全局收敛调度，以及开放 Verifier 真空与后勤群体拓扑的系统性实验。 |
@@ -63,7 +63,7 @@
 
 **当前的主控设计实在太鸡肋了。**
 
-在现有 `v0.1-alpha` 里，直接面向人类的主控会话（Primary Session）处于一个非常尴尬的夹心位置：
+在现有 `v0.2.0-alpha.1` 里，直接面向人类的主控会话（Primary Session）处于一个非常尴尬的夹心位置：
 - 它被要求不能越权干预底层的科学探索与同行盲审，这是对的；
 - 但同时，它手头仅握着 `greatwall_orchestrate` 那 11 个偏底层的工程控制动作（`init / start / pause / resume / abort_node / sync_rulings / inspect ...`），既缺乏对全局科研进展的深度理解与主动洞察，又经常在异常发生时变成一个笨拙的“命令转发器”——人类想澄清一个边界条件、排查一个卡死分支、或调整研究重心时，交互链路非常割裂，甚至在系统偶发卡顿时会诱发主控越界绕开编排器自己下场干活。
 
@@ -92,8 +92,8 @@
 
 **整个系统的解耦程度太低，这是目前制约稳定性、迭代速度和社区协作的最大工程病灶。**
 
-现在的代码库虽然在文档上划出了四大工程，但在早期版本里曾存在严重的“牵一发而动全身”（目前阶段 1 已完成后端结构拆解与契约门禁，但中高层解耦仍需持续推进）：
-- **上帝文件拆解进展与剩余项**：原 2,702 行 `control_plane_service.py` 已拆分为 [`control_plane/`](./greatwall-v6up/core_python/mcp_server/control_plane/) 下 6 个无环子域，原 1,472 行 [`orchestrator.js`](./greatwall-v6up/dsh_plugin/lib/orchestrator.js) 已拆出 4 个 [`orchestrator/`](./greatwall-v6up/dsh_plugin/lib/orchestrator/) 子模块，原 1,030 行 `tools_library.py` 已拆分为 `tools_surveyor.py` / `tools_verifier.py`，[`agent_session_host.js`](./greatwall-v6up/dsh_plugin/lib/agent_session_host.js) 已拆出 [`host/model_binding.js`](./greatwall-v6up/dsh_plugin/lib/host/model_binding.js)；但前端 [`client.js`](./greatwall-v6up/dsh_plugin/lib/client.js)（1,064 行）仍待阶段 2 模块化重写；
+现在的代码库虽然在文档上划出了四大工程，但在早期版本里曾存在严重的“牵一发而动全身”（目前 `v0.1.0-alpha.4` 与 `v0.2.0-alpha.1` 已完成后端两轮深度解耦与 RC5 运行时收敛，但前端与脚手架层仍需持续推进）：
+- **上帝文件与控制面解耦进展与剩余项**：Python 侧已将 `control_plane_service.py` 拆为 [`control_plane/`](./greatwall-v6up/core_python/mcp_server/control_plane/) 下 7 个无环子域（含独立只读 `snapshot_queries.py`），拆出 [`db_runtime.py`](./greatwall-v6up/core_python/mcp_server/db_runtime.py) 单写者大闸，并将 `tools_library.py` 拆为 `tools_surveyor.py` / `tools_verifier.py`；Node 侧已将主入口瘦身为纯装配壳，抽离 [`config.js`](./greatwall-v6up/dsh_plugin/lib/config.js)、[`control_service.js`](./greatwall-v6up/dsh_plugin/lib/control_service.js)、[`orchestrate_tool.js`](./greatwall-v6up/dsh_plugin/lib/orchestrate_tool.js)、[`orchestrator/runtime_port.js`](./greatwall-v6up/dsh_plugin/lib/orchestrator/runtime_port.js)、[`host/capability_mount.js`](./greatwall-v6up/dsh_plugin/lib/host/capability_mount.js) 与 [`bridge/dsh_schema_adapter.js`](./greatwall-v6up/dsh_plugin/lib/bridge/dsh_schema_adapter.js)，删除 12 份冗余 Preset YAML 收敛为单源 `cordis.patch.yml`；剩余核心大文件为前端 [`client.js`](./greatwall-v6up/dsh_plugin/lib/client.js)（待前端模块化与视觉重塑）；
 - **跨层契约同步与剩余耦合**：32 窄工具的名称、角色白名单、只读禁写与长耗时集合已收口至单一契约源 [`tool_registry.py`](./greatwall-v6up/core_python/mcp_server/tool_registry.py)，并通过 `control_plane/describe_contracts`、[`test_architecture_contracts.py`](./greatwall-v6up/tests/test_architecture_contracts.py) 与 [`tools/doctor.mjs`](./greatwall-v6up/dsh_plugin/tools/doctor.mjs) 实现自动化防腐；但更深层的业务状态字段演进与 7 份长 Prompt 模板之间仍存在较高的手改同步成本；
 - **清晰划分与 DSH 宿主层的协作边界**：我们的原则是**绝不侵入修改 DSH 原生工具与宿主正常功能，同时充分依托 DSH 繁荣的 Cordis 插件生态（Preset、UI 原语、原生工具与生态分发）做好协作与推广**；在此前提下，把纯科研状态机逻辑与宿主胶水层边界划清，既便于第三方开发者在 DSH 插件内顺畅协作，也为未来按需扩展其他运行时留出余地。
 
@@ -111,8 +111,8 @@ flowchart TB
 ```
 
 具体推进路径包括：
-1. **拆解上帝文件（阶段 1 后端已完成，前端 `client.js` 待阶段 2）**：已将 `control_plane_service.py` 拆分为 6 个 `control_plane/` 无环子域、将 `orchestrator.js` 拆出 4 个派发与熔断子模块、将 `tools_library.py` 按角色拆为 `tools_surveyor.py` / `tools_verifier.py`、将 `agent_session_host.js` 拆出 `host/model_binding.js`；下一步聚焦前端模块化重构；
-2. **单一契约源（阶段 1 32 窄工具已收口）**：已建立 `tool_registry.py`、`control_plane/describe_contracts` 与 `test_architecture_contracts.py` 跨层门禁；后续继续推进状态字段与脚手架片段的声明式同步；
+1. **拆解上帝文件与控制面收口（`v0.2.0-alpha.1` 后端与插件主干已完成，前端 `client.js` 待续）**：后端已形成无环控制面子域、单轨 `DispatchRuntimePort` 与统一 `GreatwallControlService`；下一步聚焦前端模块化与交互重构；
+2. **单一契约源与 RC5 严格 Schema（`v0.2.0-alpha.1` 已落地）**：已建立 `tool_registry.py`、`dsh_schema_adapter.js`、`control_plane/describe_contracts` 与 `test_architecture_contracts.py` 跨层门禁；后续继续推进状态字段与脚手架片段的声明式同步；
 3. **分离“制度骨架”与“角色脚手架”（待推进）**：让底层状态机只守住极少数硬不变量，把角色行为引导拆成可独立演进、可热替换的轻组件（与 §2.6 和 §3.3 呼应）。
 
 ### 2.2 重点方向：科研底座面向更广泛的开放性（“科研标准插座”与多维开放）

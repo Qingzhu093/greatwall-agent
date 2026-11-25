@@ -206,6 +206,74 @@ class TestArchitectureContracts(unittest.TestCase):
             self.assertIn(req_id, by_id)
             self.assertEqual(by_id[req_id]["status"], "ok", f"{req_id} 未通过: {by_id[req_id]}")
 
+    def test_7_node_dispatch_and_routes_no_private_field_access(self) -> None:
+        """真解耦静态门禁：dispatch_stage1/2/3、pair_lifecycle 与 console_routes 严禁跨模块访问 ._ 私有字段。"""
+        import re
+
+        lib_dir = ROOT_DIR / "dsh_plugin" / "lib"
+        targets = [
+            lib_dir / "orchestrator" / "dispatch_stage1.js",
+            lib_dir / "orchestrator" / "dispatch_stage2.js",
+            lib_dir / "orchestrator" / "dispatch_stage3.js",
+            lib_dir / "pair_lifecycle.js",
+            lib_dir / "console_routes.js",
+        ]
+        # 禁止对外部对象访问 ._xxx（允许普通私有局部变量与 __dirname）
+        pattern = re.compile(r"\b(?:orch|port|orchestrator|ctrl|controller|host|bridge)\._[A-Za-z]\w*")
+        violations: list[str] = []
+        for fp in targets:
+            for lineno, line in enumerate(fp.read_text(encoding="utf-8").splitlines(), start=1):
+                stripped = line.strip()
+                if stripped.startswith("//") or stripped.startswith("*"):
+                    continue
+                for m in pattern.finditer(line):
+                    violations.append(f"{fp.relative_to(ROOT_DIR)}:{lineno}: {m.group(0)}")
+        self.assertEqual(violations, [], f"发现跨模块访问 ._ 私有字段:\n" + "\n".join(violations))
+
+    def test_8_snapshot_queries_readonly_consistent(self) -> None:
+        """验证拆分后的 snapshot_queries + scheduler_rules 可在只读连接下零报错稳定输出等价快照。"""
+        import tempfile
+        from core_python.mcp_server import db_schema as db
+        from core_python.mcp_server.control_plane import (
+            get_ui_full_inspector_payload,
+            init_parse0_contract,
+            schedule_control_plane_snapshot,
+        )
+
+        with tempfile.TemporaryDirectory(prefix="gw_ro_snap_") as tmp:
+            db_path = Path(tmp) / "greatwall.db"
+            rw = db.open_rw_connection(db_path, init_schema=True)
+            try:
+                init_parse0_contract(
+                    rw,
+                    goal_and_completion_md="# Test Goal",
+                    subquestions=["Q1", "Q2"],
+                    question_order=["Q1", "Q2"],
+                    initial_instruments=[],
+                    seed_families=[],
+                    total_budget={"max_total_handoffs": 10},
+                )
+            finally:
+                rw.close()
+
+            ro = db.open_ro_connection(db_path)
+            try:
+                snap1 = schedule_control_plane_snapshot(ro, workspace_root=tmp)
+                snap2 = schedule_control_plane_snapshot(ro, workspace_root=tmp)
+                self.assertEqual(snap1["required_questions"], ["Q1", "Q2"])
+                self.assertEqual(snap1["question_order"], ["Q1", "Q2"])
+                # 排除 elapsed_sec 毫秒级漂移后其余所有字段必须 100% 严格一致
+                s1 = json.loads(json.dumps(snap1))
+                s2 = json.loads(json.dumps(snap2))
+                s1["closure_gate"].pop("elapsed_sec", None)
+                s2["closure_gate"].pop("elapsed_sec", None)
+                self.assertEqual(s1, s2)
+
+                insp = get_ui_full_inspector_payload(ro, workspace_root=tmp)
+                self.assertEqual(insp["snapshot"]["required_questions"], ["Q1", "Q2"])
+            finally:
+                ro.close()
+
 
 if __name__ == "__main__":
     unittest.main()

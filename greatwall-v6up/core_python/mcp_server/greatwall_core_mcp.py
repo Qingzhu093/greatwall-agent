@@ -1,14 +1,21 @@
 """长城 Agent V6-Up (v3.0) 核心 stdio JSON-RPC 2.0 MCP 服务端入口（零第三方依赖）。
 
 完整挂载 7 大角色共 32 个单一职责窄工具（单一契约源见 `tool_registry.py`）
-+ Single-Writer 控制面内部原语（`control_plane/*`）。
++ Single-Writer 控制面内部原语（`control_plane/*`）：
+- 双线程池隔离派发（`fast_pool` 快路径 vs `compute_pool` 慢计算池），慢任务池饱和绝不阻塞快照、时钟与停止指令；
+- 纯只读查询使用真正只读连接 `open_ro_connection` + `ro_consistent_tx` 一致快照，消除假读真写锁争用；
+- 支持标准 JSON-RPC `$/cancelRequest` 端到端真取消（排队中跳过、运行中终止隔离评测子进程树、已提交保持幂等）。
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
+import sqlite3
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +25,7 @@ if __package__ in (None, ""):
         sys.path.insert(0, _PROJECT_ROOT)
     __package__ = "core_python.mcp_server"
 
+from ..evaluators.isolated_runner import RequestCancelledError  # noqa: E402
 from .control_plane_service import (  # noqa: E402
     abort_lineage_node,
     cleanup_blind_review_sandbox,
@@ -37,13 +45,17 @@ from .control_plane_service import (  # noqa: E402
 )
 from .db_schema import (  # noqa: E402
     ERR_INVALID_INPUT,
+    ERR_LOCKED,
     FailClosedError,
+    open_ro_connection,
     open_rw_connection,
     resolve_storage_paths,
+    ro_consistent_tx,
     rw_immediate_tx,
 )
 from .mcp_core_helpers import record_fact_edge  # noqa: E402
 from .tool_registry import (  # noqa: E402
+    LONG_RUNNING_MCP_TOOLS,
     TOOL_DEFINITIONS,
     TOOL_SPEC_BY_NAME,
     export_contracts_snapshot,
@@ -98,6 +110,28 @@ from .tools_works import (  # noqa: E402
 SERVER_INFO = {"name": "greatwall-v6up-core", "version": "3.0.0"}
 PROTOCOL_VERSION = "2024-11-05"
 
+# 纯只读且无任何写库副作用的窄工具集合（排除静默写 FACT_LOG 的 get_library_entry 与 staging 沙箱的 get_blind_manuscript）
+_PURE_READONLY_TOOLS: frozenset[str] = frozenset(
+    {
+        "query_library_catalog",
+        "read_lineage_graph",
+        "get_companion_context",
+        "get_logistics_dashboard",
+        "get_survey_requests",
+        "get_works_engineering_queue",
+        "get_supervisory_audit_snapshot",
+        "check_stage2_closure_gate",
+    }
+)
+
+_COMPUTE_CONTROL_METHODS: frozenset[str] = frozenset(
+    {
+        "control_plane/recover_heavy_jobs",
+        "control_plane/stage_blind_sandbox",
+        "control_plane/cleanup_blind_sandbox",
+    }
+)
+
 _TOOL_HANDLERS: dict[str, Any] = {
     "run_isolated_eval": tool_run_isolated_eval,
     "query_library_catalog": tool_query_library_catalog,
@@ -133,11 +167,80 @@ _TOOL_HANDLERS: dict[str, Any] = {
     "register_saved_graph_query": tool_register_saved_graph_query,
 }
 
-# 由 tool_registry.py 自动派生 (handler, needs_workspace_root) 映射，杜绝手工失配
-_TOOL_REGISTRY: dict[str, tuple[Any, bool]] = {
-    name: (_TOOL_HANDLERS[name], bool(spec["needs_workspace_root"]))
+# 由 tool_registry.py 自动派生 (handler, needs_workspace_root, accepts_cancel_event) 映射
+_TOOL_REGISTRY: dict[str, tuple[Any, bool, bool]] = {
+    name: (
+        _TOOL_HANDLERS[name],
+        bool(spec["needs_workspace_root"]),
+        "cancel_event" in inspect.signature(_TOOL_HANDLERS[name]).parameters,
+    )
     for name, spec in TOOL_SPEC_BY_NAME.items()
 }
+
+
+class CancelRegistry:
+    """按 JSON-RPC 请求 ID 跟踪取消信号的线程安全注册表（支持先到取消与执行中取消）。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._events: dict[Any, threading.Event] = {}
+        self._early_cancelled: set[Any] = set()
+
+    def register(self, req_id: Any) -> threading.Event:
+        with self._lock:
+            ev = threading.Event()
+            if req_id in self._early_cancelled:
+                self._early_cancelled.discard(req_id)
+                ev.set()
+            self._events[req_id] = ev
+            return ev
+
+    def cancel(self, req_id: Any) -> bool:
+        with self._lock:
+            ev = self._events.get(req_id)
+            if ev is not None:
+                ev.set()
+                return True
+            if len(self._early_cancelled) < 256:
+                self._early_cancelled.add(req_id)
+            return False
+
+    def unregister(self, req_id: Any) -> None:
+        with self._lock:
+            self._events.pop(req_id, None)
+            self._early_cancelled.discard(req_id)
+
+    def cancel_all(self) -> None:
+        with self._lock:
+            for ev in self._events.values():
+                ev.set()
+
+
+def _open_readonly_or_migrate_once(db_path: Path) -> sqlite3.Connection:
+    """优先使用纯只读连接，仅在首次碰到未迁移旧库时执行一次写连接迁移再切回只读。"""
+    return open_ro_connection(db_path)
+
+
+def _run_readonly_query(db_path: Path, fn: Any) -> Any:
+    """在单一只读事务中执行只读查询；若遇旧库缺列自动迁移一次并重跑。"""
+    conn = _open_readonly_or_migrate_once(db_path)
+    try:
+        with ro_consistent_tx(conn):
+            return fn(conn)
+    except sqlite3.OperationalError as exc:
+        msg = str(exc).lower()
+        if "no such column" not in msg and "no such table" not in msg:
+            raise
+        conn.close()
+        conn = None
+        mig_conn = open_rw_connection(db_path, init_schema=True, force_init=True)
+        mig_conn.close()
+        conn = _open_readonly_or_migrate_once(db_path)
+        with ro_consistent_tx(conn):
+            return fn(conn)
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def dispatch_tool_call(
@@ -147,8 +250,12 @@ def dispatch_tool_call(
     workspace_root: str = "",
     caller_role: str = "",
     session_id: str = "",
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
-    """统一执行 32 个窄工具入口：剥离模型伪造身份，注入可信宿主 _meta 并处理 FailClosedError。"""
+    """统一执行 32 个窄工具入口：剥离模型伪造身份，注入可信宿主 _meta 并处理 FailClosedError 与取消信号。"""
+    if cancel_event is not None and cancel_event.is_set():
+        return FailClosedError(ERR_LOCKED, f"请求已取消 ({name})").to_dict()
+
     entry = _TOOL_REGISTRY.get(name)
     if entry is None:
         return FailClosedError(ERR_INVALID_INPUT, f"未知工具: {name!r}").to_dict()
@@ -160,7 +267,6 @@ def dispatch_tool_call(
     if not isinstance(meta, dict):
         meta = {}
 
-    # 严格丢弃模型参数内私夹的身份伪造字段
     for spoof_k in ("workspace_root", "caller_role", "role", "session_id"):
         raw_args.pop(spoof_k, None)
 
@@ -168,20 +274,32 @@ def dispatch_tool_call(
     eff_role = str(caller_role or meta.get("caller_role", "") or meta.get("role", "")).strip()
     eff_sid = str(session_id or meta.get("session_id", "")).strip()
 
-    fn, needs_ws = entry
+    fn, needs_ws, accepts_cancel = entry
     conn = None
     try:
-        paths = resolve_storage_paths(eff_ws)
-        conn = open_rw_connection(paths["db_path"], init_schema=True)
-        kwargs: dict[str, Any] = {
-            "conn": conn,
+        base_kwargs: dict[str, Any] = {
             "caller_role": eff_role,
             "session_id": eff_sid,
             **raw_args,
         }
+        if accepts_cancel:
+            base_kwargs["cancel_event"] = cancel_event
+
+        # 纯只读窄工具优先走只读连接 + 一致只读事务，避免与并发写入抢写锁
+        if name in _PURE_READONLY_TOOLS:
+            probe_paths = resolve_storage_paths(eff_ws, create_dirs=False)
+            if probe_paths["db_path"].is_file():
+                if needs_ws:
+                    base_kwargs["workspace_root"] = eff_ws or str(probe_paths["data_dir"])
+                return _run_readonly_query(probe_paths["db_path"], lambda ro_conn: fn(conn=ro_conn, **base_kwargs))
+
+        paths = resolve_storage_paths(eff_ws)
+        conn = open_rw_connection(paths["db_path"], init_schema=True)
         if needs_ws:
-            kwargs["workspace_root"] = eff_ws or str(paths["data_dir"])
-        return fn(**kwargs)
+            base_kwargs["workspace_root"] = eff_ws or str(paths["data_dir"])
+        return fn(conn=conn, **base_kwargs)
+    except RequestCancelledError as exc:
+        return FailClosedError(ERR_LOCKED, f"请求已取消 ({name}): {exc}").to_dict()
     except FailClosedError as exc:
         return exc.to_dict()
     except TypeError as exc:
@@ -193,8 +311,15 @@ def dispatch_tool_call(
             conn.close()
 
 
-def dispatch_control_call(method: str, params: dict[str, Any] | None) -> dict[str, Any]:
+def dispatch_control_call(
+    method: str,
+    params: dict[str, Any] | None,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
     """Single-Writer 控制面内部桥接原语（仅供 Node Orchestrator 调用，非模型侧工具）。"""
+    if cancel_event is not None and cancel_event.is_set():
+        return FailClosedError(ERR_LOCKED, f"控制面请求已取消 ({method})").to_dict()
     if method == "control_plane/describe_contracts":
         return {"ok": True, "data": export_contracts_snapshot()}
 
@@ -232,6 +357,29 @@ def dispatch_control_call(method: str, params: dict[str, Any] | None) -> dict[st
                     }
                 return {"ok": True, "data": {"recovered_jobs": []}}
 
+            # 快照与 UI Inspector 严格走真正只读连接 + 一致只读事务，彻底消除初始化写争用
+            if method == "control_plane/schedule_snapshot":
+                res = _run_readonly_query(
+                    probe_paths["db_path"],
+                    lambda ro_conn: schedule_control_plane_snapshot(
+                        ro_conn,
+                        max_concurrent_workers=p.get("max_concurrent_workers"),
+                        workspace_root=eff_ws,
+                    ),
+                )
+                return {"ok": True, "data": res}
+            if method == "control_plane/ui_inspector":
+                res = _run_readonly_query(
+                    probe_paths["db_path"],
+                    lambda ro_conn: get_ui_full_inspector_payload(
+                        ro_conn,
+                        workspace_root=eff_ws,
+                        selected_node_id=p.get("selected_node_id"),
+                        selected_worktree_rel_file=p.get("selected_worktree_rel_file"),
+                    ),
+                )
+                return {"ok": True, "data": res}
+
         paths = resolve_storage_paths(eff_ws)
         conn = open_rw_connection(paths["db_path"], init_schema=True)
         if method in ("control_plane/init_parse0", "control_plane/init_epoch"):
@@ -249,21 +397,6 @@ def dispatch_control_call(method: str, params: dict[str, Any] | None) -> dict[st
                 stage=p.get("stage") if p.get("stage") else None,
                 epoch_id=int(p.get("epoch_id", 1)),
                 human_signed_at=p.get("human_signed_at"),
-            )
-            return {"ok": True, "data": res}
-        if method == "control_plane/schedule_snapshot":
-            res = schedule_control_plane_snapshot(
-                conn,
-                max_concurrent_workers=p.get("max_concurrent_workers"),
-                workspace_root=eff_ws,
-            )
-            return {"ok": True, "data": res}
-        if method == "control_plane/ui_inspector":
-            res = get_ui_full_inspector_payload(
-                conn,
-                workspace_root=eff_ws,
-                selected_node_id=p.get("selected_node_id"),
-                selected_worktree_rel_file=p.get("selected_worktree_rel_file"),
             )
             return {"ok": True, "data": res}
         if method == "control_plane/sync_pressure":
@@ -329,7 +462,7 @@ def dispatch_control_call(method: str, params: dict[str, Any] | None) -> dict[st
             res = cleanup_blind_review_sandbox(eff_ws, str(p["review_id"]))
             return {"ok": True, "data": res}
         if method == "control_plane/recover_heavy_jobs":
-            res = recover_pending_heavy_jobs(conn, workspace_root=eff_ws)
+            res = recover_pending_heavy_jobs(conn, workspace_root=eff_ws, cancel_event=cancel_event)
             return {"ok": True, "data": {"recovered_jobs": res}}
         if method == "control_plane/fact_edge":
             with rw_immediate_tx(conn):
@@ -343,6 +476,8 @@ def dispatch_control_call(method: str, params: dict[str, Any] | None) -> dict[st
                 )
             return {"ok": True}
         return FailClosedError(ERR_INVALID_INPUT, f"未知控制面方法: {method!r}").to_dict()
+    except RequestCancelledError as exc:
+        return FailClosedError(ERR_LOCKED, f"控制面请求已取消 ({method}): {exc}").to_dict()
     except FailClosedError as exc:
         return exc.to_dict()
     except Exception as exc:
@@ -377,23 +512,53 @@ def _read_next_message(stdin_buf: Any) -> tuple[dict[str, Any] | None, str]:
         return json.loads(stripped.decode("utf-8")), "ndjson"
 
 
-def _write_message(stdout_buf: Any, payload: dict[str, Any], framing_mode: str) -> None:
+def _write_message(
+    stdout_buf: Any,
+    payload: dict[str, Any],
+    framing_mode: str,
+    write_lock: threading.Lock | None = None,
+) -> None:
     encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    if framing_mode == "lsp":
-        header = f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii")
-        stdout_buf.write(header + encoded)
+    frame = (
+        f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii") + encoded
+        if framing_mode == "lsp"
+        else encoded + b"\n"
+    )
+    if write_lock is not None:
+        with write_lock:
+            stdout_buf.write(frame)
+            stdout_buf.flush()
     else:
-        stdout_buf.write(encoded + b"\n")
-    stdout_buf.flush()
+        stdout_buf.write(frame)
+        stdout_buf.flush()
 
 
-def handle_jsonrpc_message(msg: dict[str, Any]) -> dict[str, Any] | None:
+def _is_compute_request(msg: dict[str, Any]) -> bool:
+    method = str(msg.get("method", ""))
+    if method == "tools/call":
+        params = msg.get("params") or {}
+        t_name = str(params.get("name", ""))
+        return t_name in LONG_RUNNING_MCP_TOOLS
+    return method in _COMPUTE_CONTROL_METHODS
+
+
+def handle_jsonrpc_message(
+    msg: dict[str, Any],
+    *,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any] | None:
     method = msg.get("method", "")
     msg_id = msg.get("id")
     params = msg.get("params") or {}
 
-    if method == "notifications/initialized" or msg_id is None:
+    if method in ("notifications/initialized", "$/cancelRequest") or msg_id is None:
         return None
+    if cancel_event is not None and cancel_event.is_set():
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "error": {"code": -32800, "message": f"Request cancelled before execution: {method}"},
+        }
     if method == "initialize":
         return {
             "jsonrpc": "2.0",
@@ -418,6 +583,7 @@ def handle_jsonrpc_message(msg: dict[str, Any]) -> dict[str, Any] | None:
             workspace_root=str(top_meta.get("workspace_root", "") or ""),
             caller_role=str(top_meta.get("caller_role", "") or top_meta.get("role", "") or ""),
             session_id=str(top_meta.get("session_id", "") or ""),
+            cancel_event=cancel_event,
         )
         is_err = not bool(res.get("ok", False))
         return {
@@ -429,7 +595,7 @@ def handle_jsonrpc_message(msg: dict[str, Any]) -> dict[str, Any] | None:
             },
         }
     if isinstance(method, str) and method.startswith("control_plane/"):
-        res = dispatch_control_call(method, params)
+        res = dispatch_control_call(method, params, cancel_event=cancel_event)
         return {"jsonrpc": "2.0", "id": msg_id, "result": res}
     return {
         "jsonrpc": "2.0",
@@ -438,24 +604,79 @@ def handle_jsonrpc_message(msg: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def serve_stdio() -> int:
+def serve_stdio(
+    *,
+    fast_workers: int | None = None,
+    compute_workers: int | None = None,
+) -> int:
     stdin_buf = sys.stdin.buffer
     stdout_buf = sys.stdout.buffer
-    while True:
+    stdout_lock = threading.Lock()
+    cancel_registry = CancelRegistry()
+
+    eff_fast = max(2, int(fast_workers or os.environ.get("GREATWALL_FAST_WORKERS", "4") or 4))
+    eff_compute = max(2, int(compute_workers or os.environ.get("GREATWALL_COMPUTE_WORKERS", "6") or 6))
+
+    fast_pool = ThreadPoolExecutor(max_workers=eff_fast, thread_name_prefix="gw-fast")
+    compute_pool = ThreadPoolExecutor(max_workers=eff_compute, thread_name_prefix="gw-compute")
+
+    def _run_and_reply(req_msg: dict[str, Any], req_framing: str, req_id: Any, ev: threading.Event) -> None:
         try:
-            msg, framing = _read_next_message(stdin_buf)
+            resp = handle_jsonrpc_message(req_msg, cancel_event=ev)
+            if resp is not None:
+                _write_message(stdout_buf, resp, req_framing or "ndjson", stdout_lock)
         except Exception as exc:
-            _write_message(
-                stdout_buf,
-                {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": f"Parse error: {exc}"}},
-                "ndjson",
-            )
-            continue
-        if msg is None:
-            return 0
-        resp = handle_jsonrpc_message(msg)
-        if resp is not None:
-            _write_message(stdout_buf, resp, framing or "ndjson")
+            if req_id is not None:
+                _write_message(
+                    stdout_buf,
+                    {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32603, "message": f"Internal error: {exc}"}},
+                    req_framing or "ndjson",
+                    stdout_lock,
+                )
+        finally:
+            if req_id is not None:
+                cancel_registry.unregister(req_id)
+
+    try:
+        while True:
+            try:
+                msg, framing = _read_next_message(stdin_buf)
+            except Exception as exc:
+                _write_message(
+                    stdout_buf,
+                    {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": f"Parse error: {exc}"}},
+                    "ndjson",
+                    stdout_lock,
+                )
+                continue
+            if msg is None:
+                return 0
+
+            method = msg.get("method", "")
+            if method == "$/cancelRequest":
+                target_id = (msg.get("params") or {}).get("id")
+                if target_id is not None:
+                    cancel_registry.cancel(target_id)
+                continue
+
+            msg_id = msg.get("id")
+            if method == "notifications/initialized" or msg_id is None:
+                continue
+
+            # initialize / ping / tools/list 极轻握手直接在 IO 线程零排队完成
+            if method in ("initialize", "ping", "tools/list"):
+                resp = handle_jsonrpc_message(msg)
+                if resp is not None:
+                    _write_message(stdout_buf, resp, framing or "ndjson", stdout_lock)
+                continue
+
+            ev = cancel_registry.register(msg_id)
+            pool = compute_pool if _is_compute_request(msg) else fast_pool
+            pool.submit(_run_and_reply, msg, framing, msg_id, ev)
+    finally:
+        cancel_registry.cancel_all()
+        fast_pool.shutdown(wait=True, cancel_futures=True)
+        compute_pool.shutdown(wait=True, cancel_futures=True)
 
 
 if __name__ == "__main__":

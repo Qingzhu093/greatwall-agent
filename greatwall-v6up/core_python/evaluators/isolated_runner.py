@@ -15,11 +15,94 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
+
+
+class RequestCancelledError(RuntimeError):
+    """请求已被上游显式取消，子进程树已终止且严禁继续落库。"""
+
+
+def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        if proc.poll() is None:
+            proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        pass
+
+
+def _run_subprocess_cancellable(
+    cmd: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    timeout_sec: float,
+    cancel_event: Any = None,
+) -> subprocess.CompletedProcess[str]:
+    """跨平台可取消子进程执行器：支持超时与 `cancel_event` 实时终止整棵子进程树。"""
+    if cancel_event is not None and cancel_event.is_set():
+        raise RequestCancelledError("请求在启动子进程前已取消")
+
+    popen_kwargs: dict[str, Any] = {
+        "cwd": cwd,
+        "env": env,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    deadline = time.monotonic() + max(0.5, float(timeout_sec))
+    try:
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                _terminate_process_tree(proc)
+                raise RequestCancelledError("请求已取消，已强制终止隔离评测子进程树")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_process_tree(proc)
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout_sec)
+            slice_sec = min(0.05, remaining) if cancel_event is not None else remaining
+            try:
+                stdout_txt, stderr_txt = proc.communicate(timeout=slice_sec)
+                return subprocess.CompletedProcess(cmd, proc.returncode, stdout_txt, stderr_txt)
+            except subprocess.TimeoutExpired:
+                if cancel_event is None:
+                    _terminate_process_tree(proc)
+                    raise
+    except Exception:
+        _terminate_process_tree(proc)
+        raise
 
 from .base_instrument import (
     ALLOWED_INSTRUMENT_TIERS,
@@ -308,6 +391,7 @@ def _run_stage_a_python(
     worktree_root: str,
     timeout_sec: float,
     persist_stage_a_path: str | None = None,
+    cancel_event: Any = None,
 ) -> tuple[bool, dict[str, Any], str]:
     """在独立临时沙箱子进程运行 Python 候选 `run(public_input)` 并可选持久化产物。"""
     with tempfile.TemporaryDirectory(prefix="gw_stage_a_") as tmp:
@@ -323,14 +407,15 @@ def _run_stage_a_python(
 
         env = _build_clean_env([str(sandbox)])
         try:
-            proc = subprocess.run(
+            proc = _run_subprocess_cancellable(
                 [sys.executable, "-I", "-c", _STAGE_A_CHILD_SCRIPT, str(cand_dst), str(pub_in_file), str(out_file), str(err_file)],
                 cwd=str(sandbox),
                 env=env,
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
+                timeout_sec=timeout_sec,
+                cancel_event=cancel_event,
             )
+        except RequestCancelledError:
+            raise
         except subprocess.TimeoutExpired:
             return False, {}, f"候选执行超时（>{timeout_sec:.1f}s）"
         except Exception as exc:
@@ -368,6 +453,7 @@ def _run_stage_b_instrument(
     spec: dict[str, Any],
     tier: str,
     timeout_sec: float,
+    cancel_event: Any = None,
 ) -> dict[str, Any]:
     """在独立子进程中执行仪器 `evaluate(artifact, spec, tier)` 并完成协议校验。"""
     with tempfile.TemporaryDirectory(prefix="gw_stage_b_") as tmp:
@@ -380,7 +466,7 @@ def _run_stage_b_instrument(
 
         env = _build_clean_env([_CORE_PYTHON_DIR, _PROJECT_ROOT_DIR, str(instrument_file.parent)])
         try:
-            proc = subprocess.run(
+            proc = _run_subprocess_cancellable(
                 [
                     sys.executable,
                     "-c",
@@ -396,10 +482,11 @@ def _run_stage_b_instrument(
                 ],
                 cwd=str(sandbox),
                 env=env,
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
+                timeout_sec=timeout_sec,
+                cancel_event=cancel_event,
             )
+        except RequestCancelledError:
+            raise
         except subprocess.TimeoutExpired:
             return {
                 "status": "INFRA_ERROR",
@@ -455,6 +542,7 @@ def run_isolated_instrument(
     artifact_schema: str = "python_run",
     worktree_root: str = "",
     persist_stage_a_path: str | None = None,
+    cancel_event: Any = None,
 ) -> dict[str, Any]:
     """统一跨进程隔离仪器执行入口（支持三档同码、四态隔离与外部持久化）。"""
     tier_l = str(tier or "official").strip().lower()
@@ -513,6 +601,7 @@ def run_isolated_instrument(
             worktree_root=worktree_root,
             timeout_sec=timeout_sec,
             persist_stage_a_path=persist_stage_a_path,
+            cancel_event=cancel_event,
         )
         if not ok_a:
             is_infra = bool(stage_a_data.get("_infra_error"))
@@ -567,6 +656,7 @@ def run_isolated_instrument(
         spec=eff_spec,
         tier=tier_l,
         timeout_sec=timeout_sec,
+        cancel_event=cancel_event,
     )
     res_b["obs_status"] = map_instrument_result_to_obs_status(res_b["status"], res_b["verdict"])
     return res_b
@@ -579,8 +669,11 @@ def run_stage_b_revaluation(
     stage_a_output_path: str | Path,
     spec: dict[str, Any],
     tier: str = "official",
+    cancel_event: Any = None,
 ) -> dict[str, Any]:
     """读取持久化 `stage_a_output.json` 交新版仪器免重跑 Stage B 重算。"""
+    if cancel_event is not None and cancel_event.is_set():
+        raise RequestCancelledError("Stage B 重评在启动前已取消")
     p = Path(stage_a_output_path)
     if not p.is_file():
         return {
@@ -612,6 +705,7 @@ def run_stage_b_revaluation(
         spec=eff_spec,
         tier=str(tier or "official"),
         timeout_sec=timeout_sec,
+        cancel_event=cancel_event,
     )
     res_b["obs_status"] = map_instrument_result_to_obs_status(res_b["status"], res_b["verdict"])
     tracks = res_b.get("tracks") or {}
@@ -631,8 +725,11 @@ def run_calibration_suite(
     calibration_suite_path: str | Path,
     workspace_root: str | Path,
     artifact_schema: str = "python_run",
+    cancel_event: Any = None,
 ) -> dict[str, Any]:
     """独立子进程实跑全量校准集用例，强校验每条用例自声明 `(expected_status, expected_verdict)` 100% 匹配。"""
+    if cancel_event is not None and cancel_event.is_set():
+        raise RequestCancelledError("校准集回归在启动前已取消")
     suite_file = Path(calibration_suite_path)
     if not suite_file.is_file():
         return {"passed": False, "error": f"校准集文件不存在: {suite_file}", "total": 0, "passed_count": 0, "failed_cases": []}
@@ -651,6 +748,8 @@ def run_calibration_suite(
     failed_cases: list[dict[str, Any]] = []
 
     for idx, case in enumerate(cases):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RequestCancelledError(f"校准集回归在第 {idx + 1} 条用例前已取消")
         if not isinstance(case, dict):
             failed_cases.append({"case_id": f"case_{idx}", "error": "校准用例必须为 JSON 对象"})
             continue
@@ -694,6 +793,7 @@ def run_calibration_suite(
                 tier=tier,
                 artifact_schema=case_schema,
                 worktree_root=str(ws_root),
+                cancel_event=cancel_event,
             )
         finally:
             if tmp_art_dir is not None:

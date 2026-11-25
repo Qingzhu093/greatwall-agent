@@ -1,6 +1,14 @@
 {
-  "plugin": {
-    "name": "Greatwall Agent V6-Up (v2.2)",
-    "description": "DSH 0.2.2-rc.5 Native External Orchestrator x Python Single-Writer 31 Narrow-Tool Scientific Collective Plugin"
+  "meta": {
+    "title": "GreatWall Research Collective (V6-Up)",
+    "description": "DSH 0.2.2-rc.5 external orchestrator plugin for long-horizon autonomous scientific discovery with dual-sandbox isolation and a SQLite single-writer kernel."
+  },
+  "config": {
+    "corePythonRoot": "Core Python Root (optional)",
+    "pythonBin": "Python Executable Path (optional)",
+    "dataDir": "Persistent Data Directory (optional)",
+    "requestTimeoutMs": "Default RPC Timeout (ms)",
+    "longToolTimeoutMs": "Long Evaluation & Export Timeout (ms)",
+    "defaultAgentOptions": "Default Sub-Agent Model Options (optional)"
   }
 }

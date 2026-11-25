@@ -12,7 +12,6 @@
 import crypto from 'node:crypto'
 import path from 'node:path'
 import { loadCoreRuntimeConfig, loadRolePrompts } from './prompts.js'
-import { ensurePresetsInstalled } from './presets.js'
 import { TelemetryCollector } from './telemetry.js'
 import { AgentSessionHost, resolveAuthoritativeModelBinding } from './agent_session_host.js'
 import { disposeNodeCompanion, driveExplorerCompanionPair } from './pair_lifecycle.js'
@@ -20,6 +19,10 @@ import {
   GovernanceItemCircuitBreaker,
   selectDispatchableExplorers,
 } from './orchestrator/circuit_breaker.js'
+import {
+  assertValidBlindSandboxResult,
+  buildDispatchRuntimePort,
+} from './orchestrator/runtime_port.js'
 import { dispatchStage1Step } from './orchestrator/dispatch_stage1.js'
 import {
   dispatchPendingHandoffRecoveries,
@@ -60,12 +63,6 @@ export class GreatwallOrchestrator {
       Number(orchCfg.governance_item_circuit_breaker_max_stalled_runs || 2),
     )
 
-    try {
-      ensurePresetsInstalled({
-        localPresetsDir: path.resolve(this.corePythonRoot, '..', 'dsh_plugin', 'presets'),
-      })
-    } catch {}
-
     this.host = new AgentSessionHost({
       ctx,
       bridge,
@@ -99,6 +96,143 @@ export class GreatwallOrchestrator {
 
   get liveSessions() {
     return this.host.liveSessions
+  }
+
+  get poolState() {
+    return this._poolState
+  }
+
+  getPoolState() {
+    return this._poolState
+  }
+
+  isPoolStopped() {
+    return this._poolState === 'stopped'
+  }
+
+  hasBackgroundTask() {
+    return Boolean(this._backgroundTask)
+  }
+
+  getEffectiveContextWindow() {
+    return this.host.effectiveContextWindow
+  }
+
+  isExplorerRunning(nodeId) {
+    return this._runningExplorers.has(nodeId)
+  }
+
+  getRunningExplorerCount() {
+    return this._runningExplorers.size
+  }
+
+  getRunningExplorerIds() {
+    return new Set(this._runningExplorers.keys())
+  }
+
+  getAvailableBriefSlots(snap, maxConcurrentWorkers = null) {
+    const effSlotCap = Math.max(1, Number(maxConcurrentWorkers || snap?.slot_cap || 6))
+    const runningBriefings = [...this._runningGov.keys()].filter((k) => k.startsWith('brief:')).length
+    const readyWaitingCount = (snap?.explorers_ready_to_run || []).filter((n) => !this._runningExplorers.has(n.node_id)).length
+    return Math.max(0, effSlotCap - this._runningExplorers.size - runningBriefings - readyWaitingCount)
+  }
+
+  isGovTaskRunning(taskKey) {
+    return this._runningGov.has(taskKey)
+  }
+
+  isBreakerOpen(key, fingerprint) {
+    return this._itemBreaker.isBroken(key, fingerprint)
+  }
+
+  launchGovTask(taskKey, runner) {
+    return this._launchGovTask(taskKey, runner)
+  }
+
+  launchGovTaskAndAwait(taskKey, runner) {
+    return this._launchGovTaskAndAwaitIfSync(taskKey, runner)
+  }
+
+  evaluateBreakerAfterTask(roleLabel, dispatchedItems, extractAfterMap) {
+    return this._evaluateBreakerAfterTask(roleLabel, dispatchedItems, extractAfterMap)
+  }
+
+  launchExplorer(node, snap, sig) {
+    return this._launchExplorerWorker(node, snap, sig)
+  }
+
+  runBlindReview(rev, sig) {
+    return this._runBlindReviewWithSandbox(rev, sig)
+  }
+
+  recordHandoffCompleted(delta = 1) {
+    this._handoffsSinceHeartbeat += Math.max(0, Number(delta) || 0)
+  }
+
+  shouldTriggerHeartbeat(nowMs = Date.now()) {
+    const hasActiveExploration = this._runningExplorers.size > 0
+    return (
+      this._handoffsSinceHeartbeat >= 3 ||
+      (this._handoffsSinceHeartbeat > 0 && this._lastHeartbeatAt > 0 && nowMs - this._lastHeartbeatAt > 180_000) ||
+      (hasActiveExploration && this._lastHeartbeatAt > 0 && nowMs - this._lastHeartbeatAt > 600_000)
+    )
+  }
+
+  markHeartbeatFired(nowMs = Date.now()) {
+    this._handoffsSinceHeartbeat = 0
+    this._lastHeartbeatAt = nowMs
+  }
+
+  initHeartbeatClockIfNeeded(nowMs = Date.now()) {
+    if (this._lastHeartbeatAt === 0) this._lastHeartbeatAt = nowMs
+  }
+
+  getLiveCompanion(nodeId) {
+    if (!nodeId) return null
+    const handle = this._nodeCompanionSessions.get(nodeId)
+    if (!handle) return null
+    if (!this.liveSessions?.has?.(handle.sessionId)) {
+      this._nodeCompanionSessions.delete(nodeId)
+      return null
+    }
+    return handle
+  }
+
+  setLiveCompanion(nodeId, handle) {
+    if (nodeId && handle) {
+      this._nodeCompanionSessions.set(nodeId, handle)
+    }
+  }
+
+  async disposeCompanion(nodeId, status = 'completed') {
+    if (!nodeId) return
+    const handle = this._nodeCompanionSessions.get(nodeId)
+    this._nodeCompanionSessions.delete(nodeId)
+    if (handle && typeof handle.dispose === 'function') {
+      try {
+        await handle.dispose(status)
+      } catch {}
+    }
+  }
+
+  setSessionReadonly(sessionId, flag) {
+    this.host?.setSessionReadonly?.(sessionId, flag)
+  }
+
+  archiveSession(sessionId, session = null) {
+    return this.host?.archiveSession?.(sessionId, session)
+  }
+
+  control(method, params = {}, opts = {}) {
+    return this.bridge.control(method, params, opts)
+  }
+
+  recordEvent(eventName, detail = {}) {
+    this.telemetry?.recordEvent?.(eventName, detail)
+  }
+
+  createDispatchRuntimePort() {
+    return buildDispatchRuntimePort(this)
   }
 
   set defaultAgentOptions(val) {
@@ -414,15 +548,16 @@ export class GreatwallOrchestrator {
    * 人类显式叫停唯一真源入口：写入控制面 `human_stop_requested_at` 并停止新探索派单，
    * 使 `PARTIAL_ON_HUMAN_STOP` 终局门禁可合法绕过 `min_commitment_window_sec` 进入 Stage 3 汇总导出。
    */
-  async humanStop(note = 'HUMAN_UI_OR_CLI_STOP') {
+  async humanStop(note = 'HUMAN_UI_OR_CLI_STOP', { callerSource = 'unknown' } = {}) {
     const res = await this.bridge.control('control_plane/record_human_stop', {
       workspace_root: this.workspaceRoot,
       note: String(note || 'HUMAN_UI_OR_CLI_STOP'),
     })
-    this.telemetry.recordEvent('human_stop_recorded', { note })
+    this.telemetry.recordEvent('human_stop_recorded', { note, callerSource })
     this._wakeLoop()
     return {
       humanStopRecorded: Boolean(res?.ok),
+      callerSource,
       record: res?.data || null,
       status: await this.getControlStatus(),
     }
@@ -578,7 +713,7 @@ export class GreatwallOrchestrator {
 
   _launchExplorerWorker(node, snap, sig) {
     const expSessionId = `gw_exp_${node.node_id}_${crypto.randomUUID().slice(0, 6)}`
-    const p = driveExplorerCompanionPair(this, node, snap, expSessionId, { signal: sig })
+    const p = driveExplorerCompanionPair(this.createDispatchRuntimePort(), node, snap, expSessionId, { signal: sig })
       .catch((err) => {
         if (err?.code !== 'GREATWALL_RUN_ABORTED') {
           this.telemetry.recordEvent('explorer_worker_error', { nodeId: node.node_id, error: String(err?.message || err) })
@@ -598,26 +733,29 @@ export class GreatwallOrchestrator {
     this._syncSlotsToTelemetry()
   }
 
+  assertValidBlindSandbox(staged, reviewId) {
+    return assertValidBlindSandboxResult(staged, reviewId, this.workspaceRoot, this.telemetry)
+  }
+
   async _runBlindReviewWithSandbox(rev, sig) {
     const reviewId = String(rev.review_id)
     const staged = await this.bridge.control('control_plane/stage_blind_sandbox', {
       workspace_root: this.workspaceRoot,
       review_id: reviewId,
     })
-    const sandboxPath = staged?.data?.sandbox_abs_path || ''
+    const sandboxPath = this.assertValidBlindSandbox(staged, reviewId)
     const uniqueVerifierSid = `gw_ver_${reviewId}_${crypto.randomUUID().slice(0, 6)}`
     try {
       await this.spawnAndRunAgent({
         role: 'library_verifier',
         sessionId: uniqueVerifierSid,
         questionId: rev.question_id,
+        reviewId,
         sandboxAbsPath: sandboxPath,
         uiLabel: `[图书馆盲审] ${rev.question_id || ''} ${reviewId}`.trim(),
         shortTransaction: true,
         signal: sig,
-        taskContextText: sandboxPath
-          ? `### 独立空白盲审沙箱目录\n- sandbox_abs_path: \`${sandboxPath}\`\n（沙箱内已只读挂载手稿绑定口径的 inputs/ 公开题面、A 栏与脱敏复核材料；物理断网且不可访问 DB/工作树/B 栏）`
-          : '',
+        taskContextText: `### 独立空白盲审沙箱目录\n- sandbox_abs_path: \`${sandboxPath}\`\n（沙箱内已只读挂载手稿绑定口径的 inputs/ 公开题面、A 栏与脱敏复核材料；物理断网且不可访问 DB/工作树/B 栏）`,
         prompt: rev.review_status === 'STAGE1_BLIND'
           ? `请以异会话执行盲审单 ${reviewId} (${rev.question_id})：先调 get_blind_manuscript 审阅脱敏 A 栏与沙箱复核工件（严格按手稿绑定 spec_revision 评判科学真伪），在空白沙箱内独立验算后调 submit_stage1_blind_ledger 锁定不可逆账本；若 Stage 1 判 PASS，紧接着调 get_unblinded_manuscript_and_peers 与 submit_stage2_unblind_verdict 完成终判（判 REVISE/REFUTED 时立即结束）。`
           : `请对审稿单 ${reviewId} (${rev.question_id}) 调用 get_unblinded_manuscript_and_peers 与 submit_stage2_unblind_verdict 完成 Stage 2 终审。`,
@@ -637,9 +775,13 @@ export class GreatwallOrchestrator {
     let idleStreak = 0
     let snapshotErrorStreak = 0
 
-    // 启动恢复：按原冻结快照续跑上次进程中断遗留的 heavy 异步评测作业
+    // 启动恢复：按原冻结快照续跑上次进程中断遗留的 heavy 异步评测作业（透传主循环取消信号）
     try {
-      const rec = await this.bridge.control('control_plane/recover_heavy_jobs', { workspace_root: this.workspaceRoot })
+      const rec = await this.bridge.control(
+        'control_plane/recover_heavy_jobs',
+        { workspace_root: this.workspaceRoot },
+        { signal: sig },
+      )
       if (rec?.data?.recovered_jobs?.length > 0) {
         this.telemetry.recordEvent('heavy_jobs_recovered', { count: rec.data.recovered_jobs.length })
       }
@@ -696,25 +838,27 @@ export class GreatwallOrchestrator {
         }
       }
 
+      const port = this.createDispatchRuntimePort()
+
       // 0. 待交接/崩溃抢救恢复
-      let dispatchedSomething = dispatchPendingHandoffRecoveries(this, snap, sig)
+      let dispatchedSomething = dispatchPendingHandoffRecoveries(port, snap, sig)
 
       // 1. Stage 1 (Parse 0) 初始化四步
-      const s1 = await dispatchStage1Step(this, snap, sig)
+      const s1 = await dispatchStage1Step(port, snap, sig)
       if (s1.handled) {
         if (s1.waitMs) await this._waitWakeOrTimeout(s1.waitMs)
         continue
       }
 
       // 2. Stage 3 两步联合终核与退修闭环
-      const s3 = dispatchStage3Step(this, snap, sig)
+      const s3 = dispatchStage3Step(port, snap, sig)
       if (s3.handled) {
         await this._waitWakeOrTimeout(s3.waitMs || 250)
         continue
       }
 
       // 3. Stage 2 治理与并发探索派发
-      const s2 = await dispatchStage2Step(this, snap, sig, maxConcurrentWorkers)
+      const s2 = await dispatchStage2Step(port, snap, sig, maxConcurrentWorkers)
       if (s2.dispatched) dispatchedSomething = true
       if (s2.continueImmediate) continue
 
