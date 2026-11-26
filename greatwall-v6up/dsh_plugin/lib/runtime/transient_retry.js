@@ -10,7 +10,7 @@
 export const DEFAULT_TRANSIENT_DELAYS_MS = Object.freeze([15_000, 30_000, 60_000])
 
 const TRANSIENT_STATUS_RE = /\b(?:408|429|500|502|503|504|522|524)\b/
-const TRANSIENT_MSG_RE = /(?:rate\s*limit|too\s*many\s*requests|overloaded|timeout|timed\s*out|econnreset|econnrefused|etimedout|epipe|socket\s*hang\s*up|network\s*error|fetch\s*failed|temporarily\s*unavailable|bad\s*gateway|service\s*unavailable)/i
+const TRANSIENT_MSG_RE = /(?:rate\s*limit|too\s*many\s*requests|overloaded|timeout|timed\s*out|econnreset|econnrefused|etimedout|epipe|socket\s*hang\s*up|network\s*error|connection\s*error|connection\s*reset|\btransport\b|fetch\s*failed|temporarily\s*unavailable|bad\s*gateway|service\s*unavailable)/i
 const NON_TRANSIENT_RE = /(?:CONTENT_REFUSED|GREATWALL_RUN_ABORTED|invalid_api_key|authentication_error|permission_denied|\b400\b|\b401\b|\b403\b)/i
 
 export function isTransientProviderError(errOrReason) {

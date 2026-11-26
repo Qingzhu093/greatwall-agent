@@ -121,16 +121,20 @@ def stage_blind_review_sandbox(
                 staged_files.append(Path(art_rel).as_posix())
             tools_src = src_base / "tools"
             if tools_src.is_dir():
-                for tf in sorted(tools_src.rglob("*.py")):
-                    if "__pycache__" in tf.parts:
+                text_exts = {".py", ".json", ".txt", ".md", ".yaml", ".yml", ".toml", ".csv", ".cfg", ".ini"}
+                for tf in sorted(tools_src.rglob("*")):
+                    if not tf.is_file() or "__pycache__" in tf.parts or tf.suffix == ".pyc":
                         continue
                     rel_t = tf.relative_to(src_base)
                     dst_t = sandbox_dir / rel_t
                     dst_t.parent.mkdir(parents=True, exist_ok=True)
-                    dst_t.write_text(
-                        _SENSITIVE_COMMENT_RE.sub("<REDACTED_ID>", tf.read_text(encoding="utf-8", errors="replace")),
-                        encoding="utf-8",
-                    )
+                    if tf.suffix.lower() in text_exts:
+                        dst_t.write_text(
+                            _SENSITIVE_COMMENT_RE.sub("<REDACTED_ID>", tf.read_text(encoding="utf-8", errors="replace")),
+                            encoding="utf-8",
+                        )
+                    else:
+                        shutil.copy2(tf, dst_t)
                     staged_files.append(rel_t.as_posix())
 
     # 3. 拷入绑定 [Obs###] 脱敏客观收据 JSON

@@ -26,6 +26,7 @@ from ..db_schema import (
 from .blind_sandbox import _rmtree_force, _set_tree_readonly
 from .scheduler_rules import check_stage2_closure_gate_data
 from .subproblem_locks import get_subproblem_active_spec_revision
+from .workspace_sync import sync_approved_public_inputs
 
 
 def compute_delivery_dir_sha256(delivery_dir: Path) -> str:
@@ -118,6 +119,12 @@ def export_stage3_deliverables_v03(
             raise FailClosedError(ERR_NOT_FOUND, f"复现节点 {nid!r} 不存在")
         repro_nodes_rows.append(node)
 
+    if mode_u == "FULL" and not repro_nodes_rows:
+        raise FailClosedError(ERR_INVALID_INPUT, "FULL 交付包必须至少绑定 1 个有效复现节点 (reproduction_candidate_nodes)")
+
+    p0_row = conn.execute("SELECT shared_inputs_json FROM parse0_contract WHERE contract_id = 'active'").fetchone()
+    shared_inputs_rels = json.loads(p0_row["shared_inputs_json"] or "[]") if p0_row else []
+
     ws_root = Path(os.path.realpath(workspace_root))
     paths = resolve_storage_paths(workspace_root)
     delivery_id = f"deliv_{uuid.uuid4().hex[:10]}"
@@ -161,6 +168,17 @@ def export_stage3_deliverables_v03(
                         copied_tools.append(dst_t.relative_to(staging_dir).as_posix())
             elif art_rel:
                 raise FailClosedError(ERR_NOT_FOUND, f"复现节点 {node['node_id']!r} 找不到快照或工作树目录")
+
+            # 复用分支/盲审的已批准公开材料装配逻辑：自动发现默认 inputs/，绝不带入未批准的 rulings/ 草稿
+            node_bundle_dir.mkdir(parents=True, exist_ok=True)
+            node_qid = str(node["question_id"])
+            sync_approved_public_inputs(
+                workspace_root,
+                str(node_bundle_dir),
+                shared_inputs_rels,
+                spec_revision=active_spec_by_q.get(node_qid, 0),
+                question_id=node_qid,
+            )
 
             repro_manifest.append(
                 {
@@ -206,6 +224,7 @@ def export_stage3_deliverables_v03(
         meta_manifest = {
             "delivery_id": delivery_id,
             "delivery_mode": mode_u,
+            "subproblem_spec_revisions": active_spec_by_q,
             "selected_l3_ids_by_question": selected_l3_ids_by_question,
             "remaining_gaps_by_question": remaining_gaps_by_question,
             "reproduction_candidate_nodes": reproduction_candidate_nodes,
@@ -383,16 +402,21 @@ def finalize_stage3_closure_on_verifier_accept(
                 invalidated_reason = f"导出冻结包后子题口径已升版（{', '.join(stale_qs)}），旧冻结包已失效，请重新导出后再终签。"
 
         if invalidated_reason:
+            # 口径升版或结项资格失效：原子退回 STAGE2_EVOLVE 并复位 closure 为 OPEN，避免卡死在 Stage 3 死锁
             conn.execute(
                 """
                 UPDATE project_closure_state
-                SET status = 'REVISION_REQUESTED',
+                SET status = 'OPEN',
                     verifier_final_audit_passed = 0,
                     verifier_revision_notes = ?,
                     updated_at = ?
                 WHERE id = 1 AND status = 'DELIVERY_EXPORTED' AND latest_delivery_id = ?
                 """,
                 (invalidated_reason, now, cur_did),
+            )
+            conn.execute(
+                "UPDATE parse0_contract SET stage = 'STAGE2_EVOLVE', updated_at = ? WHERE contract_id = 'active'",
+                (now,),
             )
         else:
             cur = conn.execute(

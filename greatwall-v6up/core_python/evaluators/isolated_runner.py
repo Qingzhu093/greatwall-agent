@@ -211,6 +211,29 @@ def _copy_branch_tools_into_sandbox(cand_src: Path, sandbox: Path, worktree_root
     return None
 
 
+def _copy_branch_inputs_into_sandbox(cand_src: Path, sandbox: Path, worktree_root: str = "") -> Path | None:
+    """将分支工作树中已批准挂载的只读公开输入目录 `<worktree>/inputs/` 同步进 Stage A 沙箱。"""
+    candidates_inputs: list[Path] = []
+    if worktree_root:
+        candidates_inputs.append(Path(worktree_root) / "inputs")
+    elif cand_src.parent.name in ("src", "scripts", "solutions", "proofs"):
+        candidates_inputs.append(cand_src.parent.parent / "inputs")
+    else:
+        candidates_inputs.append(cand_src.parent / "inputs")
+
+    for src_inputs in candidates_inputs:
+        if src_inputs.is_dir():
+            dst_inputs = sandbox / "inputs"
+            shutil.copytree(
+                src_inputs,
+                dst_inputs,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".git"),
+                dirs_exist_ok=True,
+            )
+            return src_inputs
+    return None
+
+
 def _is_python_run_artifact(artifact_path: Path, artifact_schema: str) -> bool:
     schema_l = str(artifact_schema or "").strip().lower()
     if schema_l in ("raw_file", "raw_artifact", "lean", "lean4", "json", "text", "markdown", "counterexample_json"):
@@ -399,6 +422,7 @@ def _run_stage_a_python(
         cand_dst = sandbox / cand_file.name
         shutil.copy2(cand_file, cand_dst)
         _copy_branch_tools_into_sandbox(cand_file, sandbox, worktree_root=worktree_root)
+        _copy_branch_inputs_into_sandbox(cand_file, sandbox, worktree_root=worktree_root)
 
         pub_in_file = sandbox / "_public_input.json"
         out_file = sandbox / "_stage_a_output.json"

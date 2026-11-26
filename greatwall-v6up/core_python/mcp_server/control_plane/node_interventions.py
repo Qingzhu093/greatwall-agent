@@ -205,10 +205,15 @@ def mark_node_yielded(
         raise FailClosedError(ERR_NOT_FOUND, f"节点 {node_id!r} 不存在")
     now = utc_now_iso()
     with rw_immediate_tx(conn):
-        conn.execute(
-            "UPDATE lineage_nodes SET control_state = 'HUMAN_ACTIVE', updated_at = ? WHERE node_id = ?",
+        # 仅当节点仍处于 PAUSE_DRAINING 时才落盘为 HUMAN_ACTIVE，防止迟到的暂停回执把人类已交还的节点覆写回暂停
+        cur = conn.execute(
+            "UPDATE lineage_nodes SET control_state = 'HUMAN_ACTIVE', updated_at = ? WHERE node_id = ? AND control_state = 'PAUSE_DRAINING'",
             (now, str(node_id)),
         )
+        if cur.rowcount == 0:
+            latest = conn.execute("SELECT control_state FROM lineage_nodes WHERE node_id = ?", (str(node_id),)).fetchone()
+            cur_st = str(latest["control_state"]) if latest else str(node["control_state"])
+            return {"node_id": str(node_id), "control_state": cur_st, "yielded": False, "skipped_stale": True}
         iid = _insert_intervention(
             conn,
             node_id=str(node_id),
@@ -218,7 +223,7 @@ def mark_node_yielded(
             details={"yielded_at": now, **(details or {})},
             now=now,
         )
-    return {"node_id": str(node_id), "control_state": "HUMAN_ACTIVE", "yielded_at": now, "intervention_id": iid}
+    return {"node_id": str(node_id), "control_state": "HUMAN_ACTIVE", "yielded": True, "yielded_at": now, "intervention_id": iid}
 
 
 def record_human_chat_detected(

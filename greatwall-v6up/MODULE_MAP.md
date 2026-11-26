@@ -1,4 +1,4 @@
-# GreatWall V6-Up 模块地图（MODULE_MAP · `v0.3.0-alpha.1`）
+# GreatWall V6-Up 模块地图（MODULE_MAP · `v0.3.0-alpha.2`）
 
 面向人类协作者与后续接手 AI Agent 的一页架构导航：快速定位代码边界、四大工程分层红线与整机验收命令。顶层设计论文见 [`../docs/agent_kb_v0_3/`](../docs/agent_kb_v0_3/)。
 
@@ -6,7 +6,7 @@
 
 ## 1. Python 核心与单写真相源（`core_python/`）
 
-> **并发与一致性铁律（`v0.3.0-alpha.1`）**：**并发纯只读（`open_ro_connection` + `ro_consistent_tx`）+ 并发纯外部隔离计算（锁外 100% 并行，含 Stage 3 不可变冻结目录 SHA-256 计算）+ 严格进程级单写者短锁记总账（`_SINGLE_WRITER_LOCK` + `rw_immediate_tx`）+ 持久化事务 Outbox (`runtime_effects`) 驱动异步副作用**。
+> **并发与一致性铁律（`v0.3.0-alpha.2`）**：**并发纯只读（`open_ro_connection` + `ro_consistent_tx`）+ 并发纯外部隔离计算（锁外 100% 并行，含 Stage 3 不可变冻结目录 SHA-256 计算）+ 严格进程级单写者短锁记总账（`_SINGLE_WRITER_LOCK` + `rw_immediate_tx`）+ 持久化事务 Outbox (`runtime_effects`) 驱动异步副作用**。
 
 | 路径 | 职责 | 禁止放入 / 边界红线 |
 | --- | --- | --- |
@@ -44,7 +44,7 @@
 
 ## 3. 验收与防腐门禁命令
 
-在 `greatwall-v6up/` 目录下执行（`v0.3.0-alpha.1` 全绿基线：Python `60/60`、Node `48/48`、Doctor `8/8`）：
+在 `greatwall-v6up/` 目录下执行（`v0.3.0-alpha.2` 最新全绿基线：Python `68` 项 0 失败（1 skipped）、Node `54/54`、Doctor `8/8`）：
 
 ```powershell
 # 1. Python 全量单元、旧库无损迁移、三大科研工程、并发一致性/真取消与架构防腐门禁

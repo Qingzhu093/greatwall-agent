@@ -115,10 +115,24 @@ export function buildChiefSessionId(workspaceRoot) {
  * 无宿主 `actionCards` 服务时安全返回空 disposer，自动平滑降级为右侧 UI 待拍板卡。
  */
 export function registerProposalActionCard(ctx, controlService, { logger = console } = {}) {
+  const safeGet = (holder, name) => {
+    try {
+      return typeof holder?.get === 'function' ? holder.get(name) : null
+    } catch {
+      return null
+    }
+  }
+  const safeProp = (holder, name) => {
+    try {
+      return holder?.[name] || null
+    } catch {
+      return null
+    }
+  }
   const getSvc = () =>
-    (typeof ctx?.get === 'function' ? ctx.get('actionCards') : null) ||
-    (typeof ctx?.root?.get === 'function' ? ctx.root.get('actionCards') : null) ||
-    ctx?.actionCards ||
+    safeGet(ctx, 'actionCards') ||
+    safeGet(safeProp(ctx, 'root'), 'actionCards') ||
+    safeProp(ctx, 'actionCards') ||
     null
 
   const svc = getSvc()

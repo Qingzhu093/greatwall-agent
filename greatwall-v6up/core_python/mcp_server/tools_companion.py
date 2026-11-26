@@ -590,8 +590,18 @@ def tool_submit_node_handoff(
         if row is None or str(row["node_id"]) != node_id:
             raise FailClosedError(ERR_NOT_FOUND, f"声明绑定的正式观测 {oid!r} 不存在或不属于节点 {node_id!r}")
         bound_obs_rows.append(row)
-    if grade == "MEASURED" and not clean_obs_ids:
-        raise FailClosedError(ERR_INVALID_INPUT, "evidence_grade='MEASURED' 时必须绑定至少 1 条真实 [Obs###]")
+    if grade == "MEASURED":
+        if not clean_obs_ids:
+            raise FailClosedError(ERR_INVALID_INPUT, "evidence_grade='MEASURED' 时必须绑定至少 1 条真实 [Obs###]")
+        has_valid_measured_obs = any(
+            str(r["obs_status"]) in ("VALID_PASS", "MEASURED_REJECTION", "VALID_UNDECIDED")
+            for r in bound_obs_rows
+        )
+        if not has_valid_measured_obs:
+            raise FailClosedError(
+                ERR_INVALID_INPUT,
+                "evidence_grade='MEASURED' 要求至少绑定 1 条有效实测观测（VALID_PASS / MEASURED_REJECTION / VALID_UNDECIDED），禁止仅以 CANDIDATE_ERROR 等失败收据交班！",
+            )
 
     # 人工改码/脏工件防错绑旧收据校验（问题 #12）
     if bound_obs_rows:

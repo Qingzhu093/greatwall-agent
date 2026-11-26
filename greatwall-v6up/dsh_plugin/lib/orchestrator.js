@@ -267,6 +267,9 @@ export class GreatwallOrchestrator {
       this.parentAgent = callerAgent
       this.host.parentAgent = callerAgent
     }
+    if (this._startingPromise) {
+      return this._startingPromise
+    }
     if (this._backgroundTask) {
       if (this._poolState === 'paused') {
         await this.resumeBackground()
@@ -277,67 +280,90 @@ export class GreatwallOrchestrator {
       }
     }
 
-    const lockRes = this.instanceLock.acquire()
-    if (!lockRes.ok) {
-      this._lastError = lockRes.error
-      return { started: false, alreadyRunning: false, blocked: 'INSTANCE_LOCKED', error: lockRes.error, status: await this.getControlStatus() }
-    }
+    const startSeq = (this._startSeq = (this._startSeq || 0) + 1)
+    const isStartCancelled = () => this._poolState === 'stopped' || this._startSeq !== startSeq
 
-    const binding = await this._resolveAndLockModelBinding({ explicitOptions: agentOptions, callerAgent })
-    if (!binding.ok && this._requireExplicitModelBinding) {
-      this.instanceLock.release()
-      this._lastError = 'MISSING_MODEL_BINDING: 无法解析权威 provider/model 绑定，已拒绝启动。'
-      return { started: false, alreadyRunning: false, blocked: 'MISSING_MODEL_BINDING', error: this._lastError, status: await this.getControlStatus() }
-    }
+    const runStart = async () => {
+      const lockRes = this.instanceLock.acquire()
+      if (!lockRes.ok) {
+        this._lastError = lockRes.error
+        return { started: false, alreadyRunning: false, blocked: 'INSTANCE_LOCKED', error: lockRes.error, status: await this.getControlStatus() }
+      }
+      this._poolState = 'starting'
 
-    let preSnapRes = null
-    try {
-      preSnapRes = await this.bridge.control('control_plane/schedule_snapshot', {
-        workspace_root: this.workspaceRoot,
-        ...(maxConcurrentWorkers ? { max_concurrent_workers: maxConcurrentWorkers } : {}),
-      })
-    } catch (err) {
-      this.instanceLock.release()
-      this._lastError = String(err?.message || err)
-      return { started: false, alreadyRunning: false, blocked: 'KERNEL_UNAVAILABLE', error: this._lastError, status: await this.getControlStatus() }
-    }
-    if (!preSnapRes?.ok || !preSnapRes?.data) {
-      this.instanceLock.release()
-      this._lastError = String(preSnapRes?.error || 'schedule_snapshot 返回失败')
-      return { started: false, alreadyRunning: false, blocked: 'KERNEL_UNAVAILABLE', error: this._lastError, status: await this.getControlStatus() }
-    }
-    if (!preSnapRes.data.parse0_signed) {
-      this.instanceLock.release()
-      return { started: false, alreadyRunning: false, blocked: 'NEED_PARSE0_SIGNATURE', error: '尚未签署 Parse 0 启动契约。', status: await this.getControlStatus() }
-    }
-
-    if (maxConcurrentWorkers) this.slotAllocator.setMaxWorkers(maxConcurrentWorkers)
-    if (Array.isArray(preSnapRes.data.shared_inputs_rel_paths)) this.host.sharedInputPaths = preSnapRes.data.shared_inputs_rel_paths
-    if (!this._loopAbortController || this._loopAbortController.signal.aborted) this._loopAbortController = new AbortController()
-    this._lastError = null
-    this._govCooldownUntil.clear()
-    this._itemBreaker.resetAll()
-    this._poolState = 'running'
-    this._stage3Done = false
-    this.telemetry.setOrchestratorState('running')
-
-    this._backgroundTask = this._runAsyncEventPool({ maxConcurrentWorkers })
-      .catch((err) => {
-        if (err?.code !== 'GREATWALL_RUN_ABORTED') {
-          this._lastError = String(err?.message || err)
-          this.telemetry.recordEvent('orchestrator_error', { error: this._lastError })
-        }
-      })
-      .finally(() => {
-        if (this._poolState === 'running') {
-          this._poolState = 'idle'
-          this.telemetry.setOrchestratorState('idle')
-        }
+      const binding = await this._resolveAndLockModelBinding({ explicitOptions: agentOptions, callerAgent })
+      if (isStartCancelled()) {
         this.instanceLock.release()
-        this._backgroundTask = null
-      })
+        return { started: false, alreadyRunning: false, blocked: 'STOPPED_DURING_START', status: await this.getControlStatus() }
+      }
+      if (!binding.ok && this._requireExplicitModelBinding) {
+        this.instanceLock.release()
+        this._poolState = 'idle'
+        this._lastError = 'MISSING_MODEL_BINDING: 无法解析权威 provider/model 绑定，已拒绝启动。'
+        return { started: false, alreadyRunning: false, blocked: 'MISSING_MODEL_BINDING', error: this._lastError, status: await this.getControlStatus() }
+      }
 
-    return { started: true, alreadyRunning: false, modelBinding: this._modelBinding, status: await this.getControlStatus() }
+      let preSnapRes = null
+      try {
+        preSnapRes = await this.bridge.control('control_plane/schedule_snapshot', {
+          workspace_root: this.workspaceRoot,
+          ...(maxConcurrentWorkers ? { max_concurrent_workers: maxConcurrentWorkers } : {}),
+        })
+      } catch (err) {
+        this.instanceLock.release()
+        if (!isStartCancelled()) this._poolState = 'idle'
+        this._lastError = String(err?.message || err)
+        return { started: false, alreadyRunning: false, blocked: 'KERNEL_UNAVAILABLE', error: this._lastError, status: await this.getControlStatus() }
+      }
+      if (isStartCancelled()) {
+        this.instanceLock.release()
+        return { started: false, alreadyRunning: false, blocked: 'STOPPED_DURING_START', status: await this.getControlStatus() }
+      }
+      if (!preSnapRes?.ok || !preSnapRes?.data) {
+        this.instanceLock.release()
+        this._poolState = 'idle'
+        this._lastError = String(preSnapRes?.error || 'schedule_snapshot 返回失败')
+        return { started: false, alreadyRunning: false, blocked: 'KERNEL_UNAVAILABLE', error: this._lastError, status: await this.getControlStatus() }
+      }
+      if (!preSnapRes.data.parse0_signed) {
+        this.instanceLock.release()
+        this._poolState = 'idle'
+        return { started: false, alreadyRunning: false, blocked: 'NEED_PARSE0_SIGNATURE', error: '尚未签署 Parse 0 启动契约。', status: await this.getControlStatus() }
+      }
+
+      if (maxConcurrentWorkers) this.slotAllocator.setMaxWorkers(maxConcurrentWorkers)
+      if (Array.isArray(preSnapRes.data.shared_inputs_rel_paths)) this.host.sharedInputPaths = preSnapRes.data.shared_inputs_rel_paths
+      if (!this._loopAbortController || this._loopAbortController.signal.aborted) this._loopAbortController = new AbortController()
+      this._lastError = null
+      this._govCooldownUntil.clear()
+      this._itemBreaker.resetAll()
+      this._poolState = 'running'
+      this._stage3Done = false
+      this.telemetry.setOrchestratorState('running')
+
+      this._backgroundTask = this._runAsyncEventPool({ maxConcurrentWorkers })
+        .catch((err) => {
+          if (err?.code !== 'GREATWALL_RUN_ABORTED') {
+            this._lastError = String(err?.message || err)
+            this.telemetry.recordEvent('orchestrator_error', { error: this._lastError })
+          }
+        })
+        .finally(() => {
+          if (this._poolState === 'running') {
+            this._poolState = 'idle'
+            this.telemetry.setOrchestratorState('idle')
+          }
+          this.instanceLock.release()
+          this._backgroundTask = null
+        })
+
+      return { started: true, alreadyRunning: false, modelBinding: this._modelBinding, status: await this.getControlStatus() }
+    }
+
+    this._startingPromise = runStart().finally(() => {
+      this._startingPromise = null
+    })
+    return this._startingPromise
   }
 
   pauseBackground() {
@@ -434,6 +460,7 @@ export class GreatwallOrchestrator {
   }
 
   async stopBackground(reason = 'USER_STOPPED') {
+    this._startSeq = (this._startSeq || 0) + 1
     this._poolState = 'stopped'
     this.telemetry.setOrchestratorState('stopped')
     if (this._loopAbortController) {
@@ -599,9 +626,8 @@ export class GreatwallOrchestrator {
     let idleStreak = 0
     let snapshotErrorStreak = 0
 
-    try {
-      await this.bridge.control('control_plane/recover_heavy_jobs', { workspace_root: this.workspaceRoot }, { signal: sig })
-    } catch {}
+    // 重型实验崩溃恢复放到后台异步执行，绝不阻塞主循环消费 Outbox 快控制
+    void this.bridge.control('control_plane/recover_heavy_jobs', { workspace_root: this.workspaceRoot }, { signal: sig }).catch(() => {})
 
     while (!sig.aborted && this._poolState !== 'stopped') {
       // 每轮（含全局暂停态）先消费 Outbox 副作用队列，确保节点让权、新口径热通知与总控通知不被暂停卡死

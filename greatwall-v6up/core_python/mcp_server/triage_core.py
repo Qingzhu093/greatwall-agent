@@ -211,13 +211,14 @@ def execute_triage_core(
         ok_carrier, carrier_note = has_verifiable_carrier(conn, node)
         if not ok_carrier:
             raise FailClosedError(ERR_INVARIANT, f"LEVEL_1 送审准入拦截：{carrier_note}")
+        rev_id = next_prefixed_id(conn, "review_queue", "review_id", "rev_")
         snap_path = backup_retained_candidate_snapshot(
             workspace_root=workspace_root,
             branch_id=bid,
             worktree_abs_path=str(node["worktree_abs_path"]),
             candidate_rel_path=node["candidate_rel_path"],
+            review_id=rev_id,
         )
-        rev_id = next_prefixed_id(conn, "review_queue", "review_id", "rev_")
         with rw_immediate_tx(conn):
             conn.execute(
                 """
@@ -232,8 +233,8 @@ def execute_triage_core(
                 INSERT INTO review_queue(
                     review_id, question_id, source_node_id, source_type, proposer_session_id,
                     review_status, manuscript_title, spec_revision, column_a_snapshot_md, column_b_snapshot_md,
-                    bound_obs_ids_json, artifact_rel_path, sanitized_code_diff_md, created_at, updated_at
-                ) VALUES (?, ?, ?, 'LEVEL1_MANUSCRIPT', ?, 'STAGE1_BLIND', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    bound_obs_ids_json, artifact_rel_path, artifact_snapshot_abs_path, sanitized_code_diff_md, created_at, updated_at
+                ) VALUES (?, ?, ?, 'LEVEL1_MANUSCRIPT', ?, 'STAGE1_BLIND', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     rev_id,
@@ -246,6 +247,7 @@ def execute_triage_core(
                     str(node["column_b_hypothesis_md"] or ""),
                     str(node["bound_obs_ids_json"] or "[]"),
                     node["candidate_rel_path"],
+                    snap_path,
                     str(node["sanitized_code_diff_md"] or ""),
                     now,
                     now,

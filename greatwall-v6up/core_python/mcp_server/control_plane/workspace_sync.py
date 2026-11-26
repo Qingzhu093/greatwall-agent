@@ -496,10 +496,18 @@ def backup_retained_candidate_snapshot(
     branch_id: str,
     worktree_abs_path: str,
     candidate_rel_path: str | None = None,
+    review_id: str | None = None,
 ) -> str:
-    """将分支当前最佳候选及 `<worktree>/tools/` 物理快照备份至 `$PLUGIN_DATA/.../snapshots/<branch_id>/retained_candidate/`。"""
+    """将分支当前最佳候选及 `<worktree>/tools/` 物理快照备份至受控快照目录。
+
+    传入 `review_id` 时使用按审稿单隔离的独立不可变子目录，防止退修重投覆盖历史审稿单快照。
+    """
     paths = resolve_storage_paths(workspace_root)
-    snap_dir = paths["snapshots_dir"] / branch_id / "retained_candidate"
+    if review_id:
+        safe_rev = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(review_id).strip())
+        snap_dir = paths["snapshots_dir"] / branch_id / "reviews" / safe_rev
+    else:
+        snap_dir = paths["snapshots_dir"] / branch_id / "retained_candidate"
     if snap_dir.exists():
         shutil.rmtree(snap_dir, ignore_errors=True)
     snap_dir.mkdir(parents=True, exist_ok=True)

@@ -134,11 +134,27 @@ export class HumanTakeoverCoordinator {
       liveHandle?.agent?.cancel?.({ kind: 'hook', reason })
     } catch {}
 
-    // 2. 通过 RC5 原生 ctx.jobs 清理该会话的后台 Shell 作业（无服务时平滑降级）
-    const jobsSvc =
-      (typeof this.ctx?.get === 'function' ? this.ctx.get('jobs') : null) ||
-      (typeof this.ctx?.root?.get === 'function' ? this.ctx.root.get('jobs') : null) ||
-      this.ctx?.jobs
+    // 2. 通过 RC5 原生 ctx.jobs 清理该会话的后台 Shell 作业（无服务时平滑降级，防 Cordis Proxy 未注入抛错）
+    const safeJobs = () => {
+      try {
+        if (typeof this.ctx?.get === 'function') {
+          const s = this.ctx.get('jobs')
+          if (s) return s
+        }
+      } catch {}
+      try {
+        if (typeof this.ctx?.root?.get === 'function') {
+          const s = this.ctx.root.get('jobs')
+          if (s) return s
+        }
+      } catch {}
+      try {
+        return this.ctx?.jobs || null
+      } catch {
+        return null
+      }
+    }
+    const jobsSvc = safeJobs()
     if (jobsSvc && sessionId && typeof jobsSvc.list === 'function') {
       try {
         const list = (await jobsSvc.list(sessionId)) || []

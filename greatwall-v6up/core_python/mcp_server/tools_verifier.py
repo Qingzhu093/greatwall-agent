@@ -13,10 +13,12 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from pathlib import Path
 from typing import Any
 
 from .control_plane.blind_sandbox import stage_blind_review_sandbox
 from .control_plane.delivery_freeze import finalize_stage3_closure_on_verifier_accept
+from .control_plane.scheduler_rules import check_stage2_closure_gate_data
 from .control_plane.subproblem_locks import (
     evaluate_subproblem_locks,
     get_subproblem_active_spec_revision,
@@ -421,32 +423,77 @@ def tool_submit_stage2_unblind_verdict(
                 data={"mode": "STAGE3_FINAL_AUDIT", **closed},
             )
         rev_notes = "; ".join(str(x) for x in (revision_requests or []) if str(x).strip()) or str(abstract_md or "请修正边界表述与复现一致性")
+        returned_to_stage2 = False
+        next_closure_status = "REVISION_REQUESTED"
         with rw_immediate_tx(conn):
             closure = conn.execute("SELECT * FROM project_closure_state WHERE id = 1").fetchone()
             if closure is None or str(closure["status"]) != "DELIVERY_EXPORTED":
                 raise FailClosedError(ERR_LOCKED, "当前项目不处于 DELIVERY_EXPORTED 状态")
             if not target_did or target_did != str(closure["latest_delivery_id"] or ""):
                 raise FailClosedError(ERR_CONFLICT, f"终核退修拦截：审定版本 {target_did!r} != 当前最新版本 {closure['latest_delivery_id']!r}")
+
+            # 统一判断冻结包是否已因改题升版或撤回 L3 丧失结项资格：若失效则退回 STAGE2_EVOLVE / OPEN，避免死锁在 Stage 3
+            manifest_mode = "FULL"
+            manifest_q_revs: dict[str, int] = {}
+            frozen_raw = str(closure["frozen_delivery_dir_abs_path"] or "").strip()
+            if frozen_raw:
+                manifest_fp = Path(frozen_raw) / "delivery_manifest.json"
+                if manifest_fp.is_file():
+                    try:
+                        m_obj = json.loads(manifest_fp.read_text(encoding="utf-8"))
+                        if isinstance(m_obj, dict):
+                            if m_obj.get("delivery_mode"):
+                                manifest_mode = str(m_obj["delivery_mode"]).strip().upper()
+                            if isinstance(m_obj.get("subproblem_spec_revisions"), dict):
+                                manifest_q_revs = {str(k): int(v or 0) for k, v in m_obj["subproblem_spec_revisions"].items()}
+                    except Exception:
+                        pass
+
+            gate_now = check_stage2_closure_gate_data(
+                conn, mode=manifest_mode, human_aborted=(manifest_mode == "PARTIAL_ON_HUMAN_STOP")
+            )
+            stale_qs: list[str] = []
+            if manifest_mode == "FULL":
+                for qid_chk in gate_now.get("required_questions") or []:
+                    cur_q_rev = get_subproblem_active_spec_revision(conn, str(qid_chk))
+                    frozen_q_rev = manifest_q_revs.get(str(qid_chk), -1)
+                    if frozen_q_rev >= 0 and cur_q_rev != frozen_q_rev:
+                        stale_qs.append(f"{qid_chk}(v{frozen_q_rev}->v{cur_q_rev})")
+
+            if (not gate_now["closure_allowed"]) or stale_qs:
+                returned_to_stage2 = True
+                next_closure_status = "OPEN"
+
             cur = conn.execute(
                 """
                 UPDATE project_closure_state
-                SET status = 'REVISION_REQUESTED', verifier_final_audit_passed = 0,
+                SET status = ?, verifier_final_audit_passed = 0,
                     verifier_revision_notes = ?, updated_at = ?
                 WHERE id = 1 AND status = 'DELIVERY_EXPORTED' AND latest_delivery_id = ?
                 """,
-                (rev_notes[:2000], now, target_did),
+                (next_closure_status, rev_notes[:2000], now, target_did),
             )
             if cur.rowcount != 1:
                 raise FailClosedError(ERR_CONFLICT, f"终核退修版本冲突：{target_did!r} 状态已变更")
+            if returned_to_stage2:
+                conn.execute(
+                    "UPDATE parse0_contract SET stage = 'STAGE2_EVOLVE', updated_at = ? WHERE contract_id = 'active'",
+                    (now,),
+                )
         return build_tool_receipt(
             conn=conn,
             tool_name="submit_stage2_unblind_verdict",
             question_id="ALL",
-            next_step_guidance="终核退修已置为 REVISION_REQUESTED，派回 library_chronicler 修正并重导新版本冻结包。",
+            next_step_guidance=(
+                "检测到终核期间结项资格已因口径升版/变更失效，已退回 STAGE2_EVOLVE / OPEN 恢复探索补齐新口径成果。"
+                if returned_to_stage2
+                else "终核退修已置为 REVISION_REQUESTED，派回 library_chronicler 修正并重导新版本冻结包。"
+            ),
             data={
                 "mode": "STAGE3_FINAL_AUDIT",
                 "delivery_id": target_did,
-                "closure_status": "REVISION_REQUESTED",
+                "closure_status": next_closure_status,
+                "returned_to_stage2": returned_to_stage2,
                 "verifier_final_audit_passed": False,
                 "revision_requests": revision_requests or [rev_notes],
             },

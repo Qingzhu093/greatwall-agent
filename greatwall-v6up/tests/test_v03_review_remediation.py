@@ -501,7 +501,9 @@ class TestV03ReviewRemediation(unittest.TestCase):
             cp.finalize_stage3_closure_on_verifier_accept(self.conn, target_delivery_id=did)
         self.assertEqual(ctx.exception.code, "ERR_CONFLICT")
         cs = self.conn.execute("SELECT status, verifier_revision_notes FROM project_closure_state WHERE id = 1").fetchone()
-        self.assertEqual(cs["status"], "REVISION_REQUESTED")
+        self.assertEqual(cs["status"], "OPEN")
+        p0_stage = self.conn.execute("SELECT stage FROM parse0_contract WHERE contract_id = 'active'").fetchone()
+        self.assertEqual(p0_stage["stage"], "STAGE2_EVOLVE")
 
         with rw_immediate_tx(self.conn):
             self.conn.execute(

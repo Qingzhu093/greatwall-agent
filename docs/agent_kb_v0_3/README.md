@@ -18,6 +18,6 @@
    - [后勤工程架构论文 (`ARCH_PAPER_03`)](./ARCH_PAPER_03_后勤工程_Logistics_and_Lineage_Engineering.md)
    - [图书馆工程架构论文 (`ARCH_PAPER_04`)](./ARCH_PAPER_04_图书馆工程_Library_and_PeerReview_Engineering.md)
    - [精确 SQLite DDL、旧库迁移与契约增量](./agent_kb_v0_3_04_数据模型与旧库迁移_精确SQLite_DDL与工具契约增量.md)
-2. **工程交接与底层开发实战手册（`docs/`）**
-   - [v0.2.0-alpha.1 工程交接手册 (`handover_manual_v020.md`)](../handover_manual_v020.md)
+2. **底层开发实战手册与历史演进归档（`docs/`）**
    - [DSH 0.2.2-rc.5 工程开发实战手册 (`dsh_development_handbook.md`)](../dsh_development_handbook.md)
+   - [历史演进与设计归档馆 (`docs/archive/`，含 `handover_manual_v020.md` 与早期白皮书)](../archive/README.md)

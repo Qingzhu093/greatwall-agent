@@ -351,6 +351,14 @@ def tool_run_isolated_eval(
                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
                 dirs_exist_ok=True,
             )
+        src_inputs = Path(worktree_abs) / "inputs"
+        if src_inputs.is_dir():
+            shutil.copytree(
+                src_inputs,
+                freeze_dir / "inputs",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+                dirs_exist_ok=True,
+            )
         frozen_inst = freeze_dir / f"frozen_instrument_v{int(inst['version'])}.py"
         if inst_abs.is_file():
             shutil.copy2(inst_abs, frozen_inst)

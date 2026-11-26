@@ -319,7 +319,8 @@ export async function driveExplorerCompanionPair(
   let reflectedDone = Boolean(node.first_reflection_unlocked)
   let currentTurnSignals = expRes.turnSignals || []
   let currentNativeThresholds = expRes.nativeThresholds || []
-  let lastAccountedTokens = 0
+  // 续跑同一历史会话时，以节点已记账水位作为基线，仅增量累加本次新增 Token
+  let lastAccountedTokens = Math.max(0, Number(node.pressure_tokens || 0))
 
   const hasTrigger = (name) =>
     currentTurnSignals.some((s) => s.trigger === name) ||
@@ -444,6 +445,10 @@ export async function driveExplorerCompanionPair(
       }
     }
 
+    // 若在途回合被取消/中断，进入崩溃善后前必须复核一次控制态，避免把人类暂停接管误判为 CRASH_RECOVERY
+    if (interrupted && !(terminatedExternally || yieldedToHuman || pausedByHost)) {
+      await checkNodeControlAndStatus()
+    }
     if (terminatedExternally || yieldedToHuman || pausedByHost) return
 
     const callControl = typeof orchestrator.control === 'function'
