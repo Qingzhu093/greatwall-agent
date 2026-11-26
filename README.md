@@ -2,6 +2,8 @@
 
 [English](./README_EN.md) | **简体中文**
 
+[v0.3 实机验收与子题暂停、恢复说明](./docs/v03_runtime_acceptance.md)
+
 > **面向长周期、多学派并发自主科学发现的开源多智能体实验基座**  
 > **版本状态**：`v0.3.0-alpha.1`（整机架构大版本升级 · **Superagent `gw-chief` × 10 角色 44 窄工具 × 宏观大外环四拍 × 45% 人工接管 × 模块化三问前端** · **非开箱即用的生产工具**）  
 > **开源协议**：[Apache License 2.0](./LICENSE) + [DCO 1.1](./CONTRIBUTING.md#三许可证与-dcodeveloper-certificate-of-origin签署要求) ｜ **运行底座**：[DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) `>= 0.2.2-rc.5` × Python `3.11+` × [MCP](https://modelcontextprotocol.io)
