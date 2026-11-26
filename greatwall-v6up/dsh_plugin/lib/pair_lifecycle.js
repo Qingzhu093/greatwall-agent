@@ -10,7 +10,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { syncLivePressureToDb } from './clock_and_turn_gap.js'
+import { sampleAgentContextPressure, syncLivePressureToDb } from './clock_and_turn_gap.js'
 import { formatNodeSessionTitle } from './prompts.js'
 
 const ACTIVE_EXPLORE_STATUSES = new Set(['EXPLORING', 'ACTIVE_REVISING'])
@@ -313,11 +313,13 @@ export async function driveExplorerCompanionPair(
   let interruptReason = expRes.turnEndReason ? JSON.stringify(expRes.turnEndReason) : ''
   let terminatedExternally = false
   let yieldedToHuman = false
+  let pausedByHost = false
   let earlyHandoffAuthorized = false
   let explorerWillText = ''
   let reflectedDone = Boolean(node.first_reflection_unlocked)
   let currentTurnSignals = expRes.turnSignals || []
   let currentNativeThresholds = expRes.nativeThresholds || []
+  let lastAccountedTokens = 0
 
   const hasTrigger = (name) =>
     currentTurnSignals.some((s) => s.trigger === name) ||
@@ -329,9 +331,27 @@ export async function driveExplorerCompanionPair(
       terminatedExternally = true
       return false
     }
+    const isPaused = typeof orchestrator.isPoolPaused === 'function' ? orchestrator.isPoolPaused() : false
+    if (isPaused) {
+      pausedByHost = true
+      orchestrator.recordEvent?.('explorer_paused_by_host', { nodeId: node.node_id, reason: 'pool_paused' })
+      return false
+    }
     const controlBridge = orchestrator.bridge || (typeof orchestrator.control === 'function' ? { control: orchestrator.control } : null)
     if (!controlBridge) return true
     try {
+      const sample = sampleAgentContextPressure(orchestrator.ctx, expRes.handle?.agent, effWindow)
+      const curTokens = Math.max(0, Number(sample?.pressureTokens || 0))
+      if (qid && curTokens > lastAccountedTokens) {
+        const delta = curTokens - lastAccountedTokens
+        lastAccountedTokens = curTokens
+        await controlBridge.control('control_plane/record_subproblem_tokens', {
+          workspace_root: orchestrator.workspaceRoot,
+          question_id: qid,
+          delta_tokens: delta,
+        }).catch(() => {})
+      }
+
       const syncRes = await syncLivePressureToDb(
         orchestrator.ctx,
         expRes.handle?.agent,
@@ -344,6 +364,17 @@ export async function driveExplorerCompanionPair(
       const liveStatus = String(rowData.node_status || '')
       if (liveStatus && !ACTIVE_EXPLORE_STATUSES.has(liveStatus)) {
         terminatedExternally = true
+        return false
+      }
+      if (rowData.human_stop_active) {
+        pausedByHost = true
+        orchestrator.recordEvent?.('explorer_paused_by_host', { nodeId: node.node_id, reason: 'human_stop_active' })
+        return false
+      }
+      const subState = String(rowData.subproblem_dispatch_state || '')
+      if (subState && subState !== 'DISPATCHING') {
+        pausedByHost = true
+        orchestrator.recordEvent?.('explorer_paused_by_host', { nodeId: node.node_id, reason: `subproblem_${subState}` })
         return false
       }
       const ctrlState = String(rowData.control_state || 'AUTO_RUNNING')
@@ -413,7 +444,7 @@ export async function driveExplorerCompanionPair(
       }
     }
 
-    if (terminatedExternally || yieldedToHuman) return
+    if (terminatedExternally || yieldedToHuman || pausedByHost) return
 
     const callControl = typeof orchestrator.control === 'function'
       ? (method, params) => orchestrator.control(method, params)
@@ -454,15 +485,18 @@ export async function driveExplorerCompanionPair(
       }).catch(() => {})
     }
   } finally {
-    // 若已让权给人类对话（HUMAN_ACTIVE），保留磁盘会话且不强行归档，仅释放自动化循环托管句柄
-    const disposeStatus = yieldedToHuman ? 'yielded_to_human' : (terminatedExternally ? 'terminated_external' : (interrupted ? 'interrupted_unclaimed' : 'completed'))
-    await expRes.dispose(disposeStatus, expRes.turnEndReason, { archive: yieldedToHuman ? false : undefined }).catch(() => {})
+    // 若已让权给人类对话（HUMAN_ACTIVE）或宿主暂停，保留磁盘会话不归档，也不触发崩溃交班
+    const keepUnarchived = yieldedToHuman || pausedByHost
+    const disposeStatus = yieldedToHuman
+      ? 'yielded_to_human'
+      : (pausedByHost ? 'paused_by_host' : (terminatedExternally ? 'terminated_external' : (interrupted ? 'interrupted_unclaimed' : 'completed')))
+    await expRes.dispose(disposeStatus, expRes.turnEndReason, { archive: keepUnarchived ? false : undefined }).catch(() => {})
     if (terminatedExternally) {
       await disposeNodeCompanion(orchestrator, node.node_id, 'terminated_external')
     }
   }
 
-  if (terminatedExternally || yieldedToHuman) return
+  if (terminatedExternally || yieldedToHuman || pausedByHost) return
 
   await runHandoffWithCompanion(orchestrator, node, {
     mode: interrupted ? 'CRASH_RECOVERY' : 'HANDOFF_70',

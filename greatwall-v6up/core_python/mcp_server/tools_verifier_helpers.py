@@ -224,6 +224,38 @@ def fulfill_open_gaps_and_wake_branches(
         next_node_id = None
         if blk_node is not None:
             next_node_id = f"node_{question_id.lower()}_{uuid.uuid4().hex[:8]}"
+            # 清理已失效（被撤回 is_active=0）的旧前置，并把刚核销的新 L3 注入下代依赖与交接遗嘱
+            try:
+                old_reqs = json.loads(blk_node["requires_json"] or "[]")
+                if not isinstance(old_reqs, list):
+                    old_reqs = []
+            except Exception:
+                old_reqs = []
+            cleaned_reqs: list[str] = []
+            for req in old_reqs:
+                r_str = str(req or "").strip()
+                if not r_str:
+                    continue
+                if r_str.startswith("L3-"):
+                    l3_row = conn.execute(
+                        "SELECT is_active FROM internal_research_ledger WHERE entry_id = ? AND ledger_type = 'L3_VERIFIED'",
+                        (r_str,),
+                    ).fetchone()
+                    if l3_row is not None and int(l3_row["is_active"] or 0) == 0:
+                        continue
+                if r_str not in cleaned_reqs:
+                    cleaned_reqs.append(r_str)
+            if fulfilled_by_l3_id and fulfilled_by_l3_id not in cleaned_reqs:
+                cleaned_reqs.append(fulfilled_by_l3_id)
+
+            gap_stmt = str(gap["formal_statement_md"] or "").strip()[:300]
+            prev_will = str(blk_node["will_md"] or "").strip()
+            wake_will = (
+                f"[悬赏缺口 {gid} 已由 {fulfilled_by_l3_id} 核销唤醒]\n"
+                f"核销引理：{fulfilled_by_l3_id}（原缺口：{gap_stmt}）。请直接检索并复用 {fulfilled_by_l3_id} 继续推进。"
+                + (f"\n原节点遗嘱：{prev_will}" if prev_will else "")
+            )[:1800]
+
             conn.execute(
                 "UPDATE lineage_nodes SET node_status = 'CLOSED', updated_at = ? WHERE node_id = ?",
                 (now, blk_nid),
@@ -234,9 +266,9 @@ def fulfill_open_gaps_and_wake_branches(
                     node_id, question_id, branch_id, family_id, parent_node_id, generation, node_status,
                     worktree_abs_path, retained_snapshot_abs_path, mechanism_summary, requires_json,
                     revise_count, inplace_repair_count, last_revision_requests_json, spec_revision,
-                    branch_kind, protection_generations_left, companion_session_id,
-                    reopen_condition, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'EXPLORING', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                    branch_kind, protection_generations_left, branch_budget_nodes_left, companion_session_id,
+                    will_md, reopen_condition, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'EXPLORING', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     next_node_id,
@@ -248,13 +280,15 @@ def fulfill_open_gaps_and_wake_branches(
                     str(blk_node["worktree_abs_path"]),
                     blk_node["retained_snapshot_abs_path"],
                     str(blk_node["mechanism_summary"] or "")[:99],
-                    str(blk_node["requires_json"] or "[]"),
+                    json.dumps(cleaned_reqs, ensure_ascii=False),
                     int(blk_node["revise_count"] or 0),
                     str(blk_node["last_revision_requests_json"] or "[]"),
                     active_spec_rev,
                     str(blk_node["branch_kind"] or "PURE"),
                     max(1, int(blk_node["protection_generations_left"] or 0)),
+                    blk_node["branch_budget_nodes_left"] if "branch_budget_nodes_left" in blk_node.keys() else None,
                     f"gw-comp-{next_node_id}",
+                    wake_will,
                     f"悬赏缺口 {gid} 已由 {fulfilled_by_l3_id} 核销唤醒",
                     now,
                     now,

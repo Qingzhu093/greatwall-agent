@@ -20,11 +20,13 @@ from .control_plane_service import (
     complete_runtime_effect,
     create_control_proposal,
     evaluate_subproblem_locks,
+    get_subproblem_active_spec_revision,
     get_ui_full_inspector_payload,
     init_parse0_contract,
     inspect_public_rulings_draft_status,
     mark_node_yielded,
     mark_stage1_works_checked,
+    mark_wave_conference_failed,
     pause_node,
     record_human_chat_detected,
     record_human_stop,
@@ -38,6 +40,7 @@ from .control_plane_service import (
     set_subproblem_state,
     stage_blind_review_sandbox,
     submit_works_ticket,
+    sync_approved_public_inputs,
     sync_public_inputs_to_worktree,
     sync_public_rulings,
     sync_session_pressure,
@@ -189,10 +192,12 @@ def dispatch_control_call(
             if bool(p.get("refresh_active_worktrees", False)):
                 p0_row = conn.execute("SELECT shared_inputs_json FROM parse0_contract WHERE contract_id = 'active'").fetchone()
                 shared_rels = json.loads(p0_row["shared_inputs_json"] or "[]") if p0_row else []
-                for r in conn.execute("SELECT DISTINCT worktree_abs_path FROM lineage_nodes WHERE node_status IN ('EXPLORING','ACTIVE_REVISING')").fetchall():
+                for r in conn.execute("SELECT DISTINCT question_id, worktree_abs_path FROM lineage_nodes WHERE node_status IN ('EXPLORING','ACTIVE_REVISING')").fetchall():
                     wt = str(r["worktree_abs_path"] or "").strip()
+                    qid = str(r["question_id"] or "").strip()
                     if wt and Path(wt).is_dir():
-                        sync_public_inputs_to_worktree(eff_ws, wt, shared_rels)
+                        q_rev = get_subproblem_active_spec_revision(conn, qid) if qid else 0
+                        sync_approved_public_inputs(eff_ws, wt, shared_rels, spec_revision=q_rev, question_id=qid or None)
                         refreshed_worktrees.append(wt)
             res["refreshed_worktrees"] = refreshed_worktrees
             return {"ok": True, "data": res}
@@ -302,6 +307,16 @@ def dispatch_control_call(
 
         if method == "control_plane/open_wave_conference":
             return {"ok": True, "data": check_and_open_wave_conference(conn, question_id=str(p["question_id"]), force=bool(p.get("force", False)))}
+
+        if method == "control_plane/fail_wave_conference":
+            return {
+                "ok": True,
+                "data": mark_wave_conference_failed(
+                    conn,
+                    conference_id=str(p["conference_id"]),
+                    reason=str(p.get("reason", "WAVE_EXECUTION_FAILED")),
+                ),
+            }
 
         if method == "control_plane/claim_runtime_effects":
             res = claim_runtime_effects(

@@ -2,7 +2,8 @@
 function ThreeQuestionsView({ data, busy, onControl, getUiWorkspace }) {
   const status = data?.status || {};
   const insp = data?.inspector || {};
-  const subproblems = insp.subproblem_runtime_state || status.subproblemStates || [];
+  const rawSubs = insp.subproblem_runtime_state || status.subproblemStates || insp.subproblem_states || [];
+  const subproblems = Array.isArray(rawSubs) ? rawSubs : Object.values(rawSubs || {});
   const proposals = insp.pending_proposals || [];
   const l3List = (insp.internal_ledger || []).filter((x) => x.ledger_type === "L3_VERIFIED" && Number(x.is_active) === 1);
   const autonomyMode = status.autonomyMode || insp.snapshot?.autonomy_mode || "WAVE_CONFIRM";
@@ -53,7 +54,7 @@ function ThreeQuestionsView({ data, busy, onControl, getUiWorkspace }) {
                     jsxs("div", {
                       className: "gw-row gw-muted",
                       children: [
-                        jsx("span", { children: `波次 W${s.completed_waves || 0} · 基线 ${s.solved_entry_id || "未通关"}` }),
+                        jsx("span", { children: `波次 W${s.completed_waves || 0} · 基线 ${s.baseline_entry_id || "暂无"} · 通关 ${s.solved_entry_id || "未通关"}` }),
                         s.dispatch_state !== "CLOSED" && s.dispatch_state !== "STOPPED_SOLVED"
                           ? jsx("button", {
                               className: "gw-btn",
@@ -143,7 +144,10 @@ function ThreeQuestionsView({ data, busy, onControl, getUiWorkspace }) {
                       className: "gw-row",
                       children: [
                         jsx("strong", { className: "gw-mono", children: `${item.entry_id} (${item.question_id}/v${item.verified_spec_revision || 0})` }),
-                        jsx("span", { className: stateBadgeClass(item.goal_coverage === "FULL_GOAL" ? "STOPPED_SOLVED" : "INFO"), children: item.goal_coverage || item.l3_entry_kind })
+                        jsx("span", {
+                          className: stateBadgeClass(item.goal_coverage === "FULL_GOAL" ? "STOPPED_SOLVED" : "INFO"),
+                          children: `${item.goal_coverage || item.l3_entry_kind}${item.publish_tier === "VERIFIED_INCREMENTAL" ? " · 归档" : " · 基线"}`
+                        })
                       ]
                     }),
                     jsx("div", { children: item.title }),

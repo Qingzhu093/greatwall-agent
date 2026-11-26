@@ -108,10 +108,27 @@ export class HumanTakeoverCoordinator {
   }
 
   /**
-   * 暂停并安全让权：取消在途自动回合 + 通过 DSH 原生 `ctx.jobs` 清理该会话残留后台 Shell 作业 + 落库 `mark_node_yielded`。
+   * 暂停并安全让权：按可选 `graceSec` 有界宽限等待 -> 取消在途自动回合 -> 通过 DSH 原生 `ctx.jobs` 清理后台 Shell 作业 -> 落库 `mark_node_yielded`。
    */
-  async drainAndYieldNode({ nodeId, sessionId, liveHandle = null, keepSessionForHuman = true, reason = 'PAUSE_REQUESTED' }) {
+  async drainAndYieldNode({
+    nodeId,
+    sessionId,
+    liveHandle = null,
+    livePromise = null,
+    graceSec = 0,
+    keepSessionForHuman = true,
+    reason = 'PAUSE_REQUESTED',
+  }) {
     const killedJobIds = []
+    // 0. 若存在在途执行且指定了 graceSec > 0，先进行有界温和宽限等待（让当前短步自然落盘后再强取消）
+    const graceMs = Math.min(5000, Math.max(0, Number(graceSec || 0) * 1000))
+    if (graceMs > 0 && livePromise && typeof livePromise.then === 'function') {
+      await Promise.race([
+        Promise.resolve(livePromise).catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, graceMs)),
+      ])
+    }
+
     // 1. 尝试优雅取消当前活跃自动回合
     try {
       liveHandle?.agent?.cancel?.({ kind: 'hook', reason })

@@ -89,8 +89,14 @@ def ensure_subproblem_rows(
     st = started_at or now
     tb = total_budget if isinstance(total_budget, dict) else {}
     q_budget_map = tb.get("per_question_token_budget") if isinstance(tb.get("per_question_token_budget"), dict) else {}
-    default_q_budget = max(0, int(tb.get("question_token_budget", 0) or 0))
-    default_max_waves = max(0, int(tb.get("max_waves", 0) or 0))
+    default_q_budget = max(
+        0,
+        int(tb.get("question_token_budget", tb.get("max_tokens_per_subproblem", 0)) or 0),
+    )
+    default_max_waves = max(
+        0,
+        int(tb.get("max_waves", tb.get("max_waves_per_subproblem", 0)) or 0),
+    )
     drain_grace = max(5, int(tb.get("drain_grace_sec", 60) or 60))
 
     ensured: list[str] = []
@@ -183,10 +189,11 @@ def set_subproblem_state(
     }
 
 
-def record_subproblem_tokens(conn: sqlite3.Connection, *, question_id: str, delta_tokens: int) -> None:
+def record_subproblem_tokens(conn: sqlite3.Connection, *, question_id: str, delta_tokens: int) -> dict[str, Any] | None:
     if delta_tokens <= 0:
-        return
+        return None
     now = utc_now_iso()
+    qid = str(question_id)
     with rw_immediate_tx(conn):
         conn.execute(
             """
@@ -194,8 +201,10 @@ def record_subproblem_tokens(conn: sqlite3.Connection, *, question_id: str, delt
             SET spent_tokens = spent_tokens + ?, updated_at = ?
             WHERE question_id = ?
             """,
-            (int(delta_tokens), now, str(question_id)),
+            (int(delta_tokens), now, qid),
         )
+    # 累计 Token 后立即复核三道停工锁（确保超过 question_token_budget 即刻切 PAUSED_BLOCKED 停派）
+    return evaluate_subproblem_locks(conn, question_id=qid)
 
 
 def evaluate_subproblem_locks(

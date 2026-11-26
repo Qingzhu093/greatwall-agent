@@ -25,6 +25,7 @@ from ..db_schema import (
 )
 from .blind_sandbox import _rmtree_force, _set_tree_readonly
 from .scheduler_rules import check_stage2_closure_gate_data
+from .subproblem_locks import get_subproblem_active_spec_revision
 
 
 def compute_delivery_dir_sha256(delivery_dir: Path) -> str:
@@ -233,6 +234,41 @@ def export_stage3_deliverables_v03(
                     cur_closure = conn.execute("SELECT status FROM project_closure_state WHERE id = 1").fetchone()
                     if cur_closure is not None and str(cur_closure["status"]) == "CLOSED_VERIFIED":
                         raise FailClosedError(ERR_LOCKED, "课题已进入 CLOSED_VERIFIED 终态，禁止覆盖已锁交付包")
+                    # 写锁内再次复核结项门禁与子题最新生效口径（防导出期间并发改题）
+                    recheck_gate = check_stage2_closure_gate_data(
+                        conn, mode=mode_u, human_aborted=(mode_u == "PARTIAL_ON_HUMAN_STOP")
+                    )
+                    if not recheck_gate["closure_allowed"]:
+                        raise FailClosedError(
+                            ERR_LOCKED,
+                            f"写锁内复核结项门禁已失效 ({recheck_gate['gate_code']})，中止导出切换！",
+                        )
+                    if mode_u == "FULL":
+                        live_spec_by_q = {
+                            str(r["question_id"]): int(r["active_spec_revision"] or 0)
+                            for r in conn.execute("SELECT question_id, active_spec_revision FROM subproblem_runtime_state").fetchall()
+                        }
+                        for q_req in required_qs:
+                            req_rev = live_spec_by_q.get(q_req, 0)
+                            q_l3s = [str(x) for x in (sel_map.get(q_req) or [])]
+                            if not q_l3s:
+                                raise FailClosedError(ERR_CONFLICT, f"写锁内复核：子题 {q_req} 缺少入选 L3")
+                            ph = ",".join("?" for _ in q_l3s)
+                            ok_l3 = conn.execute(
+                                f"""
+                                SELECT 1 FROM internal_research_ledger
+                                WHERE entry_id IN ({ph}) AND question_id = ?
+                                  AND ledger_type = 'L3_VERIFIED' AND is_active = 1
+                                  AND goal_coverage = 'FULL_GOAL' AND verified_spec_revision >= ?
+                                LIMIT 1
+                                """,
+                                (*q_l3s, q_req, req_rev),
+                            ).fetchone()
+                            if ok_l3 is None:
+                                raise FailClosedError(
+                                    ERR_CONFLICT,
+                                    f"导出期间子题 {q_req} 口径已升至 v{req_rev}，原选 L3 不再满足 FULL_GOAL 资格！",
+                                )
                     had_old = delivery_dir.exists()
                     if had_old:
                         delivery_dir.rename(backup_old)
@@ -298,10 +334,25 @@ def finalize_stage3_closure_on_verifier_accept(
     if not frozen_path_raw or not Path(frozen_path_raw).is_dir():
         raise FailClosedError(ERR_LOCKED, f"外部不可变冻结目录缺失: {frozen_path_raw!r}，拒绝放行结项")
 
-    # 性能优化（裁决 3）：在进入单写者写锁前只读计算不可变冻结目录的实时 SHA-256
-    live_frozen_sha = compute_delivery_dir_sha256(Path(frozen_path_raw))
+    # 性能优化（裁决 3）：在进入单写者写锁前只读计算不可变冻结目录的实时 SHA-256 并读取交付清单
+    frozen_dir_path = Path(frozen_path_raw)
+    live_frozen_sha = compute_delivery_dir_sha256(frozen_dir_path)
+    manifest_mode = str(pre["delivery_mode"] or "FULL").strip().upper()
+    manifest_q_revs: dict[str, int] = {}
+    manifest_fp = frozen_dir_path / "delivery_manifest.json"
+    if manifest_fp.is_file():
+        try:
+            m_obj = json.loads(manifest_fp.read_text(encoding="utf-8"))
+            if isinstance(m_obj, dict):
+                if m_obj.get("delivery_mode"):
+                    manifest_mode = str(m_obj["delivery_mode"]).strip().upper()
+                if isinstance(m_obj.get("subproblem_spec_revisions"), dict):
+                    manifest_q_revs = {str(k): int(v or 0) for k, v in m_obj["subproblem_spec_revisions"].items()}
+        except Exception:
+            pass
     now = utc_now_iso()
 
+    invalidated_reason = ""
     with rw_immediate_tx(conn):
         closure = conn.execute("SELECT * FROM project_closure_state WHERE id = 1").fetchone()
         if closure is None or str(closure["status"]) != "DELIVERY_EXPORTED":
@@ -316,32 +367,63 @@ def finalize_stage3_closure_on_verifier_accept(
                 ERR_LOCKED,
                 f"防审A放B完整性硬拦截：冻结目录实时 SHA-256 ({live_frozen_sha[:12]}) != 绑定哈希 ({cur_sha[:12]})！",
             )
-        cur = conn.execute(
-            """
-            UPDATE project_closure_state
-            SET status = 'CLOSED_VERIFIED',
-                verifier_audited_delivery_id = ?,
-                verifier_audited_delivery_sha256 = ?,
-                verifier_final_audit_passed = 1,
-                supervisory_signed_at = ?,
-                updated_at = ?
-            WHERE id = 1
-              AND status = 'DELIVERY_EXPORTED'
-              AND latest_delivery_id = ?
-              AND latest_delivery_sha256 = ?
-            """,
-            (cur_did, cur_sha, now, now, cur_did, cur_sha),
-        )
-        if cur.rowcount != 1:
-            raise FailClosedError(ERR_CONFLICT, "终核落签并发状态冲突")
-        conn.execute(
-            "UPDATE parse0_contract SET stage = 'CLOSED_VERIFIED', updated_at = ? WHERE contract_id = 'active'",
-            (now,),
-        )
-        conn.execute(
-            "UPDATE subproblem_runtime_state SET desired_state = 'CLOSED', dispatch_state = 'CLOSED', updated_at = ?",
-            (now,),
-        )
+
+        # 终签写锁内复核当前结项门禁与口径版本（防止导出后改题升版或撤回 L3 仍按旧冻结包直接结项）
+        gate_now = check_stage2_closure_gate_data(conn, mode=manifest_mode)
+        if not gate_now["closure_allowed"]:
+            invalidated_reason = f"导出冻结包后结项资格已失效（{gate_now['gate_code']}），需在满足新条件后重新导出冻结包。"
+        elif manifest_mode == "FULL":
+            stale_qs: list[str] = []
+            for qid in gate_now.get("required_questions") or []:
+                cur_q_rev = get_subproblem_active_spec_revision(conn, str(qid))
+                frozen_q_rev = manifest_q_revs.get(str(qid), -1)
+                if frozen_q_rev >= 0 and cur_q_rev != frozen_q_rev:
+                    stale_qs.append(f"{qid}(v{frozen_q_rev}->v{cur_q_rev})")
+            if stale_qs:
+                invalidated_reason = f"导出冻结包后子题口径已升版（{', '.join(stale_qs)}），旧冻结包已失效，请重新导出后再终签。"
+
+        if invalidated_reason:
+            conn.execute(
+                """
+                UPDATE project_closure_state
+                SET status = 'REVISION_REQUESTED',
+                    verifier_final_audit_passed = 0,
+                    verifier_revision_notes = ?,
+                    updated_at = ?
+                WHERE id = 1 AND status = 'DELIVERY_EXPORTED' AND latest_delivery_id = ?
+                """,
+                (invalidated_reason, now, cur_did),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE project_closure_state
+                SET status = 'CLOSED_VERIFIED',
+                    verifier_audited_delivery_id = ?,
+                    verifier_audited_delivery_sha256 = ?,
+                    verifier_final_audit_passed = 1,
+                    supervisory_signed_at = ?,
+                    updated_at = ?
+                WHERE id = 1
+                  AND status = 'DELIVERY_EXPORTED'
+                  AND latest_delivery_id = ?
+                  AND latest_delivery_sha256 = ?
+                """,
+                (cur_did, cur_sha, now, now, cur_did, cur_sha),
+            )
+            if cur.rowcount != 1:
+                raise FailClosedError(ERR_CONFLICT, "终核落签并发状态冲突")
+            conn.execute(
+                "UPDATE parse0_contract SET stage = 'CLOSED_VERIFIED', updated_at = ? WHERE contract_id = 'active'",
+                (now,),
+            )
+            conn.execute(
+                "UPDATE subproblem_runtime_state SET desired_state = 'CLOSED', dispatch_state = 'CLOSED', updated_at = ?",
+                (now,),
+            )
+
+    if invalidated_reason:
+        raise FailClosedError(ERR_CONFLICT, invalidated_reason)
 
     return {
         "mode": "STAGE3_FINAL_AUDIT",

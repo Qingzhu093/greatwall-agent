@@ -172,7 +172,7 @@ def sync_public_inputs_to_worktree(
     if rulings_revision_dir and rulings_revision_dir.is_dir():
         dst_rulings = inputs_dir / "rulings"
         for fp in sorted(rulings_revision_dir.rglob("*")):
-            if not fp.is_file():
+            if not fp.is_file() or fp.name == "_manifest.json":
                 continue
             rel_sub = fp.relative_to(rulings_revision_dir)
             out_fp = dst_rulings / rel_sub
@@ -182,6 +182,73 @@ def sync_public_inputs_to_worktree(
                 mounted.append(out_fp.relative_to(tgt_base).as_posix())
             except OSError:
                 continue
+
+    return mounted
+
+
+def sync_approved_public_inputs(
+    workspace_root: str,
+    target_root: str | Path,
+    explicit_rel_paths: list[str] | None = None,
+    *,
+    spec_revision: int = 0,
+    question_id: str | None = None,
+) -> list[str]:
+    """按已批准的 `spec_revision` 与 `question_id` 装配公开材料（绝不将工作区未批准 `rulings/` 草稿或其他子题裁决混入目标目录）。"""
+    tgt_base = Path(os.path.realpath(str(target_root)))
+    if not tgt_base.is_dir():
+        return []
+
+    # 清理目标工作树旧挂载的 inputs/rulings，避免同工作树跨代残留未审批草稿或无关子题裁决
+    dst_rulings = tgt_base / "inputs" / "rulings"
+    if dst_rulings.exists():
+        shutil.rmtree(dst_rulings, ignore_errors=True)
+
+    mounted = sync_public_inputs_to_worktree(
+        workspace_root,
+        target_root,
+        explicit_rel_paths,
+        skip_live_rulings=True,
+    )
+
+    rev_num = max(0, int(spec_revision or 0))
+    if rev_num <= 0:
+        return mounted
+
+    paths = resolve_storage_paths(workspace_root, create_dirs=False)
+    rev_dir = paths["ruling_revisions_dir"] / f"v{rev_num}"
+    if not rev_dir.is_dir():
+        return mounted
+
+    manifest_files: dict[str, Any] = {}
+    manifest_fp = rev_dir / "_manifest.json"
+    if manifest_fp.is_file():
+        try:
+            m_obj = json.loads(manifest_fp.read_text(encoding="utf-8"))
+            if isinstance(m_obj, dict) and isinstance(m_obj.get("files"), dict):
+                manifest_files = m_obj["files"]
+        except Exception:
+            manifest_files = {}
+
+    q_filter = str(question_id or "").strip()
+    for fp in sorted(rev_dir.rglob("*")):
+        if not fp.is_file() or fp.name == "_manifest.json":
+            continue
+        rel_sub = fp.relative_to(rev_dir)
+        rel_posix = rel_sub.as_posix()
+        if q_filter and manifest_files:
+            meta = manifest_files.get(rel_posix)
+            if isinstance(meta, dict):
+                aff = [str(x).strip() for x in (meta.get("affected_question_ids") or []) if str(x).strip()]
+                if aff and "ALL" not in [x.upper() for x in aff] and q_filter not in aff:
+                    continue
+        out_fp = dst_rulings / rel_sub
+        out_fp.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(fp, out_fp)
+            mounted.append(out_fp.relative_to(tgt_base).as_posix())
+        except OSError:
+            continue
 
     return mounted
 

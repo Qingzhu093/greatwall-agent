@@ -219,6 +219,7 @@ def _migrate_review_queue_local_lemma_constraint(conn: sqlite3.Connection) -> No
         ("column_b_snapshot_md", "''"),
         ("bound_obs_ids_json", "'[]'"),
         ("artifact_rel_path", "NULL"),
+        ("artifact_snapshot_abs_path", "NULL"),
         ("sanitized_code_diff_md", "''"),
         ("stage1_ledger_json", "NULL"),
         ("stage1_locked_at", "NULL"),
@@ -253,6 +254,7 @@ def _migrate_review_queue_local_lemma_constraint(conn: sqlite3.Connection) -> No
                 column_b_snapshot_md TEXT NOT NULL DEFAULT '',
                 bound_obs_ids_json TEXT NOT NULL DEFAULT '[]',
                 artifact_rel_path TEXT,
+                artifact_snapshot_abs_path TEXT,
                 sanitized_code_diff_md TEXT NOT NULL DEFAULT '',
                 stage1_ledger_json TEXT,
                 stage1_locked_at TEXT,
@@ -321,6 +323,7 @@ _INCREMENTAL_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("internal_research_ledger", "publish_tier", "TEXT NOT NULL DEFAULT 'BASELINE_UPDATE'"),
     ("internal_research_ledger", "verified_spec_revision", "INTEGER NOT NULL DEFAULT 0"),
     ("project_closure_state", "frozen_delivery_dir_abs_path", "TEXT NOT NULL DEFAULT ''"),
+    ("review_queue", "artifact_snapshot_abs_path", "TEXT"),
 )
 
 
@@ -347,6 +350,22 @@ def _backfill_v03_data(conn: sqlite3.Connection) -> None:
             SET companion_session_id = 'gw-comp-' || node_id
             WHERE companion_session_id = ''
             """
+        )
+
+        # 2.5 若旧库迁移时恰好停留在 DELIVERY_EXPORTED 且缺 v0.3 外部冻结目录，自动温和切至 REVISION_REQUESTED 以便重导终签
+        conn.execute(
+            """
+            UPDATE project_closure_state
+            SET status = 'REVISION_REQUESTED',
+                verifier_final_audit_passed = 0,
+                verifier_revision_notes = CASE
+                    WHEN COALESCE(verifier_revision_notes, '') = '' THEN '由 v0.2 迁移：缺少 v0.3 外部不可变冻结目录，请由 library_chronicler 重新导出冻结包后再终签。'
+                    ELSE verifier_revision_notes
+                END,
+                updated_at = ?
+            WHERE id = 1 AND status = 'DELIVERY_EXPORTED' AND COALESCE(frozen_delivery_dir_abs_path, '') = ''
+            """,
+            (now,),
         )
 
         # 3. 从 active parse0_contract 自动回填 subproblem_runtime_state

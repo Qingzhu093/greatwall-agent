@@ -258,15 +258,27 @@ def get_ui_full_inspector_payload(
                 "preview_file_content": preview_content,
             }
 
+    sub_dict = snap.get("subproblem_states") or {}
+    sub_list = snap.get("subproblem_runtime_state")
+    if not isinstance(sub_list, list):
+        sub_list = [sub_dict[q] for q in sorted(sub_dict.keys())]
+    surveys_dict = snap.get("living_surveys") or {}
+    surveys_list = snap.get("living_surveys_list")
+    if not isinstance(surveys_list, list):
+        surveys_list = [surveys_dict[q] for q in sorted(surveys_dict.keys())]
+
     return {
         "snapshot": snap,
         "topology_health": topo,
-        "subproblem_states": snap.get("subproblem_states") or {},
+        "subproblem_states": sub_dict,
+        "subproblem_runtime_state": sub_list,
         "autonomy_mode": snap.get("autonomy_mode") or "WAVE_CONFIRM",
-        "living_surveys": snap.get("living_surveys") or {},
+        "living_surveys": surveys_dict,
+        "living_surveys_list": surveys_list,
         "pending_proposals": snap.get("pending_proposals") or [],
         "proposals": proposals,
         "wave_conferences": conferences,
+        "active_wave_conferences": snap.get("active_wave_conferences") or snap.get("active_conferences") or [],
         "open_lemma_gaps": snap.get("open_lemma_gaps") or [],
         "avoidance_radar": avoidance_radar,
         "node_interventions": interventions,

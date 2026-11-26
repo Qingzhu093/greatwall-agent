@@ -128,5 +128,11 @@ export async function dispatchStage1Step(port, snap, sig) {
     return { handled: true }
   }
 
-  return { handled: false }
+  port.recordEvent('stage1_waiting_or_circuit_broken', {
+    stage: snap.stage,
+    stage1WorksChecked: Boolean(snap.stage1_works_checked),
+    externalLiteratureCount: Number(snap.external_literature_count || 0),
+    questionsNeedingBranch: snap.questions_needing_branch || [],
+  })
+  return { handled: true, waitMs: 500 }
 }

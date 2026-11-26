@@ -148,6 +148,7 @@ def fetch_topology_raw_data(conn: sqlite3.Connection, question_filter: str = "AL
                 FROM review_queue r
                 LEFT JOIN lineage_nodes n ON n.node_id = r.source_node_id
                 WHERE r.review_status = 'CLOSED_REVISE'
+                  AND r.source_type != 'LOCAL_LEMMA_SUBMISSION'
                 ORDER BY r.updated_at DESC
                 """
             ).fetchall()
@@ -186,7 +187,9 @@ def fetch_topology_raw_data(conn: sqlite3.Connection, question_filter: str = "AL
                        n.branch_id, n.family_id, n.retained_snapshot_abs_path, n.worktree_abs_path
                 FROM review_queue r
                 LEFT JOIN lineage_nodes n ON n.node_id = r.source_node_id
-                WHERE r.review_status = 'CLOSED_REVISE' AND r.question_id = ?
+                WHERE r.review_status = 'CLOSED_REVISE'
+                  AND r.source_type != 'LOCAL_LEMMA_SUBMISSION'
+                  AND r.question_id = ?
                 ORDER BY r.updated_at DESC
                 """,
                 (qf,),

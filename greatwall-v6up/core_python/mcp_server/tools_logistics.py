@@ -22,7 +22,7 @@ from .control_plane_service import (
     get_question_order_status,
     get_subproblem_active_spec_revision,
     restore_retained_candidate_snapshot,
-    sync_public_inputs_to_worktree,
+    sync_approved_public_inputs,
     sync_public_instruments_and_skills_to_worktree,
 )
 from .db_schema import (
@@ -395,7 +395,13 @@ def tool_fork_branch(
     p0_row = conn.execute("SELECT shared_inputs_json FROM parse0_contract WHERE contract_id = 'active'").fetchone()
     shared_rels = json.loads(p0_row["shared_inputs_json"] or "[]") if p0_row else []
     active_spec_rev = get_subproblem_active_spec_revision(conn, question_id)
-    mounted_inputs = sync_public_inputs_to_worktree(workspace_root, wt_dir, shared_rels)
+    mounted_inputs = sync_approved_public_inputs(
+        workspace_root,
+        wt_dir,
+        shared_rels,
+        spec_revision=active_spec_rev,
+        question_id=question_id,
+    )
     mounted_inputs.extend(sync_public_instruments_and_skills_to_worktree(conn, workspace_root, wt_dir))
 
     cfg = load_runtime_config()

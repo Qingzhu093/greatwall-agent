@@ -173,6 +173,33 @@ def tool_record_compliance_check(
             p0 = conn.execute("SELECT * FROM parse0_contract WHERE contract_id = 'active'").fetchone()
             if p0 is None or not str(p0["human_signed_at"] or "").strip() or not str(p0["goal_and_completion_md"] or "").strip():
                 raise FailClosedError(ERR_LOCKED, "PARSE0_GATE 阻断：尚未签署包含非空目标与完成判据的 Parse 0 启动表单")
+            try:
+                declared_insts = json.loads(p0["initial_instruments_json"] or "[]")
+            except Exception:
+                declared_insts = []
+            if declared_insts:
+                if int(p0["stage1_works_checked"] or 0) != 1:
+                    raise FailClosedError(
+                        ERR_LOCKED,
+                        "PARSE0_GATE 阻断：Parse 0 声明了初始科研仪器，须待 works_engineer 完成注册并落标 stage1_works_checked=1 后方可放行！",
+                    )
+                active_ids = {
+                    str(r["instrument_id"]).strip().lower()
+                    for r in conn.execute("SELECT instrument_id FROM instruments WHERE is_active = 1").fetchall()
+                }
+                missing_ids = []
+                for item in declared_insts:
+                    raw_id = str((item.get("instrument_id") or item.get("id") or "") if isinstance(item, dict) else item).strip().lower()
+                    if not raw_id:
+                        continue
+                    cands = {raw_id, f"inst_{raw_id}", raw_id[5:] if raw_id.startswith("inst_") else raw_id}
+                    if not (cands & active_ids):
+                        missing_ids.append(raw_id)
+                if missing_ids:
+                    raise FailClosedError(
+                        ERR_LOCKED,
+                        f"PARSE0_GATE 阻断：以下声明的初始仪器尚未激活就绪，严禁提前进入 Stage 2: {missing_ids}",
+                    )
             conn.execute(
                 "UPDATE parse0_contract SET stage = 'STAGE2_EVOLVE', updated_at = ? WHERE contract_id = 'active'",
                 (now,),

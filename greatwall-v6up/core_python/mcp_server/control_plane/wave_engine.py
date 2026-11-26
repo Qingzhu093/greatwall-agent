@@ -34,7 +34,7 @@ from .proposals import create_control_proposal
 from .subproblem_locks import evaluate_subproblem_locks, get_subproblem_active_spec_revision
 from .workspace_sync import (
     restore_retained_candidate_snapshot,
-    sync_public_inputs_to_worktree,
+    sync_approved_public_inputs,
     sync_public_instruments_and_skills_to_worktree,
 )
 
@@ -205,7 +205,12 @@ def check_and_open_wave_conference(conn: sqlite3.Connection, *, question_id: str
     participants = _collect_sealed_conference_participants(conn, qid)
     # 裁决 5：已封存参会助手 < 2 名时跳过第 2 拍红蓝互辩，直入 SURVEY_REFRESHING
     init_status = "ROUND_1_CRITIQUE" if len(participants) >= 2 else "SURVEY_REFRESHING"
-    wave_no = int(qrow["completed_waves"] or 0) + 1
+    # 独立递增会议序号（与成功完成波次 completed_waves 解耦，驳回 CANCELLED/失败 FAILED 后再开会绝不撞 UNIQUE(question_id, wave_no)）
+    max_seq_row = conn.execute(
+        "SELECT COALESCE(MAX(wave_no), 0) AS max_no FROM wave_conferences WHERE question_id = ?",
+        (qid,),
+    ).fetchone()
+    wave_no = max(int(qrow["completed_waves"] or 0), int(max_seq_row["max_no"] or 0)) + 1
     conf_id = f"wc_{qid.lower()}_w{wave_no}_{uuid.uuid4().hex[:6]}"
     chair_sid = f"gw-chair-{conf_id}"
     now = utc_now_iso()
@@ -245,6 +250,7 @@ def check_and_open_wave_conference(conn: sqlite3.Connection, *, question_id: str
         )
 
     return {
+        "opened": True,
         "conference_id": conf_id,
         "question_id": qid,
         "wave_no": wave_no,
@@ -398,7 +404,7 @@ def execute_approved_wave_verdict(
                 new_nid = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
                 wt_dir = Path(os.path.realpath(workspace_root)) / "worktrees" / new_bid
                 wt_dir.mkdir(parents=True, exist_ok=True)
-                sync_public_inputs_to_worktree(workspace_root, wt_dir, shared_rels)
+                sync_approved_public_inputs(workspace_root, wt_dir, shared_rels, spec_revision=active_rev, question_id=qid)
                 sync_public_instruments_and_skills_to_worktree(conn, workspace_root, wt_dir)
                 conn.execute(
                     """
@@ -433,7 +439,7 @@ def execute_approved_wave_verdict(
                 snap_raw = str(src["retained_snapshot_abs_path"] or "").strip()
                 if snap_raw and Path(snap_raw).is_dir():
                     restore_retained_candidate_snapshot(snap_raw, str(wt_dir))
-                sync_public_inputs_to_worktree(workspace_root, wt_dir, shared_rels)
+                sync_approved_public_inputs(workspace_root, wt_dir, shared_rels, spec_revision=active_rev, question_id=qid)
                 sync_public_instruments_and_skills_to_worktree(conn, workspace_root, wt_dir)
                 conn.execute(
                     """
@@ -479,7 +485,7 @@ def execute_approved_wave_verdict(
                 if pri_snap and Path(pri_snap).is_dir():
                     restore_retained_candidate_snapshot(pri_snap, str(wt_dir))
                 donor_rel = _mount_secondary_donor_readonly(conn, secondary_node_id=sec_nid, target_worktree=wt_dir)
-                sync_public_inputs_to_worktree(workspace_root, wt_dir, shared_rels)
+                sync_approved_public_inputs(workspace_root, wt_dir, shared_rels, spec_revision=active_rev, question_id=qid)
                 sync_public_instruments_and_skills_to_worktree(conn, workspace_root, wt_dir)
                 goal_txt = str(act_obj.get("synthesis_goal_md") or act_obj.get("rationale") or "旁路双供体融合验证")
                 conn.execute(
@@ -624,7 +630,60 @@ def execute_approved_wave_verdict(
             },
         )
 
-    return {"conference_id": str(conference_id), "question_id": qid, "status": "COMPLETED", "executed": executed, "skipped": skipped}
+    # 递增 completed_waves 后立即结算停工锁（锁三 max_waves 保险丝）
+    lock_eval = evaluate_subproblem_locks(conn, question_id=qid)
+    return {
+        "conference_id": str(conference_id),
+        "question_id": qid,
+        "status": "COMPLETED",
+        "executed": executed,
+        "skipped": skipped,
+        "subproblem_lock_eval": lock_eval,
+    }
+
+
+def mark_wave_conference_failed(
+    conn: sqlite3.Connection,
+    *,
+    conference_id: str,
+    reason: str = "CIRCUIT_BREAKER_STALLED",
+) -> dict[str, Any]:
+    """将无进展/熔断的圆桌会议落库标记为 FAILED 并释放子题开会锁，同时通知 gw-chief。"""
+    conf = conn.execute("SELECT * FROM wave_conferences WHERE conference_id = ?", (str(conference_id),)).fetchone()
+    if conf is None:
+        raise FailClosedError(ERR_NOT_FOUND, f"圆桌会议 {conference_id!r} 不存在")
+    cur_status = str(conf["status"])
+    if cur_status in ("COMPLETED", "CANCELLED", "EXPIRED", "FAILED"):
+        return {"conference_id": str(conference_id), "status": cur_status, "already_terminal": True}
+    now = utc_now_iso()
+    qid = str(conf["question_id"])
+    note = str(reason or "CIRCUIT_BREAKER_STALLED")[:500]
+    with rw_immediate_tx(conn):
+        conn.execute(
+            """
+            UPDATE wave_conferences
+            SET status = 'FAILED',
+                minutes_md = CASE WHEN minutes_md = '' THEN ? ELSE minutes_md || char(10) || ? END,
+                completed_at = ?
+            WHERE conference_id = ? AND status NOT IN ('COMPLETED','CANCELLED','EXPIRED','FAILED')
+            """,
+            (f"[FAILED] {note}", f"[FAILED] {note}", now, str(conference_id)),
+        )
+        enqueue_runtime_effect(
+            conn,
+            effect_key=f"chief:wave_fail:{conference_id}",
+            kind="NOTIFY_CHIEF",
+            target_type="QUESTION",
+            target_id=qid,
+            payload={
+                "event_category": "BLOCK_ALERT",
+                "conference_id": str(conference_id),
+                "question_id": qid,
+                "reason": "WAVE_CONFERENCE_FAILED",
+                "detail": note,
+            },
+        )
+    return {"conference_id": str(conference_id), "question_id": qid, "status": "FAILED", "reason": note}
 
 
 def submit_wave_verdict_decision(

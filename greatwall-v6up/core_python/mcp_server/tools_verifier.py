@@ -626,11 +626,28 @@ def tool_submit_stage2_unblind_verdict(
         if not local_lemma:
             conn.execute("UPDATE lineage_nodes SET node_status = 'SEALED', updated_at = ? WHERE node_id = ?", (now, str(rev["source_node_id"])))
 
-        # 清零无 L3 停滞计数
-        conn.execute(
-            "UPDATE subproblem_runtime_state SET completed_nodes_since_last_l3 = 0, updated_at = ? WHERE question_id = ?",
-            (now, qid),
-        )
+        # 清零无 L3 停滞计数；若 publish_tier 为 BASELINE_UPDATE 且口径不低于子题生效口径，同步更新 baseline_entry_id
+        q_rev_row = conn.execute(
+            "SELECT active_spec_revision FROM subproblem_runtime_state WHERE question_id = ?",
+            (qid,),
+        ).fetchone()
+        active_q_rev = int(q_rev_row["active_spec_revision"] or 0) if q_rev_row else 0
+        if ptier_u == "BASELINE_UPDATE" and rev_spec >= active_q_rev:
+            conn.execute(
+                """
+                UPDATE subproblem_runtime_state
+                SET completed_nodes_since_last_l3 = 0,
+                    baseline_entry_id = ?,
+                    updated_at = ?
+                WHERE question_id = ?
+                """,
+                (entry_id, now, qid),
+            )
+        else:
+            conn.execute(
+                "UPDATE subproblem_runtime_state SET completed_nodes_since_last_l3 = 0, updated_at = ? WHERE question_id = ?",
+                (now, qid),
+            )
 
         woken_gaps = fulfill_open_gaps_and_wake_branches(
             conn, question_id=qid, fulfilled_gap_ids=fulfilled_gap_ids, fulfilled_by_l3_id=entry_id, now=now

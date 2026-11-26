@@ -117,6 +117,8 @@ export class GreatwallOrchestrator {
           nodeId: nid,
           sessionId: sid,
           liveHandle: liveEntry?.handle || null,
+          livePromise: running?.promise || null,
+          graceSec: Number(payload?.grace_sec || 0),
           keepSessionForHuman: Boolean(payload?.keep_session_for_human),
           reason: String(payload?.reason || 'DRAIN_AND_STOP_NODE'),
         })
@@ -158,6 +160,7 @@ export class GreatwallOrchestrator {
   get poolState() { return this._poolState }
   getPoolState() { return this._poolState }
   isPoolStopped() { return this._poolState === 'stopped' }
+  isPoolPaused() { return this._poolState === 'paused' }
   hasBackgroundTask() { return Boolean(this._backgroundTask) }
   getEffectiveContextWindow() { return this.host.effectiveContextWindow }
   isExplorerRunning(nodeId) { return this._runningExplorers.has(nodeId) }
@@ -404,12 +407,28 @@ export class GreatwallOrchestrator {
     return { synced: Boolean(dbRes?.ok), rulingSync: dbRes?.data || null, error: dbRes?.ok ? null : dbRes?.error }
   }
 
+  async wakeOrRestartIfIdle() {
+    if (this._poolState === 'running' && this._backgroundTask) {
+      this._wakeLoop()
+      return { woken: true, restarted: false }
+    }
+    if (this._poolState === 'idle' && !this._backgroundTask && (this._modelBinding?.ok || !this._requireExplicitModelBinding)) {
+      const res = await this.startBackground()
+      return { woken: true, restarted: Boolean(res?.started) }
+    }
+    return { woken: false, restarted: false }
+  }
+
   async humanStop(note = 'HUMAN_UI_OR_CLI_STOP', { callerSource = 'unknown' } = {}) {
     const res = await this.bridge.control('control_plane/record_human_stop', {
       workspace_root: this.workspaceRoot,
       note: String(note || 'HUMAN_UI_OR_CLI_STOP'),
     })
     this.telemetry.recordEvent('human_stop_recorded', { note, callerSource })
+    for (const running of this._runningExplorers.values()) {
+      const liveEntry = this.liveSessions.get(running.sessionId)
+      try { liveEntry?.handle?.agent?.cancel?.({ kind: 'hook', reason: 'HUMAN_STOP' }) } catch {}
+    }
     this._wakeLoop()
     return { humanStopRecorded: Boolean(res?.ok), callerSource, record: res?.data || null, status: await this.getControlStatus() }
   }
@@ -466,7 +485,9 @@ export class GreatwallOrchestrator {
       activeSessions: [...this.liveSessions.entries()].map(([sid, s]) => ({ sessionId: sid, role: s.role, questionId: s.questionId, nodeId: s.nodeId, label: s.uiLabel, startedAt: s.startedAt })),
       pendingHandoffNodes: (snapData?.pending_handoff_nodes || []).map((n) => n.node_id),
       pendingProposalsCount: (snapData?.pending_proposals || []).length,
-      subproblemStates: snapData?.subproblem_runtime_state || [],
+      subproblemStates: Array.isArray(snapData?.subproblem_runtime_state)
+        ? snapData.subproblem_runtime_state
+        : Object.values(snapData?.subproblem_states || {}),
       closureAllowed: Boolean(snapData?.closure_gate?.closure_allowed),
       snapshot: snapData,
       telemetry: this.telemetry.getSummary(),
@@ -506,15 +527,18 @@ export class GreatwallOrchestrator {
   }
 
   async _evaluateBreakerAfterTask(roleLabel, dispatchedItems, extractAfterMap) {
-    if (!dispatchedItems?.length) return
+    if (!dispatchedItems?.length) return []
     try {
       const postRes = await this.bridge.control('control_plane/schedule_snapshot', { workspace_root: this.workspaceRoot })
-      if (!postRes?.ok || !postRes?.data) return
+      if (!postRes?.ok || !postRes?.data) return []
       const evals = this._itemBreaker.evaluateBatch(dispatchedItems, extractAfterMap(postRes.data))
       for (const ev of evals) {
         if (ev.newlyBroken) this.telemetry.recordEvent('governance_item_circuit_broken', { role: roleLabel, itemKey: ev.key, stalledCount: ev.stalledCount })
       }
-    } catch {}
+      return evals
+    } catch {
+      return []
+    }
   }
 
   _syncSlotsToTelemetry(stage = '') {
@@ -580,13 +604,13 @@ export class GreatwallOrchestrator {
     } catch {}
 
     while (!sig.aborted && this._poolState !== 'stopped') {
+      // 每轮（含全局暂停态）先消费 Outbox 副作用队列，确保节点让权、新口径热通知与总控通知不被暂停卡死
+      await this.effectsConsumer.drainOnce({ limit: 12, signal: sig }).catch(() => {})
+
       if (this._poolState === 'paused') {
         await this._waitWakeOrTimeout(400)
         continue
       }
-
-      // 每轮先消费 Outbox 副作用队列（45% 暂停让权、新口径热注入、总控通知等）
-      await this.effectsConsumer.drainOnce({ limit: 12, signal: sig }).catch(() => {})
 
       const snapRes = await this.bridge.control('control_plane/schedule_snapshot', {
         workspace_root: this.workspaceRoot,
@@ -644,7 +668,20 @@ export class GreatwallOrchestrator {
       if (s2.continueImmediate) continue
 
       const hasCoolingGov = [...this._govCooldownUntil.values()].some((until) => until > Date.now())
+      const activeConfs = Array.isArray(snap.active_wave_conferences)
+        ? snap.active_wave_conferences
+        : (Array.isArray(snap.active_conferences) ? snap.active_conferences : [])
+      const hasPendingHumanWait =
+        (snap.pending_proposals || []).length > 0 ||
+        (snap.human_paused_nodes || []).length > 0 ||
+        activeConfs.some((c) => String(c?.status || '') === 'PENDING_HUMAN_APPROVAL')
+
       if (!dispatchedSomething && this._runningExplorers.size === 0 && this._runningGov.size === 0 && !hasCoolingGov) {
+        if (hasPendingHumanWait) {
+          idleStreak = 0
+          await this._waitWakeOrTimeout(1000)
+          continue
+        }
         idleStreak += 1
         if (idleStreak >= 3) break
       } else {

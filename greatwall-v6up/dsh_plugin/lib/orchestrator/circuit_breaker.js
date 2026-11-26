@@ -76,7 +76,10 @@ export function selectDispatchableExplorers(
   if (!snap || snap.human_stop_active || snap.closure_gate?.closure_allowed) return []
   const slotCap = Math.max(1, Number(slotCapOverride || snap.slot_cap || 6))
   const lockedBranches = new Set(snap.triage_locked_branches || [])
-  const subStates = new Map((snap.subproblem_runtime_state || []).map((s) => [s.question_id, s.dispatch_state]))
+  const rawSubs = Array.isArray(snap.subproblem_runtime_state)
+    ? snap.subproblem_runtime_state
+    : Object.values(snap.subproblem_states || {})
+  const subStates = new Map(rawSubs.filter((s) => s?.question_id).map((s) => [s.question_id, s.dispatch_state]))
 
   const rawReady = (snap.explorers_ready_to_run || []).filter((node) => {
     if (!node || !node.node_id) return false
@@ -163,7 +166,10 @@ export function buildReviewItemFingerprints(snap) {
 
 export function buildWaveConferenceFingerprints(snap) {
   const map = new Map()
-  for (const c of snap?.active_wave_conferences || []) {
+  const confs = Array.isArray(snap?.active_wave_conferences)
+    ? snap.active_wave_conferences
+    : (Array.isArray(snap?.active_conferences) ? snap.active_conferences : [])
+  for (const c of confs) {
     if (!c?.conference_id) continue
     map.set(`wave:${c.conference_id}`, `wave:${c.conference_id}:${c.status || ''}:${c.linked_survey_id || ''}`)
   }

@@ -53,6 +53,42 @@ export function dispatchPendingHandoffRecoveries(port, snap, sig) {
       dispatchedSomething = true
     }
   }
+
+  // 人类显式授权提前交班且已退出探索循环的节点（EARLY_HANDOFF_READY）：直接由伴随助手走 HANDOFF_70 封存收口
+  for (const enode of snap.early_handoff_nodes || []) {
+    if (!enode?.node_id || port.isExplorerRunning(enode.node_id)) continue
+    const ehKey = `early_handoff:${enode.node_id}`
+    const ehFp = `early:${enode.node_id}:${enode.control_generation || 1}:${enode.updated_at || ''}`
+    if (port.isBreakerOpen(ehKey, ehFp)) continue
+    if (port.launchGovTask(ehKey, async () => {
+      const persistedWill = String(enode.will_md || enode.explorer_will_md || '').trim()
+      await port.control('control_plane/record_pending_handoff', {
+        workspace_root: port.workspaceRoot,
+        node_id: enode.node_id,
+        mode: 'HANDOFF_70',
+        explorer_will_md: persistedWill || '（人类已从暂停接管态显式授权提前交班封存，请以工作树工件与最新正式观测收据为准）',
+        reason: 'EARLY_HANDOFF_AUTHORIZED',
+      }).catch(() => {})
+      await runHandoffWithCompanion(port, enode, {
+        mode: 'HANDOFF_70',
+        explorerWillText: persistedWill || '（人类已从暂停接管态显式授权提前交班封存）',
+        interruptReason: 'EARLY_HANDOFF_AUTHORIZED',
+        signal: sig,
+      })
+      await port.evaluateBreakerAfterTask(
+        'lineage_companion',
+        [{ key: ehKey, beforeFp: ehFp }],
+        (nextSnap) => new Map(
+          (nextSnap?.early_handoff_nodes || []).map((n) => [
+            `early_handoff:${n.node_id}`,
+            `early:${n.node_id}:${n.control_generation || 1}:${n.updated_at || ''}`,
+          ]),
+        ),
+      )
+    })) {
+      dispatchedSomething = true
+    }
+  }
   return dispatchedSomething
 }
 
@@ -200,7 +236,10 @@ export async function dispatchStage2Step(port, snap, sig, maxConcurrentWorkers =
 
   // 6) 宏观大外环四拍脉冲推进（ROUND_1 -> ROUND_2 -> SURVEY_REFRESHING -> ADJUDICATING）
   const waveFpMap = buildWaveConferenceFingerprints(snap)
-  for (const conf of snap.active_wave_conferences || []) {
+  const activeWaves = Array.isArray(snap.active_wave_conferences)
+    ? snap.active_wave_conferences
+    : (Array.isArray(snap.active_conferences) ? snap.active_conferences : [])
+  for (const conf of activeWaves) {
     if (!conf?.conference_id) continue
     if (!['ROUND_1_CRITIQUE', 'ROUND_2_REBUTTAL', 'SURVEY_REFRESHING', 'ADJUDICATING'].includes(String(conf.status || ''))) {
       continue
@@ -210,7 +249,14 @@ export async function dispatchStage2Step(port, snap, sig, maxConcurrentWorkers =
     if (port.isBreakerOpen(wKey, wFp)) continue
     if (port.launchGovTask(wKey, async () => {
       await port.advanceWaveConference(conf, sig)
-      await port.evaluateBreakerAfterTask('conference_chair', [{ key: wKey, beforeFp: wFp }], buildWaveConferenceFingerprints)
+      const evals = await port.evaluateBreakerAfterTask('conference_chair', [{ key: wKey, beforeFp: wFp }], buildWaveConferenceFingerprints)
+      if (Array.isArray(evals) && evals.some((ev) => ev?.key === wKey && ev?.newlyBroken)) {
+        await port.control('control_plane/fail_wave_conference', {
+          workspace_root: port.workspaceRoot,
+          conference_id: conf.conference_id,
+          reason: `WAVE_STALLED_CIRCUIT_BROKEN:${conf.status}`,
+        }).catch(() => {})
+      }
     })) {
       dispatchedSomething = true
     }

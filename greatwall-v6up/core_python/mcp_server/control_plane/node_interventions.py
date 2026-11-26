@@ -27,6 +27,26 @@ def _compute_live_artifact_hashes(conn: sqlite3.Connection, node: sqlite3.Row) -
     wt_abs = str(node["worktree_abs_path"] or "").strip()
     cand_rel = str(node["candidate_rel_path"] or "").strip()
 
+    last_obs = conn.execute(
+        """
+        SELECT obs_id, candidate_entry_sha256, tools_dir_sha256, obs_status, spec_json
+        FROM observations
+        WHERE node_id = ?
+          AND obs_status IN ('VALID_PASS', 'MEASURED_REJECTION', 'VALID_UNDECIDED')
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        (str(node["node_id"]),),
+    ).fetchone()
+
+    # 若节点尚未交班填 candidate_rel_path，回退读取最近有效观测记录的 _artifact_rel_path
+    if not cand_rel and last_obs is not None:
+        try:
+            obs_spec = json.loads(last_obs["spec_json"] or "{}")
+            if isinstance(obs_spec, dict) and obs_spec.get("_artifact_rel_path"):
+                cand_rel = str(obs_spec["_artifact_rel_path"]).strip()
+        except Exception:
+            pass
+
     curr_cand_sha = ""
     curr_tools_sha = ""
     if wt_abs and Path(wt_abs).is_dir():
@@ -39,23 +59,14 @@ def _compute_live_artifact_hashes(conn: sqlite3.Connection, node: sqlite3.Row) -
                 curr_cand_sha = ""
         curr_tools_sha = compute_recursive_dir_sha256(Path(wt_abs) / "tools")
 
-    last_obs = conn.execute(
-        """
-        SELECT obs_id, candidate_entry_sha256, tools_dir_sha256, obs_status
-        FROM observations
-        WHERE node_id = ?
-          AND obs_status IN ('VALID_PASS', 'MEASURED_REJECTION', 'VALID_UNDECIDED')
-        ORDER BY created_at DESC LIMIT 1
-        """,
-        (str(node["node_id"]),),
-    ).fetchone()
-
     prev_cand_sha = str(last_obs["candidate_entry_sha256"] if last_obs else (node["last_reconciled_candidate_sha256"] or ""))
     prev_tools_sha = str(last_obs["tools_dir_sha256"] if last_obs else (node["last_reconciled_tools_sha256"] or ""))
 
     dirty = False
     if last_obs is not None:
-        if (curr_cand_sha and curr_cand_sha != prev_cand_sha) or (curr_tools_sha and curr_tools_sha != prev_tools_sha):
+        cand_mismatch = bool(prev_cand_sha) and (curr_cand_sha != prev_cand_sha)
+        tools_mismatch = bool(prev_tools_sha) and (curr_tools_sha != prev_tools_sha)
+        if cand_mismatch or tools_mismatch:
             dirty = True
     elif prev_cand_sha or prev_tools_sha:
         if curr_cand_sha != prev_cand_sha or curr_tools_sha != prev_tools_sha:
@@ -63,6 +74,7 @@ def _compute_live_artifact_hashes(conn: sqlite3.Connection, node: sqlite3.Row) -
 
     return {
         "last_valid_obs_id": str(last_obs["obs_id"]) if last_obs else None,
+        "resolved_candidate_rel_path": cand_rel,
         "prev_candidate_sha256": prev_cand_sha,
         "curr_candidate_sha256": curr_cand_sha,
         "prev_tools_sha256": prev_tools_sha,

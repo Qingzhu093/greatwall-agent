@@ -542,6 +542,11 @@ def schedule_control_plane_snapshot(
 
     stop_new_dispatch = bool(human_stop_active or closure_gate.get("closure_allowed"))
 
+    subproblem_runtime_list = [subproblem_states[q] for q in sorted(subproblem_states.keys())]
+    living_surveys_dict = v03_q["living_surveys"]
+    living_surveys_list = [living_surveys_dict[q] for q in sorted(living_surveys_dict.keys())]
+    active_confs = v03_q["active_conferences"]
+
     return {
         "initialized": True,
         "stage": stage,
@@ -558,6 +563,7 @@ def schedule_control_plane_snapshot(
         "shared_inputs_rel_paths": shared_inputs,
         "question_order_status": order_status,
         "subproblem_states": subproblem_states,
+        "subproblem_runtime_state": subproblem_runtime_list,
         "questions_needing_branch": questions_needing_branch,
         "understaffed_questions": [] if stop_new_dispatch else understaffed_questions,
         "orphaned_blind_review_revisions": [] if stop_new_dispatch else orphaned_revisions,
@@ -584,9 +590,11 @@ def schedule_control_plane_snapshot(
         "explorers_ready_to_run": [] if stop_new_dispatch else ready_to_run[:slot_cap],
         "blocked_by_requires_nodes": blocked_by_requires,
         "pending_proposals": v03_q["pending_proposals"],
-        "active_conferences": v03_q["active_conferences"],
+        "active_conferences": active_confs,
+        "active_wave_conferences": active_confs,
         "open_lemma_gaps": v03_q["open_lemma_gaps"],
-        "living_surveys": v03_q["living_surveys"],
+        "living_surveys": living_surveys_dict,
+        "living_surveys_list": living_surveys_list,
         "pending_effects_count": v03_q["pending_effects_count"],
         "human_stop_active": human_stop_active,
         "closure_state": closure_state,
@@ -618,6 +626,7 @@ def uninitialized_schedule_snapshot(max_concurrent_workers: int | None = None) -
         "shared_inputs_rel_paths": [],
         "question_order_status": {},
         "subproblem_states": {},
+        "subproblem_runtime_state": [],
         "questions_needing_branch": [],
         "understaffed_questions": [],
         "orphaned_blind_review_revisions": [],
@@ -645,8 +654,10 @@ def uninitialized_schedule_snapshot(max_concurrent_workers: int | None = None) -
         "blocked_by_requires_nodes": [],
         "pending_proposals": [],
         "active_conferences": [],
+        "active_wave_conferences": [],
         "open_lemma_gaps": [],
         "living_surveys": {},
+        "living_surveys_list": [],
         "pending_effects_count": 0,
         "human_stop_active": False,
         "closure_state": {"status": "OPEN"},

@@ -16,12 +16,14 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from ..evaluators.isolated_runner import compute_recursive_dir_sha256, sha256_file
 from .control_plane_service import (
     backup_retained_candidate_snapshot,
     check_and_open_wave_conference,
     evaluate_subproblem_locks,
     extract_sanitized_code_diff_md,
     get_subproblem_active_spec_revision,
+    safe_resolve_in_worktree,
 )
 from .db_schema import (
     ALLOWED_COMPANION_MODES,
@@ -579,12 +581,65 @@ def tool_submit_node_handoff(
         raise FailClosedError(ERR_INVALID_INPUT, f"交接手记总字数超限：{len(col_a) + len(col_b) + len(will)} > {max_handoff} 字")
 
     clean_obs_ids = [str(o).strip() for o in (obs_ids or []) if str(o).strip()]
+    bound_obs_rows: list[sqlite3.Row] = []
     for oid in clean_obs_ids:
-        row = conn.execute("SELECT obs_id, node_id FROM observations WHERE obs_id = ?", (oid,)).fetchone()
+        row = conn.execute(
+            "SELECT obs_id, node_id, tier, obs_status, candidate_entry_sha256, tools_dir_sha256 FROM observations WHERE obs_id = ?",
+            (oid,),
+        ).fetchone()
         if row is None or str(row["node_id"]) != node_id:
             raise FailClosedError(ERR_NOT_FOUND, f"声明绑定的正式观测 {oid!r} 不存在或不属于节点 {node_id!r}")
+        bound_obs_rows.append(row)
     if grade == "MEASURED" and not clean_obs_ids:
         raise FailClosedError(ERR_INVALID_INPUT, "evidence_grade='MEASURED' 时必须绑定至少 1 条真实 [Obs###]")
+
+    # 人工改码/脏工件防错绑旧收据校验（问题 #12）
+    if bound_obs_rows:
+        wt_abs = str(node["worktree_abs_path"] or "").strip()
+        eff_cand_rel = str(candidate_rel_path or node["candidate_rel_path"] or "").strip()
+        curr_cand_sha = ""
+        curr_tools_sha = ""
+        if wt_abs and Path(wt_abs).is_dir():
+            if eff_cand_rel:
+                try:
+                    cfp = safe_resolve_in_worktree(wt_abs, eff_cand_rel)
+                    if cfp.is_file():
+                        curr_cand_sha = sha256_file(cfp)
+                except FailClosedError:
+                    curr_cand_sha = ""
+            curr_tools_sha = compute_recursive_dir_sha256(Path(wt_abs) / "tools")
+
+        if int(node["artifact_dirty_since_last_obs"] or 0) == 1:
+            raise FailClosedError(
+                ERR_LOCKED,
+                "节点自人工改码后存在未对账变更（artifact_dirty_since_last_obs=1），禁止绑定改码前旧观测收据交班；请先重跑 run_isolated_eval(tier='official') 获取新版本收据！",
+            )
+        valid_official_rows = [
+            r
+            for r in bound_obs_rows
+            if str(r["tier"]) in ("official", "heavy")
+            and str(r["obs_status"]) in ("VALID_PASS", "MEASURED_REJECTION", "VALID_UNDECIDED")
+        ]
+        if valid_official_rows and curr_cand_sha:
+            any_cand_match = any(
+                (not str(r["candidate_entry_sha256"] or "")) or str(r["candidate_entry_sha256"]) == curr_cand_sha
+                for r in valid_official_rows
+            )
+            if not any_cand_match:
+                raise FailClosedError(
+                    ERR_LOCKED,
+                    f"候选文件 {eff_cand_rel!r} 当前 SHA-256 与声明绑定的所有正式观测收据均不一致（疑似改码后未重评），拒绝交班！",
+                )
+        if valid_official_rows and curr_tools_sha:
+            any_tools_match = any(
+                (not str(r["tools_dir_sha256"] or "")) or str(r["tools_dir_sha256"]) == curr_tools_sha
+                for r in valid_official_rows
+            )
+            if not any_tools_match:
+                raise FailClosedError(
+                    ERR_LOCKED,
+                    "当前工作树 tools/ 目录 SHA-256 与声明绑定的所有正式观测收据均不一致（疑似改码后未重评），拒绝交班！",
+                )
 
     clean_dead_ends: list[dict[str, Any]] = []
     for idx, de in enumerate(dead_ends or []):
@@ -633,13 +688,13 @@ def tool_submit_node_handoff(
         previous_snapshot_abs_path=node["retained_snapshot_abs_path"],
     )
 
-    lemma_snap_path: str | None = None
-    if clean_lemmas:
-        lemma_snap_path = backup_retained_candidate_snapshot(
+    # 为每条拆交的局部引理分别建不可覆盖的独立物理快照，绝不覆盖原分支主快照
+    for idx, lm in enumerate(clean_lemmas):
+        lm["snapshot_abs_path"] = backup_retained_candidate_snapshot(
             workspace_root=workspace_root,
-            branch_id=f"{branch_id}_lemma",
+            branch_id=f"lemma_{node_id}_{idx}_{uuid.uuid4().hex[:6]}",
             worktree_abs_path=str(node["worktree_abs_path"]),
-            candidate_rel_path=candidate_rel_path,
+            candidate_rel_path=lm["artifact_rel_path"] or candidate_rel_path,
         )
 
     inserted_dead_end_ids: list[str] = []
@@ -659,7 +714,6 @@ def tool_submit_node_handoff(
                 sanitized_code_diff_md = ?,
                 candidate_rel_path = ?,
                 bound_obs_ids_json = ?,
-                retained_snapshot_abs_path = COALESCE(?, retained_snapshot_abs_path),
                 pending_handoff_mode = NULL,
                 pending_handoff_reason = '',
                 briefing_sealed_at = ?,
@@ -675,7 +729,6 @@ def tool_submit_node_handoff(
                 sanitized_diff,
                 candidate_rel_path,
                 json.dumps(clean_obs_ids, ensure_ascii=False),
-                lemma_snap_path,
                 now,
                 now,
                 node_id,
@@ -711,8 +764,8 @@ def tool_submit_node_handoff(
                 INSERT INTO review_queue(
                     review_id, question_id, source_node_id, source_type, proposer_session_id,
                     review_status, manuscript_title, spec_revision, column_a_snapshot_md, column_b_snapshot_md,
-                    bound_obs_ids_json, artifact_rel_path, sanitized_code_diff_md, created_at, updated_at
-                ) VALUES (?, ?, ?, 'LOCAL_LEMMA_SUBMISSION', ?, 'STAGE1_BLIND', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    bound_obs_ids_json, artifact_rel_path, artifact_snapshot_abs_path, sanitized_code_diff_md, created_at, updated_at
+                ) VALUES (?, ?, ?, 'LOCAL_LEMMA_SUBMISSION', ?, 'STAGE1_BLIND', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     lrev_id,
@@ -725,6 +778,7 @@ def tool_submit_node_handoff(
                     lm["column_b"],
                     json.dumps(lm["bound_obs_ids"], ensure_ascii=False),
                     lm["artifact_rel_path"],
+                    lm["snapshot_abs_path"],
                     sanitized_diff,
                     now,
                     now,

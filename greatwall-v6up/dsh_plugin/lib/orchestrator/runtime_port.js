@@ -34,6 +34,7 @@ export function buildDispatchRuntimePort(orch) {
     bridge: orch.bridge,
     slotAllocator: orch.slotAllocator,
     isPoolStopped: () => orch.isPoolStopped(),
+    isPoolPaused: () => orch.isPoolPaused(),
     getEffectiveContextWindow: () => orch.getEffectiveContextWindow(),
     isExplorerRunning: (nodeId) => orch.isExplorerRunning(nodeId),
     getRunningExplorerCount: () => orch.getRunningExplorerCount(),

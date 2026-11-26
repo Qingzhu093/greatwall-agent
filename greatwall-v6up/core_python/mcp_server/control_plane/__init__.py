@@ -66,6 +66,7 @@ from .wave_engine import (
     build_wave_hard_ledger,
     check_and_open_wave_conference,
     execute_approved_wave_verdict,
+    mark_wave_conference_failed,
     submit_wave_verdict_decision,
 )
 from .workspace_sync import (
@@ -76,6 +77,7 @@ from .workspace_sync import (
     restore_retained_candidate_snapshot,
     safe_resolve_in_worktree,
     scan_worktree_tools_manifest,
+    sync_approved_public_inputs,
     sync_public_inputs_to_worktree,
     sync_public_instruments_and_skills_to_worktree,
     sync_public_instruments_to_all_active_worktrees,
@@ -119,6 +121,7 @@ __all__ = [
     "inspect_public_rulings_draft_status",
     "mark_node_yielded",
     "mark_stage1_works_checked",
+    "mark_wave_conference_failed",
     "pause_node",
     "record_human_chat_detected",
     "record_human_stop",
@@ -136,6 +139,7 @@ __all__ = [
     "stage_blind_review_sandbox",
     "submit_wave_verdict_decision",
     "submit_works_ticket",
+    "sync_approved_public_inputs",
     "sync_public_inputs_to_worktree",
     "sync_public_instruments_and_skills_to_worktree",
     "sync_public_instruments_to_all_active_worktrees",

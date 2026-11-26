@@ -295,6 +295,7 @@ CREATE TABLE IF NOT EXISTS review_queue (
     column_b_snapshot_md TEXT NOT NULL DEFAULT '',
     bound_obs_ids_json TEXT NOT NULL DEFAULT '[]',
     artifact_rel_path TEXT,
+    artifact_snapshot_abs_path TEXT,
     sanitized_code_diff_md TEXT NOT NULL DEFAULT '',
     stage1_ledger_json TEXT,
     stage1_locked_at TEXT,

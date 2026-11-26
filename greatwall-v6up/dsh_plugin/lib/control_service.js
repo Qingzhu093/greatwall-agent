@@ -295,7 +295,13 @@ export class GreatwallControlService {
       return { ok: Boolean(res?.synced), action: act, callerSource: caller, ...res }
     }
     if (act === 'status') {
-      return { ok: true, action: act, callerSource: caller, ...(await ctrl.orchestrator.getControlStatus()) }
+      return {
+        ok: true,
+        action: act,
+        callerSource: caller,
+        chiefPendingNotificationsCount: this.chiefInbox.peekCount(),
+        ...(await ctrl.orchestrator.getControlStatus()),
+      }
     }
 
     // === v0.3 新增 human_ui 专享高危与人工接管控制动作 ===
@@ -306,7 +312,7 @@ export class GreatwallControlService {
         decision: String(payload.decision || 'APPROVE'),
         approved_by_source: String(payload.approved_by_source || 'human_ui'),
       })
-      if (res?.ok) ctrl.orchestrator._wakeLoop?.()
+      if (res?.ok) await ctrl.orchestrator.wakeOrRestartIfIdle?.()
       return { ok: Boolean(res?.ok), action: act, callerSource: caller, data: res?.data || null, error: res?.ok ? null : res?.error }
     }
     if (act === 'pause_node') {
@@ -326,7 +332,7 @@ export class GreatwallControlService {
         actor_source: 'human_ui',
         cross_branch_note: String(payload.cross_branch_note ?? payload.note ?? ''),
       })
-      if (res?.ok) ctrl.orchestrator._wakeLoop?.()
+      if (res?.ok) await ctrl.orchestrator.wakeOrRestartIfIdle?.()
       return { ok: Boolean(res?.ok), action: act, callerSource: caller, data: res?.data || null, error: res?.ok ? null : res?.error }
     }
     if (act === 'authorize_early_handoff') {
@@ -337,7 +343,7 @@ export class GreatwallControlService {
         reason: String(payload.reason || 'HUMAN_UI_EARLY_HANDOFF'),
         cross_branch_note: String(payload.cross_branch_note ?? ''),
       })
-      if (res?.ok) ctrl.orchestrator._wakeLoop?.()
+      if (res?.ok) await ctrl.orchestrator.wakeOrRestartIfIdle?.()
       return { ok: Boolean(res?.ok), action: act, callerSource: caller, data: res?.data || null, error: res?.ok ? null : res?.error }
     }
     if (act === 'set_subproblem_state') {
@@ -348,7 +354,7 @@ export class GreatwallControlService {
         actor_source: 'human_ui',
         reason: String(payload.reason || 'HUMAN_UI_SUBPROBLEM_TOGGLE'),
       })
-      if (res?.ok) ctrl.orchestrator._wakeLoop?.()
+      if (res?.ok) await ctrl.orchestrator.wakeOrRestartIfIdle?.()
       return { ok: Boolean(res?.ok), action: act, callerSource: caller, data: res?.data || null, error: res?.ok ? null : res?.error }
     }
     if (act === 'set_autonomy_mode') {
@@ -364,8 +370,16 @@ export class GreatwallControlService {
       const chiefRes = await ensureChiefSession(ctrl, {
         prompt: String(payload.prompt || ''),
         hardCapChars: this.config.chiefAnchorHardCapChars || 1200,
+        chiefInbox: this.chiefInbox,
       })
-      return { ok: true, action: act, callerSource: caller, sessionId: chiefRes.sessionId, lastAssistantText: chiefRes.lastAssistantText }
+      return {
+        ok: true,
+        action: act,
+        callerSource: caller,
+        sessionId: chiefRes.sessionId,
+        lastAssistantText: chiefRes.lastAssistantText,
+        drainedEventsCount: chiefRes.drainedEventsCount,
+      }
     }
 
     return { ok: false, action: act, callerSource: caller, error: `未知 action: ${act}` }

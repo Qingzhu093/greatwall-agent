@@ -15,7 +15,7 @@ from .control_plane_service import (
     evaluate_subproblem_locks,
     get_subproblem_active_spec_revision,
     restore_retained_candidate_snapshot,
-    sync_public_inputs_to_worktree,
+    sync_approved_public_inputs,
     sync_public_instruments_and_skills_to_worktree,
 )
 from .db_schema import (
@@ -197,6 +197,9 @@ def execute_triage_core(
     cur_prot_left = max(0, int(node["protection_generations_left"] or 0))
     next_prot_left = max(0, cur_prot_left - 1)
     branch_kind = str(node["branch_kind"] or "PURE")
+    raw_budget = node["branch_budget_nodes_left"] if "branch_budget_nodes_left" in node.keys() else None
+    has_node_budget = raw_budget is not None
+    next_budget_left = max(0, int(raw_budget) - 1) if has_node_budget else None
 
     # 前置依赖 L3 已被撤回时，自然交接自动转 LEVEL_4B 暂停
     if int(node["premise_revoked"] or 0) == 1 and lvl not in ("LEVEL_4A", "LEVEL_4B"):
@@ -360,9 +363,28 @@ def execute_triage_core(
             if int(rem_in_orig["cnt"] or 0) == 0:
                 eff_repair_fid = orig_fid
 
+        if has_node_budget and int(next_budget_left or 0) <= 0:
+            with rw_immediate_tx(conn):
+                conn.execute(
+                    "UPDATE lineage_nodes SET family_id = ?, node_status = 'SEALED', branch_budget_nodes_left = 0, updated_at = ? WHERE node_id = ?",
+                    (eff_repair_fid, now, node_id),
+                )
+            return {
+                "question_id": qid,
+                "node_id": node_id,
+                "guidance": f"分支 {bid} ({branch_kind}) 班次预算配额已耗尽，停止原地续班并已封存 {node_id}。",
+                "data": {"closed_node_id": node_id, "next_node_id": None, "budget_exhausted": True, "node_status": "SEALED"},
+            }
+
         if node["retained_snapshot_abs_path"]:
             restore_retained_candidate_snapshot(str(node["retained_snapshot_abs_path"]), str(node["worktree_abs_path"]))
-        sync_public_inputs_to_worktree(workspace_root, str(node["worktree_abs_path"]), shared_rels)
+        sync_approved_public_inputs(
+            workspace_root,
+            str(node["worktree_abs_path"]),
+            shared_rels,
+            spec_revision=active_q_spec_rev,
+            question_id=qid,
+        )
         sync_public_instruments_and_skills_to_worktree(conn, workspace_root, str(node["worktree_abs_path"]))
 
         next_node_id = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
@@ -387,9 +409,9 @@ def execute_triage_core(
                     node_id, question_id, branch_id, family_id, parent_node_id, generation, node_status,
                     worktree_abs_path, retained_snapshot_abs_path, requires_json, revise_count,
                     inplace_repair_count, last_revision_requests_json, spec_revision,
-                    branch_kind, protection_generations_left, companion_session_id,
+                    branch_kind, protection_generations_left, branch_budget_nodes_left, companion_session_id,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'EXPLORING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, 'EXPLORING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     next_node_id,
@@ -407,6 +429,7 @@ def execute_triage_core(
                     active_q_spec_rev,
                     branch_kind,
                     next_prot_left,
+                    next_budget_left,
                     f"gw-comp-{next_node_id}",
                     now,
                     now,
@@ -435,7 +458,7 @@ def execute_triage_core(
             candidate_rel_path=node["candidate_rel_path"],
         )
         restore_retained_candidate_snapshot(snap_path, str(prot_wt))
-        sync_public_inputs_to_worktree(workspace_root, prot_wt, shared_rels)
+        sync_approved_public_inputs(workspace_root, prot_wt, shared_rels, spec_revision=active_q_spec_rev, question_id=qid)
         sync_public_instruments_and_skills_to_worktree(conn, workspace_root, prot_wt)
         prot_nid = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
         default_prot = int(cfg.get("default_protection_generations", 2))
@@ -483,7 +506,27 @@ def execute_triage_core(
         worktree_abs_path=str(node["worktree_abs_path"]),
         candidate_rel_path=node["candidate_rel_path"],
     )
-    sync_public_inputs_to_worktree(workspace_root, str(node["worktree_abs_path"]), shared_rels)
+    if has_node_budget and int(next_budget_left or 0) <= 0:
+        with rw_immediate_tx(conn):
+            conn.execute(
+                "UPDATE lineage_nodes SET family_id = ?, node_status = 'SEALED', retained_snapshot_abs_path = ?, branch_budget_nodes_left = 0, updated_at = ? WHERE node_id = ?",
+                (fid, snap_path, now, node_id),
+            )
+            conn.execute("UPDATE parse0_contract SET consecutive_non_l1_handoffs = consecutive_non_l1_handoffs + 1, updated_at = ? WHERE contract_id = 'active'", (now,))
+        return {
+            "question_id": qid,
+            "node_id": node_id,
+            "guidance": f"分支 {bid} ({branch_kind}) 班次预算配额已耗尽，已刷新快照并封存收口 {node_id}（如需保留请经下一轮圆桌显式立项）。",
+            "data": {"closed_node_id": node_id, "next_node_id": None, "budget_exhausted": True, "retained_snapshot_abs_path": snap_path},
+        }
+
+    sync_approved_public_inputs(
+        workspace_root,
+        str(node["worktree_abs_path"]),
+        shared_rels,
+        spec_revision=active_q_spec_rev,
+        question_id=qid,
+    )
     sync_public_instruments_and_skills_to_worktree(conn, workspace_root, str(node["worktree_abs_path"]))
     next_node_id = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
     with rw_immediate_tx(conn):
@@ -497,9 +540,9 @@ def execute_triage_core(
                 node_id, question_id, branch_id, family_id, parent_node_id, generation, node_status,
                 worktree_abs_path, retained_snapshot_abs_path, requires_json, revise_count,
                 inplace_repair_count, last_revision_requests_json, spec_revision,
-                branch_kind, protection_generations_left, companion_session_id,
+                branch_kind, protection_generations_left, branch_budget_nodes_left, companion_session_id,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'EXPLORING', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, 'EXPLORING', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 next_node_id,
@@ -516,6 +559,7 @@ def execute_triage_core(
                 active_q_spec_rev,
                 branch_kind,
                 next_prot_left,
+                next_budget_left,
                 f"gw-comp-{next_node_id}",
                 now,
                 now,

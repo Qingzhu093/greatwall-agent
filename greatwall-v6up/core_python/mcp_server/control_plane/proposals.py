@@ -33,7 +33,10 @@ from .effects_outbox import enqueue_runtime_effect
 from .lifecycle_ops import record_human_stop, submit_works_ticket
 from .node_interventions import authorize_early_handoff
 from .subproblem_locks import find_latest_spec_full_goal_l3, set_subproblem_state
-from .workspace_sync import sync_public_inputs_to_worktree, sync_public_instruments_and_skills_to_worktree
+from .workspace_sync import (
+    sync_approved_public_inputs,
+    sync_public_instruments_and_skills_to_worktree,
+)
 
 
 def set_autonomy_mode(
@@ -154,18 +157,51 @@ def apply_approved_ruling_amendment(
     header = f"# 补充裁决 v{new_rev}（受影响子题：{', '.join(target_qs)}）\n\n生效时间：{now}\n\n"
     ruling_file.write_text(header + clean_md + "\n", encoding="utf-8")
 
-    # 冻结版本目录到外部受控目录
+    # 冻结受控版本目录（仅继承上一受控已批准版本 + 本次新批准裁决，严禁扫入工作区未批准草稿）
     paths = resolve_storage_paths(workspace_root)
     rev_snap_dir = paths["ruling_revisions_dir"] / f"v{new_rev}"
     if rev_snap_dir.exists():
         shutil.rmtree(rev_snap_dir, ignore_errors=True)
     rev_snap_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_files: dict[str, Any] = {}
+    if new_rev > 1:
+        prev_snap_dir = paths["ruling_revisions_dir"] / f"v{new_rev - 1}"
+        if prev_snap_dir.is_dir():
+            prev_manifest_fp = prev_snap_dir / "_manifest.json"
+            if prev_manifest_fp.is_file():
+                try:
+                    pm = json.loads(prev_manifest_fp.read_text(encoding="utf-8"))
+                    if isinstance(pm, dict) and isinstance(pm.get("files"), dict):
+                        manifest_files.update(pm["files"])
+                except Exception:
+                    pass
+            for fp in sorted(p for p in prev_snap_dir.rglob("*") if p.is_file() and p.name != "_manifest.json"):
+                rel = fp.relative_to(prev_snap_dir)
+                dst = rev_snap_dir / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(fp, dst)
+
+    dst_new_ruling = rev_snap_dir / ruling_filename
+    dst_new_ruling.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ruling_file, dst_new_ruling)
+    manifest_files[ruling_filename] = {
+        "spec_revision": new_rev,
+        "affected_question_ids": list(target_qs),
+        "created_at": now,
+    }
+    (rev_snap_dir / "_manifest.json").write_text(
+        json.dumps(
+            {"spec_revision": new_rev, "affected_question_ids": list(target_qs), "files": manifest_files},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
     h = hashlib.sha256()
-    for fp in sorted(p for p in rulings_dir.rglob("*") if p.is_file()):
-        rel = fp.relative_to(rulings_dir)
-        dst = rev_snap_dir / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(fp, dst)
+    for fp in sorted(p for p in rev_snap_dir.rglob("*") if p.is_file() and p.name != "_manifest.json"):
+        rel = fp.relative_to(rev_snap_dir)
         h.update(f"{rel.as_posix()}:{hashlib.sha256(fp.read_bytes()).hexdigest()}\n".encode("utf-8"))
     new_fp = h.hexdigest()
     eff_summary = (str(summary_md or "").strip() or clean_md[:360])[:1200]
@@ -275,7 +311,7 @@ def _execute_seed_human_branch(
     new_nid = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
     wt_dir = Path(os.path.realpath(workspace_root)) / "worktrees" / new_bid
     wt_dir.mkdir(parents=True, exist_ok=True)
-    sync_public_inputs_to_worktree(workspace_root, wt_dir, shared_rels)
+    sync_approved_public_inputs(workspace_root, wt_dir, shared_rels, spec_revision=spec_rev, question_id=qid)
     sync_public_instruments_and_skills_to_worktree(conn, workspace_root, wt_dir)
 
     with rw_immediate_tx(conn):

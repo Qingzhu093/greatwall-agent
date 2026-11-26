@@ -284,6 +284,9 @@ def tool_run_isolated_eval(
         spec_sha256=spec_sha,
         instrument_sha256=inst_sha,
     )
+    stored_spec = dict(spec)
+    if raw_rel and raw_rel != ".":
+        stored_spec["_artifact_rel_path"] = raw_rel
 
     now = utc_now_iso()
     paths = resolve_storage_paths(workspace_root)
@@ -480,6 +483,20 @@ def tool_run_isolated_eval(
             cfg=cfg,
             now=now,
         )
+        if str(cached["obs_status"]) in ("VALID_PASS", "MEASURED_REJECTION", "VALID_UNDECIDED"):
+            with rw_immediate_tx(conn):
+                conn.execute(
+                    """
+                    UPDATE lineage_nodes
+                    SET artifact_dirty_since_last_obs = 0,
+                        last_reconciled_candidate_sha256 = ?,
+                        last_reconciled_tools_sha256 = ?,
+                        candidate_rel_path = CASE WHEN COALESCE(candidate_rel_path, '') = '' AND ? != '' THEN ? ELSE candidate_rel_path END,
+                        updated_at = ?
+                    WHERE node_id = ? AND node_status IN ('EXPLORING', 'ACTIVE_REVISING')
+                    """,
+                    (cand_sha, tools_sha, raw_rel, raw_rel, now, node_id),
+                )
         return build_tool_receipt(
             conn=conn,
             tool_name="run_isolated_eval",
@@ -576,11 +593,24 @@ def tool_run_isolated_eval(
                         json.dumps(res.get("tracks") or {}, ensure_ascii=False),
                         str(res.get("details") or ""),
                         pred,
-                        json.dumps(spec, ensure_ascii=False),
+                        json.dumps(stored_spec, ensure_ascii=False),
                         now,
                         now,
                     ),
                 )
+                if obs_status in ("VALID_PASS", "MEASURED_REJECTION", "VALID_UNDECIDED"):
+                    conn.execute(
+                        """
+                        UPDATE lineage_nodes
+                        SET artifact_dirty_since_last_obs = 0,
+                            last_reconciled_candidate_sha256 = ?,
+                            last_reconciled_tools_sha256 = ?,
+                            candidate_rel_path = CASE WHEN COALESCE(candidate_rel_path, '') = '' AND ? != '' THEN ? ELSE candidate_rel_path END,
+                            updated_at = ?
+                        WHERE node_id = ? AND node_status IN ('EXPLORING', 'ACTIVE_REVISING')
+                        """,
+                        (cand_sha, tools_sha, raw_rel, raw_rel, now, node_id),
+                    )
                 if stale_reval_target_ver is not None:
                     conn.execute(
                         """

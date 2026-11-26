@@ -28,6 +28,7 @@ export function mountCapabilitiesOnAgentSession(
     toolSchemas = [],
     taskContextText = '',
     extraContextProvider = null,
+    onBeforeStep = null,
     allowedMcpOverride = null,
     readonly = false,
     cleanupFns = [],
@@ -125,7 +126,19 @@ export function mountCapabilitiesOnAgentSession(
     )
   }
 
-  // 支持 gw_chief 每次对话动态注入弹性字数「全院现况锚点卡」（防压缩断链）
+  // 支持 gw_chief 每次对话动态注入弹性字数「全院现况锚点卡」（防压缩断链）与每步前实时刷新
+  if (typeof onBeforeStep === 'function' && typeof agentCtx.on === 'function') {
+    try {
+      const disposePreStep = agentCtx.on('agent/pre-step', async (payload, next) => {
+        try {
+          await onBeforeStep(agent, payload)
+        } catch {}
+        return typeof next === 'function' ? next() : undefined
+      })
+      if (typeof disposePreStep === 'function') cleanupFns.push(disposePreStep)
+    } catch {}
+  }
+
   if (typeof extraContextProvider === 'function' && typeof agentCtx.systemPrompt?.context === 'function') {
     cleanupFns.push(
       agentCtx.systemPrompt.context({

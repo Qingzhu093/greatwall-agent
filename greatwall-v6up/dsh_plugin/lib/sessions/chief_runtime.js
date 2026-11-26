@@ -33,23 +33,28 @@ export function computeChiefAnchorBudgetChars(subproblemCount = 1, hardCapChars 
 /**
  * 构造实时「全院现况锚点卡」（纯确定性快照投影，防长会话压缩后记忆断链）。
  */
-export function buildChiefAnchorCard(snap, { hardCapChars = 1200 } = {}) {
+export function buildChiefAnchorCard(snap, { hardCapChars = 1200, recentEvents = [] } = {}) {
   if (!snap || !snap.initialized) {
     return '[全院现况锚点卡] 课题尚未初始化 Parse 0 契约。'
   }
-  const subs = Array.isArray(snap.subproblem_runtime_state) ? snap.subproblem_runtime_state : []
+  const subs = Array.isArray(snap.subproblem_runtime_state)
+    ? snap.subproblem_runtime_state
+    : Object.values(snap.subproblem_states || {})
   const maxChars = computeChiefAnchorBudgetChars(subs.length, hardCapChars)
   const pendingProps = Array.isArray(snap.pending_proposals) ? snap.pending_proposals : []
-  const activeWaves = Array.isArray(snap.active_wave_conferences) ? snap.active_wave_conferences : []
+  const activeWaves = Array.isArray(snap.active_wave_conferences)
+    ? snap.active_wave_conferences
+    : (Array.isArray(snap.active_conferences) ? snap.active_conferences : [])
 
   const lines = [
     `[全院现况锚点卡] stage=${snap.stage || 'UNKNOWN'} | mode=${snap.autonomy_mode || 'WAVE_CONFIRM'} | spec=v${Number(snap.latest_spec_revision || 0)} | closure=${snap.closure_state?.status || 'OPEN'}`,
   ]
   for (const s of subs) {
+    const baseTxt = s.baseline_entry_id ? `基线=${s.baseline_entry_id}` : '基线=无'
     const solved = s.solved_entry_id ? `解=${s.solved_entry_id}` : '未通关'
     const blk = s.block_reason_code ? ` 阻塞=${s.block_reason_code}` : ''
     lines.push(
-      `- ${s.question_id}: ${s.dispatch_state}(v${Number(s.active_spec_revision || 0)}) ${solved} W${Number(s.completed_waves || 0)}${blk}`,
+      `- ${s.question_id}: ${s.dispatch_state}(v${Number(s.active_spec_revision || 0)}) ${baseTxt} ${solved} W${Number(s.completed_waves || 0)}${blk}`,
     )
   }
   if (pendingProps.length > 0) {
@@ -59,6 +64,10 @@ export function buildChiefAnchorCard(snap, { hardCapChars = 1200 } = {}) {
   if (activeWaves.length > 0) {
     const wText = activeWaves.slice(0, 4).map((w) => `${w.conference_id}:${w.question_id}[${w.status}]`).join(', ')
     lines.push(`活跃圆桌: ${wText}`)
+  }
+  if (Array.isArray(recentEvents) && recentEvents.length > 0) {
+    const eText = recentEvents.slice(-4).map((e) => `${e.eventType}(${e.payload?.question_id || e.payload?.proposal_id || e.payload?.node_id || ''})`).join('; ')
+    lines.push(`最新高信噪比通报(${recentEvents.length}): ${eText}`)
   }
   const full = lines.join('\n')
   return full.length <= maxChars ? full : `${full.slice(0, Math.max(0, maxChars - 1))}…`
@@ -148,25 +157,62 @@ export function registerProposalActionCard(ctx, controlService, { logger = conso
 }
 
 /**
- * 按需拉起或从磁盘 resume 持久 `gw_chief` 会话，并挂载弹性现况锚点卡注入器。
+ * 按需拉起或从磁盘 resume 持久 `gw_chief` 会话，并挂载每步动态刷新的弹性现况锚点卡与高信噪比收件箱消费器。
  */
-export async function ensureChiefSession(controller, { prompt = '', hardCapChars = 1200, signal = null } = {}) {
+export async function ensureChiefSession(
+  controller,
+  { prompt = '', hardCapChars = 1200, chiefInbox = null, signal = null } = {},
+) {
   const ws = controller.workspaceRoot
   const chiefSid = buildChiefSessionId(ws)
   let latestAnchorText = '[全院现况锚点卡] 加载中…'
+  const recentDrainedEvents = []
 
-  const refreshAnchor = async () => {
+  const refreshAnchorAndDrainInbox = async () => {
+    let snapData = null
     try {
       const snapRes = await controller.scheduleSnapshot()
-      if (snapRes?.ok && snapRes?.data) {
-        latestAnchorText = buildChiefAnchorCard(snapRes.data, { hardCapChars })
-      }
+      if (snapRes?.ok && snapRes?.data) snapData = snapRes.data
     } catch {}
+
+    if (chiefInbox && typeof chiefInbox.drainBatch === 'function') {
+      const drained = chiefInbox.drainBatch()
+      if (Array.isArray(drained) && drained.length > 0) {
+        recentDrainedEvents.push(...drained)
+        if (recentDrainedEvents.length > 8) {
+          recentDrainedEvents.splice(0, recentDrainedEvents.length - 8)
+        }
+      }
+    }
+
+    // 剔除已经过时/已结案的 PENDING_HUMAN_PROPOSAL 通报，避免锚点卡残留已批准提案 ID
+    const livePendingPropIds = new Set((snapData?.pending_proposals || []).map((p) => String(p?.proposal_id || '')))
+    const filteredEvents = recentDrainedEvents.filter((ev) => {
+      if (ev?.eventType === 'PENDING_HUMAN_PROPOSAL' && ev?.payload?.proposal_id) {
+        return livePendingPropIds.has(String(ev.payload.proposal_id))
+      }
+      return true
+    })
+
+    if (snapData) {
+      latestAnchorText = buildChiefAnchorCard(snapData, {
+        hardCapChars,
+        recentEvents: filteredEvents,
+      })
+    }
     return latestAnchorText
   }
-  await refreshAnchor()
+  await refreshAnchorAndDrainInbox()
 
-  return controller.orchestrator.resumeOrSpawnAgent({
+  const inboxDigest = recentDrainedEvents.length > 0
+    ? `\n\n### 待审阅的高信噪比系统通报 (${recentDrainedEvents.length} 条)\n${recentDrainedEvents.map((e) => `- [${e.eventType}] ${JSON.stringify(e.payload)}`).join('\n')}`
+    : ''
+
+  const effectivePrompt =
+    (prompt || '请调用 chief_get_overview_snapshot(question_id="ALL")，用三段简明汇报当前进度：1) 正在做什么；2) 卡在哪里与待拍板项；3) 已证实基线。') +
+    inboxDigest
+
+  const res = await controller.orchestrator.resumeOrSpawnAgent({
     role: 'gw_chief',
     sessionId: chiefSid,
     questionId: 'ALL',
@@ -175,7 +221,13 @@ export async function ensureChiefSession(controller, { prompt = '', hardCapChars
     keepAliveAfterIdle: true,
     archiveOnComplete: false,
     extraContextProvider: () => latestAnchorText,
+    onBeforeStep: () => refreshAnchorAndDrainInbox(),
     signal,
-    prompt: prompt || '请调用 chief_get_overview_snapshot(question_id="ALL")，用三段简明汇报当前进度：1) 正在做什么；2) 卡在哪里与待拍板项；3) 已证实基线。',
+    prompt: effectivePrompt,
   })
+  return {
+    ...res,
+    drainedEventsCount: recentDrainedEvents.length,
+    latestAnchorText,
+  }
 }

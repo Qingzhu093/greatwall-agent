@@ -17,6 +17,7 @@ from ..db_schema import (
 )
 from .workspace_sync import (
     _SENSITIVE_COMMENT_RE,
+    sync_approved_public_inputs,
     sync_public_inputs_to_worktree,
 )
 
@@ -94,10 +95,22 @@ def stage_blind_review_sandbox(
         (rev["source_node_id"],),
     ).fetchone()
     art_rel = str(rev["artifact_rel_path"] or (node["candidate_rel_path"] if node else "") or "").strip()
-    if node is not None and art_rel:
-        snap_raw = str(node["retained_snapshot_abs_path"] or "").strip()
-        wt_raw = str(node["worktree_abs_path"] or "").strip()
-        src_base = Path(snap_raw) if (snap_raw and Path(snap_raw).is_dir()) else (Path(wt_raw) if wt_raw else None)
+    if art_rel:
+        rev_snap_raw = (
+            str(rev["artifact_snapshot_abs_path"] or "").strip()
+            if "artifact_snapshot_abs_path" in rev.keys()
+            else ""
+        )
+        snap_raw = str(node["retained_snapshot_abs_path"] or "").strip() if node is not None else ""
+        wt_raw = str(node["worktree_abs_path"] or "").strip() if node is not None else ""
+        if rev_snap_raw and Path(rev_snap_raw).is_dir():
+            src_base = Path(rev_snap_raw)
+        elif snap_raw and Path(snap_raw).is_dir():
+            src_base = Path(snap_raw)
+        elif wt_raw:
+            src_base = Path(wt_raw)
+        else:
+            src_base = None
         if src_base is not None and src_base.is_dir():
             cand_src = src_base / art_rel
             if cand_src.is_file():
@@ -166,17 +179,13 @@ def stage_blind_review_sandbox(
         shared_rels = []
         latest_spec_rev = 0
     rev_spec = int(rev["spec_revision"] or 0) if "spec_revision" in rev.keys() else 0
-    if rev_spec < latest_spec_rev:
-        hist_dir = paths["ruling_revisions_dir"] / f"v{rev_spec}" if rev_spec > 0 else None
-        mounted_inputs = sync_public_inputs_to_worktree(
-            workspace_root,
-            sandbox_dir,
-            shared_rels,
-            rulings_revision_dir=hist_dir,
-            skip_live_rulings=True,
-        )
-    else:
-        mounted_inputs = sync_public_inputs_to_worktree(workspace_root, sandbox_dir, shared_rels)
+    mounted_inputs = sync_approved_public_inputs(
+        workspace_root,
+        sandbox_dir,
+        shared_rels,
+        spec_revision=rev_spec,
+        question_id=str(rev["question_id"] or "") or None,
+    )
     staged_files.extend(mounted_inputs)
 
     _set_tree_readonly(sandbox_dir, True)

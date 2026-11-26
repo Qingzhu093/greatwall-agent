@@ -306,9 +306,15 @@ def sync_session_pressure(
     effective_context_window: int | None = None,
     context_window_tokens: int | None = None,
 ) -> dict[str, Any]:
-    """将宿主 DSH TokenMeter 采样的真实压力水位与模型有效窗口 W = min(500k, model_window) 同步至 SQLite，并返回实时 node_status。"""
+    """将宿主 DSH TokenMeter 采样的真实压力水位与模型有效窗口 W = min(500k, model_window) 同步至 SQLite，并返回实时 node_status 与 control_state。"""
     row = conn.execute(
-        "SELECT node_id, node_status, first_reflection_unlocked, effective_context_window FROM lineage_nodes WHERE node_id = ?",
+        """
+        SELECT node_id, question_id, node_status, control_state, control_generation,
+               personal_turn_active, human_modified, artifact_dirty_since_last_obs,
+               first_reflection_unlocked, effective_context_window
+        FROM lineage_nodes
+        WHERE node_id = ?
+        """,
         (node_id,),
     ).fetchone()
     if row is None:
@@ -333,8 +339,27 @@ def sync_session_pressure(
                 "UPDATE lineage_nodes SET pressure_tokens = ?, updated_at = ? WHERE node_id = ?",
                 (pt, now, node_id),
             )
+    qrow = conn.execute(
+        "SELECT dispatch_state, desired_state FROM subproblem_runtime_state WHERE question_id = ?",
+        (str(row["question_id"]),),
+    ).fetchone()
+    p0_stop = conn.execute(
+        "SELECT human_stop_requested_at FROM project_closure_state WHERE id = 1"
+    ).fetchone()
     sig = compute_clock_signal(pt, int(row["first_reflection_unlocked"] or 0), effective_context_window=eff_win)
-    return {"node_id": node_id, "node_status": str(row["node_status"]), **sig}
+    return {
+        "node_id": node_id,
+        "question_id": str(row["question_id"]),
+        "node_status": str(row["node_status"]),
+        "control_state": str(row["control_state"] or "AUTO_RUNNING"),
+        "control_generation": int(row["control_generation"] or 1),
+        "personal_turn_active": bool(int(row["personal_turn_active"] or 0)),
+        "human_modified": bool(int(row["human_modified"] or 0)),
+        "artifact_dirty_since_last_obs": bool(int(row["artifact_dirty_since_last_obs"] or 0)),
+        "subproblem_dispatch_state": str(qrow["dispatch_state"]) if qrow else "DISPATCHING",
+        "human_stop_active": bool(p0_stop and str(p0_stop["human_stop_requested_at"] or "").strip()),
+        **sig,
+    }
 
 
 def abort_lineage_node(
