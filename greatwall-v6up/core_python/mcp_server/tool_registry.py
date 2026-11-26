@@ -1,10 +1,9 @@
-"""长城 V6-Up (v3.0) 全系统 32 个窄 MCP 工具单一契约注册表（Single Source of Truth）。
+"""GreatWall Agent v0.3 全系统 10 角色窄 MCP 工具单一契约注册表（Single Source of Truth）。
 
 职责边界：
-- 集中声明 7 大标准角色与 32 个窄工具的唯一权威元数据（角色归属、读写属性、长超时、Turn 收尾、
-  workspace_root 注入需求与完整 JSON Schema）；
-- 自动派生 RBAC 白名单、只读拦截表、长超时表与 `control_plane/describe_contracts` 握手快照；
-- 严禁反向 import `tools_*.py` 或 `control_plane/*`（仅依赖 `db_schema` 与 `mcp_schema_docs`）。
+- 集中声明 10 大标准角色与全部窄工具的唯一权威元数据（支持多角色共享只读工具，如 explorer 与 lineage_companion）；
+- 自动派生 RBAC 白名单、只读拦截表、长耗时表、回合收尾表与 `control_plane/describe_contracts` 握手快照；
+- 严禁反向 import `tools_*.py` 或 `control_plane/*`。
 """
 
 from __future__ import annotations
@@ -13,39 +12,26 @@ from copy import deepcopy
 from typing import Any
 
 from .db_schema import (
-    ERR_AUTH,
-    ERR_CONFLICT,
-    ERR_EXECUTION,
-    ERR_INVALID_INPUT,
-    ERR_INVARIANT,
-    ERR_LOCKED,
-    ERR_NOT_FOUND,
-    ERR_STORAGE,
+    CORE_ERROR_CODES,
 )
 from .mcp_schema_docs import enrich_tool_definitions
 
-CONTRACTS_SCHEMA_VERSION = "3.0.0"
+CONTRACTS_SCHEMA_VERSION = "0.3.0"
 
 CANONICAL_ROLES: tuple[str, ...] = (
+    "gw_chief",
+    "supervisory_committee",
+    "works_engineer",
     "explorer",
     "lineage_companion",
     "logistics_coordinator",
-    "library_surveyor",
+    "external_surveyor",
+    "library_chronicler",
     "library_verifier",
-    "works_engineer",
-    "supervisory_committee",
+    "conference_chair",
 )
 
-ERROR_CODES: tuple[str, ...] = (
-    ERR_AUTH,
-    ERR_CONFLICT,
-    ERR_EXECUTION,
-    ERR_INVALID_INPUT,
-    ERR_INVARIANT,
-    ERR_LOCKED,
-    ERR_NOT_FOUND,
-    ERR_STORAGE,
-)
+ERROR_CODES: tuple[str, ...] = tuple(sorted(CORE_ERROR_CODES))
 
 
 def _schema(props: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -55,7 +41,7 @@ def _schema(props: dict[str, Any], required: list[str]) -> dict[str, Any]:
 def _spec(
     *,
     name: str,
-    role: str,
+    roles: str | tuple[str, ...],
     access: str,
     description: str,
     input_schema: dict[str, Any],
@@ -63,13 +49,18 @@ def _spec(
     long_running: bool = False,
     concludes_turn: bool = False,
 ) -> dict[str, Any]:
-    if role not in CANONICAL_ROLES:
-        raise ValueError(f"非法角色: {role!r}")
+    role_tuple = (roles,) if isinstance(roles, str) else tuple(roles)
+    if not role_tuple:
+        raise ValueError(f"工具 {name!r} 缺少授权角色")
+    for r in role_tuple:
+        if r not in CANONICAL_ROLES:
+            raise ValueError(f"非法角色: {r!r}")
     if access not in ("read", "write"):
         raise ValueError(f"非法读写属性: {access!r}")
     return {
         "name": name,
-        "role": role,
+        "role": role_tuple[0],
+        "roles": role_tuple,
         "access": access,
         "needs_workspace_root": needs_workspace_root,
         "long_running": long_running,
@@ -80,10 +71,79 @@ def _spec(
 
 
 _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
-    # 1. explorer (5)
+    # ========================================================================
+    # 1. gw_chief (Superagent, 5 个物理零代码/零终端窄工具)
+    # ========================================================================
+    _spec(
+        name="chief_get_overview_snapshot",
+        roles="gw_chief",
+        access="read",
+        description="[gw_chief] Inline & Spill 全院轻量总览：返回自主档位、各子题状态/口径/最新总览 ID、待拍板提案与活跃圆桌（内联下一跳关联 ID）。",
+        input_schema=_schema({"question_id": {"type": "string", "default": "ALL"}}, []),
+    ),
+    _spec(
+        name="chief_trace_entity",
+        roles="gw_chief",
+        access="read",
+        description="[gw_chief] 强外键 Chain of Recall 回忆链只读展开：按 entity_type/entity_id 多跳查账，强制内联下一跳外键 ID 与原始 session_id 直达锚点。",
+        input_schema=_schema(
+            {
+                "entity_type": {"type": "string"},
+                "entity_id": {"type": "string"},
+            },
+            ["entity_type", "entity_id"],
+        ),
+    ),
+    _spec(
+        name="chief_get_wave_digest",
+        roles="gw_chief",
+        access="read",
+        description="[gw_chief] 读取指定子题或会议的波次圆桌纪要、最新 1500 字子题全局总览与宏观调整建议摘要。",
+        input_schema=_schema(
+            {
+                "question_id": {"type": "string"},
+                "conference_id": {"type": ["string", "null"], "default": None},
+            },
+            ["question_id"],
+        ),
+    ),
+    _spec(
+        name="chief_preview_impact",
+        roles="gw_chief",
+        access="read",
+        description="[gw_chief] 零副作用推测预演：只读测算改题影响面、排雷视图查重或波次调整受影响分支清单，绝不改库、绝不开重型分支。",
+        input_schema=_schema(
+            {
+                "preview_kind": {"type": "string"},
+                "question_id": {"type": "string", "default": "ALL"},
+                "query_text": {"type": "string", "default": ""},
+                "target_id": {"type": ["string", "null"], "default": None},
+            },
+            ["preview_kind"],
+        ),
+    ),
+    _spec(
+        name="chief_propose_control_action",
+        roles="gw_chief",
+        access="write",
+        description="[gw_chief] 唯一结构化提案提交口：将人类自然语言意图整理为 8 类宪章正门确认单写入 control_proposals，等待人类经原生卡片或 UI 显式落签。",
+        input_schema=_schema(
+            {
+                "action_type": {"type": "string"},
+                "target_id": {"type": "string"},
+                "payload": {"type": "object", "default": {}},
+                "rationale_md": {"type": "string"},
+                "human_action_question": {"type": "string", "default": ""},
+            },
+            ["action_type", "target_id", "rationale_md"],
+        ),
+    ),
+    # ========================================================================
+    # 2. explorer (7) & 共享只读 Pull 工具 (explorer + lineage_companion)
+    # ========================================================================
     _spec(
         name="run_isolated_eval",
-        role="explorer",
+        roles="explorer",
         access="write",
         needs_workspace_root=True,
         long_running=True,
@@ -103,10 +163,23 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
         ),
     ),
     _spec(
-        name="query_library_catalog",
-        role="explorer",
+        name="get_living_survey",
+        roles=("explorer", "lineage_companion"),
         access="read",
-        description="[explorer] 一级目录 Pull（0-37% 仅返回外藏 [R###]，37% 解锁后全馆两翼开放）。",
+        description="[explorer(37%+)/lineage_companion(0%+)] 拉取指定子题最新《子题全局总览（<=1500字导览索引）》与高优悬赏缺口摘要。",
+        input_schema=_schema(
+            {
+                "node_id": {"type": "string"},
+                "question_id": {"type": "string"},
+            },
+            ["node_id", "question_id"],
+        ),
+    ),
+    _spec(
+        name="query_library_catalog",
+        roles=("explorer", "lineage_companion"),
+        access="read",
+        description="[explorer(0-37%仅外藏)/lineage_companion(0%全馆)] 二级目录卡 Pull（每条<=350字简介卡与排雷视图）。",
         input_schema=_schema(
             {
                 "node_id": {"type": "string"},
@@ -119,16 +192,16 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     ),
     _spec(
         name="get_library_entry",
-        role="explorer",
+        roles=("explorer", "lineage_companion"),
         access="read",
-        description="[explorer] 二级详卡 Pull 并静默写入参考性 FACT_LOG(READ) 边。",
+        description="[explorer/lineage_companion] 三级完整原文 Pull，并静默写入参考性 FACT_LOG(READ) 边。",
         input_schema=_schema({"node_id": {"type": "string"}, "entry_id": {"type": "string"}}, ["node_id", "entry_id"]),
     ),
     _spec(
         name="request_literature_survey",
-        role="explorer",
+        roles="explorer",
         access="write",
-        description="[explorer] 委托图书馆外藏采编馆员补查外部文献/标准定理卡。",
+        description="[explorer] 委托对外采编员 external_surveyor 检索外部文献/标准定理卡（脱敏查新单）。",
         input_schema=_schema(
             {"node_id": {"type": "string"}, "question_id": {"type": "string"}, "topic_query": {"type": "string"}, "reason": {"type": "string"}},
             ["node_id", "question_id", "topic_query", "reason"],
@@ -136,7 +209,7 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     ),
     _spec(
         name="read_lineage_graph",
-        role="explorer",
+        roles="explorer",
         access="read",
         description="[explorer] 37% 解锁后翻阅本门派私有谱系 DAG 或 lineage_dead_ends 全表（物理隔离他脉）。",
         input_schema=_schema(
@@ -150,12 +223,29 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
             ["node_id", "branch_id"],
         ),
     ),
-    # 2. lineage_companion (4)
+    _spec(
+        name="handback_to_chief",
+        roles="explorer",
+        access="write",
+        description="[explorer] 越界退回权：人类直连本子节点对话时若提出改题/停他枝/结题等跨分支或全局诉求，原样退回 gw-chief 收件箱，本节点绝不越权执行。",
+        input_schema=_schema(
+            {
+                "node_id": {"type": "string"},
+                "question_id": {"type": "string"},
+                "human_request_md": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            ["node_id", "question_id", "human_request_md", "reason"],
+        ),
+    ),
+    # ========================================================================
+    # 3. lineage_companion (专属阶段工具 + 封存后圆桌发言工具)
+    # ========================================================================
     _spec(
         name="get_companion_context",
-        role="lineage_companion",
+        roles="lineage_companion",
         access="read",
-        description="[lineage_companion] 获取 PRE_SPAWN / REFLECT_37 / HANDOFF_70 / CRASH_RECOVERY 阶段隔离上下文。",
+        description="[lineage_companion] 获取 PRE_SPAWN / REFLECT_37 / HANDOFF_70 / CRASH_RECOVERY / CONFERENCE_PARTICIPANT 上下文。",
         input_schema=_schema(
             {"branch_id": {"type": "string"}, "node_id": {"type": "string"}, "mode": {"type": "string"}},
             ["branch_id", "node_id", "mode"],
@@ -163,10 +253,10 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     ),
     _spec(
         name="save_lineage_briefing",
-        role="lineage_companion",
+        roles="lineage_companion",
         access="write",
         concludes_turn=True,
-        description="[lineage_companion] 按 Rewrite_<=2200 定额滚动重压缩写入谱系状态看板（唯一硬限总长 <= 2200 字）。",
+        description="[lineage_companion] 定额滚动重压缩写入谱系前情提要（总长 <= 2200 字）。",
         input_schema=_schema(
             {
                 "branch_id": {"type": "string"},
@@ -182,10 +272,10 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     ),
     _spec(
         name="record_reflection_and_unlock_pull",
-        role="lineage_companion",
+        roles="lineage_companion",
         access="write",
         concludes_turn=True,
-        description="[lineage_companion] 记录 <=2 轮(<=300字/轮) 37% 情报型元反思并当场解锁 first_reflection_unlocked=1（无 eval_count 门槛）。",
+        description="[lineage_companion] 记录 <=2 轮(<=300字/轮) 37% 外部专家问诊并当场解锁 first_reflection_unlocked=1（无 eval_count 门槛）。",
         input_schema=_schema(
             {
                 "node_id": {"type": "string"},
@@ -199,11 +289,11 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     ),
     _spec(
         name="submit_node_handoff",
-        role="lineage_companion",
+        roles="lineage_companion",
         access="write",
         needs_workspace_root=True,
         concludes_turn=True,
-        description="[lineage_companion] 独占单写谱系 DAG 页与只追加 lineage_dead_ends 表，并置节点 AWAITING_TRIAGE。",
+        description="[lineage_companion] 70% 两步清醒交班独占落库、封存加锁（briefing_sealed_at）、可选附带结构化去向建议直落与独立局部引理拆交送审。",
         input_schema=_schema(
             {
                 "node_id": {"type": "string"},
@@ -219,23 +309,44 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
                 "candidate_rel_path": {"type": ["string", "null"], "default": None},
                 "is_empty_crash": {"type": "boolean", "default": False},
                 "tool_pain_point": {"type": ["string", "null"], "default": None},
+                "recommended_triage": {"type": ["object", "null"], "default": None},
+                "local_lemma_submissions": {"type": ["array", "null"], "items": {"type": "object"}, "default": None},
             },
             ["node_id", "branch_id", "question_id", "mechanism_summary", "evidence_grade", "column_a_facts_md", "column_b_hypothesis_md", "will_md", "obs_ids", "dead_ends", "is_empty_crash"],
         ),
     ),
-    # 3. logistics_coordinator (5)
+    _spec(
+        name="submit_conference_statement",
+        roles="lineage_companion",
+        access="write",
+        concludes_turn=True,
+        description="[lineage_companion(封存参会态)] 在宏观大外环圆桌第 1/2 轮提交点对点红蓝交锋发言（已封存节点零档案写权）。",
+        input_schema=_schema(
+            {
+                "conference_id": {"type": "string"},
+                "node_id": {"type": "string"},
+                "round_no": {"type": "integer"},
+                "statement_md": {"type": "string"},
+                "target_node_ids": {"type": "array", "items": {"type": "string"}, "default": []},
+            },
+            ["conference_id", "node_id", "round_no", "statement_md"],
+        ),
+    ),
+    # ========================================================================
+    # 4. logistics_coordinator (4 个轻量工具，已删除原五车道工具)
+    # ========================================================================
     _spec(
         name="get_logistics_dashboard",
-        role="logistics_coordinator",
+        roles="logistics_coordinator",
         access="read",
-        description="[logistics_coordinator] 纯只读 (<50ms) 拉取各题方法族谱占比、>50% 聚拢告警、待分诊页与 Ready Queue。",
+        description="[logistics_coordinator] 纯只读 (<50ms) 拉取各题方法族谱占比、>50% 聚拢告警、待分诊页、悬赏缺口与槽位状态。",
         input_schema=_schema({"question_id": {"type": "string", "default": "ALL"}}, ["question_id"]),
     ),
     _spec(
         name="register_method_family",
-        role="logistics_coordinator",
+        roles="logistics_coordinator",
         access="write",
-        description="[logistics_coordinator] 按需登记底层数学/物理思想学派（不强卡固定条数）。",
+        description="[logistics_coordinator] 登记底层数学/物理正交思想学派。",
         input_schema=_schema(
             {
                 "question_id": {"type": "string"},
@@ -248,10 +359,10 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     ),
     _spec(
         name="triage_node",
-        role="logistics_coordinator",
+        roles="logistics_coordinator",
         access="write",
         needs_workspace_root=True,
-        description="[logistics_coordinator] 对 AWAITING_TRIAGE 节点归类学派并执行四级认知分诊与快照托管。",
+        description="[logistics_coordinator] 对疑难/未归类 AWAITING_TRIAGE 节点执行六去向中观分诊与快照托管。",
         input_schema=_schema(
             {
                 "node_id": {"type": "string"},
@@ -261,16 +372,17 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
                 "rationale": {"type": "string"},
                 "barrier_proof_md": {"type": ["string", "null"], "default": None},
                 "reopen_condition": {"type": ["string", "null"], "default": None},
+                "blocking_gap_formal_statement": {"type": ["string", "null"], "default": None},
             },
             ["node_id", "assigned_family_id", "triage_level", "action", "rationale"],
         ),
     ),
     _spec(
         name="fork_branch",
-        role="logistics_coordinator",
+        roles="logistics_coordinator",
         access="write",
         needs_workspace_root=True,
-        description="[logistics_coordinator] 开启新探索分支（分支级确定性 requires、WHERE branch_id != :self 查重、双 L3 授粉门槛）。",
+        description="[logistics_coordinator] 开启新探索分支（默认 2 班岗成长保护期、确定性 requires、WHERE branch_id != :self 查重）。",
         input_schema=_schema(
             {
                 "question_id": {"type": "string"},
@@ -284,29 +396,21 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
             ["question_id", "fork_mode", "target_family_id"],
         ),
     ),
-    _spec(
-        name="dispatch_stagnation_five_lanes",
-        role="logistics_coordinator",
-        access="write",
-        description="[logistics_coordinator] 停滞看门狗或 >50% 聚拢告警触发时执行五互斥车道算力重排。",
-        input_schema=_schema(
-            {"question_id": {"type": "string"}, "lane_assignments": {"type": "array", "items": {"type": "object"}}},
-            ["question_id", "lane_assignments"],
-        ),
-    ),
-    # 4. library_surveyor (3)
+    # ========================================================================
+    # 5. external_surveyor (2 个，唯一联网，物理禁读任何院内成果)
+    # ========================================================================
     _spec(
         name="get_survey_requests",
-        role="library_surveyor",
+        roles="external_surveyor",
         access="read",
-        description="[library_surveyor] 获取 Stage 1-2 查新委托队列及 Stage 3 全量已审 L3/L2/[R###] 综合数据包。",
+        description="[external_surveyor] 仅返回脱敏外部文献查新请求与已有外藏 [R###] 目录（物理零院内 L3/L2 泄露）。",
         input_schema=_schema({"question_id": {"type": "string", "default": "ALL"}}, ["question_id"]),
     ),
     _spec(
         name="publish_external_literature_card",
-        role="library_surveyor",
+        roles="external_surveyor",
         access="write",
-        description="[library_surveyor] 将外部文献/定理卡入库左翼外藏 [R###]（outcome='CARD_PUBLISHED'），或对无解/不合规查新请求做无卡结案（outcome='UNAVAILABLE_REPORT'，不插伪卡）。",
+        description="[external_surveyor] 发布带诚实阅读深度标注的外藏参考卡 [R###]（CARD_PUBLISHED）或无解诚实结案（UNAVAILABLE_REPORT）。",
         input_schema=_schema(
             {
                 "outcome": {"type": "string", "default": "CARD_PUBLISHED"},
@@ -325,14 +429,55 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
             ["question_id"],
         ),
     ),
+    # ========================================================================
+    # 6. library_chronicler (3 个，零外网零代码，专司 1500 字总览与 Stage 3 终稿)
+    # ========================================================================
+    _spec(
+        name="get_chronicler_snapshot",
+        roles="library_chronicler",
+        access="read",
+        description="[library_chronicler] 零外网只读拉取指定子题或全卷的硬账本、圆桌交锋纪要、已审 L3/L2、可用仪器与活跃悬赏缺口。",
+        input_schema=_schema(
+            {
+                "question_id": {"type": "string", "default": "ALL"},
+                "conference_id": {"type": ["string", "null"], "default": None},
+            },
+            ["question_id"],
+        ),
+    ),
+    _spec(
+        name="publish_living_survey",
+        roles="library_chronicler",
+        access="write",
+        concludes_turn=True,
+        description="[library_chronicler] 发布每道子题唯一的《子题全局总览与明确缺口导览》（硬限 <= 1500 字），若绑定圆桌会议则同事务切至 ADJUDICATING。",
+        input_schema=_schema(
+            {
+                "question_id": {"type": "string"},
+                "sec1_baseline_and_instruments_md": {"type": "string"},
+                "sec2_l3_lemma_tree_md": {"type": "string"},
+                "sec3_avoidance_radar_md": {"type": "string"},
+                "sec4_explicit_gaps_md": {"type": "string"},
+                "conference_id": {"type": ["string", "null"], "default": None},
+                "trigger_reason": {"type": "string", "default": "WAVE_CONFERENCE"},
+            },
+            [
+                "question_id",
+                "sec1_baseline_and_instruments_md",
+                "sec2_l3_lemma_tree_md",
+                "sec3_avoidance_radar_md",
+                "sec4_explicit_gaps_md",
+            ],
+        ),
+    ),
     _spec(
         name="export_stage3_final_delivery",
-        role="library_surveyor",
+        roles="library_chronicler",
         access="write",
         needs_workspace_root=True,
         long_running=True,
         concludes_turn=True,
-        description="[library_surveyor] 导出 Stage 3 五件套（生成 delivery_id/sha256，置 DELIVERY_EXPORTED 等待两步联合终核）。",
+        description="[library_chronicler] 仅基于已审 L3 导出 Stage 3 五件套并原子锁定外部不可变冻结目录，交盲审官一步终核放行。",
         input_schema=_schema(
             {
                 "delivery_mode": {"type": "string"},
@@ -344,10 +489,52 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
             ["delivery_mode", "formal_paper_md", "selected_l3_ids_by_question", "remaining_gaps_by_question", "reproduction_candidate_nodes"],
         ),
     ),
-    # 5. library_verifier (5)
+    # ========================================================================
+    # 7. conference_chair (3 个，零外网零代码，主持圆桌并读最新总览拍板)
+    # ========================================================================
+    _spec(
+        name="get_conference_dossier",
+        roles="conference_chair",
+        access="read",
+        description="[conference_chair] 只读拉取本波代码硬账本、参会分支已封存 A 栏、圆桌交锋记录与最新《子题全局总览》。",
+        input_schema=_schema({"conference_id": {"type": "string"}}, ["conference_id"]),
+    ),
+    _spec(
+        name="record_conference_minutes",
+        roles="conference_chair",
+        access="write",
+        concludes_turn=True,
+        description="[conference_chair] 第 2 拍落盘《圆桌交锋纪要与争议焦点》，推进会议至 SURVEY_REFRESHING 等待综述官刷新总览。",
+        input_schema=_schema(
+            {
+                "conference_id": {"type": "string"},
+                "minutes_md": {"type": "string"},
+            },
+            ["conference_id", "minutes_md"],
+        ),
+    ),
+    _spec(
+        name="submit_conference_verdict",
+        roles="conference_chair",
+        access="write",
+        needs_workspace_root=True,
+        concludes_turn=True,
+        description="[conference_chair] 第 4 拍读取刚刷新的《子题全局总览》后签发 6 类宏观调整单（WAVE_CONFIRM 挂人类审批，AUTOPILOT 低风险直落）。",
+        input_schema=_schema(
+            {
+                "conference_id": {"type": "string"},
+                "actions": {"type": "array", "items": {"type": "object"}},
+                "rationale_md": {"type": "string"},
+            },
+            ["conference_id", "actions", "rationale_md"],
+        ),
+    ),
+    # ========================================================================
+    # 8. library_verifier (5 个，零外网空白沙箱实跑，支持 PARTIAL_PASS 与一步终签)
+    # ========================================================================
     _spec(
         name="get_blind_manuscript",
-        role="library_verifier",
+        roles="library_verifier",
         access="read",
         needs_workspace_root=True,
         description="[library_verifier] Stage 1 盲态拉取并挂载独立空白盲审沙箱（仅拷 A 栏、脱敏代码与 [Obs###]）。",
@@ -355,10 +542,10 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     ),
     _spec(
         name="submit_stage1_blind_ledger",
-        role="library_verifier",
+        roles="library_verifier",
         access="write",
         concludes_turn=True,
-        description="[library_verifier] 永久锁定 Stage 1 不可逆 Evidence Ledger，按 PASS / REVISE / REFUTED 精准分流。",
+        description="[library_verifier] 永久锁定 Stage 1 证据账本，支持 PASS / PARTIAL_PASS（主结论击穿但局部引理严密进 Stage 2 降级收编）/ REVISE / REFUTED，并可同事务签发反作弊 EXPLOIT 工单。",
         input_schema=_schema(
             {
                 "review_id": {"type": "string"},
@@ -367,38 +554,42 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
                 "stage1_verdict": {"type": "string"},
                 "revision_or_refutation_reason": {"type": ["string", "null"], "default": None},
                 "exact_refuted_scope_md": {"type": ["string", "null"], "default": None},
+                "exploit_ticket_payload": {"type": ["object", "null"], "default": None},
             },
             ["review_id", "question_id", "ledger_items", "stage1_verdict"],
         ),
     ),
     _spec(
         name="get_unblinded_manuscript_and_peers",
-        role="library_verifier",
+        roles="library_verifier",
         access="read",
         needs_workspace_root=True,
-        description="[library_verifier] Stage 2 解盲横审拉取，或 Stage 3 终核模式 (STAGE3_FINAL_AUDIT:<delivery_id>) 五件套核查。",
+        description="[library_verifier] Stage 2 解盲横审（附带本题全部 OPEN 悬赏缺口列表与子题生效口径），或 Stage 3 冻结包终核 (STAGE3_FINAL_AUDIT:<delivery_id>)。",
         input_schema=_schema({"review_id": {"type": "string"}}, ["review_id"]),
     ),
     _spec(
         name="submit_stage2_unblind_verdict",
-        role="library_verifier",
+        roles="library_verifier",
         access="write",
         concludes_turn=True,
-        description="[library_verifier] Stage 2 三态终判（ACCEPT* 入 L3 / REVISE 返工 / REFUTED 入 L2）及 Stage 3 终核版本落签。",
+        description="[library_verifier] Stage 2 终判（达标与基线两步分离、ACCEPT_NARROWED 同事务收编 L3+L2、fulfilled_gap_ids 核销唤醒）及 Stage 3 不可变冻结目录一步核签结项。",
         input_schema=_schema(
             {
                 "review_id": {"type": "string"},
                 "final_verdict": {"type": "string"},
                 "l3_entry_kind": {"type": ["string", "null"], "default": None},
                 "goal_coverage": {"type": ["string", "null"], "default": None},
+                "publish_tier": {"type": ["string", "null"], "default": None},
                 "is_equivalent_reduction": {"type": "boolean", "default": False},
                 "title": {"type": "string", "default": ""},
                 "abstract_md": {"type": "string", "default": ""},
                 "exact_verified_scope_md": {"type": ["string", "null"], "default": None},
                 "exact_refuted_scope_md": {"type": ["string", "null"], "default": None},
+                "narrowed_l2_title": {"type": ["string", "null"], "default": None},
                 "revision_requests": {"type": ["array", "null"], "items": {"type": "string"}, "default": None},
                 "cross_draft_comparison_notes": {"type": "string", "default": ""},
-                "cross_pollinate_nomination": {"type": ["object", "null"], "default": None},
+                "fulfilled_gap_ids": {"type": ["array", "null"], "items": {"type": "string"}, "default": None},
+                "exploit_ticket_payload": {"type": ["object", "null"], "default": None},
                 "edge_type_overrides": {"type": ["object", "null"], "default": None},
             },
             ["review_id", "final_verdict"],
@@ -406,9 +597,9 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     ),
     _spec(
         name="propose_salvaged_lemma",
-        role="library_verifier",
+        roles="library_verifier",
         access="write",
-        description="[library_verifier] Auditor 对已闭/阻塞节点打捞自包含局部引理（严禁抢断 ACTIVE_REVISING 返工分支）。",
+        description="[library_verifier] 沉船遗产打捞：对从未送审而被休眠/已闭节点提取自包含局部引理建独立盲审单。",
         input_schema=_schema(
             {
                 "source_node_id": {"type": "string"},
@@ -422,17 +613,19 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
             ["source_node_id", "question_id", "title", "abstract_md", "column_a_self_contained_proof_md", "column_b_scope_notes_md", "bound_obs_ids"],
         ),
     ),
-    # 6. works_engineer (6)
+    # ========================================================================
+    # 9. works_engineer (6 个仪器科窄工具)
+    # ========================================================================
     _spec(
         name="get_works_engineering_queue",
-        role="works_engineer",
+        roles="works_engineer",
         access="read",
-        description="[works_engineer] 纯只读 (<50ms) 返回仪器清单、熔断状态、故障/痛点工单与 pending_revalidation 待重评队列。",
+        description="[works_engineer] 纯只读 (<50ms) 返回仪器清单、熔断状态、故障/痛点/反作弊/鉴别工单与 pending_revalidation 队列。",
         input_schema=_schema({"question_id": {"type": "string", "default": "ALL"}}, ["question_id"]),
     ),
     _spec(
         name="register_question_instrument",
-        role="works_engineer",
+        roles="works_engineer",
         access="write",
         needs_workspace_root=True,
         long_running=True,
@@ -453,11 +646,11 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     ),
     _spec(
         name="upgrade_instrument_with_calibration",
-        role="works_engineer",
+        roles="works_engineer",
         access="write",
         needs_workspace_root=True,
         long_running=True,
-        description="[works_engineer] 校准集 100% 通过即升版仪器（支持可选更新 artifact_schema 与 default_spec），仅选择性将本仪器旧观测入待重评队列（零误杀他题）。",
+        description="[works_engineer] 校准集 100% 通过即升版仪器，仅将本仪器旧观测入待重评队列（零误杀他题）。",
         input_schema=_schema(
             {
                 "question_id": {"type": "string"},
@@ -472,16 +665,16 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     ),
     _spec(
         name="recompute_stage_b_only",
-        role="works_engineer",
+        roles="works_engineer",
         access="write",
         needs_workspace_root=True,
         long_running=True,
-        description="[works_engineer] 读持久化 Stage A 产物按新版仪器诚实重评（保留旧收据，成功生新收据，缺字段标 INCOMPATIBLE）。",
+        description="[works_engineer] 读持久化 Stage A 产物按新版仪器诚实重评（保留旧收据，缺字段标 INCOMPATIBLE）。",
         input_schema=_schema({"obs_id": {"type": "string"}, "question_id": {"type": "string"}}, ["obs_id", "question_id"]),
     ),
     _spec(
         name="update_skill_ledger",
-        role="works_engineer",
+        roles="works_engineer",
         access="write",
         needs_workspace_root=True,
         description="[works_engineer] No-File 校验后向工作区隔离 SKILL_LEDGER.json 登记共享工具/探针。",
@@ -500,27 +693,29 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     ),
     _spec(
         name="resolve_works_ticket",
-        role="works_engineer",
+        roles="works_engineer",
         access="write",
-        description="[works_engineer] 显式结案工造司工单（RESOLVED / WONTFIX / DUPLICATE），防止 OPEN 工单无限自旋唤醒。",
+        description="[works_engineer] 显式结案工造司工单（RESOLVED / WONTFIX / DUPLICATE）。",
         input_schema=_schema(
             {"ticket_id": {"type": "string"}, "resolution": {"type": "string"}, "resolution_note": {"type": "string"}},
             ["ticket_id", "resolution", "resolution_note"],
         ),
     ),
-    # 7. supervisory_committee (4)
+    # ========================================================================
+    # 10. supervisory_committee (4 个，聚焦 Stage 1 立项与口径歧义裁决)
+    # ========================================================================
     _spec(
         name="get_supervisory_audit_snapshot",
-        role="supervisory_committee",
+        roles="supervisory_committee",
         access="read",
-        description="[supervisory_committee] 纯只读 (<50ms) 获取 Parse 0、仪器熔断、口径红灯、聚拢告警与两步终局审计快照。",
+        description="[supervisory_committee] 纯只读 (<50ms) 获取 Parse 0 契约、各子题口径状态与合规告警快照。",
         input_schema=_schema({}, []),
     ),
     _spec(
         name="check_stage2_closure_gate",
-        role="supervisory_committee",
+        roles="supervisory_committee",
         access="read",
-        description="[supervisory_committee] 校验 CDC 双段终局门禁（FULL / PARTIAL_ON_BUDGET / PARTIAL_ON_HUMAN_STOP）。",
+        description="[supervisory_committee] 校验当前各子题生效口径下的结项门禁（FULL / PARTIAL_ON_BUDGET / PARTIAL_ON_HUMAN_STOP）。",
         input_schema=_schema(
             {"mode": {"type": "string", "default": "FULL"}, "human_aborted": {"type": "boolean", "default": False}},
             ["mode", "human_aborted"],
@@ -528,11 +723,11 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     ),
     _spec(
         name="record_compliance_check",
-        role="supervisory_committee",
+        roles="supervisory_committee",
         access="write",
         needs_workspace_root=True,
         concludes_turn=True,
-        description="[supervisory_committee] 写入 SQLite 合规与红灯告警（零 .md 落盘；CLOSURE_GATE 强校验终核版本绑定）。",
+        description="[supervisory_committee] 写入 Stage 1 PARSE0_GATE 放行或中途 AMBIGUOUS_SPEC_ALERT 口径歧义告警（Stage 3 终签已收编给盲审官冻结包事务）。",
         input_schema=_schema(
             {
                 "stage": {"type": "string"},
@@ -545,7 +740,7 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     ),
     _spec(
         name="register_saved_graph_query",
-        role="supervisory_committee",
+        roles="supervisory_committee",
         access="write",
         description="[supervisory_committee] 校验并注册单条只读 SELECT 共享图查询视图。",
         input_schema=_schema(
@@ -577,17 +772,16 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
 ]
 
 ALLOWED_TOOLS_BY_ROLE: dict[str, frozenset[str]] = {
-    role: frozenset(s["name"] for s in TOOL_SPECS if s["role"] == role)
+    role: frozenset(s["name"] for s in TOOL_SPECS if role in s["roles"])
     for role in CANONICAL_ROLES
 }
 
 ROLE_TOOL_ORDER: dict[str, tuple[str, ...]] = {
-    role: tuple(s["name"] for s in TOOL_SPECS if s["role"] == role)
+    role: tuple(s["name"] for s in TOOL_SPECS if role in s["roles"])
     for role in CANONICAL_ROLES
 }
 
 ALL_TOOL_NAMES: frozenset[str] = frozenset(s["name"] for s in TOOL_SPECS)
-# 向后兼容别名（含 resolve_works_ticket 共 32 个窄工具）
 ALL_31_TOOL_NAMES: frozenset[str] = ALL_TOOL_NAMES
 
 READONLY_BLOCKED_MCP_TOOLS: frozenset[str] = frozenset(

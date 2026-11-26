@@ -82,10 +82,26 @@ export function assertRequiredNativeTools(role, mountedToolNames, platform = pro
     if (mounted.has('write') || mounted.has('edit')) {
       throw new Error(`角色 library_verifier 严禁挂载写工具 (write/edit)，当前已挂载: ${[...mounted].join(', ')}`)
     }
-  } else if (role === 'logistics_coordinator' || role === 'supervisory_committee') {
+  } else if (role === 'lineage_companion') {
+    const forbidden = ['write', 'edit', 'pwsh', 'bash', 'web_search', 'web_fetch'].filter((n) => mounted.has(n))
+    if (forbidden.length > 0) {
+      throw new Error(`伴随角色 lineage_companion 严禁挂载写/终端/外网工具: ${forbidden.join(', ')}`)
+    }
+  } else if (role === 'external_surveyor') {
+    const forbidden = ['read', 'write', 'edit', 'pwsh', 'bash'].filter((n) => mounted.has(n))
+    if (forbidden.length > 0) {
+      throw new Error(`对外采编角色 external_surveyor 严禁挂载本地文件/终端工具: ${forbidden.join(', ')}`)
+    }
+  } else if (
+    role === 'gw_chief' ||
+    role === 'logistics_coordinator' ||
+    role === 'supervisory_committee' ||
+    role === 'library_chronicler' ||
+    role === 'conference_chair'
+  ) {
     const forbidden = ['read', 'write', 'edit', 'pwsh', 'bash', 'web_search', 'web_fetch'].filter((n) => mounted.has(n))
     if (forbidden.length > 0) {
-      throw new Error(`纯 DB 治理角色 ${role} 严禁挂载原生工具: ${forbidden.join(', ')}`)
+      throw new Error(`纯 DB 治理/总控角色 ${role} 严禁挂载原生工具: ${forbidden.join(', ')}`)
     }
   }
 

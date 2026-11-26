@@ -160,7 +160,7 @@ class TestP3ReviewFixesRegression(unittest.TestCase):
 
         # 导出版本 A：验证 reproduction_suite 含节点隔离目录与 tools/util.py
         exp_a = self._call(
-            "export_stage3_final_delivery", "library_surveyor", "ss",
+            "export_stage3_final_delivery", "library_chronicler", "ss",
             delivery_mode="FULL",
             formal_paper_md="# 论文初版 A\n本报告完整汇总 Q1 主定理的严格证明与最小复现套件，全部引用均已溯源核验并附带依赖模块。\n",
             selected_l3_ids_by_question={"Q1": [l3_id]},
@@ -186,7 +186,7 @@ class TestP3ReviewFixesRegression(unittest.TestCase):
 
         # 中途导出含非法复现节点报错：旧 final_delivery 必须毫发无损！
         bad_exp = self._call(
-            "export_stage3_final_delivery", "library_surveyor", "ss",
+            "export_stage3_final_delivery", "library_chronicler", "ss",
             delivery_mode="FULL",
             formal_paper_md="# 失败导出测试\n此导出引用了不存在的候选节点，按原子导出协议应在替换 final_delivery 目录之前即报错中止，并保证旧版合法交付包完好无损。\n",
             selected_l3_ids_by_question={"Q1": [l3_id]},
@@ -196,9 +196,9 @@ class TestP3ReviewFixesRegression(unittest.TestCase):
         self.assertFalse(bad_exp["ok"])
         self.assertIn("论文初版 A", (self.ws / "final_delivery" / "01_formal_report.md").read_text(encoding="utf-8"))
 
-        # 采编修订重导版本 B -> 盲审判 ACCEPT -> 篡改磁盘正文 -> 终签必须拦截！
+        # 终稿官修订重导版本 B -> 篡改外部不可变冻结目录内容 -> 盲审官一步终签必须因 SHA-256 失配拦截！
         exp_b = self._call(
-            "export_stage3_final_delivery", "library_surveyor", "ss",
+            "export_stage3_final_delivery", "library_chronicler", "ss",
             delivery_mode="FULL",
             formal_paper_md="# 论文修订版 B\n已严格按盲审官的修订清单补充全部边界条件、适用假设与精确验证范围，全部最小复现脚本及依赖模块均已随包归档并通过独立核验。\n",
             selected_l3_ids_by_question={"Q1": [l3_id]},
@@ -207,31 +207,28 @@ class TestP3ReviewFixesRegression(unittest.TestCase):
         )
         self.assertTrue(exp_b["ok"], exp_b)
         did_b = exp_b["data"]["delivery_id"]
-        self.assertTrue(
-            self._call(
-                "submit_stage2_unblind_verdict", "library_verifier", "sv_s3_2",
-                review_id=f"STAGE3_FINAL_AUDIT:{did_b}", final_verdict="ACCEPT",
-            )["ok"]
-        )
-
-        # 篡改磁盘文件
-        report_p = self.ws / "final_delivery" / "01_formal_report.md"
+        frozen_dir = Path(exp_b["data"]["frozen_delivery_dir_abs_path"])
+        report_p = frozen_dir / "01_formal_report.md"
         orig_text = report_p.read_text(encoding="utf-8")
+        # 外部不可变冻结目录默认设只读权限；模拟越权篡改前先临时放开写位，验证 SHA-256 门禁仍死守底线
+        os.chmod(report_p, 0o644)
         report_p.write_text(orig_text + "\n偷改一行结论\n", encoding="utf-8")
         tampered_sign = self._call(
-            "record_compliance_check", "supervisory_committee", "ssup",
-            stage="CLOSURE_GATE", status="PASSED", blocking_questions=[], notes="尝试签发被篡改交付包",
+            "submit_stage2_unblind_verdict", "library_verifier", "sv_s3_2",
+            review_id=f"STAGE3_FINAL_AUDIT:{did_b}", final_verdict="ACCEPT",
         )
         self.assertFalse(tampered_sign["ok"])
-        self.assertIn("交付包内容已变化", tampered_sign["error"])
+        self.assertIn("SHA-256", tampered_sign["error"])
 
-        # 恢复磁盘内容后终签顺利通过
+        # 恢复冻结目录内容后，盲审官一步原子终签通过并晋升 CLOSED_VERIFIED
         report_p.write_text(orig_text, encoding="utf-8")
+        os.chmod(report_p, 0o444)
         ok_sign = self._call(
-            "record_compliance_check", "supervisory_committee", "ssup",
-            stage="CLOSURE_GATE", status="PASSED", blocking_questions=[], notes="哈希校验通过准予结项",
+            "submit_stage2_unblind_verdict", "library_verifier", "sv_s3_3",
+            review_id=f"STAGE3_FINAL_AUDIT:{did_b}", final_verdict="ACCEPT",
         )
         self.assertTrue(ok_sign["ok"], ok_sign)
+        self.assertEqual(ok_sign["data"]["closure_status"], "CLOSED_VERIFIED")
 
     def test_3_all_three_bundled_example_instruments_pass_real_runner(self) -> None:
         ex_dir = ROOT_DIR / "core_python" / "evaluators" / "examples"
@@ -412,7 +409,7 @@ def evaluate(artifact, spec, tier="official"):
         with self.assertRaises(db.FailClosedError) as ctx:
             db.init_database_schema(mem)
         self.assertEqual(ctx.exception.code, db.ERR_STORAGE)
-        self.assertIn("更换新的工作区文件夹", ctx.exception.message)
+        self.assertIn("更换工作区目录", ctx.exception.message)
         mem.close()
 
         # 2) PARTIAL_ON_BUDGET 未耗尽预算时必被拒，耗尽后放行
@@ -691,7 +688,7 @@ def evaluate(artifact, spec, tier="official"):
 
         # 1) FULL 模式空壳 {} 必须被拦截
         r_empty = self._call(
-            "export_stage3_final_delivery", "library_surveyor", "ss",
+            "export_stage3_final_delivery", "library_chronicler", "ss",
             delivery_mode="FULL", selected_l3_ids_by_question={}, formal_paper_md=paper_md,
             remaining_gaps_by_question={"Q1": ""}, reproduction_candidate_nodes=[n1],
         )
@@ -700,7 +697,7 @@ def evaluate(artifact, spec, tier="official"):
 
         # 2) 传入未知子题 key 必须被拦截
         r_bad_q = self._call(
-            "export_stage3_final_delivery", "library_surveyor", "ss",
+            "export_stage3_final_delivery", "library_chronicler", "ss",
             delivery_mode="FULL", selected_l3_ids_by_question={"Q1": [l3_q1], "Q_FAKE": []},
             formal_paper_md=paper_md, remaining_gaps_by_question={"Q1": ""},
             reproduction_candidate_nodes=[n1],
@@ -712,7 +709,7 @@ def evaluate(artifact, spec, tier="official"):
         with db.rw_immediate_tx(self.conn):
             self.conn.execute("UPDATE parse0_contract SET subquestions_json = '[\"Q1\", \"Q2\"]', total_budget_json = '{\"max_total_handoffs\": 1}'")
         r_cross = self._call(
-            "export_stage3_final_delivery", "library_surveyor", "ss",
+            "export_stage3_final_delivery", "library_chronicler", "ss",
             delivery_mode="PARTIAL_ON_BUDGET",
             selected_l3_ids_by_question={"Q1": [l3_q1], "Q2": [l3_q1]},
             formal_paper_md=paper_md, remaining_gaps_by_question={"Q1": "", "Q2": "未解"},
@@ -721,12 +718,16 @@ def evaluate(artifact, spec, tier="official"):
         self.assertFalse(r_cross["ok"])
         self.assertEqual(r_cross["error_code"], db.ERR_INVALID_INPUT)
 
-        # 4) 复现包声明文件丢失必须报错，不得静默空复制
+        # 4) 复现包声明文件在工作树与托管快照均丢失时必须报错，不得静默空复制
         with db.rw_immediate_tx(self.conn):
             self.conn.execute("UPDATE parse0_contract SET subquestions_json = '[\"Q1\"]'")
-            self.conn.execute("UPDATE lineage_nodes SET candidate_rel_path = 'missing_entry.py' WHERE node_id = ?", (n1,))
+        snap_row = self.conn.execute("SELECT retained_snapshot_abs_path FROM lineage_nodes WHERE node_id = ?", (n1,)).fetchone()
+        snap_file = Path(str(snap_row["retained_snapshot_abs_path"])) / "q1_solve.py" if snap_row and snap_row["retained_snapshot_abs_path"] else None
+        (wt1 / "q1_solve.py").unlink()
+        if snap_file and snap_file.exists():
+            snap_file.unlink()
         r_missing = self._call(
-            "export_stage3_final_delivery", "library_surveyor", "ss",
+            "export_stage3_final_delivery", "library_chronicler", "ss",
             delivery_mode="FULL", selected_l3_ids_by_question={"Q1": [l3_q1]},
             formal_paper_md=paper_md, remaining_gaps_by_question={"Q1": ""},
             reproduction_candidate_nodes=[n1],
@@ -734,11 +735,12 @@ def evaluate(artifact, spec, tier="official"):
         self.assertFalse(r_missing["ok"])
         self.assertEqual(r_missing["error_code"], db.ERR_NOT_FOUND)
 
-        # 5) 恢复正常路径、导出并终签 CLOSED_VERIFIED 后，严禁再次重导倒退状态
-        with db.rw_immediate_tx(self.conn):
-            self.conn.execute("UPDATE lineage_nodes SET candidate_rel_path = 'q1_solve.py' WHERE node_id = ?", (n1,))
+        # 5) 恢复工作树复现脚本、导出并一步终签 CLOSED_VERIFIED 后，严禁再次重导倒退状态
+        _write_file(wt1 / "q1_solve.py", "print('q1')\n")
+        if snap_file:
+            _write_file(snap_file, "print('q1')\n")
         r_ok = self._call(
-            "export_stage3_final_delivery", "library_surveyor", "ss",
+            "export_stage3_final_delivery", "library_chronicler", "ss",
             delivery_mode="FULL", selected_l3_ids_by_question={"Q1": [l3_q1]},
             formal_paper_md=paper_md, remaining_gaps_by_question={"Q1": ""},
             reproduction_candidate_nodes=[n1],
@@ -750,13 +752,9 @@ def evaluate(artifact, spec, tier="official"):
             review_id=f"STAGE3_FINAL_AUDIT:{did}", final_verdict="ACCEPT",
         )
         self.assertTrue(fin["ok"], fin)
-        sup_close = self._call(
-            "record_compliance_check", "supervisory_committee", "s_sup_fin",
-            stage="CLOSURE_GATE", status="PASSED", blocking_questions=[], notes="两步终核签发结项",
-        )
-        self.assertTrue(sup_close["ok"], sup_close)
+        self.assertEqual(fin["data"]["closure_status"], "CLOSED_VERIFIED")
         r_reexport = self._call(
-            "export_stage3_final_delivery", "library_surveyor", "ss",
+            "export_stage3_final_delivery", "library_chronicler", "ss",
             delivery_mode="FULL", selected_l3_ids_by_question={"Q1": [l3_q1]},
             formal_paper_md=paper_md + "\n试图覆盖已终签终稿\n",
             remaining_gaps_by_question={"Q1": ""}, reproduction_candidate_nodes=[n1],

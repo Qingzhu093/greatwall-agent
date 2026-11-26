@@ -77,10 +77,10 @@ class TestArchitectureContracts(unittest.TestCase):
         py_snap = registry.export_contracts_snapshot()
         node_snap = _load_node_contract_snapshot()
 
-        py_all = sorted(tool for tools in py_snap["role_mcp_tools"].values() for tool in tools)
+        py_all = sorted({tool for tools in py_snap["role_mcp_tools"].values() for tool in tools})
         py_roles_sorted = {r: sorted(ts) for r, ts in py_snap["role_mcp_tools"].items()}
 
-        self.assertEqual(py_snap["tool_count"], 32)
+        self.assertEqual(py_snap["tool_count"], 44)
         self.assertEqual(node_snap["all_tools"], py_all)
         self.assertEqual(node_snap["all_31_alias"], py_all)
         self.assertEqual(node_snap["roles"], py_roles_sorted)

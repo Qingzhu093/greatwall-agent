@@ -339,8 +339,18 @@ export function registerGreatwallConsoleRoutes(
             sessionCwd,
             allowFallback: false,
           })
-          // 仅 action === 'init' 且显式指定目标工作区时允许自动创建控制器；其余写操作无匹配控制器一律 409 拒绝
-          const resolvedInitWs = action === 'init' ? (reqWs || sessionCwd) : ''
+          // 允许 init 与 v0.3 人类单写者落签/接管动作在指定目标工作区时按需拉起控制器；其余控制动作无匹配控制器一律 409 拒绝
+          const autoCreateActions = new Set([
+            'init',
+            'approve_proposal',
+            'pause_node',
+            'resume_node',
+            'authorize_early_handoff',
+            'set_subproblem_state',
+            'set_autonomy_mode',
+            'open_chief',
+          ])
+          const resolvedInitWs = autoCreateActions.has(action) ? (reqWs || sessionCwd) : ''
           if (!ctrl && !resolvedInitWs) {
             return Response.json(
               {

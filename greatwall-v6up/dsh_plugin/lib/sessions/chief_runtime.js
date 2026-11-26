@@ -1,0 +1,181 @@
+/**
+ * GreatWall v0.3 Superagent (`gw_chief`) 运行时管理器、弹性现况锚点卡与原生 Action Card 适配器。
+ *
+ * 核心设计（裁决 1）：
+ * 1. **弹性字数「全院现况锚点卡」**：字数预算 `min(hardCap, max(400, 180 + 100 * subproblems.length))`（默认硬封顶 1200 字），
+ *    在 `dsh-compaction-basic` 自动压缩后通过 `systemPrompt.context` 动态重注实现零断链；
+ * 2. **两阶段高信噪比事件过滤**：95% 常规探索进展止步于 DB+UI，仅 5 类高信噪比事件入收件箱并自然批处理；
+ * 3. **双端确认（DSH 原生 Action Card + 右侧 UI 待拍板卡）**：优先注册 RC5 `@deepseek-ai/dsh-action-cards` (`greatwall_proposal`)，
+ *    人类在聊天窗一键点击即走 `controlService.execute({ caller: 'human_ui', action: 'approve_proposal' })`，乐观锁防重。
+ * @module dsh-greatwall-v6up/sessions/chief_runtime
+ */
+import { computeWorkspaceHash } from '../telemetry.js'
+
+export const HIGH_SIGNAL_CHIEF_EVENTS = Object.freeze(new Set([
+  'MILESTONE',
+  'SUBPROBLEM_SOLVED',
+  'PENDING_HUMAN_PROPOSAL',
+  'WAVE_CONFERENCE_PENDING_APPROVAL',
+  'BLOCK_ALERT',
+  'ALL_BRANCHES_BLOCKED',
+  'EXPLORER_HANDBACK',
+]))
+
+/**
+ * 计算弹性现况锚点卡字数上限：max(400, 180 + 100 * 子题数)，受 hardCapChars（默认 1200）封顶。
+ */
+export function computeChiefAnchorBudgetChars(subproblemCount = 1, hardCapChars = 1200) {
+  const n = Math.max(1, Number(subproblemCount) || 1)
+  const cap = Math.max(400, Number(hardCapChars) || 1200)
+  return Math.min(cap, Math.max(400, 180 + 100 * n))
+}
+
+/**
+ * 构造实时「全院现况锚点卡」（纯确定性快照投影，防长会话压缩后记忆断链）。
+ */
+export function buildChiefAnchorCard(snap, { hardCapChars = 1200 } = {}) {
+  if (!snap || !snap.initialized) {
+    return '[全院现况锚点卡] 课题尚未初始化 Parse 0 契约。'
+  }
+  const subs = Array.isArray(snap.subproblem_runtime_state) ? snap.subproblem_runtime_state : []
+  const maxChars = computeChiefAnchorBudgetChars(subs.length, hardCapChars)
+  const pendingProps = Array.isArray(snap.pending_proposals) ? snap.pending_proposals : []
+  const activeWaves = Array.isArray(snap.active_wave_conferences) ? snap.active_wave_conferences : []
+
+  const lines = [
+    `[全院现况锚点卡] stage=${snap.stage || 'UNKNOWN'} | mode=${snap.autonomy_mode || 'WAVE_CONFIRM'} | spec=v${Number(snap.latest_spec_revision || 0)} | closure=${snap.closure_state?.status || 'OPEN'}`,
+  ]
+  for (const s of subs) {
+    const solved = s.solved_entry_id ? `解=${s.solved_entry_id}` : '未通关'
+    const blk = s.block_reason_code ? ` 阻塞=${s.block_reason_code}` : ''
+    lines.push(
+      `- ${s.question_id}: ${s.dispatch_state}(v${Number(s.active_spec_revision || 0)}) ${solved} W${Number(s.completed_waves || 0)}${blk}`,
+    )
+  }
+  if (pendingProps.length > 0) {
+    const pText = pendingProps.slice(0, 6).map((p) => `${p.proposal_id}:${p.action_type}(${p.target_id})`).join(', ')
+    lines.push(`待拍板提案(${pendingProps.length}): ${pText}`)
+  }
+  if (activeWaves.length > 0) {
+    const wText = activeWaves.slice(0, 4).map((w) => `${w.conference_id}:${w.question_id}[${w.status}]`).join(', ')
+    lines.push(`活跃圆桌: ${wText}`)
+  }
+  const full = lines.join('\n')
+  return full.length <= maxChars ? full : `${full.slice(0, Math.max(0, maxChars - 1))}…`
+}
+
+export class ChiefEventInbox {
+  constructor({ maxQueue = 32 } = {}) {
+    this.maxQueue = maxQueue
+    /** @type {Array<{ receivedAt: string, eventType: string, payload: object }>} */
+    this._queue = []
+  }
+
+  /** 过滤低信噪比常规事件，仅放行 5 类高信噪比事件入收件箱。 */
+  ingest(eventObj) {
+    const p = eventObj?.payload || eventObj || {}
+    const evType = String(p.event_type || p.event_category || p.reason || '').trim().toUpperCase()
+    const matched = [...HIGH_SIGNAL_CHIEF_EVENTS].some((k) => evType.includes(k))
+    if (!matched) return { accepted: false, reason: 'low_signal_filtered' }
+    this._queue.push({
+      receivedAt: new Date().toISOString(),
+      eventType: evType,
+      payload: p,
+    })
+    if (this._queue.length > this.maxQueue) {
+      this._queue.splice(0, this._queue.length - this.maxQueue)
+    }
+    return { accepted: true, queueSize: this._queue.length }
+  }
+
+  drainBatch() {
+    return this._queue.splice(0, this._queue.length)
+  }
+
+  peekCount() {
+    return this._queue.length
+  }
+}
+
+export function buildChiefSessionId(workspaceRoot) {
+  return `gw-chief-${computeWorkspaceHash(workspaceRoot)}`
+}
+
+/**
+ * 向 DSH 0.2.2-rc.5 原生 `actionCards` 服务注册 `greatwall_proposal` 交互卡片（裁决 1）。
+ * 无宿主 `actionCards` 服务时安全返回空 disposer，自动平滑降级为右侧 UI 待拍板卡。
+ */
+export function registerProposalActionCard(ctx, controlService, { logger = console } = {}) {
+  const getSvc = () =>
+    (typeof ctx?.get === 'function' ? ctx.get('actionCards') : null) ||
+    (typeof ctx?.root?.get === 'function' ? ctx.root.get('actionCards') : null) ||
+    ctx?.actionCards ||
+    null
+
+  const svc = getSvc()
+  if (!svc || typeof svc.register !== 'function') {
+    return { registered: false, dispose: () => {} }
+  }
+
+  try {
+    const unreg = svc.register({
+      kind: 'greatwall_proposal',
+      title: '长城科研控制提案确认',
+      async handleAction(actionEvent) {
+        const proposalId = String(actionEvent?.proposalId || actionEvent?.data?.proposal_id || '').trim()
+        const workspaceRoot = String(actionEvent?.workspaceRoot || actionEvent?.data?.workspace_root || '').trim()
+        const decision = String(actionEvent?.decision || actionEvent?.action || 'APPROVE').trim().toUpperCase()
+        return controlService.execute({
+          caller: 'human_ui',
+          action: 'approve_proposal',
+          workspaceRoot,
+          payload: {
+            proposal_id: proposalId,
+            decision: decision === 'REJECT' ? 'REJECT' : 'APPROVE',
+            approved_by_source: 'action_card_human',
+          },
+        })
+      },
+    })
+    return {
+      registered: true,
+      dispose: typeof unreg === 'function' ? unreg : () => {},
+    }
+  } catch (err) {
+    logger?.warn?.('[dsh-greatwall-v6up] registerProposalActionCard fallback:', String(err?.message || err))
+    return { registered: false, dispose: () => {} }
+  }
+}
+
+/**
+ * 按需拉起或从磁盘 resume 持久 `gw_chief` 会话，并挂载弹性现况锚点卡注入器。
+ */
+export async function ensureChiefSession(controller, { prompt = '', hardCapChars = 1200, signal = null } = {}) {
+  const ws = controller.workspaceRoot
+  const chiefSid = buildChiefSessionId(ws)
+  let latestAnchorText = '[全院现况锚点卡] 加载中…'
+
+  const refreshAnchor = async () => {
+    try {
+      const snapRes = await controller.scheduleSnapshot()
+      if (snapRes?.ok && snapRes?.data) {
+        latestAnchorText = buildChiefAnchorCard(snapRes.data, { hardCapChars })
+      }
+    } catch {}
+    return latestAnchorText
+  }
+  await refreshAnchor()
+
+  return controller.orchestrator.resumeOrSpawnAgent({
+    role: 'gw_chief',
+    sessionId: chiefSid,
+    questionId: 'ALL',
+    uiLabel: '[科研总控] gw-chief',
+    shortTransaction: false,
+    keepAliveAfterIdle: true,
+    archiveOnComplete: false,
+    extraContextProvider: () => latestAnchorText,
+    signal,
+    prompt: prompt || '请调用 chief_get_overview_snapshot(question_id="ALL")，用三段简明汇报当前进度：1) 正在做什么；2) 卡在哪里与待拍板项；3) 已证实基线。',
+  })
+}

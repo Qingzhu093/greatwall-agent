@@ -43,26 +43,30 @@ def open_rw_connection_with_init(
     p = Path(db_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p), timeout=30.0, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-    conn.execute("PRAGMA busy_timeout=30000;")
-    if init_schema:
-        real_key = os.path.realpath(str(p))
-        sig = _db_file_signature(p)
-        need_init = force_init
-        if not need_init:
-            with _INIT_DB_LOCK:
-                if sig is None or _INITIALIZED_DB_SIGNATURES.get(real_key) != sig:
-                    need_init = True
-        if need_init:
-            with _INIT_DB_LOCK:
-                sig2 = _db_file_signature(p)
-                if force_init or sig2 is None or _INITIALIZED_DB_SIGNATURES.get(real_key) != sig2:
-                    init_fn(conn)
-                    new_sig = _db_file_signature(p)
-                    if new_sig is not None:
-                        _INITIALIZED_DB_SIGNATURES[real_key] = new_sig
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+        if init_schema:
+            real_key = os.path.realpath(str(p))
+            sig = _db_file_signature(p)
+            need_init = force_init
+            if not need_init:
+                with _INIT_DB_LOCK:
+                    if sig is None or _INITIALIZED_DB_SIGNATURES.get(real_key) != sig:
+                        need_init = True
+            if need_init:
+                with _INIT_DB_LOCK:
+                    sig2 = _db_file_signature(p)
+                    if force_init or sig2 is None or _INITIALIZED_DB_SIGNATURES.get(real_key) != sig2:
+                        init_fn(conn)
+                        new_sig = _db_file_signature(p)
+                        if new_sig is not None:
+                            _INITIALIZED_DB_SIGNATURES[real_key] = new_sig
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 

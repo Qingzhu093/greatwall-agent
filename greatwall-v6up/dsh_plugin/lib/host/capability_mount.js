@@ -1,9 +1,5 @@
 /**
- * 子会话能力挂载单元（从 AgentSessionHost 拆出，专注工具裁剪、沙箱 Guard、FactLog、物理时钟与 Prompt 拼装）。
- *
- * 严格遵循 RC5 规范：
- * - 移除了 RC5 中已不存在的 `agentCtx.tools.presentAs('native')` 空转调用（由 Preset 声明 `@deepseek-ai/dsh-tool-executor-native` 承担）；
- * - 所有注册项的 disposer 统一压入 `cleanupFns`，确保会话结束或插件卸载时彻底释放。
+ * GreatWall v0.3 子会话能力挂载单元（工具裁剪、沙箱 Guard、FactLog、物理时钟、动态锚点与窄 MCP 工具）。
  * @module dsh-greatwall-v6up/host/capability_mount
  */
 import path from 'node:path'
@@ -12,22 +8,14 @@ import { installRoleSandboxGuard } from '../read_isolated_sandbox.js'
 import { installFactLogMiddleware } from '../fact_log_middleware.js'
 import { installLiveClockObservers, registerScopedMcpTools } from '../clock_and_turn_gap.js'
 
-/**
- * 为指定角色的子会话挂载受限原生工具、双向沙箱 Guard、FactLog、物理时钟、白名单 Prompt 与窄 MCP 工具。
- * @param {object} hostDeps
- * @param {any} hostDeps.rootCtx
- * @param {any} hostDeps.bridge
- * @param {string} hostDeps.workspaceRoot
- * @param {Record<string, string>} hostDeps.rolePrompts
- * @param {string[]} hostDeps.protectedDirs
- * @param {string[]} hostDeps.sharedInputPaths
- * @param {number} hostDeps.effectiveContextWindow
- * @param {(sessionId: string, flag: boolean) => void} hostDeps.setSessionReadonly
- * @param {(sessionId: string) => boolean} hostDeps.isSessionReadonly
- * @param {any} agentCtx
- * @param {any} agent
- * @param {object} mountOpts
- */
+const ZERO_NATIVE_ROLES = new Set([
+  'gw_chief',
+  'logistics_coordinator',
+  'supervisory_committee',
+  'library_chronicler',
+  'conference_chair',
+])
+
 export function mountCapabilitiesOnAgentSession(
   hostDeps,
   agentCtx,
@@ -39,6 +27,8 @@ export function mountCapabilitiesOnAgentSession(
     sandboxAbsPath = '',
     toolSchemas = [],
     taskContextText = '',
+    extraContextProvider = null,
+    allowedMcpOverride = null,
     readonly = false,
     cleanupFns = [],
     turnSignals = [],
@@ -46,9 +36,12 @@ export function mountCapabilitiesOnAgentSession(
   },
 ) {
   const allowNative = readonly
-    ? (role === 'logistics_coordinator' || role === 'supervisory_committee' ? [] : ['read', 'glob', 'grep'])
+    ? (ZERO_NATIVE_ROLES.has(role) || role === 'external_surveyor' ? [] : ['read', 'glob', 'grep'])
     : resolvePlatformAllowedTools(role, process.platform)
-  const mcpToolNames = readonly ? [] : (ROLE_MCP_TOOLS[role] || [])
+
+  const mcpToolNames = readonly
+    ? []
+    : (Array.isArray(allowedMcpOverride) ? allowedMcpOverride : (ROLE_MCP_TOOLS[role] || []))
 
   const inherited = agentCtx.tools?.schemas?.(agent)?.map((s) => s.name) || []
   if (inherited.length > 0 && typeof agentCtx.tools?.restrict === 'function') {
@@ -58,11 +51,9 @@ export function mountCapabilitiesOnAgentSession(
     } else {
       const allowSet = new Set(allowNative)
       const matchedAllow = inherited.filter((n) => allowSet.has(n))
-      if (matchedAllow.length > 0) {
-        restrictDispose = agentCtx.tools.restrict({ allow: matchedAllow })
-      } else {
-        restrictDispose = agentCtx.tools.restrict({ deny: inherited })
-      }
+      restrictDispose = matchedAllow.length > 0
+        ? agentCtx.tools.restrict({ allow: matchedAllow })
+        : agentCtx.tools.restrict({ deny: inherited })
     }
     if (typeof restrictDispose === 'function') cleanupFns.push(restrictDispose)
   }
@@ -134,11 +125,23 @@ export function mountCapabilitiesOnAgentSession(
     )
   }
 
+  // 支持 gw_chief 每次对话动态注入弹性字数「全院现况锚点卡」（防压缩断链）
+  if (typeof extraContextProvider === 'function' && typeof agentCtx.systemPrompt?.context === 'function') {
+    cleanupFns.push(
+      agentCtx.systemPrompt.context({
+        name: `greatwall:anchor:${role}`,
+        order: 15,
+        text: () => extraContextProvider(agent),
+        required: true,
+        interpolate: false,
+      }),
+    )
+  }
+
   cleanupFns.push(
     agentCtx.on('system-prompt/assemble', async (assembly, _assembleCtx, next) => {
       const out = await next()
       if (Array.isArray(out?.sections)) {
-        // 严格白名单：仅保留 harness:identity、本插件 greatwall:* 角色契约与本 Preset 自带 tool-* 说明，挡住全局第三方插件 section 污染
         out.sections = out.sections.filter((sec) => {
           const nm = String(sec?.name || '')
           if (nm === 'tool-fs:guidance') return false

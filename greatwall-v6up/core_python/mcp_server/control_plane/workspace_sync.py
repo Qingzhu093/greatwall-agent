@@ -360,13 +360,13 @@ def sync_public_instruments_to_all_active_worktrees(
     return count
 
 
-def sync_public_rulings(conn: sqlite3.Connection, *, workspace_root: str) -> dict[str, Any]:
-    """轻量检测工作区 `rulings/` 公开补充裁决文档变动：仅在文件指纹变化时递增 `latest_spec_revision` 并留存版本快照。"""
+def inspect_public_rulings_draft_status(conn: sqlite3.Connection, *, workspace_root: str) -> dict[str, Any]:
+    """v0.3 纯只读检测工作区 `rulings/` 是否存在尚未经人类提案落签的磁盘草稿变更（彻底废除扫磁盘自动升版暗门！）。"""
     p0 = conn.execute(
         "SELECT latest_spec_revision, latest_ruling_summary_md, ruling_fingerprint_sha256 FROM parse0_contract WHERE contract_id = 'active'"
     ).fetchone()
     if p0 is None:
-        return {"changed": False, "latest_spec_revision": 0, "latest_ruling_summary_md": ""}
+        return {"draft_changed": False, "latest_spec_revision": 0, "latest_ruling_summary_md": "", "ruling_files": []}
 
     cur_rev = int(p0["latest_spec_revision"] or 0)
     cur_fp = str(p0["ruling_fingerprint_sha256"] or "")
@@ -381,56 +381,31 @@ def sync_public_rulings(conn: sqlite3.Connection, *, workspace_root: str) -> dic
             key=lambda p: p.relative_to(rulings_dir).as_posix(),
         )
 
-    if not files and not cur_fp:
-        return {"changed": False, "latest_spec_revision": cur_rev, "latest_ruling_summary_md": cur_summary}
-
     h = hashlib.sha256()
-    summary_parts: list[str] = []
     for fp in files:
         rel = fp.relative_to(rulings_dir).as_posix()
-        file_sha = sha256_file(fp)
-        h.update(f"{rel}:{file_sha}\n".encode("utf-8"))
-        try:
-            snippet = fp.read_text(encoding="utf-8", errors="replace").strip().replace("\r\n", "\n")[:260]
-        except OSError:
-            snippet = ""
-        summary_parts.append(f"- `{rel}`: {snippet}")
+        h.update(f"{rel}:{sha256_file(fp)}\n".encode("utf-8"))
     new_fp = h.hexdigest() if files else ""
 
-    if new_fp == cur_fp:
-        return {"changed": False, "latest_spec_revision": cur_rev, "latest_ruling_summary_md": cur_summary}
-
-    new_rev = cur_rev + 1
-    new_summary = ("\n".join(summary_parts))[:1200] if summary_parts else "(rulings/ 目录已清空)"
-    paths = resolve_storage_paths(workspace_root)
-    rev_snap_dir = paths["ruling_revisions_dir"] / f"v{new_rev}"
-    if rev_snap_dir.exists():
-        shutil.rmtree(rev_snap_dir, ignore_errors=True)
-    rev_snap_dir.mkdir(parents=True, exist_ok=True)
-    for fp in files:
-        rel = fp.relative_to(rulings_dir)
-        dst = rev_snap_dir / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            shutil.copy2(fp, dst)
-        except OSError:
-            pass
-
-    now = utc_now_iso()
-    with rw_immediate_tx(conn):
-        conn.execute(
-            """
-            UPDATE parse0_contract
-            SET latest_spec_revision = ?, latest_ruling_summary_md = ?, ruling_fingerprint_sha256 = ?, updated_at = ?
-            WHERE contract_id = 'active'
-            """,
-            (new_rev, new_summary, new_fp, now),
-        )
     return {
-        "changed": True,
-        "latest_spec_revision": new_rev,
-        "latest_ruling_summary_md": new_summary,
+        "draft_changed": bool(new_fp and new_fp != cur_fp),
+        "latest_spec_revision": cur_rev,
+        "latest_ruling_summary_md": cur_summary,
         "ruling_files": [fp.relative_to(rulings_dir).as_posix() for fp in files],
+        "note": "v0.3 磁盘 rulings/ 变更仅作草稿只读提示，须由人类确认 AMEND_RULING_DRAFT 提案方可升版生效。",
+    }
+
+
+def sync_public_rulings(conn: sqlite3.Connection, *, workspace_root: str) -> dict[str, Any]:
+    """向后兼容别名：严禁扫盘静默升版，仅返回只读草稿提示。"""
+    st = inspect_public_rulings_draft_status(conn, workspace_root=workspace_root)
+    return {
+        "changed": False,
+        "draft_changed": st["draft_changed"],
+        "latest_spec_revision": st["latest_spec_revision"],
+        "latest_ruling_summary_md": st["latest_ruling_summary_md"],
+        "ruling_files": st["ruling_files"],
+        "note": st["note"],
     }
 
 

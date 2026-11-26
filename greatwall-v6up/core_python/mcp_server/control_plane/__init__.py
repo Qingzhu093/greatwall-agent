@@ -1,20 +1,26 @@
-"""长城 V6-Up (v3.0) 控制面按领域拆分包（6 个无环内聚子域）。"""
+"""控制面子域汇总导出（无环单向依赖，严禁反向 import tools_*.py）。"""
 
 from .blind_sandbox import (
-    _rmtree_force,
-    _set_tree_readonly,
     cleanup_blind_review_sandbox,
     stage_blind_review_sandbox,
 )
 from .delivery_and_jobs import (
-    compute_delivery_dir_sha256,
     execute_heavy_async_job,
-    export_stage3_deliverables,
     recover_pending_heavy_jobs,
 )
+from .delivery_freeze import (
+    compute_delivery_dir_sha256,
+    export_stage3_deliverables_v03 as export_stage3_deliverables,
+    finalize_stage3_closure_on_verifier_accept,
+)
+from .effects_outbox import (
+    cancel_stale_effects_for_target,
+    claim_runtime_effects,
+    complete_runtime_effect,
+    enqueue_runtime_effect,
+    renew_runtime_effect_lease,
+)
 from .lifecycle_ops import (
-    _canonical_instrument_key,
-    _parse_iso_utc,
     abort_lineage_node,
     compute_missing_initial_instruments,
     init_parse0_contract,
@@ -23,6 +29,19 @@ from .lifecycle_ops import (
     record_pending_handoff,
     submit_works_ticket,
     sync_session_pressure,
+)
+from .node_interventions import (
+    authorize_early_handoff,
+    mark_node_yielded,
+    pause_node,
+    record_human_chat_detected,
+    resume_node,
+)
+from .proposals import (
+    apply_approved_ruling_amendment,
+    approve_control_proposal,
+    create_control_proposal,
+    set_autonomy_mode,
 )
 from .scheduler_rules import (
     check_branch_requires_satisfied,
@@ -33,16 +52,27 @@ from .scheduler_rules import (
     schedule_control_plane_snapshot,
     uninitialized_schedule_snapshot,
 )
+from .subproblem_locks import (
+    ensure_subproblem_rows,
+    evaluate_subproblem_locks,
+    find_latest_spec_full_goal_l3,
+    get_subproblem_active_spec_revision,
+    record_subproblem_tokens,
+    set_subproblem_state,
+)
 from .ui_projection import get_ui_full_inspector_payload
+from .wave_engine import (
+    append_conference_statement,
+    build_wave_hard_ledger,
+    check_and_open_wave_conference,
+    execute_approved_wave_verdict,
+    submit_wave_verdict_decision,
+)
 from .workspace_sync import (
-    _FORBIDDEN_SHARED_NAMES,
-    _PUBLIC_INPUT_DEFAULT_DIRS,
-    _PUBLIC_INPUT_TOP_EXTS,
-    _SENSITIVE_COMMENT_RE,
-    _is_forbidden_public_path,
     backup_retained_candidate_snapshot,
     discover_public_input_entries,
     extract_sanitized_code_diff_md,
+    inspect_public_rulings_draft_status,
     restore_retained_candidate_snapshot,
     safe_resolve_in_worktree,
     scan_worktree_tools_manifest,
@@ -53,40 +83,58 @@ from .workspace_sync import (
 )
 
 __all__ = [
-    "_FORBIDDEN_SHARED_NAMES",
-    "_PUBLIC_INPUT_DEFAULT_DIRS",
-    "_PUBLIC_INPUT_TOP_EXTS",
-    "_SENSITIVE_COMMENT_RE",
-    "_canonical_instrument_key",
-    "_is_forbidden_public_path",
-    "_parse_iso_utc",
-    "_rmtree_force",
-    "_set_tree_readonly",
     "abort_lineage_node",
+    "append_conference_statement",
+    "apply_approved_ruling_amendment",
+    "approve_control_proposal",
+    "authorize_early_handoff",
     "backup_retained_candidate_snapshot",
+    "build_wave_hard_ledger",
+    "cancel_stale_effects_for_target",
+    "check_and_open_wave_conference",
     "check_branch_requires_satisfied",
     "check_stage2_closure_gate_data",
+    "claim_runtime_effects",
     "cleanup_blind_review_sandbox",
+    "complete_runtime_effect",
     "compute_delivery_dir_sha256",
     "compute_family_concentration_alerts",
     "compute_missing_initial_instruments",
     "compute_topology_and_revision_health",
+    "create_control_proposal",
     "discover_public_input_entries",
+    "enqueue_runtime_effect",
+    "ensure_subproblem_rows",
+    "evaluate_subproblem_locks",
+    "execute_approved_wave_verdict",
     "execute_heavy_async_job",
     "export_stage3_deliverables",
     "extract_sanitized_code_diff_md",
+    "finalize_stage3_closure_on_verifier_accept",
+    "find_latest_spec_full_goal_l3",
     "get_question_order_status",
+    "get_subproblem_active_spec_revision",
     "get_ui_full_inspector_payload",
     "init_parse0_contract",
+    "inspect_public_rulings_draft_status",
+    "mark_node_yielded",
     "mark_stage1_works_checked",
+    "pause_node",
+    "record_human_chat_detected",
     "record_human_stop",
     "record_pending_handoff",
+    "record_subproblem_tokens",
     "recover_pending_heavy_jobs",
+    "renew_runtime_effect_lease",
     "restore_retained_candidate_snapshot",
+    "resume_node",
     "safe_resolve_in_worktree",
     "scan_worktree_tools_manifest",
     "schedule_control_plane_snapshot",
+    "set_autonomy_mode",
+    "set_subproblem_state",
     "stage_blind_review_sandbox",
+    "submit_wave_verdict_decision",
     "submit_works_ticket",
     "sync_public_inputs_to_worktree",
     "sync_public_instruments_and_skills_to_worktree",

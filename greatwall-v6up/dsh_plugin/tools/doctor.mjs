@@ -161,7 +161,7 @@ function checkToolContractsSync(pySnapshot) {
   if (!pySnapshot) {
     return {
       id: 'tool_contracts_sync',
-      title: 'Python ↔ Node 32 窄工具跨层契约同步',
+      title: 'Python ↔ Node 44 窄工具与 10 角色跨层契约同步',
       status: 'error',
       required: true,
       detail: '因 Python 运行时检查失败，无法比对跨层契约',
@@ -170,7 +170,7 @@ function checkToolContractsSync(pySnapshot) {
 
   const mismatches = []
   const pyRoles = pySnapshot.role_mcp_tools || {}
-  const pyAllTools = Object.values(pyRoles).flat()
+  const pyAllTools = [...new Set(Object.values(pyRoles).flat())]
 
   const allDiff = sortedDiff(pyAllTools, ALL_MCP_TOOLS)
   if (!allDiff.equal) mismatches.push({ field: 'all_tools', ...allDiff })
@@ -197,7 +197,7 @@ function checkToolContractsSync(pySnapshot) {
   if (mismatches.length > 0) {
     return {
       id: 'tool_contracts_sync',
-      title: 'Python ↔ Node 32 窄工具跨层契约同步',
+      title: 'Python ↔ Node 44 窄工具与 10 角色跨层契约同步',
       status: 'error',
       required: true,
       detail: `发现 ${mismatches.length} 处跨层契约漂移: ${mismatches.map((m) => m.field).join(', ')}`,
@@ -207,10 +207,10 @@ function checkToolContractsSync(pySnapshot) {
 
   return {
     id: 'tool_contracts_sync',
-    title: 'Python ↔ Node 32 窄工具跨层契约同步',
+    title: 'Python ↔ Node 44 窄工具与 10 角色跨层契约同步',
     status: 'ok',
     required: true,
-    detail: `32 窄工具 / 7 角色路由 / 21 只读禁写 / 5 长耗时 / 7 回合收尾工具全部 100% 同步`,
+    detail: `${ALL_MCP_TOOLS.size} 窄工具 / ${CANONICAL_ROLES.length} 角色路由 / ${READONLY_BLOCKED_MCP_TOOLS.size} 只读禁写 / ${LONG_RUNNING_MCP_TOOLS.size} 长耗时 / ${TURN_CONCLUDING_TOOLS.size} 回合收尾工具全部 100% 同步`,
   }
 }
 
@@ -220,7 +220,7 @@ function checkPresetsIntegrity() {
   if (!fs.existsSync(BUNDLE_PATCH_PATH)) {
     return {
       id: 'presets_integrity',
-      title: '6 套子角色 DSH Preset 单源声明 (cordis.patch.yml)',
+      title: '8 套 v0.3 DSH Preset 单源声明 (cordis.patch.yml)',
       status: 'error',
       required: true,
       detail: `缺少权威 Bundle 声明文件: ${BUNDLE_PATCH_PATH}`,
@@ -232,7 +232,7 @@ function checkPresetsIntegrity() {
   } catch (err) {
     return {
       id: 'presets_integrity',
-      title: '6 套子角色 DSH Preset 单源声明 (cordis.patch.yml)',
+      title: '8 套 v0.3 DSH Preset 单源声明 (cordis.patch.yml)',
       status: 'error',
       required: true,
       detail: `解析 cordis.patch.yml 失败: ${err?.message || err}`,
@@ -253,15 +253,21 @@ function checkPresetsIntegrity() {
     if (!pluginNames.has('@deepseek-ai/dsh-tool-executor-native')) {
       issues.push(`${pid} 缺少 @deepseek-ai/dsh-tool-executor-native`)
     }
+    if (pid === 'greatwall-explorer' && pluginNames.has('@deepseek-ai/dsh-compaction-tool-result-pruner')) {
+      issues.push('红线违规：greatwall-explorer 严禁挂载 dsh-compaction-tool-result-pruner')
+    }
+    if (pid === 'greatwall-chief' && !pluginNames.has('@deepseek-ai/dsh-compaction-basic')) {
+      issues.push('greatwall-chief 必须挂载 @deepseek-ai/dsh-compaction-basic')
+    }
   }
-  const ok = presetIds.length === 6 && declared.length === 6 && issues.length === 0
+  const ok = presetIds.length === 8 && declared.length === 8 && issues.length === 0
   return {
     id: 'presets_integrity',
-    title: '6 套子角色 DSH Preset 单源声明 (cordis.patch.yml)',
+    title: '8 套 v0.3 DSH Preset 单源声明 (cordis.patch.yml)',
     status: ok ? 'ok' : 'error',
     required: true,
     detail: ok
-      ? `6 套单源 Preset 齐全且均对齐 RC5 native executor (${presetIds.join(', ')})`
+      ? `8 套单源 Preset 齐全且全部符合 v0.3 隔离与 RC5 native executor 规约 (${presetIds.join(', ')})`
       : `Preset 声明异常: ${issues.join('; ')}`,
   }
 }
@@ -276,13 +282,52 @@ function checkAgentTemplates() {
   if (!fs.existsSync(path.join(CORE_PYTHON_ROOT, 'config.json'))) {
     missing.push('config.json')
   }
-  const ok = missing.length === 0
+  const legacySurveyor = path.join(CORE_PYTHON_ROOT, 'agents', 'library_surveyor.md')
+  const extras = fs.existsSync(legacySurveyor) ? ['agents/library_surveyor.md (旧 v0.2 遗留未清理)'] : []
+  const ok = missing.length === 0 && extras.length === 0
   return {
     id: 'agent_templates',
-    title: '7 份角色系统提示词与 core_python/config.json',
+    title: '10 份角色系统提示词与 core_python/config.json',
     status: ok ? 'ok' : 'error',
     required: true,
-    detail: ok ? `7 份角色模板与 config.json 完整就绪` : `缺失文件: ${missing.join(', ')}`,
+    detail: ok
+      ? `10 份 v0.3 角色模板与 config.json 完整就绪（零旧版残留）`
+      : `模板异常: ${[...missing.map((x) => `缺失 ${x}`), ...extras].join('; ')}`,
+  }
+}
+
+/** @returns {CheckItem} */
+function checkV03Redlines() {
+  const issues = []
+  const pkgPath = path.join(PLUGIN_ROOT, 'package.json')
+  try {
+    const pkgRaw = fs.readFileSync(pkgPath, 'utf8')
+    if (pkgRaw.includes('dsh-client-ui-primitives')) {
+      issues.push('package.json 仍包含禁止引用的 dsh-client-ui-primitives')
+    }
+  } catch (err) {
+    issues.push(`无法读取 package.json: ${err?.message || err}`)
+  }
+
+  const clientPath = path.join(PLUGIN_ROOT, 'lib', 'client.js')
+  if (!fs.existsSync(clientPath)) {
+    issues.push('缺少前端编译产物 lib/client.js（请先运行 npm run build:client）')
+  } else {
+    const clientRaw = fs.readFileSync(clientPath, 'utf8')
+    if (clientRaw.includes('dsh-client-ui-primitives')) {
+      issues.push('lib/client.js 包含禁止引用的 dsh-client-ui-primitives')
+    }
+  }
+
+  const ok = issues.length === 0
+  return {
+    id: 'v03_redlines',
+    title: 'v0.3 前端构建产物与工程红线校验',
+    status: ok ? 'ok' : 'error',
+    required: true,
+    detail: ok
+      ? 'lib/client.js 已构建、零 dsh-client-ui-primitives 依赖'
+      : issues.join('; '),
   }
 }
 
@@ -338,6 +383,7 @@ function main() {
     checkToolContractsSync(pySnapshot),
     checkPresetsIntegrity(),
     checkAgentTemplates(),
+    checkV03Redlines(),
     checkDshProfileMount(),
   ]
 

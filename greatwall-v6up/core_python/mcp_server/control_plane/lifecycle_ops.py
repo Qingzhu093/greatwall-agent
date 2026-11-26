@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..db_schema import (
+    ALLOWED_AUTONOMY_MODES,
+    ALLOWED_WORKS_TICKET_TYPES,
     ERR_INVALID_INPUT,
     ERR_NOT_FOUND,
     FailClosedError,
@@ -20,8 +22,9 @@ from ..mcp_core_helpers import (
     load_runtime_config,
     resolve_effective_context_window,
 )
+from .subproblem_locks import ensure_subproblem_rows
 
-_ALLOWED_WORKS_TICKET_TYPES = {"INSTRUMENT_ERROR", "PAIN_POINT", "DUPLICATE_TOOL", "EXPLOIT"}
+_ALLOWED_WORKS_TICKET_TYPES = set(ALLOWED_WORKS_TICKET_TYPES)
 
 
 def _canonical_instrument_key(iid: str) -> str:
@@ -129,8 +132,9 @@ def init_parse0_contract(
     stage: str | None = None,
     epoch_id: int = 1,
     human_signed_at: str | None = None,
+    autonomy_mode: str = "WAVE_CONFIRM",
 ) -> dict[str, Any]:
-    """写入或更新 active Parse 0 六项启动契约表单（单写者控制面调用；更新已有契约时默认保留当前 stage 不倒退）。"""
+    """写入或更新 active Parse 0 六项启动契约表单（同事务自动初始化 subproblem_runtime_state）。"""
     clean_goal = str(goal_and_completion_md or "").strip()
     if not clean_goal:
         raise FailClosedError(ERR_INVALID_INPUT, "Parse 0 第 1 项 goal_and_completion_md 不可为空")
@@ -144,6 +148,9 @@ def init_parse0_contract(
         raise FailClosedError(ERR_INVALID_INPUT, "Parse 0 第 2 项 subquestions 至少须包含 1 个非空子题标识")
     order_list = [str(q).strip() for q in (question_order or []) if str(q).strip()]
     clean_shared_inputs = [str(p).strip().replace("\\", "/") for p in (shared_inputs_rel_paths or []) if str(p).strip()]
+    eff_autonomy = str(autonomy_mode or "WAVE_CONFIRM").strip().upper()
+    if eff_autonomy not in ALLOWED_AUTONOMY_MODES:
+        eff_autonomy = "WAVE_CONFIRM"
     now = utc_now_iso()
     signed_ts = str(human_signed_at or now)
     explicit_stage = stage if stage in ("STAGE1_PARSE0", "STAGE2_EVOLVE", "STAGE3_CONSOLIDATE", "CLOSED_VERIFIED") else None
@@ -156,9 +163,9 @@ def init_parse0_contract(
             INSERT INTO parse0_contract(
                 contract_id, goal_and_completion_md, subquestions_json, question_order_json,
                 initial_instruments_json, seed_families_json, total_budget_json,
-                min_commitment_window_sec, delivery_spec_md, shared_inputs_json, human_signed_at,
-                stage, consecutive_non_l1_handoffs, epoch_id, created_at, updated_at
-            ) VALUES ('active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                min_commitment_window_sec, delivery_spec_md, shared_inputs_json, autonomy_mode,
+                human_signed_at, stage, consecutive_non_l1_handoffs, epoch_id, created_at, updated_at
+            ) VALUES ('active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
             ON CONFLICT(contract_id) DO UPDATE SET
                 goal_and_completion_md = excluded.goal_and_completion_md,
                 subquestions_json = excluded.subquestions_json,
@@ -169,6 +176,7 @@ def init_parse0_contract(
                 min_commitment_window_sec = excluded.min_commitment_window_sec,
                 delivery_spec_md = excluded.delivery_spec_md,
                 shared_inputs_json = excluded.shared_inputs_json,
+                autonomy_mode = excluded.autonomy_mode,
                 human_signed_at = excluded.human_signed_at,
                 {stage_update_sql}
                 epoch_id = excluded.epoch_id,
@@ -184,6 +192,7 @@ def init_parse0_contract(
                 max(0, int(min_commitment_window_sec or 0)),
                 str(delivery_spec_md or ""),
                 json.dumps(clean_shared_inputs, ensure_ascii=False),
+                eff_autonomy,
                 signed_ts,
                 insert_stage,
                 int(epoch_id or 1),
@@ -198,8 +207,17 @@ def init_parse0_contract(
             """,
             (now,),
         )
-        cur_row = conn.execute("SELECT stage FROM parse0_contract WHERE contract_id = 'active'").fetchone()
+        cur_row = conn.execute("SELECT stage, latest_spec_revision FROM parse0_contract WHERE contract_id = 'active'").fetchone()
         eff_stage = str(cur_row["stage"]) if cur_row else insert_stage
+        cur_rev = int(cur_row["latest_spec_revision"] or 0) if cur_row else 0
+        ensure_subproblem_rows(
+            conn,
+            qs,
+            min_commitment_sec=max(0, int(min_commitment_window_sec or 0)),
+            total_budget=total_budget,
+            active_spec_revision=cur_rev,
+            started_at=signed_ts,
+        )
 
     return {
         "contract_id": "active",
@@ -207,6 +225,7 @@ def init_parse0_contract(
         "question_order": order_list,
         "shared_inputs_rel_paths": clean_shared_inputs,
         "min_commitment_window_sec": max(0, int(min_commitment_window_sec or 0)),
+        "autonomy_mode": eff_autonomy,
         "stage": eff_stage,
         "human_signed_at": signed_ts,
         "epoch_id": int(epoch_id or 1),

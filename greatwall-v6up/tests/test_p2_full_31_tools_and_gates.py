@@ -121,7 +121,7 @@ class TestP2Full31ToolsAndGates(unittest.TestCase):
     def test_1_pure_derivation_no_obs_37_unlock_and_pre_spawn_isolation(self) -> None:
         lit = self._call(
             "publish_external_literature_card",
-            "library_surveyor",
+            "external_surveyor",
             "s_surv",
             ref_id="R001",
             question_id="Q1",
@@ -352,11 +352,11 @@ class TestP2Full31ToolsAndGates(unittest.TestCase):
         # FULL 模式终稿验证测试将 min_commitment_window_sec 置 0（窗口阻断在 test_5 单独测）
         with db.rw_immediate_tx(self.conn):
             self.conn.execute("UPDATE parse0_contract SET min_commitment_window_sec = 0 WHERE contract_id = 'active';")
-        # 导出版本 A
+        # 导出版本 A（v0.3 由 library_chronicler 导出并写入外部不可变冻结目录）
         exp_a = self._call(
             "export_stage3_final_delivery",
-            "library_surveyor",
-            "s_surv",
+            "library_chronicler",
+            "s_chr",
             delivery_mode="FULL",
             formal_paper_md="# 终稿版本 A\n完整论文正文 A：本报告系统汇总 Q1 与 Q2 两条正交主线的严格定理证明、独立盲审验证结论与可复现工件路径清单，所有核心结论均已通过两阶段盲审并入库 L3。\n",
             selected_l3_ids_by_question=l3_by_q,
@@ -366,23 +366,11 @@ class TestP2Full31ToolsAndGates(unittest.TestCase):
         self.assertTrue(exp_a["ok"], exp_a)
         deliv_a = exp_a["data"]["delivery_id"]
 
-        # 核查员对版本 A 做 Stage 3 终核通过
-        audit_a = self._call(
-            "submit_stage2_unblind_verdict",
-            "library_verifier",
-            "s_ver_final",
-            review_id=f"STAGE3_FINAL_AUDIT:{deliv_a}",
-            final_verdict="ACCEPT",
-            title="版本 A 终稿审定",
-            abstract_md="版本 A 全部溯源与引用一致。",
-        )
-        self.assertTrue(audit_a["ok"], audit_a)
-
-        # 在监察委签发前，采编重导出修改后的版本 B！
+        # 在核查员终审前，馆员重导出修改后的版本 B！
         exp_b = self._call(
             "export_stage3_final_delivery",
-            "library_surveyor",
-            "s_surv",
+            "library_chronicler",
+            "s_chr",
             delivery_mode="FULL",
             formal_paper_md="# 终稿版本 B\n修改后的论文正文 B（内容已变更）：本修订版更新了 Q2 结论的表述并补充了实验参数边界说明，用于验证终稿版本 SHA-256 绑定门禁是否能阻断旧审稿签字放行新版。\n",
             selected_l3_ids_by_question=l3_by_q,
@@ -393,21 +381,33 @@ class TestP2Full31ToolsAndGates(unittest.TestCase):
         deliv_b = exp_b["data"]["delivery_id"]
         self.assertNotEqual(exp_a["data"]["delivery_sha256"], exp_b["data"]["delivery_sha256"])
 
-        # 监察委试图直接签发 CLOSURE_GATE(PASSED)（偷梁换柱审 A 放 B）：必须被拒！
+        # 核查员滞后针对旧版 A 试图终签 ACCEPT（防审 A 放 B）：必须被单写者事务拦死！
         blocked = self._call(
+            "submit_stage2_unblind_verdict",
+            "library_verifier",
+            "s_ver_stale",
+            review_id=f"STAGE3_FINAL_AUDIT:{deliv_a}",
+            final_verdict="ACCEPT",
+            title="尝试用旧版 A 放行新版 B",
+            abstract_md="版本 A 全部溯源与引用一致。",
+        )
+        self.assertFalse(blocked["ok"])
+        self.assertEqual(blocked["error_code"], db.ERR_CONFLICT)
+
+        # 裁决 3：supervisory_committee 旧二次 CLOSURE_GATE 放行已正式退役
+        old_gate = self._call(
             "record_compliance_check",
             "supervisory_committee",
             "s_sup",
             stage="CLOSURE_GATE",
             status="PASSED",
             blocking_questions=[],
-            notes="尝试直接放行",
+            notes="验证旧二次放行已废除",
         )
-        self.assertFalse(blocked["ok"])
-        self.assertEqual(blocked["error_code"], db.ERR_LOCKED)
-        self.assertIn("防审 A 放 B", blocked["error"])
+        self.assertFalse(old_gate["ok"])
+        self.assertEqual(old_gate["error_code"], db.ERR_LOCKED)
 
-        # 核查员重审版本 B 通过后，监察委再签发 CLOSURE_GATE(PASSED) 才晋升 CLOSED_VERIFIED
+        # 核查员对当前最新版本 B 终审 ACCEPT -> 一步原子结项晋升 CLOSED_VERIFIED
         audit_b = self._call(
             "submit_stage2_unblind_verdict",
             "library_verifier",
@@ -418,17 +418,6 @@ class TestP2Full31ToolsAndGates(unittest.TestCase):
             abstract_md="版本 B 全部引用与哈希匹配。",
         )
         self.assertTrue(audit_b["ok"], audit_b)
-
-        passed = self._call(
-            "record_compliance_check",
-            "supervisory_committee",
-            "s_sup",
-            stage="CLOSURE_GATE",
-            status="PASSED",
-            blocking_questions=[],
-            notes="三项版本校验全部通过，准予结项。",
-        )
-        self.assertTrue(passed["ok"], passed)
         st = self.conn.execute("SELECT status FROM project_closure_state WHERE id = 1;").fetchone()["status"]
         self.assertEqual(st, "CLOSED_VERIFIED")
 
@@ -654,10 +643,10 @@ def evaluate(artifact, spec, tier="official"):
 
     def test_7_jsonrpc_and_fact_bridge_cli(self) -> None:
         init_resp = mcp.handle_jsonrpc_message({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
-        self.assertEqual(init_resp["result"]["serverInfo"]["version"], "3.0.0")
+        self.assertEqual(init_resp["result"]["serverInfo"]["version"], "0.3.0-alpha.1")
 
         list_resp = mcp.handle_jsonrpc_message({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
-        self.assertEqual(len(list_resp["result"]["tools"]), 32)
+        self.assertEqual(len(list_resp["result"]["tools"]), 44)
 
         snap_resp = mcp.handle_jsonrpc_message({
             "jsonrpc": "2.0",

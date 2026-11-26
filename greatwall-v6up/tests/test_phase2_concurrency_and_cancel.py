@@ -510,17 +510,7 @@ class TestPhase2ConcurrencyAndCancel(unittest.TestCase):
                 )
                 deliv_a = exp_a["delivery_id"]
 
-                # 1) 盲审官验收 A
-                tool_submit_stage2_unblind_verdict(
-                    conn=conn,
-                    caller_role="library_verifier",
-                    session_id="s_ver_a",
-                    review_id=f"STAGE3_FINAL_AUDIT:{deliv_a}",
-                    final_verdict="ACCEPT",
-                    revision_requests=[],
-                )
-
-                # 2) 在监察委签发 A 前，馆员导出新版 B（重置 verifier_final_audit_passed=0）
+                # 1) 在盲审官终签 A 之前，馆员先导出新版 B（重置 latest_delivery_id 为 B）
                 exp_b = export_stage3_deliverables(
                     conn,
                     workspace_root=str(ws),
@@ -533,25 +523,7 @@ class TestPhase2ConcurrencyAndCancel(unittest.TestCase):
                 deliv_b = exp_b["delivery_id"]
                 self.assertNotEqual(deliv_a, deliv_b)
 
-                # 3) 监察委尝试在未审过 B 时签发必须被单写者事务拦死！
-                with self.assertRaises(db.FailClosedError):
-                    tool_record_compliance_check(
-                        conn=conn,
-                        workspace_root=str(ws),
-                        caller_role="supervisory_committee",
-                        session_id="s_sup",
-                        stage="CLOSURE_GATE",
-                        status="PASSED",
-                        notes="尝试签发未审 B",
-                    )
-                st_row = conn.execute(
-                    "SELECT status, latest_delivery_id, verifier_final_audit_passed FROM project_closure_state WHERE id = 1"
-                ).fetchone()
-                self.assertEqual(st_row["status"], "DELIVERY_EXPORTED")
-                self.assertEqual(st_row["latest_delivery_id"], deliv_b)
-                self.assertEqual(int(st_row["verifier_final_audit_passed"]), 0)
-
-                # 4) 盲审官滞后针对旧版 A 落签 ACCEPT，必须被 WHERE latest_delivery_id = ? 拦死，严禁错把 B 标为已审！
+                # 2) 盲审官滞后针对旧版 A 落签 ACCEPT，必须被单写者事务拦死（防审 A 放 B）！
                 with self.assertRaises(db.FailClosedError):
                     tool_submit_stage2_unblind_verdict(
                         conn=conn,
@@ -561,13 +533,15 @@ class TestPhase2ConcurrencyAndCancel(unittest.TestCase):
                         final_verdict="ACCEPT",
                         revision_requests=[],
                     )
-                st_row2 = conn.execute(
-                    "SELECT verifier_final_audit_passed FROM project_closure_state WHERE id = 1"
+                st_row = conn.execute(
+                    "SELECT status, latest_delivery_id, verifier_final_audit_passed FROM project_closure_state WHERE id = 1"
                 ).fetchone()
-                self.assertEqual(int(st_row2["verifier_final_audit_passed"]), 0)
+                self.assertEqual(st_row["status"], "DELIVERY_EXPORTED")
+                self.assertEqual(st_row["latest_delivery_id"], deliv_b)
+                self.assertEqual(int(st_row["verifier_final_audit_passed"]), 0)
 
-                # 5) 模拟导出 COMMIT 阶段抛 sqlite3.OperationalError，验证 final_delivery/ 磁盘目录被 100% 完整回滚回 B！
-                import core_python.mcp_server.control_plane.delivery_and_jobs as dj_mod
+                # 3) 模拟导出 COMMIT 阶段抛异常，验证 final_delivery/ 磁盘目录被 100% 完整回滚回 B！
+                import core_python.mcp_server.control_plane.delivery_freeze as dj_mod
                 from contextlib import contextmanager
 
                 orig_tx = dj_mod.rw_immediate_tx
@@ -598,6 +572,28 @@ class TestPhase2ConcurrencyAndCancel(unittest.TestCase):
                 restored_report = (ws / "final_delivery" / "01_formal_report.md").read_text(encoding="utf-8")
                 self.assertIn("Version B", restored_report)
                 self.assertNotIn("Version C", restored_report)
+
+                # 4) 盲审官针对当前版本 B 终签 ACCEPT -> 一步原子结项 CLOSED_VERIFIED，之后严禁覆盖重导！
+                tool_submit_stage2_unblind_verdict(
+                    conn=conn,
+                    caller_role="library_verifier",
+                    session_id="s_ver_b",
+                    review_id=f"STAGE3_FINAL_AUDIT:{deliv_b}",
+                    final_verdict="ACCEPT",
+                    revision_requests=[],
+                )
+                st_closed = conn.execute("SELECT status FROM project_closure_state WHERE id = 1").fetchone()
+                self.assertEqual(st_closed["status"], "CLOSED_VERIFIED")
+                with self.assertRaises(db.FailClosedError):
+                    export_stage3_deliverables(
+                        conn,
+                        workspace_root=str(ws),
+                        delivery_mode="FULL",
+                        formal_paper_md=paper_c,
+                        selected_l3_ids_by_question={"Q1": ["L3-001"]},
+                        remaining_gaps_by_question={"Q1": "无"},
+                        reproduction_candidate_nodes=[node_id],
+                    )
             finally:
                 conn.close()
 

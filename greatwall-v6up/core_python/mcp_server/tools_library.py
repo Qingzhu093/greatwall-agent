@@ -1,14 +1,15 @@
-"""长城 V6-Up (v3.0) 中央图书馆 8 个窄工具薄兼容聚合门面（Facade）。
+"""GreatWall v0.3 中央图书馆四角色窄工具聚合导出。"""
 
-实际实现已按角色职责分离至：
-- `tools_surveyor.py`（`library_surveyor` 3 个外藏采编与 Stage 3 导出工具）
-- `tools_verifier.py`（`library_verifier` 5 个独立空白沙箱盲审与异会话打捞工具）
-"""
-
-from .tools_surveyor import (  # noqa: F401
+from .tools_library_roles import (  # noqa: F401
     tool_export_stage3_final_delivery,
+    tool_get_chronicler_snapshot,
+    tool_get_conference_dossier,
     tool_get_survey_requests,
     tool_publish_external_literature_card,
+    tool_publish_living_survey,
+    tool_record_conference_minutes,
+    tool_submit_conference_statement,
+    tool_submit_conference_verdict,
 )
 from .tools_verifier import (  # noqa: F401
     _apply_revise_or_exhaust,
@@ -24,7 +25,13 @@ from .tools_verifier import (  # noqa: F401
 __all__ = [
     "tool_get_survey_requests",
     "tool_publish_external_literature_card",
+    "tool_get_chronicler_snapshot",
+    "tool_publish_living_survey",
     "tool_export_stage3_final_delivery",
+    "tool_get_conference_dossier",
+    "tool_record_conference_minutes",
+    "tool_submit_conference_verdict",
+    "tool_submit_conference_statement",
     "tool_get_blind_manuscript",
     "tool_submit_stage1_blind_ledger",
     "tool_get_unblinded_manuscript_and_peers",

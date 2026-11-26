@@ -97,7 +97,7 @@ class TestP4Round5RemediationContracts(unittest.TestCase):
                 "fulfilled_request_ids": [req_id],
                 "unavailable_reason_md": "已核查公开来源与竞赛规约，赛后内部答案包客观不存在且违背合规边界，按规约无卡结案。",
             },
-            role="library_surveyor",
+            role="external_surveyor",
             sid="surv_1",
         )
         self.assertTrue(unavail["ok"], unavail)
@@ -282,13 +282,38 @@ class TestP4Round5RemediationContracts(unittest.TestCase):
         rev_id = tr["data"]["created_review_id"]
         self.assertEqual(tr["data"]["spec_revision"], 0)
 
-        # 人类事后往 rulings/ 新增补充裁决文档，触发 spec_revision 升至 v1
+        # 裁决 4：废除扫盘自动静默升版暗门（磁盘未审批文件仅只读提示），必须走 AMEND_RULING_DRAFT 人类审批单入口升版至 v1
         (self.ws / "rulings").mkdir(parents=True, exist_ok=True)
         (self.ws / "rulings" / "ruling_01.md").write_text("# 补充裁决 v1\n新增非对称约束条件。\n", encoding="utf-8")
         sync_res = self._ctrl("control_plane/sync_public_rulings", {"refresh_active_worktrees": True})
         self.assertTrue(sync_res["ok"])
-        self.assertTrue(sync_res["data"]["changed"])
-        self.assertEqual(sync_res["data"]["latest_spec_revision"], 1)
+        self.assertFalse(sync_res["data"]["changed"])
+        self.assertEqual(sync_res["data"]["latest_spec_revision"], 0)
+
+        prop = self._call(
+            "chief_propose_control_action",
+            {
+                "action_type": "AMEND_RULING_DRAFT",
+                "target_id": "Q1",
+                "rationale_md": "补充裁决 v1：新增非对称约束条件。",
+                "payload": {
+                    "affected_question_ids": ["Q1"],
+                    "ruling_title": "补充裁决 v1",
+                    "ruling_markdown": "# 补充裁决 v1\n新增非对称约束条件。\n",
+                    "summary_md": "补充裁决 v1：新增非对称约束条件。",
+                },
+            },
+            role="gw_chief",
+            sid="chief_r5",
+        )
+        self.assertTrue(prop["ok"], prop)
+        appr = self._ctrl(
+            "control_plane/approve_control_proposal",
+            {"proposal_id": prop["data"]["proposal_id"], "decision": "APPROVE", "approved_by_source": "human_ui"},
+        )
+        self.assertTrue(appr["ok"], appr)
+        exec_res = appr["data"].get("execution") or appr["data"]
+        self.assertEqual(exec_res["latest_spec_revision"], 1)
 
         # 零工具后勤与监察委均可从 DB 视图直接看到 latest_spec_revision=1 与裁决摘要
         dash = self._call("get_logistics_dashboard", {"question_id": "ALL"}, role="logistics_coordinator", sid="log_2")
@@ -321,7 +346,7 @@ class TestP4Round5RemediationContracts(unittest.TestCase):
         ub = self._call("get_unblinded_manuscript_and_peers", {"review_id": rev_id}, role="library_verifier", sid="ver_1")
         self.assertTrue(ub["ok"])
         self.assertEqual(ub["data"]["spec_revision"], 0)
-        self.assertEqual(ub["data"]["latest_spec_revision"], 1)
+        self.assertEqual(ub["data"]["active_spec_revision"], 1)
         self.assertTrue(ub["data"]["spec_revision_outdated"])
 
         # Stage 2 禁止对旧口径手稿标最新 FULL_GOAL！
@@ -341,7 +366,7 @@ class TestP4Round5RemediationContracts(unittest.TestCase):
             sid="ver_1",
         )
         self.assertFalse(bad_full["ok"])
-        self.assertIn("spec_revision=v0", bad_full["error"])
+        self.assertIn("旧口径 v0", bad_full["error"])
 
         # 改为 PARTIAL_OR_LEMMA 并在 exact_verified_scope_md 标明 v0 口径 -> 顺利入库 L3
         ok_partial = self._call(

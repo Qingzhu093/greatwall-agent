@@ -1,28 +1,15 @@
 /**
- * 长城 V6-Up (v3.0) 单条待办项级熔断器、探索者合法性过滤与客观指纹构造器。
- *
- * 纯逻辑模块（零 DSH 运行时依赖），可独立毫秒级单测。
+ * GreatWall v0.3 单条待办项级熔断器、探索者合法性过滤（+1 人类优先槽）与客观指纹构造器。
  * @module dsh-greatwall-v6up/orchestrator/circuit_breaker
  */
+import { isHumanPriorityNode } from '../runtime/worker_slots.js'
 
-/**
- * 单条待办项级无客观进展熔断器（对齐 09 §2.2 第 6 条）：
- * - 同一条待办项连续 `maxStalledRuns`（默认 2）次被调度后客观指纹毫无变化，才仅挂起该单项；
- * - 若该项取得任何可核验客观进展（指纹变化）或离队，计数立刻归零；
- * - 同队列其他健康待办项完全不受影响；外部状态改变或人工 `resume` 时自动复位。
- */
 export class GovernanceItemCircuitBreaker {
   constructor(maxStalledRuns = 2) {
     this.maxStalledRuns = Math.max(1, Number(maxStalledRuns) || 2)
-    /** @type {Map<string, { stalledCount: number, lastFingerprint: string, broken: boolean, brokenAt: string | null }>} */
     this._items = new Map()
   }
 
-  /**
-   * 依据最新快照指纹判断某项是否已被熔断；若外部状态变化（指纹不同）则自动复位解除熔断！
-   * @param {string} itemKey
-   * @param {string} currentFingerprint
-   */
   isBroken(itemKey, currentFingerprint) {
     const rec = this._items.get(itemKey)
     if (!rec) return false
@@ -33,12 +20,6 @@ export class GovernanceItemCircuitBreaker {
     return rec.broken
   }
 
-  /**
-   * 在某批待办项执行完毕并拉取新快照后，按单条项逐一评估是否取得客观进展。
-   * @param {Array<{ key: string, beforeFp: string }>} dispatchedItems
-   * @param {Map<string, string>} afterFpMap 仍在队列中的待办项最新指纹表（不在表中表示已出队完成）
-   * @returns {Array<{ key: string, stalledCount: number, newlyBroken: boolean }>}
-   */
   evaluateBatch(dispatchedItems, afterFpMap) {
     const results = []
     for (const { key, beforeFp } of dispatchedItems || []) {
@@ -48,13 +29,7 @@ export class GovernanceItemCircuitBreaker {
       }
       const afterFp = String(afterFpMap.get(key) || '')
       if (afterFp !== String(beforeFp || '')) {
-        // 虽未出队但已产生可核验客观进展，计数清零绝不误熔断
-        this._items.set(key, {
-          stalledCount: 0,
-          lastFingerprint: afterFp,
-          broken: false,
-          brokenAt: null,
-        })
+        this._items.set(key, { stalledCount: 0, lastFingerprint: afterFp, broken: false, brokenAt: null })
         results.push({ key, stalledCount: 0, newlyBroken: false })
         continue
       }
@@ -80,39 +55,64 @@ export class GovernanceItemCircuitBreaker {
   getBrokenItems() {
     const out = []
     for (const [key, rec] of this._items.entries()) {
-      if (rec.broken) {
-        out.push({ key, stalledCount: rec.stalledCount, brokenAt: rec.brokenAt })
-      }
+      if (rec.broken) out.push({ key, stalledCount: rec.stalledCount, brokenAt: rec.brokenAt })
     }
     return out
   }
 }
 
 /**
- * 纯函数过滤本轮合法可派发的探索者节点（严格实施 `triage_locked_branches` 防抢跑与 `human_stop_active` 拦截，
- * 且遵循无人值守红灯策略：`ambiguous_spec_alerts` 绝不阻塞继续派单）。
- * @param {any} snap
- * @param {Set<string>} runningExplorerIds
- * @param {number} [slotCapOverride]
+ * 纯函数过滤本轮合法可派发的探索者节点：
+ * - 遵守 `triage_locked_branches`、`human_stop_active` 与子题停工锁（`subproblem_dispatch_states`）；
+ * - 跳过 `control_state` 处于 `PAUSE_DRAINING / HUMAN_ACTIVE` 的人工接管节点；
+ * - 人类优先节点（`HUMAN_SEEDED` / `human_modified`）排序置前并可额外使用 `+1` 人类保留槽位。
  */
-export function selectDispatchableExplorers(snap, runningExplorerIds = new Set(), slotCapOverride = null) {
+export function selectDispatchableExplorers(
+  snap,
+  runningExplorerIds = new Set(),
+  slotCapOverride = null,
+  { humanReserveSlots = 1, slotAllocator = null } = {},
+) {
   if (!snap || snap.human_stop_active || snap.closure_gate?.closure_allowed) return []
   const slotCap = Math.max(1, Number(slotCapOverride || snap.slot_cap || 6))
   const lockedBranches = new Set(snap.triage_locked_branches || [])
+  const subStates = new Map((snap.subproblem_runtime_state || []).map((s) => [s.question_id, s.dispatch_state]))
+
+  const rawReady = (snap.explorers_ready_to_run || []).filter((node) => {
+    if (!node || !node.node_id) return false
+    if (runningExplorerIds.has(node.node_id)) return false
+    if (node.branch_id && lockedBranches.has(node.branch_id)) return false
+    const cs = String(node.control_state || 'AUTO_RUNNING')
+    if (cs === 'PAUSE_DRAINING' || cs === 'HUMAN_ACTIVE') return false
+    const qState = subStates.get(node.question_id)
+    if (qState && qState !== 'DISPATCHING') return false
+    return true
+  })
+
+  // 人类刚动过手或种下的种子枝优先排前
+  rawReady.sort((a, b) => Number(isHumanPriorityNode(b)) - Number(isHumanPriorityNode(a)))
+
   const candidates = []
-  let occupied = runningExplorerIds.size
-  for (const node of snap.explorers_ready_to_run || []) {
-    if (occupied >= slotCap) break
-    if (!node || !node.node_id) continue
-    if (runningExplorerIds.has(node.node_id)) continue
-    if (node.branch_id && lockedBranches.has(node.branch_id)) continue
-    candidates.push(node)
-    occupied += 1
+  let normalOccupied = runningExplorerIds.size
+  let humanReserveUsed = 0
+
+  for (const node of rawReady) {
+    if (slotAllocator) {
+      if (!slotAllocator.canAcquire(node)) continue
+      candidates.push(node)
+      continue
+    }
+    if (normalOccupied < slotCap) {
+      candidates.push(node)
+      normalOccupied += 1
+    } else if (isHumanPriorityNode(node) && humanReserveUsed < humanReserveSlots) {
+      candidates.push(node)
+      humanReserveUsed += 1
+    }
   }
   return candidates
 }
 
-/** 为快照中各治理队列的每一条独立待办构造可核验客观指纹映射（严格单条隔离，不受同队列他项进出影响）。 */
 export function buildWorksItemFingerprints(snap) {
   const map = new Map()
   const instFpById = new Map()
@@ -121,18 +121,14 @@ export function buildWorksItemFingerprints(snap) {
     if (id) instFpById.set(id, String(s))
   }
   for (const inst of snap?.unhealthy_instruments || []) {
-    const k = `works:inst:${inst.instrument_id}`
-    map.set(k, `inst:v${inst.version}:err=${inst.consecutive_error_count}:${inst.updated_at || ''}`)
+    map.set(`works:inst:${inst.instrument_id}`, `inst:v${inst.version}:err=${inst.consecutive_error_count}:${inst.updated_at || ''}`)
   }
   for (const t of snap?.open_works_tickets || []) {
-    const k = `works:ticket:${t.ticket_id}`
-    // 仅绑定本工单自身状态及其直接关联的单个 instrument_id，严禁受其他无关仪器变动干扰
     const boundInstFp = t.instrument_id ? (instFpById.get(String(t.instrument_id)) || '') : ''
-    map.set(k, `tkt:${t.updated_at || ''}:${t.payload_json || ''}|inst=${boundInstFp}`)
+    map.set(`works:ticket:${t.ticket_id}`, `tkt:${t.updated_at || ''}:${t.payload_json || ''}|inst=${boundInstFp}`)
   }
   for (const rv of snap?.pending_revalidation || []) {
-    const k = `works:reval:${rv.queue_id}`
-    map.set(k, `reval:${rv.obs_id}:v${rv.target_version}:${rv.updated_at || ''}`)
+    map.set(`works:reval:${rv.queue_id}`, `reval:${rv.obs_id}:v${rv.target_version}:${rv.updated_at || ''}`)
   }
   return map
 }
@@ -142,7 +138,6 @@ export function buildSurveyItemFingerprints(snap) {
   for (const r of snap?.pending_surveys || []) {
     const id = r.req_id || r.request_id
     if (!id) continue
-    // 仅绑定单条查新单自身状态，严禁被同批其他查新单入卡计数重置计数
     map.set(`survey:${id}`, `req:${id}:${r.status || 'PENDING'}`)
   }
   return map
@@ -162,6 +157,15 @@ export function buildReviewItemFingerprints(snap) {
   for (const r of snap?.pending_reviews || []) {
     if (!r?.review_id) continue
     map.set(`review:${r.review_id}`, `rev:${r.review_id}:${r.review_status || ''}`)
+  }
+  return map
+}
+
+export function buildWaveConferenceFingerprints(snap) {
+  const map = new Map()
+  for (const c of snap?.active_wave_conferences || []) {
+    if (!c?.conference_id) continue
+    map.set(`wave:${c.conference_id}`, `wave:${c.conference_id}:${c.status || ''}:${c.linked_survey_id || ''}`)
   }
   return map
 }

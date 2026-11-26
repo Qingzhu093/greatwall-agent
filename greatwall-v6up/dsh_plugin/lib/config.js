@@ -1,10 +1,8 @@
 /**
- * 长城 V6-Up (v3.0) DSH 插件真接线配置解析与标准 Config 声明。
+ * GreatWall v0.3 DSH 插件配置解析与动态 Config Schema（裁决 6）。
  *
- * 只暴露入口实际读取并生效的 6 项配置（彻底剔除未消费的假旋钮，避免配置面板误导用户）：
- * - `corePythonRoot`、`pythonBin`、`dataDir`
- * - `requestTimeoutMs`、`longToolTimeoutMs`
- * - `defaultAgentOptions`（provider / model / reasoningEffort）
+ * - 优先动态探测宿主 `@deepseek-ai/schemastery`，原生支持 DSH Plugin Manager 自动表单渲染；
+ * - 独立单测或无宿主环境时自动平滑回退至零依赖 Standard Schema v1 (`~standard.validate`)。
  * @module dsh-greatwall-v6up/config
  */
 import path from 'node:path'
@@ -15,12 +13,10 @@ export const DEFAULT_PLUGIN_CONFIG = Object.freeze({
   dataDir: '',
   requestTimeoutMs: 60_000,
   longToolTimeoutMs: 300_000,
+  chiefAnchorHardCapChars: 1200,
   defaultAgentOptions: Object.freeze({}),
 })
 
-/**
- * 供 DSH Plugin Manager / Schema 工具参考的 JSON Schema 描述。
- */
 export const CONFIG_SCHEMA_DESCRIPTOR = Object.freeze({
   type: 'object',
   properties: {
@@ -49,6 +45,11 @@ export const CONFIG_SCHEMA_DESCRIPTOR = Object.freeze({
       default: 300_000,
       description: '长耗时仪器评测、校准集回归与 Stage 3 导出超时（毫秒，默认 300000）。',
     },
+    chiefAnchorHardCapChars: {
+      type: 'number',
+      default: 1200,
+      description: 'gw-chief 现况锚点卡弹性字数硬上限（默认 1200 字，公式 max(400, 180 + 100 * 子题数)）。',
+    },
     defaultAgentOptions: {
       type: 'object',
       default: {},
@@ -73,84 +74,102 @@ function sanitizeAgentOptions(raw) {
   return out
 }
 
-/**
- * 符合 Standard Schema v1 (`~standard.validate`) 的零依赖插件 Config 校验器。
- * 直接对齐 DSH 0.2.2-rc.5 内置 Cordis 4.1.0 `resolveConfig` 的同步校验协议：
- * - 合法配置返回 `{ value }`（带完整默认值与规范化数值）；
- * - 非法类型返回 `{ issues: [{ message, path }] }`，避免装载阶段抛 `Cannot read properties of undefined (reading 'validate')`。
- */
-export const Config = Object.freeze({
+function validateFallbackStandardSchema(input) {
+  const raw = input === undefined || input === null ? {} : input
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    return { issues: [{ message: 'dsh-greatwall-v6up 配置必须为对象', path: [] }] }
+  }
+  const issues = []
+  for (const strKey of ['corePythonRoot', 'pythonBin', 'dataDir']) {
+    const val = raw[strKey]
+    if (val !== undefined && typeof val !== 'string') {
+      issues.push({ message: `${strKey} 必须为字符串`, path: [strKey] })
+    }
+  }
+  for (const numKey of ['requestTimeoutMs', 'longToolTimeoutMs', 'chiefAnchorHardCapChars']) {
+    const val = raw[numKey]
+    if (val !== undefined && (typeof val !== 'number' || !Number.isFinite(val) || val <= 0)) {
+      issues.push({ message: `${numKey} 必须为正有限数字`, path: [numKey] })
+    }
+  }
+  if (raw.defaultAgentOptions !== undefined) {
+    if (!raw.defaultAgentOptions || typeof raw.defaultAgentOptions !== 'object' || Array.isArray(raw.defaultAgentOptions)) {
+      issues.push({ message: 'defaultAgentOptions 必须为对象', path: ['defaultAgentOptions'] })
+    } else {
+      for (const subKey of ['provider', 'model', 'reasoningEffort']) {
+        const sv = raw.defaultAgentOptions[subKey]
+        if (sv !== undefined && typeof sv !== 'string') {
+          issues.push({ message: `defaultAgentOptions.${subKey} 必须为字符串`, path: ['defaultAgentOptions', subKey] })
+        }
+      }
+    }
+  }
+  if (issues.length > 0) return { issues }
+
+  const requestTimeoutMs = raw.requestTimeoutMs !== undefined
+    ? Math.floor(raw.requestTimeoutMs)
+    : DEFAULT_PLUGIN_CONFIG.requestTimeoutMs
+  const longToolTimeoutMs = Math.max(
+    requestTimeoutMs,
+    raw.longToolTimeoutMs !== undefined ? Math.floor(raw.longToolTimeoutMs) : DEFAULT_PLUGIN_CONFIG.longToolTimeoutMs,
+  )
+  const chiefAnchorHardCapChars = Math.max(
+    400,
+    raw.chiefAnchorHardCapChars !== undefined
+      ? Math.floor(raw.chiefAnchorHardCapChars)
+      : DEFAULT_PLUGIN_CONFIG.chiefAnchorHardCapChars,
+  )
+  return {
+    value: {
+      corePythonRoot: typeof raw.corePythonRoot === 'string' ? raw.corePythonRoot.trim() : '',
+      pythonBin: typeof raw.pythonBin === 'string' ? raw.pythonBin.trim() : '',
+      dataDir: typeof raw.dataDir === 'string' ? raw.dataDir.trim() : '',
+      requestTimeoutMs,
+      longToolTimeoutMs,
+      chiefAnchorHardCapChars,
+      defaultAgentOptions: sanitizeAgentOptions(raw.defaultAgentOptions),
+    },
+  }
+}
+
+const FALLBACK_STANDARD_CONFIG = Object.freeze({
   ...CONFIG_SCHEMA_DESCRIPTOR,
   '~standard': Object.freeze({
     version: 1,
     vendor: 'dsh-greatwall-v6up',
-    validate(input) {
-      const raw = input === undefined || input === null ? {} : input
-      if (typeof raw !== 'object' || Array.isArray(raw)) {
-        return {
-          issues: [{ message: 'dsh-greatwall-v6up 配置必须为对象', path: [] }],
-        }
-      }
-      const issues = []
-      for (const strKey of ['corePythonRoot', 'pythonBin', 'dataDir']) {
-        const val = raw[strKey]
-        if (val !== undefined && typeof val !== 'string') {
-          issues.push({ message: `${strKey} 必须为字符串`, path: [strKey] })
-        }
-      }
-      for (const numKey of ['requestTimeoutMs', 'longToolTimeoutMs']) {
-        const val = raw[numKey]
-        if (val !== undefined && (typeof val !== 'number' || !Number.isFinite(val) || val <= 0)) {
-          issues.push({ message: `${numKey} 必须为正有限数字`, path: [numKey] })
-        }
-      }
-      if (raw.defaultAgentOptions !== undefined) {
-        if (!raw.defaultAgentOptions || typeof raw.defaultAgentOptions !== 'object' || Array.isArray(raw.defaultAgentOptions)) {
-          issues.push({ message: 'defaultAgentOptions 必须为对象', path: ['defaultAgentOptions'] })
-        } else {
-          for (const subKey of ['provider', 'model', 'reasoningEffort']) {
-            const sv = raw.defaultAgentOptions[subKey]
-            if (sv !== undefined && typeof sv !== 'string') {
-              issues.push({
-                message: `defaultAgentOptions.${subKey} 必须为字符串`,
-                path: ['defaultAgentOptions', subKey],
-              })
-            }
-          }
-        }
-      }
-      if (issues.length > 0) {
-        return { issues }
-      }
-      const requestTimeoutMs =
-        raw.requestTimeoutMs !== undefined
-          ? Math.floor(raw.requestTimeoutMs)
-          : DEFAULT_PLUGIN_CONFIG.requestTimeoutMs
-      const longToolTimeoutMs = Math.max(
-        requestTimeoutMs,
-        raw.longToolTimeoutMs !== undefined
-          ? Math.floor(raw.longToolTimeoutMs)
-          : DEFAULT_PLUGIN_CONFIG.longToolTimeoutMs,
-      )
-      return {
-        value: {
-          corePythonRoot: typeof raw.corePythonRoot === 'string' ? raw.corePythonRoot.trim() : '',
-          pythonBin: typeof raw.pythonBin === 'string' ? raw.pythonBin.trim() : '',
-          dataDir: typeof raw.dataDir === 'string' ? raw.dataDir.trim() : '',
-          requestTimeoutMs,
-          longToolTimeoutMs,
-          defaultAgentOptions: sanitizeAgentOptions(raw.defaultAgentOptions),
-        },
-      }
-    },
+    validate: validateFallbackStandardSchema,
   }),
 })
 
-/**
- * 解析并规范化插件运行时配置（只保留真接线字段）。
- * @param {Record<string, any>} [rawConfig]
- * @param {string} defaultCorePythonRoot
- */
+let _resolvedConfig = FALLBACK_STANDARD_CONFIG
+let _configBackend = 'standard-schema-v1'
+
+try {
+  const mod = await import('@deepseek-ai/schemastery')
+  const Schema = mod?.default || mod?.Schema || mod
+  if (Schema && typeof Schema.object === 'function') {
+    _resolvedConfig = Schema.object({
+      corePythonRoot: Schema.string().default('').description(CONFIG_SCHEMA_DESCRIPTOR.properties.corePythonRoot.description),
+      pythonBin: Schema.string().default('').description(CONFIG_SCHEMA_DESCRIPTOR.properties.pythonBin.description),
+      dataDir: Schema.string().default('').description(CONFIG_SCHEMA_DESCRIPTOR.properties.dataDir.description),
+      requestTimeoutMs: Schema.number().min(1000).default(60_000).description(CONFIG_SCHEMA_DESCRIPTOR.properties.requestTimeoutMs.description),
+      longToolTimeoutMs: Schema.number().min(1000).default(300_000).description(CONFIG_SCHEMA_DESCRIPTOR.properties.longToolTimeoutMs.description),
+      chiefAnchorHardCapChars: Schema.number().min(400).max(4000).default(1200).description(CONFIG_SCHEMA_DESCRIPTOR.properties.chiefAnchorHardCapChars.description),
+      defaultAgentOptions: Schema.object({
+        provider: Schema.string().description('默认模型提供方'),
+        model: Schema.string().description('默认模型 ID'),
+        reasoningEffort: Schema.string().description('默认思考强度 (low / medium / high)'),
+      }).default({}).description(CONFIG_SCHEMA_DESCRIPTOR.properties.defaultAgentOptions.description),
+    })
+    _configBackend = 'schemastery'
+  }
+} catch {
+  // 独立测试环境无宿主 @deepseek-ai/schemastery，自动使用零依赖 Standard Schema v1 回退
+}
+
+export const CONFIG_SCHEMA_BACKEND = _configBackend
+export const Config = _resolvedConfig
+
 export function resolvePluginConfig(rawConfig = {}, defaultCorePythonRoot = '') {
   const src = rawConfig && typeof rawConfig === 'object' ? rawConfig : {}
   const coreRootRaw = typeof src.corePythonRoot === 'string' ? src.corePythonRoot.trim() : ''
@@ -162,6 +181,10 @@ export function resolvePluginConfig(rawConfig = {}, defaultCorePythonRoot = '') 
     requestTimeoutMs,
     sanitizePositiveInt(src.longToolTimeoutMs, DEFAULT_PLUGIN_CONFIG.longToolTimeoutMs),
   )
+  const chiefAnchorHardCapChars = Math.max(
+    400,
+    sanitizePositiveInt(src.chiefAnchorHardCapChars, DEFAULT_PLUGIN_CONFIG.chiefAnchorHardCapChars),
+  )
   const defaultAgentOptions = sanitizeAgentOptions(src.defaultAgentOptions)
 
   return {
@@ -170,6 +193,7 @@ export function resolvePluginConfig(rawConfig = {}, defaultCorePythonRoot = '') 
     dataDir,
     requestTimeoutMs,
     longToolTimeoutMs,
+    chiefAnchorHardCapChars,
     defaultAgentOptions,
   }
 }

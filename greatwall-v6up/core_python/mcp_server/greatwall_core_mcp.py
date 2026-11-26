@@ -1,10 +1,10 @@
-"""长城 Agent V6-Up (v3.0) 核心 stdio JSON-RPC 2.0 MCP 服务端入口（零第三方依赖）。
+"""GreatWall Agent v0.3 核心 stdio JSON-RPC 2.0 MCP 服务端入口（零第三方依赖）。
 
-完整挂载 7 大角色共 32 个单一职责窄工具（单一契约源见 `tool_registry.py`）
-+ Single-Writer 控制面内部原语（`control_plane/*`）：
-- 双线程池隔离派发（`fast_pool` 快路径 vs `compute_pool` 慢计算池），慢任务池饱和绝不阻塞快照、时钟与停止指令；
-- 纯只读查询使用真正只读连接 `open_ro_connection` + `ro_consistent_tx` 一致快照，消除假读真写锁争用；
-- 支持标准 JSON-RPC `$/cancelRequest` 端到端真取消（排队中跳过、运行中终止隔离评测子进程树、已提交保持幂等）。
+完整挂载 10 大角色共 44 个去重单一职责窄工具（单一契约源见 `tool_registry.py`）
++ Single-Writer 控制面内部原语（`control_plane_dispatch.py`）：
+- 双线程池隔离派发（`fast_pool` 快路径 vs `compute_pool` 慢计算池）；
+- 纯只读查询使用真正只读连接 `open_ro_connection` + `ro_consistent_tx` 一致快照；
+- 支持标准 JSON-RPC `$/cancelRequest` 端到端真取消。
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ from __future__ import annotations
 import inspect
 import json
 import os
-import sqlite3
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -26,39 +25,25 @@ if __package__ in (None, ""):
     __package__ = "core_python.mcp_server"
 
 from ..evaluators.isolated_runner import RequestCancelledError  # noqa: E402
-from .control_plane_service import (  # noqa: E402
-    abort_lineage_node,
-    cleanup_blind_review_sandbox,
-    get_ui_full_inspector_payload,
-    init_parse0_contract,
-    mark_stage1_works_checked,
-    record_human_stop,
-    record_pending_handoff,
-    recover_pending_heavy_jobs,
-    schedule_control_plane_snapshot,
-    stage_blind_review_sandbox,
-    submit_works_ticket,
-    sync_public_inputs_to_worktree,
-    sync_public_rulings,
-    sync_session_pressure,
-    uninitialized_schedule_snapshot,
-)
+from .control_plane_dispatch import dispatch_control_call, run_readonly_query  # noqa: E402
 from .db_schema import (  # noqa: E402
     ERR_INVALID_INPUT,
     ERR_LOCKED,
     FailClosedError,
-    open_ro_connection,
     open_rw_connection,
     resolve_storage_paths,
-    ro_consistent_tx,
-    rw_immediate_tx,
 )
-from .mcp_core_helpers import record_fact_edge  # noqa: E402
 from .tool_registry import (  # noqa: E402
     LONG_RUNNING_MCP_TOOLS,
     TOOL_DEFINITIONS,
     TOOL_SPEC_BY_NAME,
-    export_contracts_snapshot,
+)
+from .tools_chief import (  # noqa: E402
+    tool_chief_get_overview_snapshot,
+    tool_chief_get_wave_digest,
+    tool_chief_preview_impact,
+    tool_chief_propose_control_action,
+    tool_chief_trace_entity,
 )
 from .tools_companion import (  # noqa: E402
     tool_get_companion_context,
@@ -68,25 +53,25 @@ from .tools_companion import (  # noqa: E402
 )
 from .tools_explorer import (  # noqa: E402
     tool_get_library_entry,
+    tool_get_living_survey,
+    tool_handback_to_chief,
     tool_query_library_catalog,
     tool_read_lineage_graph,
     tool_request_literature_survey,
     tool_run_isolated_eval,
 )
-from .tools_surveyor import (  # noqa: E402
+from .tools_library_roles import (  # noqa: E402
     tool_export_stage3_final_delivery,
+    tool_get_chronicler_snapshot,
+    tool_get_conference_dossier,
     tool_get_survey_requests,
     tool_publish_external_literature_card,
-)
-from .tools_verifier import (  # noqa: E402
-    tool_get_blind_manuscript,
-    tool_get_unblinded_manuscript_and_peers,
-    tool_propose_salvaged_lemma,
-    tool_submit_stage1_blind_ledger,
-    tool_submit_stage2_unblind_verdict,
+    tool_publish_living_survey,
+    tool_record_conference_minutes,
+    tool_submit_conference_statement,
+    tool_submit_conference_verdict,
 )
 from .tools_logistics import (  # noqa: E402
-    tool_dispatch_stagnation_five_lanes,
     tool_fork_branch,
     tool_get_logistics_dashboard,
     tool_register_method_family,
@@ -98,6 +83,13 @@ from .tools_supervisory import (  # noqa: E402
     tool_record_compliance_check,
     tool_register_saved_graph_query,
 )
+from .tools_verifier import (  # noqa: E402
+    tool_get_blind_manuscript,
+    tool_get_unblinded_manuscript_and_peers,
+    tool_propose_salvaged_lemma,
+    tool_submit_stage1_blind_ledger,
+    tool_submit_stage2_unblind_verdict,
+)
 from .tools_works import (  # noqa: E402
     tool_get_works_engineering_queue,
     tool_recompute_stage_b_only,
@@ -107,17 +99,24 @@ from .tools_works import (  # noqa: E402
     tool_upgrade_instrument_with_calibration,
 )
 
-SERVER_INFO = {"name": "greatwall-v6up-core", "version": "3.0.0"}
+SERVER_INFO = {"name": "greatwall-v6up-core", "version": "0.3.0-alpha.1"}
 PROTOCOL_VERSION = "2024-11-05"
 
-# 纯只读且无任何写库副作用的窄工具集合（排除静默写 FACT_LOG 的 get_library_entry 与 staging 沙箱的 get_blind_manuscript）
+# 纯只读且无任何写库副作用的窄工具集合（排除写 FACT_LOG 的 get_library_entry 与挂载沙箱的 get_blind_manuscript / get_unblinded_manuscript_and_peers）
 _PURE_READONLY_TOOLS: frozenset[str] = frozenset(
     {
+        "chief_get_overview_snapshot",
+        "chief_trace_entity",
+        "chief_get_wave_digest",
+        "chief_preview_impact",
+        "get_living_survey",
         "query_library_catalog",
         "read_lineage_graph",
         "get_companion_context",
         "get_logistics_dashboard",
         "get_survey_requests",
+        "get_chronicler_snapshot",
+        "get_conference_dossier",
         "get_works_engineering_queue",
         "get_supervisory_audit_snapshot",
         "check_stage2_closure_gate",
@@ -133,34 +132,56 @@ _COMPUTE_CONTROL_METHODS: frozenset[str] = frozenset(
 )
 
 _TOOL_HANDLERS: dict[str, Any] = {
+    # gw_chief (5)
+    "chief_get_overview_snapshot": tool_chief_get_overview_snapshot,
+    "chief_trace_entity": tool_chief_trace_entity,
+    "chief_get_wave_digest": tool_chief_get_wave_digest,
+    "chief_preview_impact": tool_chief_preview_impact,
+    "chief_propose_control_action": tool_chief_propose_control_action,
+    # explorer & 共享 Pull (7)
     "run_isolated_eval": tool_run_isolated_eval,
+    "get_living_survey": tool_get_living_survey,
     "query_library_catalog": tool_query_library_catalog,
     "get_library_entry": tool_get_library_entry,
     "request_literature_survey": tool_request_literature_survey,
     "read_lineage_graph": tool_read_lineage_graph,
+    "handback_to_chief": tool_handback_to_chief,
+    # lineage_companion (5)
     "get_companion_context": tool_get_companion_context,
     "save_lineage_briefing": tool_save_lineage_briefing,
     "record_reflection_and_unlock_pull": tool_record_reflection_and_unlock_pull,
     "submit_node_handoff": tool_submit_node_handoff,
+    "submit_conference_statement": tool_submit_conference_statement,
+    # logistics_coordinator (4)
     "get_logistics_dashboard": tool_get_logistics_dashboard,
     "register_method_family": tool_register_method_family,
     "triage_node": tool_triage_node,
     "fork_branch": tool_fork_branch,
-    "dispatch_stagnation_five_lanes": tool_dispatch_stagnation_five_lanes,
+    # external_surveyor (2)
     "get_survey_requests": tool_get_survey_requests,
     "publish_external_literature_card": tool_publish_external_literature_card,
+    # library_chronicler (3)
+    "get_chronicler_snapshot": tool_get_chronicler_snapshot,
+    "publish_living_survey": tool_publish_living_survey,
     "export_stage3_final_delivery": tool_export_stage3_final_delivery,
+    # conference_chair (3)
+    "get_conference_dossier": tool_get_conference_dossier,
+    "record_conference_minutes": tool_record_conference_minutes,
+    "submit_conference_verdict": tool_submit_conference_verdict,
+    # library_verifier (5)
     "get_blind_manuscript": tool_get_blind_manuscript,
     "submit_stage1_blind_ledger": tool_submit_stage1_blind_ledger,
     "get_unblinded_manuscript_and_peers": tool_get_unblinded_manuscript_and_peers,
     "submit_stage2_unblind_verdict": tool_submit_stage2_unblind_verdict,
     "propose_salvaged_lemma": tool_propose_salvaged_lemma,
+    # works_engineer (6)
     "get_works_engineering_queue": tool_get_works_engineering_queue,
     "register_question_instrument": tool_register_question_instrument,
     "upgrade_instrument_with_calibration": tool_upgrade_instrument_with_calibration,
     "recompute_stage_b_only": tool_recompute_stage_b_only,
     "update_skill_ledger": tool_update_skill_ledger,
     "resolve_works_ticket": tool_resolve_works_ticket,
+    # supervisory_committee (4)
     "get_supervisory_audit_snapshot": tool_get_supervisory_audit_snapshot,
     "check_stage2_closure_gate": tool_check_stage2_closure_gate,
     "record_compliance_check": tool_record_compliance_check,
@@ -179,7 +200,7 @@ _TOOL_REGISTRY: dict[str, tuple[Any, bool, bool]] = {
 
 
 class CancelRegistry:
-    """按 JSON-RPC 请求 ID 跟踪取消信号的线程安全注册表（支持先到取消与执行中取消）。"""
+    """按 JSON-RPC 请求 ID 跟踪取消信号的线程安全注册表。"""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -216,33 +237,6 @@ class CancelRegistry:
                 ev.set()
 
 
-def _open_readonly_or_migrate_once(db_path: Path) -> sqlite3.Connection:
-    """优先使用纯只读连接，仅在首次碰到未迁移旧库时执行一次写连接迁移再切回只读。"""
-    return open_ro_connection(db_path)
-
-
-def _run_readonly_query(db_path: Path, fn: Any) -> Any:
-    """在单一只读事务中执行只读查询；若遇旧库缺列自动迁移一次并重跑。"""
-    conn = _open_readonly_or_migrate_once(db_path)
-    try:
-        with ro_consistent_tx(conn):
-            return fn(conn)
-    except sqlite3.OperationalError as exc:
-        msg = str(exc).lower()
-        if "no such column" not in msg and "no such table" not in msg:
-            raise
-        conn.close()
-        conn = None
-        mig_conn = open_rw_connection(db_path, init_schema=True, force_init=True)
-        mig_conn.close()
-        conn = _open_readonly_or_migrate_once(db_path)
-        with ro_consistent_tx(conn):
-            return fn(conn)
-    finally:
-        if conn is not None:
-            conn.close()
-
-
 def dispatch_tool_call(
     name: str,
     arguments: dict[str, Any] | None,
@@ -252,7 +246,7 @@ def dispatch_tool_call(
     session_id: str = "",
     cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
-    """统一执行 32 个窄工具入口：剥离模型伪造身份，注入可信宿主 _meta 并处理 FailClosedError 与取消信号。"""
+    """统一执行全部窄工具入口：剥离模型伪造身份，注入可信宿主 _meta 并处理 FailClosedError 与取消信号。"""
     if cancel_event is not None and cancel_event.is_set():
         return FailClosedError(ERR_LOCKED, f"请求已取消 ({name})").to_dict()
 
@@ -285,13 +279,12 @@ def dispatch_tool_call(
         if accepts_cancel:
             base_kwargs["cancel_event"] = cancel_event
 
-        # 纯只读窄工具优先走只读连接 + 一致只读事务，避免与并发写入抢写锁
         if name in _PURE_READONLY_TOOLS:
             probe_paths = resolve_storage_paths(eff_ws, create_dirs=False)
             if probe_paths["db_path"].is_file():
                 if needs_ws:
                     base_kwargs["workspace_root"] = eff_ws or str(probe_paths["data_dir"])
-                return _run_readonly_query(probe_paths["db_path"], lambda ro_conn: fn(conn=ro_conn, **base_kwargs))
+                return run_readonly_query(probe_paths["db_path"], lambda ro_conn: fn(conn=ro_conn, **base_kwargs))
 
         paths = resolve_storage_paths(eff_ws)
         conn = open_rw_connection(paths["db_path"], init_schema=True)
@@ -311,182 +304,6 @@ def dispatch_tool_call(
             conn.close()
 
 
-def dispatch_control_call(
-    method: str,
-    params: dict[str, Any] | None,
-    *,
-    cancel_event: threading.Event | None = None,
-) -> dict[str, Any]:
-    """Single-Writer 控制面内部桥接原语（仅供 Node Orchestrator 调用，非模型侧工具）。"""
-    if cancel_event is not None and cancel_event.is_set():
-        return FailClosedError(ERR_LOCKED, f"控制面请求已取消 ({method})").to_dict()
-    if method == "control_plane/describe_contracts":
-        return {"ok": True, "data": export_contracts_snapshot()}
-
-    p = dict(params or {})
-    eff_ws = str(p.pop("workspace_root", "") or os.environ.get("GREATWALL_WORKSPACE_ROOT", "")).strip()
-    conn = None
-    try:
-        # 纯只读探测与启动恢复：若尚未初始化数据库，严禁无故创建目录与 300KB 空库
-        if method in ("control_plane/schedule_snapshot", "control_plane/recover_heavy_jobs", "control_plane/ui_inspector"):
-            probe_paths = resolve_storage_paths(eff_ws, create_dirs=False)
-            if not probe_paths["db_path"].is_file():
-                if method == "control_plane/schedule_snapshot":
-                    return {
-                        "ok": True,
-                        "data": uninitialized_schedule_snapshot(
-                            max_concurrent_workers=p.get("max_concurrent_workers")
-                        ),
-                    }
-                if method == "control_plane/ui_inspector":
-                    return {
-                        "ok": True,
-                        "data": {
-                            "snapshot": uninitialized_schedule_snapshot(),
-                            "topology_health": {},
-                            "method_families": [],
-                            "lineage_nodes": [],
-                            "observations": [],
-                            "probes": [],
-                            "reviews": [],
-                            "internal_ledger": [],
-                            "works_tickets": [],
-                            "compliance_logs": [],
-                            "selected_node_detail": None,
-                        },
-                    }
-                return {"ok": True, "data": {"recovered_jobs": []}}
-
-            # 快照与 UI Inspector 严格走真正只读连接 + 一致只读事务，彻底消除初始化写争用
-            if method == "control_plane/schedule_snapshot":
-                res = _run_readonly_query(
-                    probe_paths["db_path"],
-                    lambda ro_conn: schedule_control_plane_snapshot(
-                        ro_conn,
-                        max_concurrent_workers=p.get("max_concurrent_workers"),
-                        workspace_root=eff_ws,
-                    ),
-                )
-                return {"ok": True, "data": res}
-            if method == "control_plane/ui_inspector":
-                res = _run_readonly_query(
-                    probe_paths["db_path"],
-                    lambda ro_conn: get_ui_full_inspector_payload(
-                        ro_conn,
-                        workspace_root=eff_ws,
-                        selected_node_id=p.get("selected_node_id"),
-                        selected_worktree_rel_file=p.get("selected_worktree_rel_file"),
-                    ),
-                )
-                return {"ok": True, "data": res}
-
-        paths = resolve_storage_paths(eff_ws)
-        conn = open_rw_connection(paths["db_path"], init_schema=True)
-        if method in ("control_plane/init_parse0", "control_plane/init_epoch"):
-            res = init_parse0_contract(
-                conn,
-                goal_and_completion_md=str(p.get("goal_and_completion_md") or p.get("goal_md") or ""),
-                subquestions=p.get("subquestions") or p.get("required_questions"),
-                question_order=p.get("question_order"),
-                initial_instruments=p.get("initial_instruments"),
-                seed_families=p.get("seed_families"),
-                total_budget=p.get("total_budget"),
-                min_commitment_window_sec=int(p.get("min_commitment_window_sec", 0) or 0),
-                delivery_spec_md=str(p.get("delivery_spec_md") or ""),
-                shared_inputs_rel_paths=p.get("shared_inputs_rel_paths"),
-                stage=p.get("stage") if p.get("stage") else None,
-                epoch_id=int(p.get("epoch_id", 1)),
-                human_signed_at=p.get("human_signed_at"),
-            )
-            return {"ok": True, "data": res}
-        if method == "control_plane/sync_pressure":
-            res = sync_session_pressure(
-                conn,
-                node_id=str(p["node_id"]),
-                pressure_tokens=int(p["pressure_tokens"]),
-                effective_context_window=p.get("effective_context_window"),
-                context_window_tokens=p.get("context_window_tokens"),
-            )
-            return {"ok": True, "data": res}
-        if method == "control_plane/mark_stage1_works_checked":
-            res = mark_stage1_works_checked(conn)
-            return {"ok": True, "data": res}
-        if method == "control_plane/sync_public_rulings":
-            res = sync_public_rulings(conn, workspace_root=eff_ws)
-            refreshed_worktrees: list[str] = []
-            if bool(p.get("refresh_active_worktrees", False)):
-                p0_row = conn.execute("SELECT shared_inputs_json FROM parse0_contract WHERE contract_id = 'active'").fetchone()
-                shared_rels = json.loads(p0_row["shared_inputs_json"] or "[]") if p0_row else []
-                for r in conn.execute(
-                    "SELECT DISTINCT worktree_abs_path FROM lineage_nodes WHERE node_status IN ('EXPLORING','ACTIVE_REVISING')"
-                ).fetchall():
-                    wt = str(r["worktree_abs_path"] or "").strip()
-                    if wt and Path(wt).is_dir():
-                        sync_public_inputs_to_worktree(eff_ws, wt, shared_rels)
-                        refreshed_worktrees.append(wt)
-            res["refreshed_worktrees"] = refreshed_worktrees
-            return {"ok": True, "data": res}
-        if method == "control_plane/abort_node":
-            res = abort_lineage_node(
-                conn,
-                node_id=str(p["node_id"]),
-                reason=str(p.get("reason", "ABORTED_BY_CONTROLLER")),
-            )
-            return {"ok": True, "data": res}
-        if method == "control_plane/submit_works_ticket":
-            res = submit_works_ticket(
-                conn,
-                question_id=str(p.get("question_id", "ALL")),
-                ticket_type=str(p.get("ticket_type", "INSTRUMENT_ERROR")),
-                instrument_id=p.get("instrument_id"),
-                description=str(p.get("description", p.get("reason", ""))),
-                source=str(p.get("source", "main_controller")),
-            )
-            return {"ok": True, "data": res}
-        if method == "control_plane/record_human_stop":
-            res = record_human_stop(conn, note=str(p.get("note", "HUMAN_UI_OR_CLI_STOP")))
-            return {"ok": True, "data": res}
-        if method == "control_plane/record_pending_handoff":
-            res = record_pending_handoff(
-                conn,
-                node_id=str(p["node_id"]),
-                mode=str(p.get("mode", "HANDOFF_70")),
-                explorer_will_md=str(p.get("explorer_will_md", "")),
-                reason=str(p.get("reason", "")),
-            )
-            return {"ok": True, "data": res}
-        if method == "control_plane/stage_blind_sandbox":
-            res = stage_blind_review_sandbox(conn, workspace_root=eff_ws, review_id=str(p["review_id"]))
-            return {"ok": True, "data": res}
-        if method == "control_plane/cleanup_blind_sandbox":
-            res = cleanup_blind_review_sandbox(eff_ws, str(p["review_id"]))
-            return {"ok": True, "data": res}
-        if method == "control_plane/recover_heavy_jobs":
-            res = recover_pending_heavy_jobs(conn, workspace_root=eff_ws, cancel_event=cancel_event)
-            return {"ok": True, "data": {"recovered_jobs": res}}
-        if method == "control_plane/fact_edge":
-            with rw_immediate_tx(conn):
-                record_fact_edge(
-                    conn,
-                    source_id=str(p.get("source_id") or p.get("src_id") or p.get("node_id") or p.get("session_id") or "host"),
-                    target_id=str(p.get("target_id") or p.get("dst_id") or ""),
-                    edge_type=str(p.get("edge_type") or "USED_TOOL"),
-                    session_id=str(p.get("session_id") or ""),
-                    metadata=p.get("metadata") if isinstance(p.get("metadata"), dict) else {},
-                )
-            return {"ok": True}
-        return FailClosedError(ERR_INVALID_INPUT, f"未知控制面方法: {method!r}").to_dict()
-    except RequestCancelledError as exc:
-        return FailClosedError(ERR_LOCKED, f"控制面请求已取消 ({method}): {exc}").to_dict()
-    except FailClosedError as exc:
-        return exc.to_dict()
-    except Exception as exc:
-        return FailClosedError(ERR_INVALID_INPUT, f"控制面异常 ({method}): {exc}").to_dict()
-    finally:
-        if conn is not None:
-            conn.close()
-
-
 def _read_next_message(stdin_buf: Any) -> tuple[dict[str, Any] | None, str]:
     while True:
         raw_line = stdin_buf.readline()
@@ -501,8 +318,7 @@ def _read_next_message(stdin_buf: Any) -> tuple[dict[str, Any] | None, str]:
             header_line = stripped
             while True:
                 if header_line.lower().startswith(b"content-length:"):
-                    val_str = header_line.split(b":", 1)[1].strip().decode("ascii")
-                    content_length = int(val_str)
+                    content_length = int(header_line.split(b":", 1)[1].strip().decode("ascii"))
                 nxt = stdin_buf.readline()
                 if not nxt or nxt in (b"\r\n", b"\n"):
                     break
@@ -537,8 +353,7 @@ def _is_compute_request(msg: dict[str, Any]) -> bool:
     method = str(msg.get("method", ""))
     if method == "tools/call":
         params = msg.get("params") or {}
-        t_name = str(params.get("name", ""))
-        return t_name in LONG_RUNNING_MCP_TOOLS
+        return str(params.get("name", "")) in LONG_RUNNING_MCP_TOOLS
     return method in _COMPUTE_CONTROL_METHODS
 
 
@@ -585,13 +400,12 @@ def handle_jsonrpc_message(
             session_id=str(top_meta.get("session_id", "") or ""),
             cancel_event=cancel_event,
         )
-        is_err = not bool(res.get("ok", False))
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
                 "content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}],
-                "isError": is_err,
+                "isError": not bool(res.get("ok", False)),
             },
         }
     if isinstance(method, str) and method.startswith("control_plane/"):
@@ -663,7 +477,6 @@ def serve_stdio(
             if method == "notifications/initialized" or msg_id is None:
                 continue
 
-            # initialize / ping / tools/list 极轻握手直接在 IO 线程零排队完成
             if method in ("initialize", "ping", "tools/list"):
                 resp = handle_jsonrpc_message(msg)
                 if resp is not None:

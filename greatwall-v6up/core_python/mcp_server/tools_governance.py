@@ -1,17 +1,29 @@
-"""V6-Up (v3.0) 治理层 22 工具聚合导出（logistics 5 + surveyor 3 + verifier 5 + works 5 + supervisory 4）。"""
+"""GreatWall v0.3 治理与图书馆层工具聚合导出（gw_chief + logistics + library 4角色 + works + supervisory）。"""
 
+from .tools_chief import (
+    tool_chief_get_overview_snapshot,
+    tool_chief_get_wave_digest,
+    tool_chief_preview_impact,
+    tool_chief_propose_control_action,
+    tool_chief_trace_entity,
+)
 from .tools_library import (
     tool_export_stage3_final_delivery,
     tool_get_blind_manuscript,
+    tool_get_chronicler_snapshot,
+    tool_get_conference_dossier,
     tool_get_survey_requests,
     tool_get_unblinded_manuscript_and_peers,
     tool_propose_salvaged_lemma,
     tool_publish_external_literature_card,
+    tool_publish_living_survey,
+    tool_record_conference_minutes,
+    tool_submit_conference_statement,
+    tool_submit_conference_verdict,
     tool_submit_stage1_blind_ledger,
     tool_submit_stage2_unblind_verdict,
 )
 from .tools_logistics import (
-    tool_dispatch_stagnation_five_lanes,
     tool_fork_branch,
     tool_get_logistics_dashboard,
     tool_register_method_family,
@@ -33,14 +45,24 @@ from .tools_works import (
 )
 
 __all__ = [
+    "tool_chief_get_overview_snapshot",
+    "tool_chief_trace_entity",
+    "tool_chief_get_wave_digest",
+    "tool_chief_preview_impact",
+    "tool_chief_propose_control_action",
     "tool_get_logistics_dashboard",
     "tool_register_method_family",
     "tool_triage_node",
     "tool_fork_branch",
-    "tool_dispatch_stagnation_five_lanes",
     "tool_get_survey_requests",
     "tool_publish_external_literature_card",
+    "tool_get_chronicler_snapshot",
+    "tool_publish_living_survey",
     "tool_export_stage3_final_delivery",
+    "tool_get_conference_dossier",
+    "tool_record_conference_minutes",
+    "tool_submit_conference_verdict",
+    "tool_submit_conference_statement",
     "tool_get_blind_manuscript",
     "tool_submit_stage1_blind_ledger",
     "tool_get_unblinded_manuscript_and_peers",

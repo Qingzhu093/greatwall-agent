@@ -40,10 +40,14 @@ def get_ui_full_inspector_payload(
         for r in conn.execute(
             """
             SELECT node_id, question_id, branch_id, family_id, parent_node_id, generation,
-                   spec_revision, node_status, worktree_abs_path, retained_snapshot_abs_path,
+                   branch_kind, protection_generations_left, branch_budget_nodes_left,
+                   companion_session_id, briefing_sealed_at, secondary_donor_node_id,
+                   spec_revision, node_status, control_state, control_generation,
+                   personal_turn_active, human_modified, artifact_dirty_since_last_obs,
+                   worktree_abs_path, retained_snapshot_abs_path,
                    mechanism_summary, evidence_grade, candidate_rel_path, bound_obs_ids_json,
                    revise_count, inplace_repair_count, pressure_tokens, effective_context_window,
-                   first_reflection_unlocked, lane_assignment, pending_handoff_mode,
+                   first_reflection_unlocked, pending_handoff_mode,
                    pending_handoff_reason, created_at, updated_at
             FROM lineage_nodes
             ORDER BY created_at ASC
@@ -116,6 +120,30 @@ def get_ui_full_inspector_payload(
         dict(r)
         for r in conn.execute(
             "SELECT * FROM compliance_alerts ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+    ]
+    interventions = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT * FROM node_interventions ORDER BY created_at DESC LIMIT 30"
+        ).fetchall()
+    ]
+    conferences = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT * FROM wave_conferences ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+    ]
+    proposals = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT * FROM control_proposals ORDER BY created_at DESC LIMIT 30"
+        ).fetchall()
+    ]
+    avoidance_radar = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT * FROM v_library_avoidance_radar ORDER BY created_at DESC LIMIT 30"
         ).fetchall()
     ]
 
@@ -233,6 +261,15 @@ def get_ui_full_inspector_payload(
     return {
         "snapshot": snap,
         "topology_health": topo,
+        "subproblem_states": snap.get("subproblem_states") or {},
+        "autonomy_mode": snap.get("autonomy_mode") or "WAVE_CONFIRM",
+        "living_surveys": snap.get("living_surveys") or {},
+        "pending_proposals": snap.get("pending_proposals") or [],
+        "proposals": proposals,
+        "wave_conferences": conferences,
+        "open_lemma_gaps": snap.get("open_lemma_gaps") or [],
+        "avoidance_radar": avoidance_radar,
+        "node_interventions": interventions,
         "method_families": families,
         "lineage_nodes": all_nodes,
         "observations": obs_list,

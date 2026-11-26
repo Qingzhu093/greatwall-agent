@@ -1,25 +1,23 @@
 /**
- * 长城 V6-Up (v3.0) 独立会话托管宿主机（AgentSessionHost）：
+ * GreatWall v0.3 独立会话托管宿主机（AgentSessionHost）。
  *
- * 核心能力：
- * 1. 基于 6 套专用 Preset 创建同工作区独立会话；`library_verifier` 挂载独立空白盲审沙箱 `sandboxAbsPath`；
- * 2. 平台感知原生工具挂载强断言 (`win32->pwsh`, 非 `win32->bash`，覆盖 `explorer`、`works_engineer`、`library_verifier`)；
- * 3. `setSessionReadonly(sessionId, flag)` 支持 70% 两步清醒交接期间将在线探索者瞬时锁为只读文本收官态；
- * 4. 完整支持单节点伴随会话保活 (`keepAliveAfterIdle`)、冷恢复自动重挂窄工具与沙箱 Guard、短事务归档。
+ * v0.3 升级：
+ * 1. 支持 DSH 0.2.2-rc.5 原生 `ctx.agents.resume(options)` 按确定性 sessionId 从磁盘恢复历史会话
+ *    （用于 `gw-comp-<node_id>`、`gw-chair-<conference_id>`、`gw-chief-<ws_hash>`），无历史时平滑回退 `create`；
+ * 2. 严守 7 条工程红线：保留 `_inheritParentPermissionState`（防 Windows 0xC0000142）、先 `handle.dispose()` 再 `archiveSession()`、
+ *    探索者禁开 pruner；
+ * 3. 集成 `runWithTransientRetry` 瞬态 429/5xx 原地退避与 `humanTakeover` 人类发言监测、温和 `injectPolicyChange`。
  * @module dsh-greatwall-v6up/agent_session_host
  */
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import {
-  CANONICAL_ROLES,
-  ROLE_EFFORT_MAP,
-  formatNodeSessionTitle,
-} from './prompts.js'
+import { CANONICAL_ROLES, ROLE_EFFORT_MAP, formatNodeSessionTitle } from './prompts.js'
 import { ROLE_TO_PRESET } from './presets.js'
 import { syncLivePressureToDb } from './clock_and_turn_gap.js'
 import { buildBlackboxTrajectorySummary } from './blackbox_projection.js'
 import { mountCapabilitiesOnAgentSession } from './host/capability_mount.js'
+import { runWithTransientRetry } from './runtime/transient_retry.js'
 import {
   assertRequiredNativeTools,
   createAbortGraceRace,
@@ -52,6 +50,7 @@ export class AgentSessionHost {
     defaultAgentOptions = {},
     effectiveContextWindow = 500_000,
     autoArchiveShortTx = true,
+    humanTakeover = null,
     telemetry,
   }) {
     this.ctx = ctx
@@ -64,23 +63,17 @@ export class AgentSessionHost {
     this.defaultAgentOptions = defaultAgentOptions
     this.effectiveContextWindow = Math.max(1, Number(effectiveContextWindow || 500_000))
     this.autoArchiveShortTx = Boolean(autoArchiveShortTx)
+    this.humanTakeover = humanTakeover
     this.telemetry = telemetry
 
-    /** @type {Map<string, any>} */
     this.liveSessions = new Map()
-    /** @type {Map<string, boolean>} */
     this._sessionReadonlyFlags = new Map()
-    /** @type {Set<string>} */
     this._setupHandledAgentIds = new Set()
-    /** @type {Array<object> | null} */
     this._cachedToolSchemas = null
-    /** @type {Map<string, string>} */
     this._latestGovernanceSessions = new Map()
-
     this._resumeListenerDisposer = this._installResumeAutoRemountListener()
   }
 
-  /** 动态切换指定在线会话的只读保护标志（用于 70% 探索者最后一轮亲笔遗嘱只读收官）。 */
   setSessionReadonly(sessionId, isReadonly) {
     if (!sessionId) return
     this._sessionReadonlyFlags.set(sessionId, Boolean(isReadonly))
@@ -88,6 +81,19 @@ export class AgentSessionHost {
 
   isSessionReadonly(sessionId) {
     return Boolean(this._sessionReadonlyFlags.get(sessionId))
+  }
+
+  /** 向在线探索会话温和热注入新口径裁决通知（绝不强杀在途旧口径分支）。 */
+  injectPolicyChange(sessionId, noticeText) {
+    const entry = this.liveSessions.get(sessionId)
+    if (!entry?.handle?.agent) return { injected: false, reason: 'session_not_live' }
+    const msg = createUserTextMessage(noticeText, 'user')
+    this.humanTakeover?.markPluginMessage?.(sessionId, noticeText)
+    if (typeof entry.handle.agent.inject === 'function') {
+      entry.handle.agent.inject(msg)
+      return { injected: true, method: 'inject' }
+    }
+    return { injected: false, reason: 'agent_inject_unavailable' }
   }
 
   _installResumeAutoRemountListener() {
@@ -110,7 +116,7 @@ export class AgentSessionHost {
           toolSchemas: cachedSchemas,
           readonly: settled || Boolean(ident.readonly),
           taskContextText: settled
-            ? '⚠️ 注意：该节点短事务已结案，当前处于冷恢复只读追问/审计模式（严禁写磁盘或篡改库状态）。'
+            ? '⚠️ 注意：该节点短事务已结案或已封存，当前处于只读追问/审计模式（严禁写磁盘或篡改库状态）。'
             : '',
           cleanupFns: cleanups,
           turnSignals: [],
@@ -136,9 +142,7 @@ export class AgentSessionHost {
   _canonicalizeForWorkspaceMatch(targetPath) {
     if (!targetPath) return ''
     let resolved = path.resolve(String(targetPath))
-    try {
-      resolved = fs.realpathSync(resolved)
-    } catch {}
+    try { resolved = fs.realpathSync(resolved) } catch {}
     const norm = path.normalize(resolved)
     return process.platform === 'win32' ? norm.toLowerCase() : norm
   }
@@ -152,20 +156,13 @@ export class AgentSessionHost {
     if (!session?.id) return
     const sessionCwd = session?.header?.cwd || ''
     const isCross = crossCwd !== null ? Boolean(crossCwd) : this._isCrossCwd(sessionCwd)
-    // RC5 dsh-workspace 严格校验 realpathNormalize(header.cwd) === workspace.path；跨 cwd 子会话预期跳过 attachSession，
-    // 同目录会话挂载失败则明确记遥测，不再静默吞错。
     if (!isCross) {
       try {
         const reg = typeof this.ctx?.get === 'function' ? this.ctx.get('workspaceRegistry') : this.ctx?.workspaceRegistry
         const ws = await reg?.resolveByPath?.(this.workspaceRoot)
-        if (ws && typeof ws.attachSession === 'function') {
-          await ws.attachSession(session.id)
-        }
+        if (ws && typeof ws.attachSession === 'function') await ws.attachSession(session.id)
       } catch (err) {
-        this.telemetry?.recordEvent?.('session_attach_error', {
-          sessionId: session.id,
-          error: String(err?.message || err),
-        })
+        this.telemetry?.recordEvent?.('session_attach_error', { sessionId: session.id, error: String(err?.message || err) })
       }
     }
     if (title) {
@@ -180,14 +177,13 @@ export class AgentSessionHost {
     }
   }
 
-  async archiveSession(sessionId, _session = null) {
+  async archiveSession(sessionId) {
     if (!this.autoArchiveShortTx || !sessionId) return { archived: false, skipped: true }
     const reg = typeof this.ctx?.get === 'function' ? this.ctx.get('workspaceRegistry') : this.ctx?.workspaceRegistry
     if (!reg || typeof reg.archiveSession !== 'function') {
       return { archived: false, skipped: true, reason: 'no_workspace_registry' }
     }
     try {
-      // RC5 dsh-workspace.archiveSession 操作全局归档集，同目录与跨 cwd 子会话均直接调用原生归档
       await reg.archiveSession(sessionId)
     } catch (err) {
       const msg = String(err?.message || err)
@@ -225,19 +221,14 @@ export class AgentSessionHost {
   async _resolveSafeReasoningEffort(targetEffort, provider, model) {
     if (!targetEffort) return undefined
     const llmSvc = this.ctx?.get?.('llm')
-    if (!llmSvc || typeof llmSvc.resolveModelInfo !== 'function' || !provider || !model) {
-      return targetEffort
-    }
+    if (!llmSvc || typeof llmSvc.resolveModelInfo !== 'function' || !provider || !model) return targetEffort
     try {
       const info = await llmSvc.resolveModelInfo(provider, model)
       const efforts = info?.reasoning?.efforts
       if (!Array.isArray(efforts) || efforts.length === 0) return undefined
       const ids = efforts.map((e) => String(e?.id || '')).filter(Boolean)
       if (ids.includes(targetEffort)) return targetEffort
-      if (targetEffort === 'medium') {
-        if (ids.includes('high')) return 'high'
-        if (ids.includes('low')) return 'low'
-      }
+      if (targetEffort === 'medium') return ids.includes('high') ? 'high' : (ids.includes('low') ? 'low' : ids[0])
       if (targetEffort === 'high') return ids[ids.length - 1]
       return ids[0]
     } catch {
@@ -249,18 +240,12 @@ export class AgentSessionHost {
     try {
       const liveSess = session || this.ctx?.sessions?.get?.(sessionId)
       let events = typeof liveSess?.snapshotEvents === 'function' ? liveSess.snapshotEvents() : null
-      if (!Array.isArray(events)) {
-        const sq = this.ctx?.sessionQuery
-        if (sq && typeof sq.listEvents === 'function') {
-          events = await sq.listEvents(sessionId)
-        }
+      if (!Array.isArray(events) && typeof this.ctx?.sessionQuery?.listEvents === 'function') {
+        events = await this.ctx.sessionQuery.listEvents(sessionId)
       }
       if (!Array.isArray(events)) return null
       for (let i = events.length - 1; i >= 0; i--) {
-        const ev = events[i]
-        if (ev?.type === 'turn/end') {
-          return ev?.data?.reason || ev?.payload?.reason || { kind: 'stop' }
-        }
+        if (events[i]?.type === 'turn/end') return events[i]?.data?.reason || events[i]?.payload?.reason || { kind: 'stop' }
       }
     } catch {}
     return null
@@ -281,19 +266,11 @@ export class AgentSessionHost {
 
   _recordContentRefusal(sessionId, role, turnEndReason) {
     if (turnEndReason?.kind !== 'error' || turnEndReason.error?.code !== 'CONTENT_REFUSED') return
-    this.telemetry.recordEvent('model_content_refused', {
-      sessionId,
-      role,
-      code: turnEndReason.error.code,
-      message: '模型提供方拒绝了本轮请求。',
-    })
+    this.telemetry.recordEvent('model_content_refused', { sessionId, role, code: turnEndReason.error.code })
   }
 
   /**
-   * 仅当主控父会话已获人类显式授权（例如桌面端 defaultPreset 或 CLI `--permission-mode danger-full-access`）时，
-   * 将父会话的权限预设 / `sandbox/mode` 同步给新创建的子会话，避免 headless 下子会话跌落 `workspace-write`
-   * 触发 Windows ACL 受限令牌跑 `pwsh` 报 `0xC0000142`（同时我方双向沙箱 Guard 仍 100% 同步拦截越界访问）。
-   * @param {any} childSession
+   * 不可触碰工程红线 1：同步父会话权限预设 / sandbox/mode，防 Windows headless 跑 pwsh 报 0xC0000142。
    */
   _inheritParentPermissionState(childSession) {
     const parentSession = this.parentAgent?.session
@@ -305,19 +282,13 @@ export class AgentSessionHost {
       if (permSvc && typeof permSvc.current === 'function' && typeof permSvc.set === 'function') {
         const parentPreset = permSvc.current(parentSession)
         const childPreset = permSvc.current(childSession)
-        if (
-          parentPreset &&
-          parentPreset !== 'custom' &&
-          parentPreset !== 'auto' &&
-          parentPreset !== childPreset
-        ) {
+        if (parentPreset && parentPreset !== 'custom' && parentPreset !== 'auto' && parentPreset !== childPreset) {
           permSvc.set(childSession, parentPreset)
           return
         }
       }
     } catch {}
 
-    // 回退路径：直接通过 DSH 原生 sandboxPolicy / 会话事件流同步 sandbox/mode 与 approval/policy
     try {
       let parentMode = ''
       const sbSvc =
@@ -331,27 +302,31 @@ export class AgentSessionHost {
         const evs = parentSession.snapshotEvents() || []
         for (let i = evs.length - 1; i >= 0; i--) {
           const ev = evs[i]
-          if (!parentMode && ev?.type === 'sandbox/mode' && ev?.data?.mode) {
-            parentMode = String(ev.data.mode).trim()
-          }
-          if (!parentApproval && ev?.type === 'approval/policy' && ev?.data?.policy) {
-            parentApproval = String(ev.data.policy).trim()
-          }
+          if (!parentMode && ev?.type === 'sandbox/mode' && ev?.data?.mode) parentMode = String(ev.data.mode).trim()
+          if (!parentApproval && ev?.type === 'approval/policy' && ev?.data?.policy) parentApproval = String(ev.data.policy).trim()
           if (parentMode && parentApproval) break
         }
       }
       if (parentMode && typeof childSession.append === 'function') {
-        const curMode = sbSvc && typeof sbSvc.resolve === 'function'
-          ? String(sbSvc.resolve({ session: childSession })?.mode || '').trim()
-          : ''
-        if (curMode !== parentMode) {
-          childSession.append('sandbox/mode', { mode: parentMode })
-        }
+        const curMode = sbSvc && typeof sbSvc.resolve === 'function' ? String(sbSvc.resolve({ session: childSession })?.mode || '').trim() : ''
+        if (curMode !== parentMode) childSession.append('sandbox/mode', { mode: parentMode })
       }
       if (parentApproval && typeof childSession.append === 'function') {
         childSession.append('approval/policy', { policy: parentApproval })
       }
     } catch {}
+  }
+
+  /**
+   * 优先通过 DSH RC5 原生 `ctx.agents.resume(sessionId)` 从磁盘恢复确定性会话；
+   * 若会话尚未落盘或宿主无 `resume`，自动透明回退到 `spawnAndRunAgent`。
+   */
+  async resumeOrSpawnAgent(opts) {
+    const sid = String(opts?.sessionId || '').trim()
+    if (sid && this.liveSessions.has(sid) && !opts.allowedMcpOverride) {
+      return this.continueAliveAgent(sid, opts.prompt, { signal: opts.signal })
+    }
+    return this.spawnAndRunAgent({ ...opts, preferResume: Boolean(sid) })
   }
 
   async spawnAndRunAgent({
@@ -366,19 +341,18 @@ export class AgentSessionHost {
     cwd = '',
     sandboxAbsPath = '',
     taskContextText = '',
+    extraContextProvider = null,
+    allowedMcpOverride = null,
     agentOptions = {},
     keepAliveAfterIdle = false,
     uiLabel = '',
     shortTransaction = true,
     archiveOnComplete = null,
+    preferResume = false,
     signal = null,
   }) {
-    if (!CANONICAL_ROLES.includes(role)) {
-      throw new Error(`非法角色名: ${role}`)
-    }
-    if (!this.ctx?.agents || typeof this.ctx.agents.create !== 'function') {
-      throw new Error('DSH ctx.agents.create 不可用')
-    }
+    if (!CANONICAL_ROLES.includes(role)) throw new Error(`非法角色名: ${role}`)
+    if (!this.ctx?.agents || typeof this.ctx.agents.create !== 'function') throw new Error('DSH ctx.agents.create 不可用')
     if (signal?.aborted) {
       const err = new Error('GREATWALL_RUN_ABORTED')
       err.code = 'GREATWALL_RUN_ABORTED'
@@ -392,7 +366,7 @@ export class AgentSessionHost {
     const effWorktree = (role === 'explorer' || role === 'lineage_companion') && cwd ? path.resolve(cwd) : this.workspaceRoot
     const effSandbox = role === 'library_verifier' && sandboxAbsPath ? path.resolve(sandboxAbsPath) : ''
     if (role === 'library_verifier' && !effSandbox) {
-      throw new Error('BLIND_SANDBOX_REQUIRED: library_verifier 必须挂载独立空白盲审沙箱 sandboxAbsPath，禁止回退主工作区！')
+      throw new Error('BLIND_SANDBOX_REQUIRED: library_verifier 必须挂载独立空白盲审沙箱 sandboxAbsPath！')
     }
     const metaCwd = role === 'library_verifier'
       ? effSandbox
@@ -422,59 +396,64 @@ export class AgentSessionHost {
     let resolvedPresetId = null
     if (agentPresetsSvc && targetPreset) {
       let resolved = null
-      try {
-        resolved = await agentPresetsSvc.resolve(targetPreset)
-      } catch {}
-      if (!resolved) {
-        throw new Error(`角色 ${role} 所需的 Agent Preset "${targetPreset}" 无法在 agentPresets 中解析（请确认插件入口已装配或 cordis.patch.yml 已生效）。`)
-      }
-      if (resolved.broken) {
-        throw new Error(`角色 ${role} 所需的 Agent Preset "${targetPreset}" 损坏 (${resolved.broken})，请检查 Cordis 插件声明。`)
-      }
+      try { resolved = await agentPresetsSvc.resolve(targetPreset) } catch {}
+      if (!resolved) throw new Error(`角色 ${role} 所需的 Agent Preset "${targetPreset}" 无法在 agentPresets 中解析。`)
+      if (resolved.broken) throw new Error(`角色 ${role} 所需的 Agent Preset "${targetPreset}" 损坏 (${resolved.broken})。`)
       resolvedPresetId = targetPreset
     }
 
-    const createOpts = {
-      sessionId: effSid,
-      meta: {
-        cwd: metaCwd,
-        ...(resolvedPresetId ? { agentPreset: resolvedPresetId } : {}),
-      },
-      agentOptions: mergedAgentOptions,
-      setup: async (agentCtx, agent) => {
-        this._setupHandledAgentIds.add(agent.id)
-        const scopedPresets = (typeof agentCtx?.get === 'function' ? agentCtx.get('agentPresets') : null) || agentPresetsSvc
-        if (resolvedPresetId && scopedPresets && typeof scopedPresets.mount === 'function') {
-          await scopedPresets.mount(agentCtx, resolvedPresetId)
-        }
-        this.mountCapabilitiesOnAgent(agentCtx, agent, {
-          role,
-          nodeId,
-          cwd: effWorktree,
-          sandboxAbsPath: effSandbox,
-          toolSchemas,
-          taskContextText,
-          cleanupFns,
-          turnSignals,
-          onNativeThresholdHit: (ev) => {
-            nativeThresholds.push(ev)
-            // 纯原生工具长回合跨过 37% / 70% 或节点在 DB 中已被外部关闭时主动安全收束当前 Turn
-            if (ev?.trigger === 'REFLECT_37' || ev?.trigger === 'HANDOFF_70' || ev?.trigger === 'NODE_TERMINATED') {
-              thresholdCancelled = true
-              try {
-                liveHandleRef?.agent?.cancel?.({ kind: 'hook', reason: ev.trigger })
-              } catch {}
-            }
-          },
-        })
-        if (typeof agentPresetsSvc?.register === 'function') {
-          const mountedNames = (agentCtx.tools?.schemas?.(agent) || []).map((s) => s.name)
-          assertRequiredNativeTools(role, mountedNames, process.platform)
-        }
-      },
+    const setupFn = async (agentCtx, agent) => {
+      this._setupHandledAgentIds.add(agent.id)
+      const scopedPresets = (typeof agentCtx?.get === 'function' ? agentCtx.get('agentPresets') : null) || agentPresetsSvc
+      if (resolvedPresetId && scopedPresets && typeof scopedPresets.mount === 'function') {
+        await scopedPresets.mount(agentCtx, resolvedPresetId)
+      }
+      this.mountCapabilitiesOnAgent(agentCtx, agent, {
+        role,
+        nodeId,
+        cwd: effWorktree,
+        sandboxAbsPath: effSandbox,
+        toolSchemas,
+        taskContextText,
+        extraContextProvider,
+        allowedMcpOverride,
+        cleanupFns,
+        turnSignals,
+        onNativeThresholdHit: (ev) => {
+          nativeThresholds.push(ev)
+          if (ev?.trigger === 'REFLECT_37' || ev?.trigger === 'HANDOFF_70' || ev?.trigger === 'NODE_TERMINATED') {
+            thresholdCancelled = true
+            try { liveHandleRef?.agent?.cancel?.({ kind: 'hook', reason: ev.trigger }) } catch {}
+          }
+        },
+      })
+      if (typeof agentPresetsSvc?.register === 'function') {
+        const mountedNames = (agentCtx.tools?.schemas?.(agent) || []).map((s) => s.name)
+        assertRequiredNativeTools(role, mountedNames, process.platform)
+      }
     }
 
-    const handle = await this.ctx.agents.create(createOpts)
+    const commonOpts = {
+      sessionId: effSid,
+      meta: { cwd: metaCwd, ...(resolvedPresetId ? { agentPreset: resolvedPresetId } : {}) },
+      agentOptions: mergedAgentOptions,
+      setup: setupFn,
+    }
+
+    let handle = null
+    let resumedFromDisk = false
+    if (preferResume && typeof this.ctx.agents.resume === 'function') {
+      try {
+        handle = await this.ctx.agents.resume(commonOpts)
+        resumedFromDisk = true
+      } catch {
+        handle = null
+      }
+    }
+    if (!handle) {
+      handle = await this.ctx.agents.create(commonOpts)
+    }
+
     liveHandleRef = handle
     this._inheritParentPermissionState(handle?.agent?.session)
     const crossCwd = this._isCrossCwd(metaCwd)
@@ -491,12 +470,18 @@ export class AgentSessionHost {
       workspaceRoot: this.workspaceRoot,
       crossCwd,
       shortTransaction,
+      resumedFromDisk,
       title: sessionTitle,
     })
 
     await this.attachAndNameSession(handle.agent.session, sessionTitle, { crossCwd })
 
-    if (!shortTransaction && ['logistics_coordinator', 'works_engineer', 'library_surveyor', 'supervisory_committee'].includes(role)) {
+    if (role === 'explorer' && nodeId && this.humanTakeover) {
+      const unwatch = this.humanTakeover.watchExplorerSession(nodeId, handle.agent.session)
+      cleanupFns.push(unwatch)
+    }
+
+    if (!shortTransaction && ['logistics_coordinator', 'works_engineer', 'external_surveyor', 'library_chronicler', 'supervisory_committee'].includes(role)) {
       const prevSid = this._latestGovernanceSessions.get(role)
       if (prevSid && prevSid !== effSid && !this.liveSessions.has(prevSid)) {
         await this.archiveSession(prevSid)
@@ -512,22 +497,14 @@ export class AgentSessionHost {
       this.liveSessions.delete(effSid)
       this._sessionReadonlyFlags.delete(effSid)
       this._setupHandledAgentIds.delete(effSid)
-      const sessionRef = handle?.agent?.session
-      // 1. 先释放活跃会话句柄与挂载钩子（RC5 dsh-workspace 禁止归档仍处于活跃状态的会话）
-      try {
-        await handle.dispose()
-      } catch {}
+      // 严格先 dispose() 再 archiveSession()
+      try { await handle.dispose() } catch {}
       for (const fn of cleanupFns.splice(0)) {
-        try {
-          await fn()
-        } catch {}
+        try { await fn() } catch {}
       }
-      // 2. 释放完毕后再执行原生归档，并将真实归档结果（而非期望值）写入遥测
       const wantArchive = archive !== null ? Boolean(archive) : Boolean(defaultShouldArchive)
       let archRes = { archived: false, error: null }
-      if (wantArchive) {
-        archRes = await this.archiveSession(effSid, sessionRef)
-      }
+      if (wantArchive) archRes = await this.archiveSession(effSid)
       this.telemetry.recordSessionEnd({
         sessionId: effSid,
         status: statusLabel,
@@ -554,23 +531,8 @@ export class AgentSessionHost {
       handleDispose: disposeAll,
     })
 
-    const onAbortSignal = () => {
-      try {
-        handle.agent.cancel?.({ kind: 'parent' })
-      } catch {}
-    }
-    if (signal) {
-      if (signal.aborted) onAbortSignal()
-      else signal.addEventListener('abort', onAbortSignal, { once: true })
-    }
-
-    try {
-      if (!signal?.aborted) {
-        handle.agent.followup(createUserTextMessage(prompt, 'user'))
-        await createAbortGraceRace(signal, handle.agent.whenIdle())
-      }
-    } finally {
-      if (signal) signal.removeEventListener('abort', onAbortSignal)
+    if (prompt) {
+      await this._runFollowupTurn(effSid, handle, prompt, signal, role)
     }
 
     if (signal?.aborted) {
@@ -582,9 +544,7 @@ export class AgentSessionHost {
 
     const turnEndReason = await this.inspectLastTurnEndReason(effSid, handle?.agent?.session)
     this._recordContentRefusal(effSid, role, turnEndReason)
-    const isAbnormalEnd = Boolean(
-      !thresholdCancelled && turnEndReason && (turnEndReason.kind === 'error' || turnEndReason.kind === 'aborted'),
-    )
+    const isAbnormalEnd = Boolean(!thresholdCancelled && turnEndReason && (turnEndReason.kind === 'error' || turnEndReason.kind === 'aborted'))
     thresholdCancelled = false
 
     if (role === 'explorer' && nodeId) {
@@ -602,6 +562,7 @@ export class AgentSessionHost {
       sessionId: effSid,
       role,
       nodeId,
+      resumedFromDisk,
       turnSignals,
       nativeThresholds,
       turnEndReason,
@@ -613,6 +574,43 @@ export class AgentSessionHost {
     }
   }
 
+  async _runFollowupTurn(sessionId, handle, promptText, signal, role) {
+    const onAbortSignal = () => {
+      try { handle.agent.cancel?.({ kind: 'parent' }) } catch {}
+    }
+    if (signal) {
+      if (signal.aborted) onAbortSignal()
+      else signal.addEventListener('abort', onAbortSignal, { once: true })
+    }
+    try {
+      await runWithTransientRetry(
+        async () => {
+          if (signal?.aborted) return
+          this.humanTakeover?.markPluginMessage?.(sessionId, promptText)
+          handle.agent.followup(createUserTextMessage(promptText, 'user'))
+          await createAbortGraceRace(signal, handle.agent.whenIdle())
+          const reason = await this.inspectLastTurnEndReason(sessionId, handle?.agent?.session)
+          if (reason?.kind === 'error' && reason?.error) {
+            const err = new Error(String(reason.error.message || reason.error.code || 'turn_error'))
+            err.code = reason.error.code
+            err.status = reason.error.status
+            throw err
+          }
+        },
+        {
+          signal,
+          onRetry: ({ attempt, delayMs, error }) => {
+            this.telemetry?.recordEvent?.('transient_provider_retry', { sessionId, role, attempt, delayMs, error })
+          },
+        },
+      ).catch(() => {
+        // 非瞬态或耗尽重试后交由上层 inspectLastTurnEndReason 统一处置
+      })
+    } finally {
+      if (signal) signal.removeEventListener('abort', onAbortSignal)
+    }
+  }
+
   async continueAliveAgent(sessionId, promptText, { signal = null } = {}) {
     const entry = this.liveSessions.get(sessionId)
     if (!entry) throw new Error(`会话 ${sessionId} 未处于保活状态`)
@@ -621,20 +619,7 @@ export class AgentSessionHost {
       err.code = 'GREATWALL_RUN_ABORTED'
       throw err
     }
-    const onAbort = () => {
-      try {
-        entry.handle?.agent?.cancel?.({ kind: 'parent' })
-      } catch {}
-    }
-    if (signal) signal.addEventListener('abort', onAbort, { once: true })
-
-    try {
-      entry.handle.agent.followup(createUserTextMessage(promptText, 'user'))
-      await createAbortGraceRace(signal, entry.handle.agent.whenIdle())
-    } finally {
-      if (signal) signal.removeEventListener('abort', onAbort)
-    }
-
+    await this._runFollowupTurn(sessionId, entry.handle, promptText, signal, entry.role)
     if (signal?.aborted) {
       const err = new Error('GREATWALL_RUN_ABORTED')
       err.code = 'GREATWALL_RUN_ABORTED'
@@ -659,9 +644,7 @@ export class AgentSessionHost {
   }
 
   async disposeAllSessions() {
-    try {
-      this._resumeListenerDisposer?.()
-    } catch {}
+    try { this._resumeListenerDisposer?.() } catch {}
     const entries = [...this.liveSessions.values()]
     if (entries.length > 0) {
       await Promise.allSettled(entries.map((entry) => entry.handleDispose('disposed')))

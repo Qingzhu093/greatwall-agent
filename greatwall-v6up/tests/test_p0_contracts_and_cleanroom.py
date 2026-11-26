@@ -40,7 +40,7 @@ class TestP0ContractsAndCleanroom(unittest.TestCase):
         self.assertEqual(orch["governance_item_circuit_breaker_max_stalled_runs"], 2)
         self.assertTrue(orch["versioned_spec_revision_binding"])
         self.assertTrue(orch["mount_public_inputs_readonly_into_sandboxes"])
-        self.assertTrue(orch["companion_reuse_within_single_node"])
+        self.assertTrue(orch["companion_resume_by_deterministic_session_id"])
         self.assertTrue(orch["companion_forbid_cross_generation_persistence"])
         self.assertTrue(orch["verifier_isolated_execution_sandbox"])
         self.assertTrue(orch["external_r_open_from_0pct"])
@@ -109,9 +109,9 @@ class TestP0ContractsAndCleanroom(unittest.TestCase):
             rb = item.get("rollback_pointer", "")
             self.assertTrue((ROOT_DIR / "core_python" / rb).is_file(), f"回滚指针不存在: {rb}")
 
-    def test_32_tools_schema_consistency_and_enums(self) -> None:
+    def test_44_tools_schema_consistency_and_enums(self) -> None:
         defs = mcp.TOOL_DEFINITIONS
-        self.assertEqual(len(defs), 32)
+        self.assertEqual(len(defs), 44)
         def_names = {d["name"] for d in defs}
         self.assertEqual(def_names, set(mcp._TOOL_REGISTRY.keys()))
         self.assertEqual(def_names, set(helpers.ALL_TOOL_NAMES))
@@ -128,8 +128,8 @@ class TestP0ContractsAndCleanroom(unittest.TestCase):
         # 核对核心枚举与 db_schema 同源
         pub_props = by_name["publish_external_literature_card"]["inputSchema"]["properties"]
         self.assertEqual(set(pub_props["outcome"]["enum"]), set(db.ALLOWED_SURVEY_OUTCOMES))
-        self.assertEqual(set(pub_props["support_scope"]["enum"]), set(db.ALLOWED_SUPPORT_SCOPES))
-        self.assertEqual(set(pub_props["read_depth"]["enum"]), set(db.ALLOWED_READ_DEPTHS))
+        self.assertEqual({x for x in pub_props["support_scope"]["enum"] if x is not None}, set(db.ALLOWED_SUPPORT_SCOPES))
+        self.assertEqual({x for x in pub_props["read_depth"]["enum"] if x is not None}, set(db.ALLOWED_READ_DEPTHS))
         self.assertEqual(pub_props["abstract_md"]["minLength"], 60)
         self.assertGreaterEqual(pub_props["abstract_md"]["maxLength"], 600)
 
@@ -141,7 +141,7 @@ class TestP0ContractsAndCleanroom(unittest.TestCase):
 
     def test_dsh_package_json_v3_files_whitelist(self) -> None:
         pkg = json.loads((ROOT_DIR / "dsh_plugin" / "package.json").read_text(encoding="utf-8"))
-        self.assertEqual(pkg["version"], "3.0.0")
+        self.assertEqual(pkg["version"], "0.3.0-alpha.1")
         files = pkg.get("files", [])
         self.assertIn("lib", files)
         self.assertIn("cordis.patch.yml", files)

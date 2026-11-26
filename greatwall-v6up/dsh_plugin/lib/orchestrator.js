@@ -1,33 +1,30 @@
 /**
- * 长城 V6-Up (v3.0) 外部无状态异步事件池编排器主入口。
+ * GreatWall v0.3 异步事件池编排器主入口（精简高内聚，零上帝文件）。
  *
- * 职责划分（子模块位于 `./orchestrator/`）：
- * - `orchestrator/circuit_breaker.js`：单条待办项熔断器、探索者合法性过滤与客观指纹构造；
- * - `orchestrator/dispatch_stage1.js`：Stage 1 (Parse 0) 四步初始化派发；
- * - `orchestrator/dispatch_stage2.js`：Stage 2 待交接恢复、五类治理角色与探索者并发派发；
- * - `orchestrator/dispatch_stage3.js`：Stage 3 退修重导、盲审终核与监察联合终签派发；
- * - 本文件：编排器生命周期控制（start / pause / resume / stop / humanStop / abortNode / submitWorksTicket / syncPublicRulings）与极简主循环骨架。
+ * v0.3 架构集成：
+ * - `WorkspaceInstanceLock`：单机单实例 `host.lock` 防双活抢单；
+ * - `RuntimeEffectsConsumer`：每轮先消费 SQLite Outbox（60s 租约、崩溃认领、热注入 `NOTIFY_POLICY_CHANGED`、45% 让权与 `NOTIFY_CHIEF` 路由）；
+ * - `WorkerSlotAllocator`：`maxWorkers` 普通槽 + `+1` 人类优先保留槽；
+ * - `HumanTakeoverCoordinator`：45% 暂停让权 + `ctx.jobs` 清理 + `source.rpcId` 人类对话让权；
+ * - `WaveConferenceRunner`：宏观大外环四拍脉冲确定性驱动；
+ * - 废除 `resume` 扫盘自动升版暗门（改为只读草稿提示，裁决 4）。
  * @module dsh-greatwall-v6up/orchestrator
  */
 import crypto from 'node:crypto'
 import path from 'node:path'
 import { loadCoreRuntimeConfig, loadRolePrompts } from './prompts.js'
-import { TelemetryCollector } from './telemetry.js'
+import { TelemetryCollector, resolveTelemetryFilePath } from './telemetry.js'
 import { AgentSessionHost, resolveAuthoritativeModelBinding } from './agent_session_host.js'
 import { disposeNodeCompanion, driveExplorerCompanionPair } from './pair_lifecycle.js'
-import {
-  GovernanceItemCircuitBreaker,
-  selectDispatchableExplorers,
-} from './orchestrator/circuit_breaker.js'
-import {
-  assertValidBlindSandboxResult,
-  buildDispatchRuntimePort,
-} from './orchestrator/runtime_port.js'
+import { WorkspaceInstanceLock } from './runtime/instance_lock.js'
+import { WorkerSlotAllocator } from './runtime/worker_slots.js'
+import { RuntimeEffectsConsumer } from './runtime/effects_consumer.js'
+import { HumanTakeoverCoordinator } from './sessions/human_takeover.js'
+import { GovernanceItemCircuitBreaker, selectDispatchableExplorers } from './orchestrator/circuit_breaker.js'
+import { assertValidBlindSandboxResult, buildDispatchRuntimePort } from './orchestrator/runtime_port.js'
+import { WaveConferenceRunner } from './orchestrator/wave_conference_runner.js'
 import { dispatchStage1Step } from './orchestrator/dispatch_stage1.js'
-import {
-  dispatchPendingHandoffRecoveries,
-  dispatchStage2Step,
-} from './orchestrator/dispatch_stage2.js'
+import { dispatchPendingHandoffRecoveries, dispatchStage2Step } from './orchestrator/dispatch_stage2.js'
 import { dispatchStage3Step } from './orchestrator/dispatch_stage3.js'
 
 export { GovernanceItemCircuitBreaker, selectDispatchableExplorers }
@@ -43,6 +40,7 @@ export class GreatwallOrchestrator {
     defaultAgentOptions = {},
     parentAgent = null,
     autoArchiveShortTx = true,
+    onChiefNotify = null,
   }) {
     this.ctx = ctx
     this.bridge = bridge
@@ -50,6 +48,7 @@ export class GreatwallOrchestrator {
     this.workspaceRoot = path.resolve(workspaceRoot)
     this.dataDir = dataDir
     this.parentAgent = parentAgent
+    this._onChiefNotify = onChiefNotify
 
     this.runtimeConfig = loadCoreRuntimeConfig(this.corePythonRoot)
     this.rolePrompts = loadRolePrompts(this.corePythonRoot)
@@ -59,9 +58,17 @@ export class GreatwallOrchestrator {
     const orchCfg = this.runtimeConfig?.orchestration_and_eval || {}
     this._windowCapTokens = Number(clkCfg.context_window_cap_tokens || clkCfg.context_window_tokens || 500_000)
     this._requireExplicitModelBinding = orchCfg.require_explicit_model_binding !== false
-    this._itemBreaker = new GovernanceItemCircuitBreaker(
-      Number(orchCfg.governance_item_circuit_breaker_max_stalled_runs || 2),
-    )
+    this._itemBreaker = new GovernanceItemCircuitBreaker(Number(orchCfg.governance_item_circuit_breaker_max_stalled_runs || 2))
+
+    const wsDataRoot = path.dirname(resolveTelemetryFilePath({ dataDir, workspaceRoot: this.workspaceRoot }))
+    this.instanceLock = new WorkspaceInstanceLock(path.join(wsDataRoot, 'host.lock'))
+    this.slotAllocator = new WorkerSlotAllocator(Number(orchCfg.default_max_concurrent_workers || 4), 1)
+    this.humanTakeover = new HumanTakeoverCoordinator({
+      ctx,
+      bridge,
+      workspaceRoot: this.workspaceRoot,
+      telemetry: this.telemetry,
+    })
 
     this.host = new AgentSessionHost({
       ctx,
@@ -73,125 +80,124 @@ export class GreatwallOrchestrator {
       defaultAgentOptions,
       effectiveContextWindow: this._windowCapTokens,
       autoArchiveShortTx,
+      humanTakeover: this.humanTakeover,
       telemetry: this.telemetry,
+    })
+
+    this.effectsConsumer = new RuntimeEffectsConsumer({
+      bridge,
+      workspaceRoot: this.workspaceRoot,
+      ownerInstanceId: this.instanceLock.ownerId,
+      telemetry: this.telemetry,
+      handlers: this._buildEffectHandlers(),
     })
 
     this._modelBinding = null
     this._poolState = 'idle'
     this._loopAbortController = null
     this._backgroundTask = null
-    /** @type {Set<() => void>} */
     this._wakeResolvers = new Set()
     this._lastError = null
     this._runningExplorers = new Map()
     this._runningGov = new Map()
     this._govCooldownUntil = new Map()
-    /** 单节点同会话伴随暂停保活句柄表（严格按 node_id 绑定，绝不跨代复用） */
     this._nodeCompanionSessions = new Map()
-    this._handoffsSinceHeartbeat = 0
-    this._lastHeartbeatAt = 0
     this._seenAmbiguousAlertIds = new Set()
     this._stage3Done = false
   }
 
-  get liveSessions() {
-    return this.host.liveSessions
+  _buildEffectHandlers() {
+    return {
+      DRAIN_AND_STOP_NODE: async (eff, payload) => {
+        const nid = String(eff.target_id || '')
+        const running = this._runningExplorers.get(nid)
+        const sid = running?.sessionId || `gw-exp-${nid}`
+        const liveEntry = this.liveSessions.get(sid)
+        await this.humanTakeover.drainAndYieldNode({
+          nodeId: nid,
+          sessionId: sid,
+          liveHandle: liveEntry?.handle || null,
+          keepSessionForHuman: Boolean(payload?.keep_session_for_human),
+          reason: String(payload?.reason || 'DRAIN_AND_STOP_NODE'),
+        })
+      },
+      CANCEL_NODE_SESSION: async (eff, payload) => {
+        const nid = String(eff.target_id || '')
+        const running = this._runningExplorers.get(nid)
+        const sid = running?.sessionId || `gw-exp-${nid}`
+        const liveEntry = this.liveSessions.get(sid)
+        await this.humanTakeover.drainAndYieldNode({
+          nodeId: nid,
+          sessionId: sid,
+          liveHandle: liveEntry?.handle || null,
+          keepSessionForHuman: false,
+          reason: String(payload?.reason || 'CANCEL_NODE_SESSION'),
+        })
+      },
+      NOTIFY_POLICY_CHANGED: async (eff, payload) => {
+        const nid = String(eff.target_id || '')
+        const running = this._runningExplorers.get(nid)
+        if (!running) return
+        const notice = `[新公开裁决口径 v${payload?.new_spec_revision || '?'}] 人类已修订子题 ${payload?.question_id || ''} 口径：${payload?.summary_md || ''}（详见 ${payload?.ruling_file || 'rulings/'}）。你当前在途思路仍可自然收尾，但若需达最新 FULL_GOAL 请对齐新口径。`
+        this.host.injectPolicyChange(running.sessionId, notice)
+      },
+      NOTIFY_CHIEF: async (eff, payload) => {
+        this.telemetry.recordEvent('chief_notification_received', { seq: eff.seq, targetId: eff.target_id, payload })
+        if (typeof this._onChiefNotify === 'function') {
+          await this._onChiefNotify({ seq: eff.seq, targetType: eff.target_type, targetId: eff.target_id, payload })
+        }
+      },
+      WAKE_BLOCKED_BRANCH: async () => { this._wakeLoop() },
+      SPAWN_PAIR: async () => { this._wakeLoop() },
+      RUN_WAVE_CONFERENCE: async () => { this._wakeLoop() },
+      REFRESH_LIVING_SURVEY: async () => { this._wakeLoop() },
+    }
   }
 
-  get poolState() {
-    return this._poolState
-  }
+  get liveSessions() { return this.host.liveSessions }
+  get poolState() { return this._poolState }
+  getPoolState() { return this._poolState }
+  isPoolStopped() { return this._poolState === 'stopped' }
+  hasBackgroundTask() { return Boolean(this._backgroundTask) }
+  getEffectiveContextWindow() { return this.host.effectiveContextWindow }
+  isExplorerRunning(nodeId) { return this._runningExplorers.has(nodeId) }
+  getRunningExplorerCount() { return this._runningExplorers.size }
+  getRunningExplorerIds() { return new Set(this._runningExplorers.keys()) }
+  isGovTaskRunning(taskKey) { return this._runningGov.has(taskKey) }
+  isBreakerOpen(key, fp) { return this._itemBreaker.isBroken(key, fp) }
+  launchGovTask(taskKey, runner) { return this._launchGovTask(taskKey, runner) }
+  launchGovTaskAndAwait(taskKey, runner) { return this._launchGovTaskAndAwaitIfSync(taskKey, runner) }
+  evaluateBreakerAfterTask(roleLabel, items, extractAfterMap) { return this._evaluateBreakerAfterTask(roleLabel, items, extractAfterMap) }
+  launchExplorer(node, snap, sig) { return this._launchExplorerWorker(node, snap, sig) }
+  runBlindReview(rev, sig) { return this._runBlindReviewWithSandbox(rev, sig) }
+  advanceWaveConference(conf, sig) { return new WaveConferenceRunner(this.createDispatchRuntimePort()).advanceConference(conf, sig) }
+  setSessionReadonly(sid, flag) { this.host?.setSessionReadonly?.(sid, flag) }
+  archiveSession(sid) { return this.host?.archiveSession?.(sid) }
+  control(method, params = {}, opts = {}) { return this.bridge.control(method, params, opts) }
+  recordEvent(eventName, detail = {}) { this.telemetry?.recordEvent?.(eventName, detail) }
+  createDispatchRuntimePort() { return buildDispatchRuntimePort(this) }
+  set defaultAgentOptions(val) { this.host.defaultAgentOptions = val }
+  get defaultAgentOptions() { return this.host.defaultAgentOptions }
+  spawnAndRunAgent(opts) { return this.host.spawnAndRunAgent(opts) }
+  resumeOrSpawnAgent(opts) { return this.host.resumeOrSpawnAgent(opts) }
+  continueAliveAgent(sid, promptText, opts) { return this.host.continueAliveAgent(sid, promptText, opts) }
+  assertValidBlindSandbox(staged, reviewId) { return assertValidBlindSandboxResult(staged, reviewId, this.workspaceRoot, this.telemetry) }
 
-  getPoolState() {
-    return this._poolState
-  }
-
-  isPoolStopped() {
-    return this._poolState === 'stopped'
-  }
-
-  hasBackgroundTask() {
-    return Boolean(this._backgroundTask)
-  }
-
-  getEffectiveContextWindow() {
-    return this.host.effectiveContextWindow
-  }
-
-  isExplorerRunning(nodeId) {
-    return this._runningExplorers.has(nodeId)
-  }
-
-  getRunningExplorerCount() {
-    return this._runningExplorers.size
-  }
-
-  getRunningExplorerIds() {
-    return new Set(this._runningExplorers.keys())
+  setChiefNotifyHandler(fn) {
+    this._onChiefNotify = typeof fn === 'function' ? fn : null
   }
 
   getAvailableBriefSlots(snap, maxConcurrentWorkers = null) {
-    const effSlotCap = Math.max(1, Number(maxConcurrentWorkers || snap?.slot_cap || 6))
+    const effCap = Math.max(1, Number(maxConcurrentWorkers || snap?.slot_cap || this.slotAllocator.maxWorkers))
     const runningBriefings = [...this._runningGov.keys()].filter((k) => k.startsWith('brief:')).length
     const readyWaitingCount = (snap?.explorers_ready_to_run || []).filter((n) => !this._runningExplorers.has(n.node_id)).length
-    return Math.max(0, effSlotCap - this._runningExplorers.size - runningBriefings - readyWaitingCount)
-  }
-
-  isGovTaskRunning(taskKey) {
-    return this._runningGov.has(taskKey)
-  }
-
-  isBreakerOpen(key, fingerprint) {
-    return this._itemBreaker.isBroken(key, fingerprint)
-  }
-
-  launchGovTask(taskKey, runner) {
-    return this._launchGovTask(taskKey, runner)
-  }
-
-  launchGovTaskAndAwait(taskKey, runner) {
-    return this._launchGovTaskAndAwaitIfSync(taskKey, runner)
-  }
-
-  evaluateBreakerAfterTask(roleLabel, dispatchedItems, extractAfterMap) {
-    return this._evaluateBreakerAfterTask(roleLabel, dispatchedItems, extractAfterMap)
-  }
-
-  launchExplorer(node, snap, sig) {
-    return this._launchExplorerWorker(node, snap, sig)
-  }
-
-  runBlindReview(rev, sig) {
-    return this._runBlindReviewWithSandbox(rev, sig)
-  }
-
-  recordHandoffCompleted(delta = 1) {
-    this._handoffsSinceHeartbeat += Math.max(0, Number(delta) || 0)
-  }
-
-  shouldTriggerHeartbeat(nowMs = Date.now()) {
-    const hasActiveExploration = this._runningExplorers.size > 0
-    return (
-      this._handoffsSinceHeartbeat >= 3 ||
-      (this._handoffsSinceHeartbeat > 0 && this._lastHeartbeatAt > 0 && nowMs - this._lastHeartbeatAt > 180_000) ||
-      (hasActiveExploration && this._lastHeartbeatAt > 0 && nowMs - this._lastHeartbeatAt > 600_000)
-    )
-  }
-
-  markHeartbeatFired(nowMs = Date.now()) {
-    this._handoffsSinceHeartbeat = 0
-    this._lastHeartbeatAt = nowMs
-  }
-
-  initHeartbeatClockIfNeeded(nowMs = Date.now()) {
-    if (this._lastHeartbeatAt === 0) this._lastHeartbeatAt = nowMs
+    return Math.max(0, effCap + 1 - this._runningExplorers.size - runningBriefings - readyWaitingCount)
   }
 
   getLiveCompanion(nodeId) {
     if (!nodeId) return null
     const handle = this._nodeCompanionSessions.get(nodeId)
-    if (!handle) return null
-    if (!this.liveSessions?.has?.(handle.sessionId)) {
+    if (!handle || !this.liveSessions?.has?.(handle.sessionId)) {
       this._nodeCompanionSessions.delete(nodeId)
       return null
     }
@@ -199,9 +205,7 @@ export class GreatwallOrchestrator {
   }
 
   setLiveCompanion(nodeId, handle) {
-    if (nodeId && handle) {
-      this._nodeCompanionSessions.set(nodeId, handle)
-    }
+    if (nodeId && handle) this._nodeCompanionSessions.set(nodeId, handle)
   }
 
   async disposeCompanion(nodeId, status = 'completed') {
@@ -209,46 +213,8 @@ export class GreatwallOrchestrator {
     const handle = this._nodeCompanionSessions.get(nodeId)
     this._nodeCompanionSessions.delete(nodeId)
     if (handle && typeof handle.dispose === 'function') {
-      try {
-        await handle.dispose(status)
-      } catch {}
+      try { await handle.dispose(status) } catch {}
     }
-  }
-
-  setSessionReadonly(sessionId, flag) {
-    this.host?.setSessionReadonly?.(sessionId, flag)
-  }
-
-  archiveSession(sessionId, session = null) {
-    return this.host?.archiveSession?.(sessionId, session)
-  }
-
-  control(method, params = {}, opts = {}) {
-    return this.bridge.control(method, params, opts)
-  }
-
-  recordEvent(eventName, detail = {}) {
-    this.telemetry?.recordEvent?.(eventName, detail)
-  }
-
-  createDispatchRuntimePort() {
-    return buildDispatchRuntimePort(this)
-  }
-
-  set defaultAgentOptions(val) {
-    this.host.defaultAgentOptions = val
-  }
-
-  get defaultAgentOptions() {
-    return this.host.defaultAgentOptions
-  }
-
-  spawnAndRunAgent(opts) {
-    return this.host.spawnAndRunAgent(opts)
-  }
-
-  continueAliveAgent(sessionId, promptText, opts) {
-    return this.host.continueAliveAgent(sessionId, promptText, opts)
   }
 
   _wakeLoop() {
@@ -270,10 +236,6 @@ export class GreatwallOrchestrator {
     })
   }
 
-  /**
-   * 启动前强制解析并锁定权威模型绑定与自适应窗口 W = min(500k, model_window)。
-   * 缺 provider/model 时绝不静默放行，彻底杜绝第五轮隐式跌落到第三方中转站事故！
-   */
   async _resolveAndLockModelBinding({ explicitOptions = {}, callerAgent = null } = {}) {
     const binding = await resolveAuthoritativeModelBinding({
       explicitOptions,
@@ -282,15 +244,9 @@ export class GreatwallOrchestrator {
       configDefaultOptions: this.defaultAgentOptions,
       runtimeDefaultWindow: this._windowCapTokens,
     })
-    if (!binding.ok && this._requireExplicitModelBinding) {
-      return binding
-    }
+    if (!binding.ok && this._requireExplicitModelBinding) return binding
     if (binding.ok) {
-      this.defaultAgentOptions = {
-        ...this.defaultAgentOptions,
-        provider: binding.provider,
-        model: binding.model,
-      }
+      this.defaultAgentOptions = { ...this.defaultAgentOptions, provider: binding.provider, model: binding.model }
     }
     this.host.effectiveContextWindow = binding.effectiveContextWindow || this._windowCapTokens
     this._modelBinding = binding
@@ -298,7 +254,6 @@ export class GreatwallOrchestrator {
       provider: binding.provider || '(none)',
       model: binding.model || '(none)',
       effectiveContextWindow: this.host.effectiveContextWindow,
-      detectedModelWindow: binding.detectedModelWindow,
       source: binding.source,
     })
     return binding
@@ -309,7 +264,6 @@ export class GreatwallOrchestrator {
       this.parentAgent = callerAgent
       this.host.parentAgent = callerAgent
     }
-    // 幂等保护：若后台循环仍在存活，running 直接返回，paused 则恢复原循环，严禁起第二条并发循环
     if (this._backgroundTask) {
       if (this._poolState === 'paused') {
         await this.resumeBackground()
@@ -320,24 +274,19 @@ export class GreatwallOrchestrator {
       }
     }
 
-    // 1. 显式模型绑定硬门禁（未解析到明确 provider/model 一律拒启，绝不跌落未授权默认模型）
-    const binding = await this._resolveAndLockModelBinding({
-      explicitOptions: agentOptions,
-      callerAgent,
-    })
-    if (!binding.ok && this._requireExplicitModelBinding) {
-      this._lastError = 'MISSING_MODEL_BINDING: 无法解析权威 provider/model 绑定，已拒绝启动以防子会话静默跌落至未授权模型。请在主控会话先选定模型，或在 start 时显式传入 provider 与 model。'
-      this.telemetry.recordEvent('start_blocked_missing_model_binding', { source: binding.source })
-      return {
-        started: false,
-        alreadyRunning: false,
-        blocked: 'MISSING_MODEL_BINDING',
-        error: this._lastError,
-        status: await this.getControlStatus(),
-      }
+    const lockRes = this.instanceLock.acquire()
+    if (!lockRes.ok) {
+      this._lastError = lockRes.error
+      return { started: false, alreadyRunning: false, blocked: 'INSTANCE_LOCKED', error: lockRes.error, status: await this.getControlStatus() }
     }
 
-    // 2. 内核可达性与 Parse 0 签署门禁
+    const binding = await this._resolveAndLockModelBinding({ explicitOptions: agentOptions, callerAgent })
+    if (!binding.ok && this._requireExplicitModelBinding) {
+      this.instanceLock.release()
+      this._lastError = 'MISSING_MODEL_BINDING: 无法解析权威 provider/model 绑定，已拒绝启动。'
+      return { started: false, alreadyRunning: false, blocked: 'MISSING_MODEL_BINDING', error: this._lastError, status: await this.getControlStatus() }
+    }
+
     let preSnapRes = null
     try {
       preSnapRes = await this.bridge.control('control_plane/schedule_snapshot', {
@@ -345,55 +294,29 @@ export class GreatwallOrchestrator {
         ...(maxConcurrentWorkers ? { max_concurrent_workers: maxConcurrentWorkers } : {}),
       })
     } catch (err) {
+      this.instanceLock.release()
       this._lastError = String(err?.message || err)
-      return {
-        started: false,
-        alreadyRunning: false,
-        blocked: 'KERNEL_UNAVAILABLE',
-        error: this._lastError,
-        status: await this.getControlStatus(),
-      }
+      return { started: false, alreadyRunning: false, blocked: 'KERNEL_UNAVAILABLE', error: this._lastError, status: await this.getControlStatus() }
     }
     if (!preSnapRes?.ok || !preSnapRes?.data) {
+      this.instanceLock.release()
       this._lastError = String(preSnapRes?.error || 'schedule_snapshot 返回失败')
-      return {
-        started: false,
-        alreadyRunning: false,
-        blocked: 'KERNEL_UNAVAILABLE',
-        error: this._lastError,
-        status: await this.getControlStatus(),
-      }
+      return { started: false, alreadyRunning: false, blocked: 'KERNEL_UNAVAILABLE', error: this._lastError, status: await this.getControlStatus() }
     }
     if (!preSnapRes.data.parse0_signed) {
-      return {
-        started: false,
-        alreadyRunning: false,
-        blocked: 'NEED_PARSE0_SIGNATURE',
-        error: '尚未签署 Parse 0 启动契约，请先调用 init（或传入非空 goal_and_completion_md）后再启动事件池。',
-        status: await this.getControlStatus(),
-      }
+      this.instanceLock.release()
+      return { started: false, alreadyRunning: false, blocked: 'NEED_PARSE0_SIGNATURE', error: '尚未签署 Parse 0 启动契约。', status: await this.getControlStatus() }
     }
 
-    if (Array.isArray(preSnapRes.data.shared_inputs_rel_paths)) {
-      this.host.sharedInputPaths = preSnapRes.data.shared_inputs_rel_paths
-    }
-    if (!this._loopAbortController || this._loopAbortController.signal.aborted) {
-      this._loopAbortController = new AbortController()
-    }
+    if (maxConcurrentWorkers) this.slotAllocator.setMaxWorkers(maxConcurrentWorkers)
+    if (Array.isArray(preSnapRes.data.shared_inputs_rel_paths)) this.host.sharedInputPaths = preSnapRes.data.shared_inputs_rel_paths
+    if (!this._loopAbortController || this._loopAbortController.signal.aborted) this._loopAbortController = new AbortController()
     this._lastError = null
     this._govCooldownUntil.clear()
     this._itemBreaker.resetAll()
     this._poolState = 'running'
     this._stage3Done = false
     this.telemetry.setOrchestratorState('running')
-    this.telemetry.recordEvent('orchestrator_start', {
-      maxConcurrentWorkers,
-      modelBinding: {
-        provider: this._modelBinding?.provider || '',
-        model: this._modelBinding?.model || '',
-        effectiveContextWindow: this.host.effectiveContextWindow,
-      },
-    })
 
     this._backgroundTask = this._runAsyncEventPool({ maxConcurrentWorkers })
       .catch((err) => {
@@ -407,6 +330,7 @@ export class GreatwallOrchestrator {
           this._poolState = 'idle'
           this.telemetry.setOrchestratorState('idle')
         }
+        this.instanceLock.release()
         this._backgroundTask = null
       })
 
@@ -417,46 +341,29 @@ export class GreatwallOrchestrator {
     if (this._poolState !== 'running') return { paused: false, state: this._poolState }
     this._poolState = 'paused'
     this.telemetry.setOrchestratorState('paused')
-    this.telemetry.recordEvent('orchestrator_pause')
     this._wakeLoop()
     return { paused: true, state: this._poolState }
   }
 
-  /**
-   * 恢复后台事件池：同步检测 `rulings/` 新增或修改的《补充裁决文档》（自动递增 `latest_spec_revision`
-   * 供后续新派节点与 0 工具治理视图使用，严禁覆写已在跑旧口径节点的 worktree/inputs/），同时复位所有单待办熔断项。
-   */
   async resumeBackground() {
-    if (this._poolState !== 'paused') {
-      return { resumed: false, state: this._poolState }
-    }
-    let rulingSync = null
+    if (this._poolState !== 'paused') return { resumed: false, state: this._poolState }
+    // 裁决 4：彻底废除扫盘自动静默升版暗门，仅只读检测是否有未审批磁盘草稿
+    let draftNotice = null
     try {
-      const r = await this.bridge.control('control_plane/sync_public_rulings', {
-        workspace_root: this.workspaceRoot,
-        refresh_active_worktrees: false,
-      })
-      rulingSync = r?.data || null
+      const r = await this.bridge.control('control_plane/inspect_rulings_draft', { workspace_root: this.workspaceRoot })
+      draftNotice = r?.data || null
     } catch {}
     this._itemBreaker.resetAll()
     this._govCooldownUntil.clear()
     this._poolState = 'running'
     this.telemetry.setOrchestratorState('running')
-    this.telemetry.recordEvent('orchestrator_resume', { rulingSync })
     this._wakeLoop()
-    return { resumed: true, state: this._poolState, rulingSync }
+    return { resumed: true, state: this._poolState, draftNotice }
   }
 
-  /**
-   * 确定性精准中止单个失控/旧口径探索节点（替代运行时 steer 广播）：
-   * 1. 原子调用 `control_plane/abort_node` 将 SQLite 置为 `CLOSED` 并清空待交接标记；
-   * 2. 向在线探索者发 cancel 并销毁对应伴随会话句柄，瞬间释槽且杜绝重派。
-   */
   async abortNode(nodeId, reason = 'ABORTED_BY_CONTROLLER') {
     const nid = String(nodeId || '').trim()
-    if (!nid) {
-      return { aborted: false, error: 'node_id 不能为空' }
-    }
+    if (!nid) return { aborted: false, error: 'node_id 不能为空' }
     const dbRes = await this.bridge.control('control_plane/abort_node', {
       workspace_root: this.workspaceRoot,
       node_id: nid,
@@ -464,39 +371,16 @@ export class GreatwallOrchestrator {
     })
     const running = this._runningExplorers.get(nid)
     if (running) {
-      const sessEntry = this.liveSessions.get(running.sessionId)
-      try {
-        sessEntry?.handle?.agent?.cancel?.({ kind: 'parent' })
-      } catch {}
+      try { this.liveSessions.get(running.sessionId)?.handle?.agent?.cancel?.({ kind: 'parent' }) } catch {}
     }
     await disposeNodeCompanion(this, nid, 'aborted')
-    this._handoffsSinceHeartbeat += 1
-    this.telemetry.recordEvent('node_aborted', { nodeId: nid, reason, dbOk: Boolean(dbRes?.ok) })
     this._wakeLoop()
-    return {
-      aborted: Boolean(dbRes?.ok),
-      nodeId: nid,
-      dbResult: dbRes?.data || null,
-      error: dbRes?.ok ? null : (dbRes?.error || 'abort_node failed'),
-      status: await this.getControlStatus(),
-    }
+    return { aborted: Boolean(dbRes?.ok), nodeId: nid, dbResult: dbRes?.data || null, error: dbRes?.ok ? null : dbRes?.error, status: await this.getControlStatus() }
   }
 
-  /**
-   * 主控/人类通过控制面正规通道向科研仪器科（works_engineering_queue）签发 OPEN 工单，
-   * 复位工单队列冷却并立刻唤醒后台事件池派发 works_engineer 处置。
-   */
-  async submitWorksTicket({
-    questionId = 'ALL',
-    ticketType = 'INSTRUMENT_ERROR',
-    instrumentId = null,
-    description = '',
-    source = 'main_controller',
-  } = {}) {
+  async submitWorksTicket({ questionId = 'ALL', ticketType = 'INSTRUMENT_ERROR', instrumentId = null, description = '', source = 'main_controller' } = {}) {
     const desc = String(description || '').trim()
-    if (!desc) {
-      return { submitted: false, error: 'description（工单问题描述）不能为空' }
-    }
+    if (!desc) return { submitted: false, error: 'description 不能为空' }
     const dbRes = await this.bridge.control('control_plane/submit_works_ticket', {
       workspace_root: this.workspaceRoot,
       question_id: String(questionId || 'ALL').trim() || 'ALL',
@@ -507,47 +391,19 @@ export class GreatwallOrchestrator {
     })
     if (dbRes?.ok) {
       this._govCooldownUntil.delete('works:queue')
-      this.telemetry.recordEvent('works_ticket_submitted', {
-        ticketId: dbRes?.data?.ticket_id || null,
-        questionId: dbRes?.data?.question_id || questionId,
-        ticketType: dbRes?.data?.ticket_type || ticketType,
-        instrumentId: dbRes?.data?.instrument_id || instrumentId,
-        source,
-      })
       this._wakeLoop()
     }
-    return {
-      submitted: Boolean(dbRes?.ok),
-      ticket: dbRes?.data || null,
-      error: dbRes?.ok ? null : (dbRes?.error || 'submit_works_ticket failed'),
-      status: await this.getControlStatus(),
-    }
+    return { submitted: Boolean(dbRes?.ok), ticket: dbRes?.data || null, error: dbRes?.ok ? null : dbRes?.error, status: await this.getControlStatus() }
   }
 
-  /** 主控显式同步工作区 `rulings/` 补充裁决文档（升版 spec_revision 并可选刷新活跃 Worktree）。 */
   async syncPublicRulings(refreshActiveWorktrees = false) {
     const dbRes = await this.bridge.control('control_plane/sync_public_rulings', {
       workspace_root: this.workspaceRoot,
       refresh_active_worktrees: Boolean(refreshActiveWorktrees),
     })
-    if (dbRes?.ok) {
-      this.telemetry.recordEvent('public_rulings_synced', {
-        changed: Boolean(dbRes?.data?.changed),
-        latestSpecRevision: dbRes?.data?.latest_spec_revision ?? null,
-      })
-      this._wakeLoop()
-    }
-    return {
-      synced: Boolean(dbRes?.ok),
-      rulingSync: dbRes?.data || null,
-      error: dbRes?.ok ? null : (dbRes?.error || 'sync_public_rulings failed'),
-    }
+    return { synced: Boolean(dbRes?.ok), rulingSync: dbRes?.data || null, error: dbRes?.ok ? null : dbRes?.error }
   }
 
-  /**
-   * 人类显式叫停唯一真源入口：写入控制面 `human_stop_requested_at` 并停止新探索派单，
-   * 使 `PARTIAL_ON_HUMAN_STOP` 终局门禁可合法绕过 `min_commitment_window_sec` 进入 Stage 3 汇总导出。
-   */
   async humanStop(note = 'HUMAN_UI_OR_CLI_STOP', { callerSource = 'unknown' } = {}) {
     const res = await this.bridge.control('control_plane/record_human_stop', {
       workspace_root: this.workspaceRoot,
@@ -555,42 +411,28 @@ export class GreatwallOrchestrator {
     })
     this.telemetry.recordEvent('human_stop_recorded', { note, callerSource })
     this._wakeLoop()
-    return {
-      humanStopRecorded: Boolean(res?.ok),
-      callerSource,
-      record: res?.data || null,
-      status: await this.getControlStatus(),
-    }
+    return { humanStopRecorded: Boolean(res?.ok), callerSource, record: res?.data || null, status: await this.getControlStatus() }
   }
 
   async stopBackground(reason = 'USER_STOPPED') {
     this._poolState = 'stopped'
     this.telemetry.setOrchestratorState('stopped')
-    this.telemetry.recordEvent('orchestrator_stop', { reason })
     if (this._loopAbortController) {
-      try {
-        this._loopAbortController.abort(new Error(reason))
-      } catch {}
+      try { this._loopAbortController.abort(new Error(reason)) } catch {}
     }
     for (const entry of this.liveSessions.values()) {
-      try {
-        entry.handle?.agent?.cancel?.({ kind: 'parent' })
-      } catch {}
+      try { entry.handle?.agent?.cancel?.({ kind: 'parent' }) } catch {}
     }
     this._wakeLoop()
     if (this._backgroundTask) {
-      await Promise.race([
-        this._backgroundTask.catch(() => {}),
-        new Promise((r) => setTimeout(r, 2500)),
-      ])
+      await Promise.race([this._backgroundTask.catch(() => {}), new Promise((r) => setTimeout(r, 2500))])
     }
-    for (const nid of [...this._nodeCompanionSessions.keys()]) {
-      await disposeNodeCompanion(this, nid, 'aborted')
-    }
+    for (const nid of [...this._nodeCompanionSessions.keys()]) await disposeNodeCompanion(this, nid, 'aborted')
     const leftovers = [...this.liveSessions.values()]
     if (leftovers.length > 0) {
       await Promise.allSettled(leftovers.map((entry) => entry.handleDispose('aborted', { kind: 'aborted' })))
     }
+    this.instanceLock.release()
     return { stopped: true, state: this._poolState }
   }
 
@@ -600,46 +442,31 @@ export class GreatwallOrchestrator {
     let statusError = this._lastError || null
     try {
       const res = await this.bridge.control('control_plane/schedule_snapshot', { workspace_root: this.workspaceRoot })
-      if (res?.ok && res?.data) {
-        snapData = res.data
-        kernelAlive = true
-      } else {
-        statusError = String(res?.error || 'schedule_snapshot 返回失败')
-      }
-    } catch (err) {
-      statusError = String(err?.message || err)
-    }
-    const liveList = [...this.liveSessions.entries()].map(([sid, s]) => ({
-      sessionId: sid,
-      role: s.role,
-      questionId: s.questionId,
-      nodeId: s.nodeId,
-      label: s.uiLabel,
-      startedAt: s.startedAt,
-    }))
+      if (res?.ok && res?.data) { snapData = res.data; kernelAlive = true }
+      else statusError = String(res?.error || 'schedule_snapshot 返回失败')
+    } catch (err) { statusError = String(err?.message || err) }
+
     return {
       poolState: this._poolState,
       kernelAlive,
       lastError: statusError,
       initialized: snapData ? Boolean(snapData.initialized ?? true) : false,
       stage: snapData?.stage || this.telemetry.state.stage,
+      autonomyMode: snapData?.autonomy_mode || 'WAVE_CONFIRM',
       closureStatus: snapData?.closure_state?.status || 'OPEN',
       humanStopActive: Boolean(snapData?.human_stop_active),
+      slotAllocation: this.slotAllocator.snapshot(),
       modelBinding: this._modelBinding,
       effectiveContextWindow: this.host.effectiveContextWindow,
       latestSpecRevision: Number(snapData?.latest_spec_revision || 0),
       runningExplorersCount: this._runningExplorers.size,
-      runningExplorers: [...this._runningExplorers.values()].map((e) => ({
-        nodeId: e.node.node_id,
-        questionId: e.node.question_id,
-        sessionId: e.sessionId,
-      })),
+      runningExplorers: [...this._runningExplorers.values()].map((e) => ({ nodeId: e.node.node_id, questionId: e.node.question_id, sessionId: e.sessionId })),
       runningGovernanceTasks: [...this._runningGov.keys()],
       circuitBrokenItems: this._itemBreaker.getBrokenItems(),
-      activeSessions: liveList,
+      activeSessions: [...this.liveSessions.entries()].map(([sid, s]) => ({ sessionId: sid, role: s.role, questionId: s.questionId, nodeId: s.nodeId, label: s.uiLabel, startedAt: s.startedAt })),
       pendingHandoffNodes: (snapData?.pending_handoff_nodes || []).map((n) => n.node_id),
-      ambiguousSpecAlerts: snapData?.ambiguous_spec_alerts || [],
-      familyConcentrationAlerts: snapData?.family_concentration_alerts || [],
+      pendingProposalsCount: (snapData?.pending_proposals || []).length,
+      subproblemStates: snapData?.subproblem_runtime_state || [],
       closureAllowed: Boolean(snapData?.closure_gate?.closure_allowed),
       snapshot: snapData,
       telemetry: this.telemetry.getSummary(),
@@ -648,8 +475,7 @@ export class GreatwallOrchestrator {
 
   _launchGovTask(taskKey, runner) {
     if (this._runningGov.has(taskKey)) return false
-    const cooldownUntil = this._govCooldownUntil.get(taskKey) || 0
-    if (cooldownUntil > Date.now()) return false
+    if ((this._govCooldownUntil.get(taskKey) || 0) > Date.now()) return false
     let failed = false
     const p = Promise.resolve()
       .then(runner)
@@ -679,22 +505,14 @@ export class GreatwallOrchestrator {
     if (p) await p
   }
 
-  /** 拉取最新快照并对刚刚执行完毕的一批单待办项结算无进展熔断计数。 */
   async _evaluateBreakerAfterTask(roleLabel, dispatchedItems, extractAfterMap) {
     if (!dispatchedItems?.length) return
     try {
       const postRes = await this.bridge.control('control_plane/schedule_snapshot', { workspace_root: this.workspaceRoot })
       if (!postRes?.ok || !postRes?.data) return
-      const afterMap = extractAfterMap(postRes.data)
-      const evals = this._itemBreaker.evaluateBatch(dispatchedItems, afterMap)
+      const evals = this._itemBreaker.evaluateBatch(dispatchedItems, extractAfterMap(postRes.data))
       for (const ev of evals) {
-        if (ev.newlyBroken) {
-          this.telemetry.recordEvent('governance_item_circuit_broken', {
-            role: roleLabel,
-            itemKey: ev.key,
-            stalledCount: ev.stalledCount,
-          })
-        }
+        if (ev.newlyBroken) this.telemetry.recordEvent('governance_item_circuit_broken', { role: roleLabel, itemKey: ev.key, stalledCount: ev.stalledCount })
       }
     } catch {}
   }
@@ -702,17 +520,15 @@ export class GreatwallOrchestrator {
   _syncSlotsToTelemetry(stage = '') {
     this.telemetry.updateActiveSlots({
       stage,
-      activeExplorers: [...this._runningExplorers.values()].map((e) => ({
-        nodeId: e.node.node_id,
-        questionId: e.node.question_id,
-        sessionId: e.sessionId,
-      })),
+      activeExplorers: [...this._runningExplorers.values()].map((e) => ({ nodeId: e.node.node_id, questionId: e.node.question_id, sessionId: e.sessionId })),
       activeGovernance: [...this._runningGov.keys()],
     })
   }
 
   _launchExplorerWorker(node, snap, sig) {
-    const expSessionId = `gw_exp_${node.node_id}_${crypto.randomUUID().slice(0, 6)}`
+    const slotTier = this.slotAllocator.acquire(node)
+    if (!slotTier) return
+    const expSessionId = `gw-exp-${node.node_id}`
     const p = driveExplorerCompanionPair(this.createDispatchRuntimePort(), node, snap, expSessionId, { signal: sig })
       .catch((err) => {
         if (err?.code !== 'GREATWALL_RUN_ABORTED') {
@@ -721,28 +537,17 @@ export class GreatwallOrchestrator {
       })
       .finally(() => {
         this._runningExplorers.delete(node.node_id)
+        this.slotAllocator.release(node.node_id)
         this._syncSlotsToTelemetry()
         this._wakeLoop()
       })
-    this._runningExplorers.set(node.node_id, {
-      promise: p,
-      node,
-      sessionId: expSessionId,
-      startedAt: Date.now(),
-    })
+    this._runningExplorers.set(node.node_id, { promise: p, node, sessionId: expSessionId, slotTier, startedAt: Date.now() })
     this._syncSlotsToTelemetry()
-  }
-
-  assertValidBlindSandbox(staged, reviewId) {
-    return assertValidBlindSandboxResult(staged, reviewId, this.workspaceRoot, this.telemetry)
   }
 
   async _runBlindReviewWithSandbox(rev, sig) {
     const reviewId = String(rev.review_id)
-    const staged = await this.bridge.control('control_plane/stage_blind_sandbox', {
-      workspace_root: this.workspaceRoot,
-      review_id: reviewId,
-    })
+    const staged = await this.bridge.control('control_plane/stage_blind_sandbox', { workspace_root: this.workspaceRoot, review_id: reviewId })
     const sandboxPath = this.assertValidBlindSandbox(staged, reviewId)
     const uniqueVerifierSid = `gw_ver_${reviewId}_${crypto.randomUUID().slice(0, 6)}`
     try {
@@ -755,18 +560,13 @@ export class GreatwallOrchestrator {
         uiLabel: `[图书馆盲审] ${rev.question_id || ''} ${reviewId}`.trim(),
         shortTransaction: true,
         signal: sig,
-        taskContextText: `### 独立空白盲审沙箱目录\n- sandbox_abs_path: \`${sandboxPath}\`\n（沙箱内已只读挂载手稿绑定口径的 inputs/ 公开题面、A 栏与脱敏复核材料；物理断网且不可访问 DB/工作树/B 栏）`,
+        taskContextText: `### 独立空白盲审沙箱目录\n- sandbox_abs_path: \`${sandboxPath}\``,
         prompt: rev.review_status === 'STAGE1_BLIND'
-          ? `请以异会话执行盲审单 ${reviewId} (${rev.question_id})：先调 get_blind_manuscript 审阅脱敏 A 栏与沙箱复核工件（严格按手稿绑定 spec_revision 评判科学真伪），在空白沙箱内独立验算后调 submit_stage1_blind_ledger 锁定不可逆账本；若 Stage 1 判 PASS，紧接着调 get_unblinded_manuscript_and_peers 与 submit_stage2_unblind_verdict 完成终判（判 REVISE/REFUTED 时立即结束）。`
-          : `请对审稿单 ${reviewId} (${rev.question_id}) 调用 get_unblinded_manuscript_and_peers 与 submit_stage2_unblind_verdict 完成 Stage 2 终审。`,
+          ? `请异会话执行盲审单 ${reviewId} (${rev.question_id})：调 get_blind_manuscript 独立验算后调 submit_stage1_blind_ledger（PASS 或 PARTIAL_PASS 均推进 Stage 2）；若通过即调 get_unblinded_manuscript_and_peers 与 submit_stage2_unblind_verdict 完成终判。`
+          : `请对审稿单 ${reviewId} (${rev.question_id}) 调 get_unblinded_manuscript_and_peers 与 submit_stage2_unblind_verdict 完成 Stage 2 终判。`,
       })
     } finally {
-      await this.bridge
-        .control('control_plane/cleanup_blind_sandbox', {
-          workspace_root: this.workspaceRoot,
-          review_id: reviewId,
-        })
-        .catch(() => {})
+      await this.bridge.control('control_plane/cleanup_blind_sandbox', { workspace_root: this.workspaceRoot, review_id: reviewId }).catch(() => {})
     }
   }
 
@@ -775,16 +575,8 @@ export class GreatwallOrchestrator {
     let idleStreak = 0
     let snapshotErrorStreak = 0
 
-    // 启动恢复：按原冻结快照续跑上次进程中断遗留的 heavy 异步评测作业（透传主循环取消信号）
     try {
-      const rec = await this.bridge.control(
-        'control_plane/recover_heavy_jobs',
-        { workspace_root: this.workspaceRoot },
-        { signal: sig },
-      )
-      if (rec?.data?.recovered_jobs?.length > 0) {
-        this.telemetry.recordEvent('heavy_jobs_recovered', { count: rec.data.recovered_jobs.length })
-      }
+      await this.bridge.control('control_plane/recover_heavy_jobs', { workspace_root: this.workspaceRoot }, { signal: sig })
     } catch {}
 
     while (!sig.aborted && this._poolState !== 'stopped') {
@@ -793,21 +585,23 @@ export class GreatwallOrchestrator {
         continue
       }
 
+      // 每轮先消费 Outbox 副作用队列（45% 暂停让权、新口径热注入、总控通知等）
+      await this.effectsConsumer.drainOnce({ limit: 12, signal: sig }).catch(() => {})
+
       const snapRes = await this.bridge.control('control_plane/schedule_snapshot', {
         workspace_root: this.workspaceRoot,
         max_concurrent_workers: maxConcurrentWorkers,
       })
       if (!snapRes?.ok || !snapRes?.data) {
         snapshotErrorStreak += 1
-        const errMsg = String(snapRes?.error || 'schedule_snapshot 返回空响应或失败回执')
         this.telemetry.recordEvent('orchestrator_snapshot_error', {
+          error: String(snapRes?.error || 'schedule_snapshot 返回失败'),
           streak: snapshotErrorStreak,
-          error: errMsg,
         })
         if (snapshotErrorStreak >= 3) {
-          this._lastError = errMsg
+          this._lastError = String(snapRes?.error || 'schedule_snapshot 连续失败')
           this._poolState = 'error'
-          this.telemetry.setOrchestratorState('error', this.telemetry.state.stage || 'ERROR')
+          this.telemetry.setOrchestratorState('error', 'ERROR')
           break
         }
         await this._waitWakeOrTimeout(250)
@@ -816,48 +610,35 @@ export class GreatwallOrchestrator {
       snapshotErrorStreak = 0
 
       const snap = snapRes.data
-      if (Array.isArray(snap.shared_inputs_rel_paths)) {
-        this.host.sharedInputPaths = snap.shared_inputs_rel_paths
-      }
-      const closureSt = snap?.closure_state?.status || 'OPEN'
-      if (snap.stage === 'CLOSED_VERIFIED' || closureSt === 'CLOSED_VERIFIED' || this._stage3Done) {
+      if (Array.isArray(snap.shared_inputs_rel_paths)) this.host.sharedInputPaths = snap.shared_inputs_rel_paths
+      if (snap.stage === 'CLOSED_VERIFIED' || snap?.closure_state?.status === 'CLOSED_VERIFIED' || this._stage3Done) {
         this.telemetry.setOrchestratorState('idle', 'CLOSED_VERIFIED')
         break
       }
       this._syncSlotsToTelemetry(snap.stage)
 
-      // 红灯口径歧义告警：记入遥测留待人类核查，绝不停摆继续推进原已签口径
       for (const al of snap.ambiguous_spec_alerts || []) {
         if (al?.alert_id && !this._seenAmbiguousAlertIds.has(al.alert_id)) {
           this._seenAmbiguousAlertIds.add(al.alert_id)
-          this.telemetry.recordEvent('alert_ambiguous_spec_red_light', {
-            alertId: al.alert_id,
-            notes: al.notes,
-            policy: 'CONTINUE_BASELINE_WITH_RED_ALERT',
-          })
+          this.telemetry.recordEvent('alert_ambiguous_spec_red_light', { alertId: al.alert_id, notes: al.notes })
         }
       }
 
       const port = this.createDispatchRuntimePort()
-
-      // 0. 待交接/崩溃抢救恢复
       let dispatchedSomething = dispatchPendingHandoffRecoveries(port, snap, sig)
 
-      // 1. Stage 1 (Parse 0) 初始化四步
       const s1 = await dispatchStage1Step(port, snap, sig)
       if (s1.handled) {
         if (s1.waitMs) await this._waitWakeOrTimeout(s1.waitMs)
         continue
       }
 
-      // 2. Stage 3 两步联合终核与退修闭环
       const s3 = dispatchStage3Step(port, snap, sig)
       if (s3.handled) {
         await this._waitWakeOrTimeout(s3.waitMs || 250)
         continue
       }
 
-      // 3. Stage 2 治理与并发探索派发
       const s2 = await dispatchStage2Step(port, snap, sig, maxConcurrentWorkers)
       if (s2.dispatched) dispatchedSomething = true
       if (s2.continueImmediate) continue
@@ -874,14 +655,16 @@ export class GreatwallOrchestrator {
     }
   }
 
-  async runUntilClosed({ signal = null, maxCycles = 25, maxConcurrentWorkers = null, agentOptions = {}, callerAgent = null } = {}) {
-    void maxCycles
+  async runUntilClosed({ signal = null, maxConcurrentWorkers = null, agentOptions = {}, callerAgent = null } = {}) {
     const binding = await this._resolveAndLockModelBinding({ explicitOptions: agentOptions, callerAgent })
     if (!binding.ok && this._requireExplicitModelBinding) {
-      const err = new Error('MISSING_MODEL_BINDING: 无法解析权威 provider/model 绑定，已拒绝启动')
+      const err = new Error('MISSING_MODEL_BINDING: 无法解析权威 provider/model 绑定')
       err.code = 'MISSING_MODEL_BINDING'
       throw err
     }
+    const lockRes = this.instanceLock.acquire()
+    if (!lockRes.ok) throw new Error(lockRes.error)
+    if (maxConcurrentWorkers) this.slotAllocator.setMaxWorkers(maxConcurrentWorkers)
 
     this._loopAbortController = new AbortController()
     const onExtAbort = () => this._loopAbortController.abort(new Error('EXTERNAL_SIGNAL_ABORTED'))
@@ -903,20 +686,17 @@ export class GreatwallOrchestrator {
       if (signal) signal.removeEventListener('abort', onExtAbort)
       this._poolState = 'idle'
       this.telemetry.setOrchestratorState('idle')
+      this.instanceLock.release()
     }
     const finalSnap = await this.bridge.control('control_plane/schedule_snapshot', { workspace_root: this.workspaceRoot })
     const closed = finalSnap?.data?.stage === 'CLOSED_VERIFIED' || finalSnap?.data?.closure_state?.status === 'CLOSED_VERIFIED' || this._stage3Done
-    return {
-      closed,
-      aborted,
-      modelBinding: this._modelBinding,
-      circuitBrokenItems: this._itemBreaker.getBrokenItems(),
-      snapshot: finalSnap?.data,
-    }
+    return { closed, aborted, modelBinding: this._modelBinding, circuitBrokenItems: this._itemBreaker.getBrokenItems(), snapshot: finalSnap?.data }
   }
 
   async disposeAll() {
     await this.stopBackground('DISPOSE_ALL')
+    this.humanTakeover.disposeAll()
     await this.host.disposeAllSessions()
+    this.instanceLock.release()
   }
 }

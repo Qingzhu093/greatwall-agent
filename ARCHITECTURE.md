@@ -1,7 +1,11 @@
-# GreatWall Agent (`v0.2.0-alpha.1`) 系统架构说明
+# GreatWall Agent (`v0.3.0-alpha.1`) 系统架构说明
 
-> **版本与状态声明**：`v0.2.0-alpha.1`（重大底座重构版本 · **DSH `0.2.2-rc.5` 深度适配 × 并发读写解耦 × 单写者强一致** · **Apache 2.0 + DCO**）  
-> **文档定位**：本文面向开源协作者、系统架构研究者与希望基于本项目二次改造的开发者，从设计哲学、四大工程的深度拆解、基于真实代码的接口契约，到坦诚可见的技术债与未解难题，完整还原 GreatWall Agent 的设计与实现细节。本项目目前仍处于早期实验演进阶段，并非开箱即用的生产工具；后续演进构想与重构计划见 [`ROADMAP.md`](./ROADMAP.md)，全部论文、工程项目与公开技术生态溯源见 [`REFERENCES.md`](./REFERENCES.md)。
+> **版本与状态声明**：代码库已正式重构升级至 **`v0.3.0-alpha.1`** （**Apache 2.0 + DCO**）。  
+> **最新 `v0.3` 顶层架构论文与精确模块地图**：
+>
+> - `v0.3` 总导航与四大工程论文：[`docs/agent_kb_v0_3/agent_kb_v0_3_00_INDEX_总导航_三层职责分离与里程碑路线.md`](./docs/agent_kb_v0_3/agent_kb_v0_3_00_INDEX_总导航_三层职责分离与里程碑路线.md)
+> - `v0.3` 代码边界、红线与验收命令：[`greatwall-v6up/MODULE_MAP.md`](./greatwall-v6up/MODULE_MAP.md)  
+> - 以下正文保留 `v0.2.0-alpha.1` 原始设计哲学、工程控制论张力与历史演进脉络作为背景参考，所有最新接口与模块结构以上述 `v0.3` 权威文档为准。
 
 ---
 
@@ -104,11 +108,13 @@ greatwall-v6up/
 当我真正用 AI 打过数学建模、算法或科研类比赛，很快发现一个非常棘手的现实：**仅靠现有 Agent Harness 自带的通用团队协作功能，几乎不可能照顾到彼此互斥的不同学派与不同解法。** 哪怕同时拉起多个子智能体，只要缺乏隔离与显式分流，不出几轮它们就会迅速趋同到同一个“表面容易写出代码、实则存在结构天花板”的局部解法里，多并发瞬间退化为昂贵的算力重播。
 
 这背后有一个必须正面承认的底层前提：**我必须默认，当前的基座大模型是一种学术品味（Academic Taste）非常弱的存在（哪怕是Claude也是如此）。** 它的符号推演带宽很高、预训练知识极其庞大，但一旦进入十小时级的长程开放任务，就会暴露出三类顽固倾向：
+
 1. **长上下文注意力退化与“体面怠惰”**：对话拉长到数十万 Token 后，模型不仅推理成本二次方上升，还会牢牢锚定在自己早期的局部直觉里，最终用极其流畅的学术辞令自我合理化，宣布“当前解已接近理论极限”并停止实质探索；
 2. **高并发下的群体思维坍塌**：多个 Agent 如果共享一个未经审定的公告板，早期谁先跑出一个能看的结果，其余分支立刻蜂拥跟风；
 3. **工具损坏与科学失败混淆**：评测脚本读错字段、模拟器环境报错，如果没有结构化归因隔离，模型会直接把平台 Bug 当成“这个数学思路不行”而放弃真正有价值的突破。
 
 放到更大的行业与学术背景里看，这一方向也存在明显的空白：
+
 - 大规模多智能体并行科研已经展现出惊人潜力——例如 OpenAI 用 64 并发 Agent 推进圈双覆盖猜想（CDC），乃至用上千个去中心化 Agent 协作探索 Navier-Stokes 方程的奇点/爆破问题；
 - 但市场上真正跑通的同类系统绝大多数是闭源的；开源社区则大多聚焦在某一个具体领域的专用插件（比如 Lean 形式化证明工具链），或者是面向通用软件工程的 Workflow 与通用多智能体编排框架；
 - 而在学术界，近两年已经出现了不少极具创新性与代表性的探索——如 *The Station*、*AgentDiscover*、*Cogentic*、*Stateless Language Agents (SLA)*、*Red Queen Gödel Machine (RQGM)* 和 *Audit the Scaffold*。它们各自打磨出了很有价值的机制，却缺少一个把这些前沿思路真正组装落地、供人持续改造的开放工程基座。
@@ -120,6 +126,7 @@ greatwall-v6up/
 既然基座模型是一位“推演带宽极高、知识面浩瀚，但学术品味薄弱、易脑雾、易怠惰与浮夸的科研新人”，整个系统的使命就**不应该是**充当监工、指望靠一堆脆弱的正则脚本或繁琐的行政公文去规训她（正如初始手稿 [`docs/architecture/手写project.md`](./docs/architecture/手写project.md) 里写的：如果仅靠正则清洗吹捧词就能做好学术审稿，人类科研共同体就不需要同行评议了）。
 
 相反，本架构把整套系统定位为一座**服务一线科研探索者的学术共同体**：
+
 - **唯有 Science 与一线科研探索者本身是目的**，所有治理机构、数据库、沙箱和协议都只是脚手架；
 - 替她挡住过早的群体噪声，给她可靠透明的实验仪器，在她容易陷入局部内卷时请外部视角敲醒她，在她上下文膨胀到神志不清前帮她把真实证据链与“科研遗嘱”安全交给下一代，并对她提交的硬核成果给予独立公正的实测审定。
 
@@ -155,7 +162,7 @@ greatwall-v6up/
 本架构在设计上吸收了多篇 2025–2026 自主科研论文与公开规范的核心机理，并结合 DSH 插件体系做了工程落地（完整的原作者问题、吸收机制、代码落点、演进路线图前沿参考与公共链接详见 **[`REFERENCES.md`](./REFERENCES.md)**）：
 
 | 借鉴来源 | 在本系统中吸收的核心机制 | 当前 `v0.2.0-alpha.1` 主要落点 |
-|---|---|---|
+| --- | --- | --- |
 | **Cogentic** (`arXiv:2609.40324`) | 协调层严守 `No Mathematical Opinion`；单篇+跨篇两阶段对抗审稿；独立 `Auditor` 抽取引理异会话复验 | 后勤/监察零偏见调度；两阶段盲审与 `propose_salvaged_lemma` |
 | **The Station v1/v2** (`2608.23691`, `2610.08927`) | 初期学徒隔离防跟风；`37%` 强制外部专家元反思（11 类题库 + 29 条夜科学题）；先锁不可逆 `Evidence Ledger` 再裁决；五车道停滞复苏；无标量多轨道 `tracks` | `0–37%` 内藏锁定、伴随 `REFLECT_37`、`trg_reviews_lock_stage1`、`dispatch_stagnation_five_lanes`、仪器 `tracks` |
 | **Stateless Language Agents (SLA)** (`2610.07625`) | “有状态的搜索 + 无状态的智能体”；严格区分代码执行报错与科学负结果；`Retained Candidate` 物理快照与声明式探索准则 | 短生命周期会话托管、四态错误隔离、后勤 `LEVEL_2` 快照原地修补 |
@@ -190,7 +197,7 @@ greatwall-v6up/
 ### 2.2 逻辑组织（一委三部）与四大工程映射
 
 | 工程划分 | 对应逻辑机构 / 角色 | 解决什么问题 | 核心源码模块 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **1. 设施工程** | 插件编排内核（Orchestrator）<br>监察委员会（一委：`supervisory_committee`）<br>外围人机接入（Prototype） | 扁平会话拉起与销毁、模型绑定与窗口适配、单待办熔断、版本化裁决同步、双向隔离沙箱、SQLite 单写者真相库、流程合规与终局核签 | [`orchestrator.js`](./greatwall-v6up/dsh_plugin/lib/orchestrator.js) & [`orchestrator/`](./greatwall-v6up/dsh_plugin/lib/orchestrator/)、[`agent_session_host.js`](./greatwall-v6up/dsh_plugin/lib/agent_session_host.js) & [`host/model_binding.js`](./greatwall-v6up/dsh_plugin/lib/host/model_binding.js)、[`read_isolated_sandbox.js`](./greatwall-v6up/dsh_plugin/lib/read_isolated_sandbox.js)、[`presets.js`](./greatwall-v6up/dsh_plugin/lib/presets.js)、[`tool_registry.py`](./greatwall-v6up/core_python/mcp_server/tool_registry.py)、[`db_schema.py`](./greatwall-v6up/core_python/mcp_server/db_schema.py)、[`control_plane/`](./greatwall-v6up/core_python/mcp_server/control_plane/)、[`tools_supervisory.py`](./greatwall-v6up/core_python/mcp_server/tools_supervisory.py) |
 | **2. 仪器科学工程** | 工造司（一部：`works_engineer`） | 科研仪器/诊断探针/计算环境供给、三档同码执行、四态错误隔离（判不了不判负）、四元复合缓存、校准集回归升版与工单闭环 | [`base_instrument.py`](./greatwall-v6up/core_python/evaluators/base_instrument.py)、[`isolated_runner.py`](./greatwall-v6up/core_python/evaluators/isolated_runner.py)、[`tools_works.py`](./greatwall-v6up/core_python/mcp_server/tools_works.py) |
 | **3. 后勤工程** | 后勤工作部（二部：`logistics_coordinator`）<br>一线探索单元（`explorer` ◄─1:1─► `lineage_companion`） | 单节点自适应上下文时钟（`37% / 70%`）、伴随单节点挂起续传、谱系 DAG 与死胡同归档、定额重压缩看板、六类分诊、动态族谱与 `>50%` 无豁免分流、五车道复苏 | [`pair_lifecycle.js`](./greatwall-v6up/dsh_plugin/lib/pair_lifecycle.js)、[`clock_and_turn_gap.js`](./greatwall-v6up/dsh_plugin/lib/clock_and_turn_gap.js)、[`tools_explorer.py`](./greatwall-v6up/core_python/mcp_server/tools_explorer.py)、[`tools_companion.py`](./greatwall-v6up/core_python/mcp_server/tools_companion.py)、[`tools_logistics.py`](./greatwall-v6up/core_python/mcp_server/tools_logistics.py) |
@@ -241,6 +248,7 @@ stateDiagram-v2
 设施工程负责一切跨业务部门的底座机制：运行时编排、模型与队列守卫、隔离沙箱与权限矩阵、SQLite 单写者真相库、监察委员会与外围人机接口。
 
 #### 1. 两层物理架构、双池并发与进程通信边界
+
 - **上层 · DSH Cordis 插件（`greatwall-v6up/dsh_plugin/`）**：采用 ESM JavaScript 编写，零修改 DSH 原生 `app.asar`，通过 `export const inject = ['tools', 'systemPrompt', 'agents', 'sessionProjections', 'tokenMeter', 'sessionQuery']` 注入宿主能力，并导出符合 Cordis 4.1.0 规范的零依赖 Standard Schema v1 `Config`（`~standard.validate`）；主控工具与 HTTP 路由统一收口至 `GreatwallControlService`（One Operation, Two Callers），插件卸载经 `ctx.effect` 返回异步 Promise 全量回收工具、技能、路由、活跃子会话与 Python 子进程；
 - **下层 · Python 3.11+ 并发计算 × 单写者真相内核（`greatwall-v6up/core_python/`）**：零第三方强依赖，采用**「并发只读 + 并发纯外部计算 + 严格单写者记总账」**三层模型：
   - **双线程池防队头阻塞**：`greatwall_core_mcp.py` 拆分为 `fast_pool`（只读查询、时钟同步、控制面短写）与 `compute_pool`（隔离评测、校准回归、重型任务、Stage 3 导出），慢计算池饱和时快照与停止指令仍毫秒级响应；
@@ -249,9 +257,11 @@ stateDiagram-v2
 - **分级超时对齐**：常规元数据与只读轮询默认短超时（`60s`），而 `run_isolated_eval(official/heavy)`、校准集回归与 Stage 3 导出显式配置长超时（`300s`），并透传给 DSH 工具 `timeoutMs`。
 
 #### 2. 插件编排内核（Orchestrator）的六项确定性机制
+
 1. **无 Root 扁平并发与两类会话生命周期**：
    - 系统不走宿主原生父子派单树（规避 `maxDepth = 1` 与子代理并发上限），由 `agent_session_host.js` 直接调 `ctx.agents.create()` 拉起平级独立会话；
    - **5 类治理角色（一次性短会话）**与**单节点探索单元（节点内保活伴随）**的清理边界严格不同：
+
      ```js
      // 模式 A：5 类治理短会话 —— 执行完毕立即销毁并清理临时盲审沙箱
      if (isOneShotGovernanceRole(role)) {
@@ -271,6 +281,7 @@ stateDiagram-v2
        await companionHandle.dispose() // 节点结束即销毁，严禁跨代常驻
      }
      ```
+
 2. **显式模型绑定解析链与拒启门禁**：
    - `start` 前必须按**「显式启动参数 > `callerAgent.options` > 主控会话事件流（`model/selection` / `request/context`） > 插件配置」**解析权威 `{ provider, model, modelPhysicalWindow }`（因为 DSH UI 手动切模型只写会话事件流，不写 `agent.options`）；
    - 解析失败直接拒启 **`MISSING_MODEL_BINDING`**，严禁传空 `agentOptions` 导致子会话静默跌落到未授权模型渠道。
@@ -287,7 +298,9 @@ stateDiagram-v2
    - 探索循环每轮续推前借 `control_plane/sync_pressure` 顺带核查 SQLite 实时 `node_status`，节点一旦已被外部关闭或中止，立即停机销毁探索者与伴随释放槽位；待交接/待抢救状态唯一落 SQLite `lineage_nodes.pending_handoff_mode`，消除内存双账本。
 
 #### 3. 双向隔离沙箱与角色权限规划（`read_isolated_sandbox.js` & `presets.js`）
+
 隔离机制严格区分两个方向：
+
 - **开放外部 $\to$ 内部**：工作区公开输入目录（`inputs/`、`source_materials/`、`problem_pack/`、`data/`、`rulings/`、`attachments/` 等及顶层公开文档）对有文件权限的角色只读开放；`fork_branch` 与构建盲审沙箱时，同步挂载对应 `spec_revision` 的公开输入至 `<sandbox>/inputs/`；
 - **严防内部 $\to$ 外部**：所有数据库、Stage A 产物、物理快照、隐藏校准集与临时盲审沙箱全部外置在工作区之外的 `$PLUGIN_DATA/workspaces/<ws_hash>/`；通过目录外置 + 环境变量清理 + `read_isolated_sandbox.js` 同步拦截实现应用层防线：
   - 基于节点 `cwd` 执行 `resolveCanonicalTarget()`（`fs.realpathSync` 逐层解析最深存在祖先并做 Windows 小写规范化），阻断 `../` 与符号链接逃逸；
@@ -299,7 +312,7 @@ stateDiagram-v2
 在受控沙箱内部，7 类角色映射到 **6 套 DSH Agent Presets**（`presets.js`），按岗位需求分配最小原生工具集（不以防泄密为由剥夺盲审官在独立空白沙箱内跑代码验算的能力）：
 
 | 角色契约 | DSH Preset | 默认推理强度 | 允许原生工具（`win32→pwsh`, 非 `win32→bash`） | 沙箱与读写边界 | MCP 工具数 |
-|---|---|:---:|---|---|:---:|
+| --- | --- | :---: | --- | --- | :---: |
 | `explorer` | `greatwall-explorer` | `high` | `read`, `write`, `edit`, `read_image`, `glob`, `grep`, Shell | 写权锁死本分支 Worktree；只读公开 `inputs/`；禁 DB/隐藏集/`evaluators/`/他脉/外网 | 5 |
 | `lineage_companion` | `greatwall-companion` | `medium` | `read`, `glob`, `grep` | 单向只读配对探索节点 Worktree 与公开输入区；禁写、禁 Shell | 4 |
 | `logistics_coordinator` | `greatwall-db-only` | `low` | `[]`（0 原生工具） | 纯 SQLite 状态机视图驱动 | 5 |
@@ -309,16 +322,20 @@ stateDiagram-v2
 | `supervisory_committee` | `greatwall-db-only` | `low` | `[]`（0 原生工具） | 纯只读数据库审计视图 | 4 |
 
 #### 4. SQLite 单写者真相库与三道数据库硬不变量
+
 数据库启用 `PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;`，全部写操作经 `BEGIN IMMEDIATE`（`rw_immediate_tx`）串行落库，核心数据按“唯一真相表 vs 派生查询视图”分离（真相永只追加不篡改，视图可从真相无损重建），并在内核层用 **3 条业务硬触发器 + 1 条唯一部分索引** 死守关键不变量：
+
 1. `trg_reviews_lock_stage1`：一旦 `review_queue.stage1_locked_at IS NOT NULL`，任何试图篡改 `stage1_ledger_json` 或锁定时间的 `UPDATE` 直接 `ABORT`（保证解盲后不可倒改盲态证据账本）；
 2. `trg_l3_require_verified_review` + `uq_l3_verified_review`：插入 `internal_research_ledger(ledger_type='L3_VERIFIED')` 时，强校验 `verified_review_id` 在 `review_queue` 中存在**同 `question_id`、双阶段均已锁定且终判为 `ACCEPT / ACCEPT_NARROWED`** 的记录，配套唯一部分索引从内核层封死“无单入库”、“Q2 借用 Q1 审稿单串题”与“一单多插 `L3`”；
 3. `trg_obs_pending_reval_require_queue`：观测更新为 `PENDING_REVALIDATION` 时，强校验同事务已在 `pending_revalidation_queue` 插入对应活跃重评行，杜绝观测被孤立作废。
 
 #### 5. 监察委员会（一委：`supervisory_committee`）
+
 - **超然流程哨兵**：0 原生工具、推理强度 `low`、单次唤醒 `<=5` 步，严守“零科学偏见、零磁盘 `.md` 公文”，所有检查与告警仅写 `compliance_alerts`；
 - **核心职能**：① 核验 Parse 0 已签发（`PARSE0_GATE`）；② 监控 `UNHEALTHY` 熔断仪器与学派聚拢分流响应；③ 无人值守期发现原始题意根本歧义时写入 **`ALERT_AMBIGUOUS_SPEC`** 亮红灯留待人类事后裁决，同时**严禁挂起停摆，维持当前口径续跑**；④ 校验双段终局门禁（强核验控制面写入的真实 `human_stop_requested_at`，绝不轻信 Agent 自传 `human_aborted=true` 绕过最短投入窗）并在版本哈希一致后签发 `CLOSURE_GATE(PASSED)`。
 
 #### 6. 外围人机接入与观测原型（`console_routes.js` & `client.js`）
+
 - 主控会话通过 `greatwall_orchestrate` 操控后台编排内核；
 - 右侧栏「长城科研指挥舱」挂载于 DSH `ctx.connection.fetch` 鉴权围栏内，通过 `GET /api/greatwall.status` 与 `POST /api/greatwall.control` 展示活跃状态、谱系 DAG、节点看板/反思/遗嘱、会话黑匣子轨迹与 Worktree 文件源码，并提供紧急按钮。该层目前为无构建链手写 JSX 的早期原型，易用性较弱。
 
@@ -329,13 +346,17 @@ stateDiagram-v2
 仪器科学工程由**工造司（`works_engineer` / `tools_works.py`）**与通用隔离执行容器（[`base_instrument.py`](./greatwall-v6up/core_python/evaluators/base_instrument.py)、[`isolated_runner.py`](./greatwall-v6up/core_python/evaluators/isolated_runner.py)）构成。
 
 #### 1. 第一性定位：仪器与可观测性提供商
+
 工造司不是给每道科学题硬捏一个标量分数的“判官”，而是实验室里的**仪器科**：
+
 - **通用容器零领域硬编码**：是否需要参考基线、某题是否允许全零解、物理误差容差怎么算，全部由课题仪器插件自行实现；纯理论或开放课题允许 0 个 `VERDICT` 判定器开局；
 - **Stage 1 统一初始仪器核查责任**：进入 Stage 1 时统一唤醒 `works_engineer` 核查 `parse0_contract.initial_instruments_json`——非空则锻造、校准并注册全部初始仪器（若多台仪器中途某台失败，恢复仅续做未完成项）；为空则调用 `get_works_engineering_queue` 确认无待建仪器并正常退出，由控制面核验 SQLite 状态后置 `stage1_works_checked = 1`；
 - **日常工作优先级**：① 修复 `INSTRUMENT_ERROR / INFRA_ERROR` 故障并经 `resolve_works_ticket` 闭合 `PAIN_POINT / DUPLICATE_TOOL / EXPLOIT` 工单（队列 `status` 统一置 `RESOLVED`，具体 `resolution ['RESOLVED'|'WONTFIX'|'DUPLICATE']` 与说明记入 `payload_json` 供审计） $\to$ ② 扩张科研可观测性探针（把黑盒模拟器拆出分种子耗时、长尾分位、守恒残差谱等诊断维度） $\to$ ③ 加固防作弊与收编多分支重复手造的实用脚本。
 
 #### 2. 统一仪器抽象与三档同码执行
+
 所有验证器、诊断探针与仿真环境统一分为三类 `instrument_role`：`VERDICT`（产出正式 `verdict` 与 `[Obs###]`）、`PROBE`（只读诊断剖面，`verdict` 恒为 `None`）、`ENV`（运行时与基准数据集）。全部实现唯一协议：
+
 ```python
 evaluate(artifact, spec, tier) -> {
     "status":  "OK" | "CANDIDATE_ERROR" | "INSTRUMENT_ERROR" | "INFRA_ERROR",
@@ -344,6 +365,7 @@ evaluate(artifact, spec, tier) -> {
     "details": str                                          # 面向探索者的结构化诊断文本
 }
 ```
+
 - **统一取数与加载**：平台输入唯一放置在 `spec["public_input"]`，通过 `get_public_input(spec)` 安全读取（缺键必抛 `InstrumentInputError` $\to$ `INSTRUMENT_ERROR`，绝不静默判 0 分）。Python 候选模块默认用 `runpy.run_path(cand_file, run_name="_gw_candidate")` 加载调用 `run(public_input)`，避免误触发 `if __name__ == "__main__":` 且绝不靠正则解析 `stdout` 判分；`.lean` / 反例 JSON 等由仪器插件按自身 `artifact_schema` 执行。
 - **同一份代码三档调用**：
   - `probe`（快速探索档）：挂载公开/开发样例高频调试，只写 `probe_diagnostic_logs`，**不记入 `observations`**；
@@ -353,13 +375,14 @@ evaluate(artifact, spec, tier) -> {
 #### 3. 四态错误物理隔离与四元复合缓存
 
 | 返回 `status` | 精确归因 | 平台确定性动作 |
-|---|---|---|
+| --- | --- | --- |
 | `OK` | 仪器健康跑完并给出有效观测 | 按 `verdict` 映射为 `VALID_PASS` / `MEASURED_REJECTION` / `VALID_UNDECIDED` 入账 |
 | `CANDIDATE_ERROR` | 候选自身语法错、崩溃、缺入口、超时 | 归探索者工程缺陷（后勤可判 `LEVEL_2` 原地修补上限 3 次），不计入科学否定 |
 | `INSTRUMENT_ERROR` | 仪器自身异常、漏读 `public_input`、违约 | **零处罚探索者**（不打 0 分、不扣修补配额、不增停滞计数、穿透缓存）；同事务自动开单工造司；连续出错 3 次自动熔断置 `UNHEALTHY` |
 | `INFRA_ERROR` | 进程/磁盘/RPC 超时等底座异常 | 同样**零处罚探索者**、穿透缓存允许重试并记录系统告警 |
 
 幂等缓存键采用**四元复合指纹**：
+
 ```text
 cache_key = sha256(
   candidate_entry_sha256
@@ -370,6 +393,7 @@ cache_key = sha256(
 ```
 
 #### 4. 校准集回归升版、版本域隔离与工具台账
+
 - **上线与升版唯一门控**：`PROBE` / `ENV` 可免配校准集；`VERDICT` 注册与升版必须附带独立校准集并在独立子进程逐条实跑，**100% 匹配每条用例自声明的 `(expected_status, expected_verdict)`**（如空文件预期 `CANDIDATE_ERROR + None`、作弊毒样本预期 `OK + FAIL`、合法金样本预期 `OK + PASS`）即直接激活/升版——修 Bug 或封堵刷分只需先把复现用例加入校准集再修代码，绝不要求修 Bug 补丁在旧指标上“赢分”。
 - **版本域可比性与诚实重评**：所有 `[Obs###]` 永久绑定 `(instrument_id, instrument_version)` 不可跨版本混排；每次 `official / heavy` 将 Stage A 候选输出持久化至 `$PLUGIN_DATA/.../eval_artifacts/<obs_id>/stage_a_output.json`。升版后旧观测标待重评并入 `pending_revalidation_queue`，工造司调 `recompute_stage_b_only` 按新版重算：**永久保留旧收据不覆盖**（置 `SUPERSEDED_REVALIDATED`），重评成功生成绑定新版且经 `revalidated_from_obs_id` 关联的新 `[Obs###]`；若旧产物缺新字段或输入规格已变，诚实将旧收据与队列项置 `INCOMPATIBLE` 结案。
 - **共享工具台账（`SKILL_LEDGER.json`）**：多分支重复手造的辅助脚本由工造司收编为共享只读探针，经可执行与文件实存校验后登记 `skill_id`（`^[a-z0-9_]+$`）、`applicable_scope`、`version`、原始成败计数、`verified_artifact_rel_path` 与 `rollback_pointer`。
@@ -381,9 +405,11 @@ cache_key = sha256(
 后勤工程由**后勤工作部（`logistics_coordinator`）**与基层**一线科研探索单元（`explorer` ◄─1:1─► `lineage_companion`）**组成，负责单节点探索质量、代际记忆传承、分诊快照与高并发学派多样性治理。
 
 #### 1. 单节点同会话伴随（方案 A）与四幕生命周期
+
 宿主在单个探索节点 `node_id` 生命周期内，为 `explorer` 配对创建**唯一一个**开启 `keepAliveAfterIdle` 的 `lineage_companion` 会话——它依次承接 `PRE_SPAWN`（写行前看板后暂停）$\to$ `REFLECT_37`（续传元反思后暂停）$\to$ `HANDOFF_70`（续传核对单写落库），**节点结束即随探索者一同销毁，严禁跨代常驻**（既让伴随在 70% 验收时天然记得行前看板与 37% 探索者承诺，又杜绝跨代记忆漂移；遇宿主重启或断线则自动按 `node_id` 从 SQLite 冷启动兜底）。
 
 沿自适应上下文压力时钟 `pressure_pct = pressure_tokens / W`（`W = min(500k, model_physical_window)`），单个探索节点走完四幕节律：
+
 1. **第一幕 `0% – 37%`（独思净室）**：
    - 启动仅 Push `<=2200` 字《谱系状态看板》、上代《遗嘱》、子题契约、`<worktree>/tools/` 清单，并开放只读公开 `inputs/` 与图书馆左翼**外藏 `[R###]`**；
    - **物理锁定公共内藏 `L3/L2` 与本脉深层 DAG / `lineage_dead_ends`**，让探索者先带着自身独立视角撞一次真墙，防止开局直接跟风抄作业。
@@ -400,15 +426,17 @@ cache_key = sha256(
    - **异常 `<70%` 断线抢救（`CRASH_RECOVERY`）**：只要非一字未产空崩溃（`is_empty_crash == false`），哪怕未满 `37%` 且无数值 `Obs`，只要留有推导稿、反例脚本或阶段代码，一律抢救写入正式 DAG 页置 `AWAITING_TRIAGE`。
 
 #### 2. 真相归档与有限看板解耦
+
 - **历代全量只增不忘 $\to$ `lineage_dead_ends`**：伴随每次交接将本代排除边界按 `SCIENTIFIC_REFUTATION / IMPL_FAILURE / ENV_FAILURE` 追加写入，跨门派物理隔离，第 30 代过 37% 仍可查第 1 代记录；
 - **启动扉页摘要 $\to$ `lineage_briefings`（`<= 2200` 字定额滚动重压缩）**：伴随在下代启动前以 $O(1)$ 输入（仅读旧看板 + 刚退场这一页最新手记）执行定额重写 $\text{Rewrite}_{\le 2200}$（绝非字符串累加，服务端硬限总长 `<= 2200` 绝不静默切片）：段 1 锁定核心机制、段 2 合并覆写最新前提/快照与置顶活跃 `REVISE` 异议、段 3 覆盖刷新当前未解矛盾、段 4 仅留当前最相关 Top-K 死胡同并附全表条数索引、段 5 整体替换为最新《科研遗嘱》。
 
 #### 3. 后勤调度总管的六类分诊、分支依赖与学派分流
+
 - **`AWAITING_TRIAGE` 禁抢跑硬锁**：节点处于待分诊且后勤尚未完成 `triage_node` 并刷新 `retained_candidate` 物理快照之前，编排内核严禁为该分支启动下代探索者。
 - **六类精确认知分诊**（先过滤全部平台错误，零处罚）：
 
 | 分诊类别 | 适用科学情形 | 确定性动作与分支去向 |
-|---|---|---|
+| --- | --- | --- |
 | `ROUTINE_CONTINUATION` | 正常渐进探索与局部排除 | 保持 `ACTIVE`，刷新看板派生下代 |
 | `LEVEL_1` | 产出与主张形态匹配的可核验载体 | 备份 `retained_candidate` 物理快照，分支置只读冻结 `PENDING_REVIEW` 送盲审 |
 | `LEVEL_2` | `CANDIDATE_ERROR` 导致科学假说尚未被真实检验 | 锁定方向禁止换路，从物理快照恢复原地修补（上限 3 次）；满 3 次仍败写本脉 `dead_ends(IMPL_FAILURE)` 回退健康祖先（**不入图书馆 `L2`**） |
@@ -426,7 +454,9 @@ cache_key = sha256(
 图书馆工程由**外藏采编 & Stage 3 撰稿馆员（`library_surveyor`）**与**隔离沙箱实测盲审官（`library_verifier`）**分权运作（[`tools_library.py`](./greatwall-v6up/core_python/mcp_server/tools_library.py)），既是跨门派唯一合法交流枢纽，也是科学质量与终局诚实度的总闸门。
 
 #### 1. 两翼物理分表与诚实无解查新
+
 两张独立物理表共用统一的两级按需检索（`query_library_catalog` 扫 `<=350` 字目录卡 $\to$ `get_library_entry` 按 ID 拉全文，避免上下文被长文献淹没）：
+
 - **左翼 · 外藏表 `external_literature_cards` (`[R###]`)**：
   - `0%` 起全程开放，明确标定为**“带来源出处但未经本系统独立复验的外部参考摘要”**（学术正确性由引用作者与盲审实证核查）；入库强校验 `read_depth`（`full_text / specified_sections / abstract_only`）、5 枚举 `support_scope` 与 `60–1500` 字符独立 `abstract_md`；
   - **区分“馆员完成查新”与“图书馆获得文献”**：若委托资料客观不存在或违背合规边界，馆员在同一入口传 **`outcome = "UNAVAILABLE_REPORT"`** 与 `unavailable_reason_md`——**不向 `external_literature_cards` 插入任何伪 `[R###]` 卡、不强迫虚填 `read_depth`**，仅将对应 `survey_requests` 置为 `CLOSED_UNAVAILABLE` 并保存已查范围与不可得原因。
@@ -435,16 +465,18 @@ cache_key = sha256(
   - **`L2_FAILURE_RECORD`（否定雷达）**：保持高度纯净，只收录 `REFUTED`（实锤证伪/致命反例）与 `UNRESOLVED_OBJECTION`（经最多 2 轮 `REVISE` 返工仍未解异议）；**一切代码崩溃、修补超限与环境报错严禁入 `L2`**。
 
 #### 2. 四轨可核验送审准入
+
 后勤在 `LEVEL_1 / LEVEL_4A` 送审时只检查“材料形式与主张类型是否匹配”，通吃四类异构科研产物：
 
 | 科学主张形态 | 送审必需可核验载体 | 盲审沙箱复核方式 |
-|---|---|---|
+| --- | --- | --- |
 | **数值 / 物理仿真 / 优化** | 合法 `official` / `heavy` `[Obs###]`（无隐藏集题附固定配置多种子 `[Obs###]`）+ 脱敏核心代码 | 沙箱复跑代码，执行独立变种子或扰动边界复现 |
 | **形式化定理证明** | 证明检查器（如 Lean 4 `lake build`）`PASS` 凭证 + 完整源码 | 核对原命题防篡改、`#print axioms` 公理审计并实跑编译 |
 | **构造性反例** | 具体反例对象参数/数据 + 最小可运行复核校验脚本 | 沙箱亲手运行校验脚本验算前提成立与目标破坏 |
 | **纯解析数学推导** | 自包含分步推导正文 + 前提公理边界声明 + 极端特例自检说明 | 借助 Python/SymPy 逐行核验恒等式、边界特例与 7 类结构漏洞 |
 
 #### 3. 空白沙箱两阶段实测盲审状态机与跨口径公正性
+
 每次审稿唤醒全新 `library_verifier`，编排内核现建独立空白沙箱 `blind_sandbox_<review_id>/`，仅只读拷入手稿绑定 **`spec_revision`** 对应的公开 `inputs/`、A 栏文本、脱敏代码/证明/反例文件与 `[Obs###]`（0 写权、物理隔离 DB/B 栏/隐藏集/探索 Worktree/外网，审毕即删）：
 
 ```mermaid
@@ -463,6 +495,7 @@ flowchart LR
 - **`Auditor` 废墟引理打捞**：仅限已闭/阻塞节点（服务端强校验原分支不处于 `ACTIVE_REVISING` 返工期），剥离重写为自包含命题后作为全新 `STAGE1_BLIND` 审稿单入队，强校验 **`session_id != proposer_session_id`** 走完整两阶段盲审。
 
 #### 4. Stage 3 五件套导出与版本绑定终核
+
 - `export_stage3_final_delivery` 严禁混入未过盲审的草稿；落盘五件套至 `<workspace>/final_delivery/` 时生成 `(latest_delivery_id, latest_delivery_sha256)`、置 `DELIVERY_EXPORTED` 并强制重置 `verifier_final_audit_passed = 0`；
 - 编排内核唤醒 `library_verifier` 调用现有盲审工具（传入 `review_id = "STAGE3_FINAL_AUDIT:<delivery_id>"`）实跑复现脚本并逐条核对总报告未夸大任何被引 `L3` 的 `exact_verified_scope_md`：通过则写入 `verifier_audited_delivery_id / sha256` 落签；不通过则将 `project_closure_state.status` 置为 **`REVISION_REQUESTED`** 并写入 **`verifier_revision_notes`** 退回 `library_surveyor` 修正重导（产生新哈希重走终核）。
 
@@ -475,8 +508,9 @@ flowchart LR
 ### 4.1 人机与主控入口契约（DSH Tool & Console HTTP）
 
 1. **主控会话工具 `greatwall_orchestrate`**（[`dsh_plugin/lib/index.js`](./greatwall-v6up/dsh_plugin/lib/index.js)）—— 11 个控制动作：
+
    | Action | 核心作用 | 关键入参 |
-   |---|---|---|
+   | --- | --- | --- |
    | `init` | 签署 Parse 0 六项启动表单并初始化数据库 | `workspace_root`, `goal_and_completion_md`, `subquestions`, `question_order`, `initial_instruments`, `seed_families`, `total_budget`, `min_commitment_window_sec`, `delivery_spec_md`, `shared_inputs_rel_paths` |
    | `start` | 解析权威模型绑定并异步启动编排内核循环 | `workspace_root`, 可选 `provider`, `model`, `effective_context_window` |
    | `pause` / `resume` / `stop` | 暂停 / 恢复（自动同步 `rulings/`） / 停止编排循环 | `workspace_root` |
@@ -485,6 +519,7 @@ flowchart LR
    | `submit_works_ticket` | 向工造司签发正式工单并立刻唤醒处理 | `workspace_root`, `question_id`, `ticket_type`, `payload` |
    | `sync_rulings` | 显式扫描 `rulings/` 更新 `spec_revision` 与摘要 | `workspace_root` |
    | `inspect` / `status` | 深度只读透视 SQLite 全态 / 查询编排摘要 | `workspace_root` |
+
 2. **控制台鉴权 HTTP 路由**（[`dsh_plugin/lib/console_routes.js`](./greatwall-v6up/dsh_plugin/lib/console_routes.js)）：
    - `GET /api/greatwall.status`：查询活跃控制器或磁盘遥测、谱系 DAG Flow、五段看板/元反思/遗嘱、跨 cwd 会话黑匣子轨迹与 Worktree 文件源码；
    - `POST /api/greatwall.control`：执行 `pause / resume / stop / human_stop / abort_node`（强制 `allowFallback: false`，指定工作区不匹配绝不误杀隔壁工作区）。
@@ -496,6 +531,7 @@ flowchart LR
   - 调度与水位：`control_plane/schedule_snapshot`、`control_plane/sync_pressure`、`control_plane/record_pending_handoff`、`control_plane/abort_node`、`control_plane/record_human_stop`；
   - 沙箱、遥测与工单：`control_plane/stage_blind_sandbox`、`control_plane/cleanup_blind_sandbox`、`control_plane/fact_edge`、`control_plane/submit_works_ticket`、`control_plane/recover_heavy_jobs`、`control_plane/ui_inspector`。
 - **统一 MCP 工具回执外壳**：
+
   ```json
   {
     "ok": true,
@@ -510,6 +546,7 @@ flowchart LR
     "next_step_guidance": "[JIT-Guidance] 服务端确定性生成的下一步提示"
   }
   ```
+
 - **8 个结构化底层错误码常量**（[`db_schema.py`](./greatwall-v6up/core_python/mcp_server/db_schema.py)）：`ERR_AUTH`、`ERR_CONFLICT`、`ERR_EXECUTION`、`ERR_INVALID_INPUT`、`ERR_INVARIANT`、`ERR_LOCKED`、`ERR_NOT_FOUND`、`ERR_STORAGE`（控制面侧另含 `MISSING_MODEL_BINDING`、`HUMAN_STOP_NOT_RECORDED`）。
 
 ### 4.3 七大角色 × 32 个窄 MCP 工具精确契约
@@ -517,7 +554,7 @@ flowchart LR
 工具入口强制按会话角色校验白名单（权威单一契约源位于 [`tool_registry.py`](./greatwall-v6up/core_python/mcp_server/tool_registry.py)，由 [`test_architecture_contracts.py`](./greatwall-v6up/tests/test_architecture_contracts.py) 与 [`doctor.mjs`](./greatwall-v6up/dsh_plugin/tools/doctor.mjs) 强校验与 [`prompts.js`](./greatwall-v6up/dsh_plugin/lib/prompts.js) 及 7 份角色模板 100% 同步）：
 
 | 角色 | 工具名称 | 必填入参 (`required`) | 可选入参 (`optional`) |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **`explorer`** (5) | `[W] run_isolated_eval` | `node_id, question_id, instrument_id, tier, artifact_rel_path, linguistic_prediction, declared_refs` | `job_id` |
 | | `[R] query_library_catalog` | `node_id, question_id, scope, keyword` | — |
 | | `[R] get_library_entry` | `node_id, entry_id` | — |
@@ -554,6 +591,7 @@ flowchart LR
 ### 4.4 仪器插件与校准集扩展契约
 
 核自 [`base_instrument.py`](./greatwall-v6up/core_python/evaluators/base_instrument.py) 与 [`isolated_runner.py`](./greatwall-v6up/core_python/evaluators/isolated_runner.py)：
+
 - **输入辅助**：`get_public_input(spec)` 校验 `spec` 与 `spec["public_input"]` 均为 `dict`，缺失即抛 `InstrumentInputError`；
 - **返回体硬校验（`validate_instrument_result`）**：`status ∈ {OK, CANDIDATE_ERROR, INSTRUMENT_ERROR, INFRA_ERROR}`；`PROBE` 角色 `verdict` 恒为 `None`，`VERDICT` 角色在 `status == "OK"` 时 `verdict ∈ {PASS, FAIL, UNDECIDED}`，非 `OK` 时 `verdict` 恒为 `None`；`tracks` 值仅允许有限 `float / int / str / bool / None`；`details` 必为 `str`；
 - **校准集 JSON**：用例数组，每条声明 `{"case_id", "expected_status", "expected_verdict", "artifact_rel_path", "public_input"}`。
@@ -561,6 +599,7 @@ flowchart LR
 ### 4.5 SQLite 持久化 Schema 与触发器契约
 
 核自 [`db_schema.py`](./greatwall-v6up/core_python/mcp_server/db_schema.py)：
+
 - **19 张核心普通表**：`parse0_contract`, `instruments`, `observations`, `probe_diagnostic_logs`, `async_eval_jobs`, `lineage_nodes`, `lineage_dead_ends`, `lineage_briefings`, `external_literature_cards`, `internal_research_ledger`, `review_queue`, `pending_revalidation_queue`, `method_families`, `epistemic_edges`, `works_engineering_queue`, `survey_requests`, `compliance_alerts`, `saved_graph_queries`, `project_closure_state`（含 `OPEN / DELIVERY_EXPORTED / REVISION_REQUESTED / CLOSED_VERIFIED` 与 `verifier_revision_notes`）；
 - **2 张 FTS5 虚表 + 6 条 FTS 同步触发器**：`external_literature_fts`、`internal_research_fts`；
 - **3 条业务硬触发器 + 1 条核心唯一部分索引**：`trg_reviews_lock_stage1`、`trg_l3_require_verified_review`、`trg_obs_pending_reval_require_queue`、`uq_l3_verified_review`。

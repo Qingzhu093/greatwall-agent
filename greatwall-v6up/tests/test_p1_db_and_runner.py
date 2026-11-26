@@ -613,7 +613,7 @@ def evaluate(artifact, spec, tier="official"):
     def test_6_fts5_sanitization_multilingual_and_special_chars(self) -> None:
         res = self._call(
             "publish_external_literature_card",
-            "library_surveyor",
+            "external_surveyor",
             "s_surv",
             ref_id="R001",
             question_id="Q1",

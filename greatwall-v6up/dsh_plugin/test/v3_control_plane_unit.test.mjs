@@ -86,7 +86,7 @@ test('DSH RC5 流式拒答：首次回合与续跑均保留错误码并写入遥
       recordEvent: (type, detail) => recorded.push({ type, ...detail }),
     },
   })
-  const run = { role: 'library_surveyor', prompt: 'Replay a model turn', archiveOnComplete: false }
+  const run = { role: 'external_surveyor', prompt: 'Replay a model turn', archiveOnComplete: false }
   const first = await host.spawnAndRunAgent({ ...run, sessionId: 'live', keepAliveAfterIdle: true })
   assert.equal(first.isAbnormalEnd, false)
   assert.deepEqual(recorded, [])
@@ -104,33 +104,42 @@ test('DSH RC5 流式拒答：首次回合与续跑均保留错误码并写入遥
   await host.disposeAllSessions()
 })
 
-test('1. 6套Preset、角色路由与平台感知原生工具白名单', () => {
-  assert.equal(ALL_31_MCP_TOOLS.size, 32)
+test('1. 8套Preset、10角色路由与平台感知原生工具白名单', () => {
+  assert.equal(ALL_31_MCP_TOOLS.size, 44)
   assert.ok(ROLE_MCP_TOOLS.works_engineer.includes('register_question_instrument'))
   assert.ok(ROLE_MCP_TOOLS.works_engineer.includes('upgrade_instrument_with_calibration'))
   assert.ok(ROLE_MCP_TOOLS.works_engineer.includes('resolve_works_ticket'))
+  assert.ok(ROLE_MCP_TOOLS.gw_chief.includes('chief_propose_control_action'))
+  assert.ok(ROLE_MCP_TOOLS.library_chronicler.includes('publish_living_survey'))
+  assert.ok(ROLE_MCP_TOOLS.conference_chair.includes('submit_conference_verdict'))
 
-  // 7 角色全映射到 6 套职责极净单源 Preset（直接派生自 cordis.patch.yml）
+  // 10 角色全映射到 8 套职责极净单源 Preset（直接派生自 cordis.patch.yml）
   const winDefsList = buildDeclarativePresetConfigs('win32')
   const presets = winDefsList.map((d) => d.id)
-  assert.equal(presets.length, 6)
+  assert.equal(presets.length, 8)
   for (const role of CANONICAL_ROLES) {
     assert.ok(presets.includes(ROLE_TO_PRESET[role]), `角色 ${role} 映射缺失`)
   }
+  assert.equal(ROLE_TO_PRESET.gw_chief, 'greatwall-chief')
   assert.equal(ROLE_TO_PRESET.logistics_coordinator, 'greatwall-db-only')
   assert.equal(ROLE_TO_PRESET.supervisory_committee, 'greatwall-db-only')
+  assert.equal(ROLE_TO_PRESET.conference_chair, 'greatwall-db-only')
   assert.equal(ROLE_TO_PRESET.library_verifier, 'greatwall-verifier')
-  assert.equal(ROLE_TO_PRESET.library_surveyor, 'greatwall-surveyor')
+  assert.equal(ROLE_TO_PRESET.external_surveyor, 'greatwall-external-surveyor')
+  assert.equal(ROLE_TO_PRESET.library_chronicler, 'greatwall-chronicler')
 
   // 平台感知 Shell 工具与平权矩阵
   assert.equal(resolvePlatformShellTool('win32'), 'pwsh')
   assert.equal(resolvePlatformShellTool('linux'), 'bash')
+  assert.deepEqual(resolvePlatformAllowedTools('gw_chief', 'win32'), [])
   assert.deepEqual(resolvePlatformAllowedTools('logistics_coordinator', 'win32'), [])
   assert.deepEqual(resolvePlatformAllowedTools('supervisory_committee', 'linux'), [])
+  assert.deepEqual(resolvePlatformAllowedTools('library_chronicler', 'linux'), [])
+  assert.deepEqual(resolvePlatformAllowedTools('conference_chair', 'win32'), [])
   assert.deepEqual(resolvePlatformAllowedTools('library_verifier', 'win32'), ['read', 'glob', 'grep', 'pwsh'])
   assert.deepEqual(resolvePlatformAllowedTools('library_verifier', 'linux'), ['read', 'glob', 'grep', 'bash'])
 
-  // 声明式 Preset 插件校验：6 套均挂载 RC5 tool-executor-native；verifier 有只读 fs + 平台 shell，db-only 仅 persona + native executor
+  // 声明式 Preset 插件校验：8 套均挂载 RC5 tool-executor-native；chief 启用 compaction-basic，explorer 禁 pruner
   const winDefs = Object.fromEntries(winDefsList.map((d) => [d.id, d]))
   for (const def of winDefsList) {
     assert.ok(
@@ -138,6 +147,14 @@ test('1. 6套Preset、角色路由与平台感知原生工具白名单', () => {
       `Preset ${def.id} 必须挂载 @deepseek-ai/dsh-tool-executor-native`,
     )
   }
+  assert.ok(
+    winDefs['greatwall-chief'].plugins.some((p) => p.name === '@deepseek-ai/dsh-compaction-basic'),
+    'greatwall-chief 必须启用原生 @deepseek-ai/dsh-compaction-basic',
+  )
+  assert.ok(
+    !winDefs['greatwall-explorer'].plugins.some((p) => p.name === '@deepseek-ai/dsh-compaction-tool-result-pruner'),
+    'greatwall-explorer 严禁开启 dsh-compaction-tool-result-pruner',
+  )
   const verPlugins = winDefs['greatwall-verifier'].plugins
   assert.equal(verPlugins.find((p) => p.id === 'tool-fs')?.config?.write, false)
   assert.equal(verPlugins.find((p) => p.id === 'tool-pwsh')?.disabled, false)
@@ -151,7 +168,7 @@ test('2. 平台感知原生工具挂载强断言 (assertRequiredNativeTools)', (
   assert.doesNotThrow(() => assertRequiredNativeTools('library_verifier', ['read', 'bash'], 'linux'))
   assert.throws(() => assertRequiredNativeTools('library_verifier', ['read', 'write', 'pwsh'], 'win32'), /严禁挂载写工具/)
   assert.doesNotThrow(() => assertRequiredNativeTools('logistics_coordinator', [], 'win32'))
-  assert.throws(() => assertRequiredNativeTools('supervisory_committee', ['read'], 'win32'), /纯 DB 治理角色/)
+  assert.throws(() => assertRequiredNativeTools('supervisory_committee', ['read'], 'win32'), /纯 DB 治理/)
 })
 
 test('3. 双隔离沙箱 Guard：探索Worktree + 动态只读遗嘱 + 空白盲审沙箱 + 工造司禁改worktrees', () => {
@@ -216,9 +233,9 @@ test('3. 双隔离沙箱 Guard：探索Worktree + 动态只读遗嘱 + 空白盲
     )
     assert.match(String(evalWorks({ name: 'write', arguments: { file_path: path.join(wt1, 'cand.py') } })), /严禁修改探索者分支工作树/)
 
-    // 3.4 纯 DB 角色：拒一切原生工具，放行 31 窄工具
+    // 3.4 纯 DB 角色：拒一切原生工具，放行窄工具
     const evalLog = createSandboxCallEvaluator({ role: 'logistics_coordinator', workspaceRoot: ws })
-    assert.match(String(evalLog({ name: 'read', arguments: { file_path: path.join(ws, 'a.txt') } })), /0 原生工具/)
+    assert.match(String(evalLog({ name: 'read', arguments: { file_path: path.join(ws, 'a.txt') } })), /物理零原生工具/)
     assert.equal(evalLog({ name: 'triage_node', arguments: {} }), undefined)
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true })
@@ -270,7 +287,7 @@ test('5. GreatwallMcpBridge 分级超时与 Python 31 窄工具实时握手冒�
     assert.equal(bridge.resolveControlTimeoutMs('control_plane/recover_heavy_jobs'), 300_000)
 
     const tools = await bridge.listTools()
-    assert.equal(tools.length, 32)
+    assert.equal(tools.length, 44)
     const snap = await bridge.control('control_plane/schedule_snapshot', {})
     assert.equal(snap?.ok, true)
     assert.equal(snap?.data?.stage, 'STAGE1_PARSE0')
@@ -356,21 +373,22 @@ test('6. pair_lifecycle 单节点同会话伴随暂停续传与 70% 两步清醒
       },
     }
 
-    // 1) PRE_SPAWN：创建伴随并保活
+    // 1) PRE_SPAWN：v0.3 采用确定性会话 ID gw-comp-<node_id> 短事务落看板并释放内存句柄（后续原生 resume 唤醒）
     const compPre = await runPreSpawnBriefingWithCompanion(fakeOrch, node)
-    assert.ok(fakeOrch._nodeCompanionSessions.has(node.node_id))
+    assert.equal(compPre.sessionId, `gw-comp-${node.node_id}`)
+    assert.equal(fakeOrch._nodeCompanionSessions.has(node.node_id), false, 'PRE_SPAWN 完成后不常驻内存，按需 resume 唤醒')
 
-    // 2) 探索 -> 37% 续传同一个伴随 -> 70% 探索者切只读亲笔遗嘱 -> 续传同一个伴随交接 -> 彻底销毁伴随
+    // 2) 探索 -> 37% 按同一确定性 ID 唤醒伴随 -> 70% 探索者切只读亲笔遗嘱 -> 再次按同一 ID 唤醒伴随交接 -> 彻底清空句柄
     await driveExplorerCompanionPair(fakeOrch, node, { goal_and_completion_md: '# Goal' }, 'exp_sid_1')
 
     const compSpawns = events.filter((e) => e.type === 'spawn' && e.role === 'lineage_companion')
     const compContinues = events.filter((e) => e.type === 'continue' && e.role === 'lineage_companion')
-    assert.equal(compSpawns.length, 1, '同节点 PRE_SPAWN -> 37% -> 70% 应仅启动 1 个伴随会话')
+    assert.ok(compSpawns.length >= 2, '同节点 PRE_SPAWN -> 37% -> 70% 应按需触发确定性会话唤醒')
+    assert.ok(compSpawns.every((e) => e.sid === compPre.sessionId), '所有伴随唤醒必须复用同一确定性 gw-comp-<node_id>')
     assert.ok(compContinues.every((e) => e.sid === compPre.sessionId), '所有续传必须命中同一个伴随 sessionId')
     assert.equal(readonlyStates.get('exp_sid_1'), true, '70% 收官前探索者必须被动态置为只读态')
     assert.equal(fakeOrch._nodeCompanionSessions.has(node.node_id), false, '节点结束后伴随句柄必须清空，严禁跨代常驻')
     assert.ok(disposedIds.some((d) => d.sid === compPre.sessionId), '伴随必须被显式 dispose')
-    assert.equal(fakeOrch._handoffsSinceHeartbeat, 1)
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true })
   }
@@ -508,7 +526,7 @@ test('8. 无阈值绝不跳过 37% 提前交接 + 70% 只读禁写/评测 MCP + 
     await driveExplorerCompanionPair(fakeOrch, node, { goal_and_completion_md: '# Goal' }, 'exp_noshortcut')
 
     assert.ok(receivedTaskCtx.includes('BRIEF_BODY_MARKER'), '探索者上下文必须包含五段看板正文')
-    assert.ok(receivedTaskCtx.includes('EXPLORATION: 测试五车道透传'), '探索者上下文必须包含五车道指令')
+    assert.ok(receivedTaskCtx.includes('handback_to_chief'), '探索者上下文必须包含 v0.3 越界退回总控守则')
     assert.ok(sequence.indexOf('explorer:turn2:hit_37') > sequence.indexOf('explorer:turn1:no_threshold'), '首轮无阈值必须续推，不可跳过 37%')
     assert.ok(sequence.indexOf('setReadonly:true') > sequence.indexOf('explorer:turn3:hit_70'), '必须触达 70% 后才切只读收官')
     const persistWill = persistedCalls.find((c) => c.method === 'control_plane/record_pending_handoff')
@@ -1189,9 +1207,9 @@ test('22. 子会话自动继承父会话 permissionPresets / sandbox/mode（根�
 })
 
 test('23. 单源 Preset 100%对齐 complete:false + RC5 native executor + AgentSessionHost 白名单防全局污染', async () => {
-  // 1) 单源 cordis.patch.yml 派生的 6 套声明式 Preset
+  // 1) 单源 cordis.patch.yml 派生的 8 套声明式 Preset
   const defs = buildDeclarativePresetConfigs('win32')
-  assert.equal(defs.length, 6)
+  assert.equal(defs.length, 8)
   for (const def of defs) {
     const persona = def.plugins.find((p) => p.id === 'persona')
     assert.equal(persona?.config?.complete, false, `${def.id} declarative persona 必须为 complete:false`)
@@ -1380,8 +1398,8 @@ test('26. GreatwallMcpBridge.describeContracts 实时握手与 Node 静态契约
   })
   try {
     const snap1 = await bridge.describeContracts()
-    const pyAll = Object.values(snap1.role_mcp_tools || {}).flat().sort()
-    assert.equal(snap1.tool_count, 32)
+    const pyAll = [...new Set(Object.values(snap1.role_mcp_tools || {}).flat())].sort()
+    assert.equal(snap1.tool_count, 44)
     assert.deepEqual(pyAll, [...ALL_MCP_TOOLS].sort())
     assert.deepEqual([...snap1.readonly_blocked_mcp_tools].sort(), [...READONLY_BLOCKED_MCP_TOOLS].sort())
     assert.deepEqual([...snap1.long_running_mcp_tools].sort(), [...LONG_RUNNING_MCP_TOOLS].sort())
@@ -1463,18 +1481,18 @@ test('27. Phase 1 真解耦验证：纯 Fake DispatchRuntimePort 脱离真实宿
   assert.equal(r2.dispatched, true)
   assert.deepEqual(launchedExplorers, ['n_fake_1'])
 
-  // 3) Stage 3 终签派发
+  // 3) Stage 3 终签派发（v0.3 裁决 3：由 library_verifier 对不可变冻结目录一步终签，取消旧 supervisory 二次签发）
   const r3 = dispatchStage3Step(
     makeFakePort(),
     {
-      stage3_supervisory_sign_pending: true,
-      closure_state: { latest_delivery_id: 'deliv_001' },
+      stage3_final_audit_pending: true,
+      closure_state: { status: 'DELIVERY_EXPORTED', latest_delivery_id: 'deliv_001' },
     },
     sig,
   )
   assert.equal(r3.handled, true)
   assert.equal(r3.dispatched, true)
-  assert.ok(launchedGov.includes('stage3:sign:deliv_001'))
+  assert.ok(launchedGov.includes('stage3:final_audit:deliv_001'))
 })
 
 test('28. Phase 1 正本清源：真接线 Config 过滤、控制服务并发互斥与插件卸载全清理', async () => {
@@ -1635,7 +1653,7 @@ test('30. Phase 2A+2B Bridge spawn error 防崩、AbortSignal 真取消与工具
   }
 })
 
-test('31. Phase 2B RC5 严格 JSON Schema 适配：遍历全量 32 工具 100% 合规 + 重叠联合 Fail-Closed', async () => {
+test('31. Phase 2B RC5 严格 JSON Schema 适配：遍历全量 44 工具 100% 合规 + 重叠联合 Fail-Closed', async () => {
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_p2_schema_'))
   const bridge = new GreatwallMcpBridge({
     corePythonRoot: CORE_PYTHON_ROOT,
@@ -1674,7 +1692,7 @@ test('31. Phase 2B RC5 严格 JSON Schema 适配：遍历全量 32 工具 100% �
 
   try {
     const tools = await bridge.listTools()
-    assert.equal(tools.length, 32)
+    assert.equal(tools.length, 44)
     for (const t of tools) {
       const adapted = normalizeSchemaForDsh(t.inputSchema, { toolName: t.name })
       assertRc5StrictSchema(adapted, t.name)

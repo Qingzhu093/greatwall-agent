@@ -6,7 +6,7 @@
  *    保障纯数学推导与零仪器探索节点同样准时获得 37% 诊断反思与内藏解锁；
  * 2. `pct >= 0.70` 触发 `HANDOFF_70`，进入探索者只读亲笔遗嘱 + 伴随单写交接两步闭环；
  * 3. `submit_stage1_blind_ledger` 在 `REVISE` 或 `REFUTED` 时立刻 `exec.concludeTurn()`，
- *    `PASS` 时保留回合继续解盲执行 Stage 2。
+ *    `PASS` 或 `PARTIAL_PASS` 时保留回合继续解盲执行 Stage 2。
  * @module dsh-greatwall-v6up/clock_and_turn_gap
  */
 import { TURN_CONCLUDING_TOOLS } from './prompts.js'

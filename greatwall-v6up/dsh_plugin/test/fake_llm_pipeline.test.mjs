@@ -283,21 +283,8 @@ test('L2 剧本 1：零费用假模型全链路沙盘（272k 自适应窗口 + �
         return '已确认无初始仪器需求，Stage 1 核查完成。'
       }
 
-      // 2) 图书馆采编：Stage 1 建外藏 [R001] / Stage 3 导出五件套
-      if (sid.startsWith('gw_library_surveyor_')) {
-        if (api.promptText.includes('export_stage3_final_delivery')) {
-          const reqs = await api.callTool('get_survey_requests', { question_id: 'ALL' })
-          const l3s = (reqs?.data?.stage3_synthesis_bundle?.l3_verified || []).map((x) => x.entry_id)
-          const exp = await api.callTool('export_stage3_final_delivery', {
-            delivery_mode: 'FULL',
-            formal_paper_md: '# 最小覆盖圆上界完整证明报告\n\n基于经独立空白沙箱实测核验的定理 L3-001，我们在欧氏平面任意有限点集上严格证明了 Jung 上界并附带可复现验证脚本。\n',
-            selected_l3_ids_by_question: { Q1: l3s },
-            remaining_gaps_by_question: { Q1: '无剩余断点，Q1 已全部闭合。' },
-            reproduction_candidate_nodes: [createdNodeId],
-          })
-          assert.equal(exp.ok, true, JSON.stringify(exp))
-          return 'Stage 3 五件套已导出。'
-        }
+      // 2a) 对外文献采编：Stage 1 建外藏 [R001]
+      if (sid.startsWith('gw_external_surveyor_')) {
         const pub = await api.callTool('publish_external_literature_card', {
           outcome: 'CARD_PUBLISHED',
           ref_id: 'R001',
@@ -312,6 +299,20 @@ test('L2 剧本 1：零费用假模型全链路沙盘（272k 自适应窗口 + �
         })
         assert.equal(pub.ok, true, JSON.stringify(pub))
         return '外藏卡 R001 已入库。'
+      }
+
+      // 2b) 对内综述与终稿官：Stage 3 导出五件套与外部不可变冻结目录
+      if (sid.startsWith('gw_library_chronicler_')) {
+        const l3s = ['L3-001']
+        const exp = await api.callTool('export_stage3_final_delivery', {
+          delivery_mode: 'FULL',
+          formal_paper_md: '# 最小覆盖圆上界完整证明报告\n\n基于经独立空白沙箱实测核验的定理 L3-001，我们在欧氏平面任意有限点集上严格证明了 Jung 上界并附带可复现验证脚本。\n',
+          selected_l3_ids_by_question: { Q1: l3s },
+          remaining_gaps_by_question: { Q1: '无剩余断点，Q1 已全部闭合。' },
+          reproduction_candidate_nodes: [createdNodeId],
+        })
+        assert.equal(exp.ok, true, JSON.stringify(exp))
+        return 'Stage 3 五件套已导出并冻结。'
       }
 
       // 3) 后勤总管：Stage 1 开枝 / Stage 2 分诊送盲审
@@ -377,8 +378,8 @@ test('L2 剧本 1：零费用假模型全链路沙盘（272k 自适应窗口 + �
         return '监察委记录完成。'
       }
 
-      // 5) 单节点同会话伴随：PRE_SPAWN -> REFLECT_37 -> HANDOFF_70
-      if (sid.startsWith('gw_comp_')) {
+      // 5) 单节点确定性会话 ID 伴随：PRE_SPAWN -> REFLECT_37 -> HANDOFF_70
+      if (sid.startsWith('gw-comp-') || sid.startsWith('gw_comp_')) {
         auditTrail.companionSessionIds.add(sid)
         if (api.promptText.includes('阶段 PRE_SPAWN')) {
           await api.callTool('get_companion_context', { branch_id: createdBranchId, node_id: createdNodeId, mode: 'PRE_SPAWN' })
@@ -433,7 +434,7 @@ test('L2 剧本 1：零费用假模型全链路沙盘（272k 自适应窗口 + �
       }
 
       // 6) 探索者：验证公开 inputs/ 可读 + _hidden 越界被拦 + 272k 窗口 37% -> 70% + 70% 只读禁写
-      if (sid.startsWith('gw_exp_')) {
+      if (sid.startsWith('gw-exp-') || sid.startsWith('gw_exp_')) {
         if (api.promptText.includes('70% 清醒收官')) {
           // 实测 70% 只读态尝试写文件被真实沙箱 Guard 拦截！
           const badW = await api.callTool('write', { file_path: path.join(api.cwd, 'forbidden_edit.py'), content: 'x=1' })
@@ -474,9 +475,9 @@ test('L2 剧本 1：零费用假模型全链路沙盘（272k 自适应窗口 + �
         return '已推进至 70.2% (191k/272k)，准备清醒收官。'
       }
 
-      // 7) 图书馆盲审官：空白沙箱 Stage 1 + Stage 2 与 Stage 3 终核
-      if (sid.startsWith('gw_ver_')) {
-        if (api.promptText.includes('Stage 3 终稿独立核验')) {
+      // 7) 图书馆盲审官：空白沙箱 Stage 1 + Stage 2 与 Stage 3 一步原子终签
+      if (sid.startsWith('gw_ver_') || sid.startsWith('gw_library_verifier_')) {
+        if (api.promptText.includes('STAGE3_FINAL_AUDIT:')) {
           const m = api.promptText.match(/STAGE3_FINAL_AUDIT:[a-zA-Z0-9_-]+/)
           const auditRevId = m ? m[0] : ''
           const ub = await api.callTool('get_unblinded_manuscript_and_peers', { review_id: auditRevId })
@@ -660,7 +661,7 @@ test('L2 剧本 2：第五轮全故障回归（缺绑定拒启、无解查新不
       modelWindow: 272_000,
       async onAgentTurn(api) {
         const sid = api.sessionId
-        if (sid.startsWith('gw_library_surveyor_')) {
+        if (sid.startsWith('gw_external_surveyor_')) {
           surveyorRuns += 1
           const res = await api.callTool('publish_external_literature_card', {
             outcome: 'UNAVAILABLE_REPORT',
@@ -698,16 +699,17 @@ test('L2 剧本 2：第五轮全故障回归（缺绑定拒启、无解查新不
           }
           return '后勤分诊完成'
         }
-        if (sid.startsWith('gw_exp_')) {
+        if (sid.startsWith('gw-exp-') || sid.startsWith('gw_exp_')) {
           expTurns += 1
           if (expTurns === 1 && orchRef) {
-            // 探索者刚跑完第 1 轮，控制面执行确定性 pause -> 放补充裁决 -> abortNode -> resume！
+            // 探索者刚跑完第 1 轮，控制面执行确定性 pause -> 放补充裁决草稿 -> abortNode -> resume（裁决 4：只读检测草稿、绝不静默升版）！
             orchRef.pauseBackground()
             fs.mkdirSync(path.join(ws, 'rulings'), { recursive: true })
             fs.writeFileSync(path.join(ws, 'rulings', 'ruling_v1.md'), '# 补充裁决 v1\n请改用新约束。\n', 'utf8')
             await orchRef.abortNode(nid, 'SWITCH_TO_RULING_V1')
             assert.equal(api.isCancelled(), true, 'abortNode 应向 DSH 发送有效取消原因')
-            await orchRef.resumeBackground()
+            const resumeRes = await orchRef.resumeBackground()
+            assert.equal(resumeRes?.draftNotice?.unapproved_draft_detected, true, 'resume 应只读提示未审批磁盘草稿')
             resumedAfterAbort = true
           }
           return '探索者一轮结束'
@@ -744,7 +746,7 @@ test('L2 剧本 2：第五轮全故障回归（缺绑定拒启、无解查新不
     assert.equal(st.snapshot.open_works_tickets.length, 1, '健康工单已结案，仅剩卡死工单留在 OPEN 且已被单条熔断')
     assert.ok(st.circuitBrokenItems.some((b) => b.key.startsWith('works:ticket:')), '控制面状态必须显式暴露单待办熔断告警')
     assert.equal(expTurns, 1, 'abortNode 后在线探索者必须在下轮前立刻退槽，严禁僵尸续推！')
-    assert.equal(st.latestSpecRevision, 1, 'resume 必须自动检测到 rulings/ 新增文档并递增 latest_spec_revision=1')
+    assert.equal(st.latestSpecRevision, 0, '裁决 4：未审批的磁盘 rulings 草稿绝不得静默自动升版')
 
     await orch.disposeAll()
   } finally {

@@ -28,7 +28,9 @@ from .snapshot_queries import (
     fetch_l3_counts_by_question,
     fetch_parse0_subquestions_and_order,
     fetch_snapshot_queues_and_tables,
+    fetch_subproblem_states,
     fetch_topology_raw_data,
+    fetch_v03_queues,
 )
 
 
@@ -401,10 +403,10 @@ def schedule_control_plane_snapshot(
     stage1_works_checked = bool(int(p0.get("stage1_works_checked") or 0)) if p0 else False
     latest_spec_revision = int(p0.get("latest_spec_revision") or 0) if p0 else 0
     latest_ruling_summary_md = str(p0.get("latest_ruling_summary_md") or "") if p0 else ""
+    autonomy_mode = str(p0.get("autonomy_mode") or "WAVE_CONFIRM") if p0 else "WAVE_CONFIRM"
     missing_initial_instruments = compute_missing_initial_instruments(conn) if p0 else []
     goal_md = str(p0["goal_and_completion_md"] or "") if p0 else ""
     stage = str(p0["stage"]) if p0 else "STAGE1_PARSE0"
-    non_l1 = int(p0["consecutive_non_l1_handoffs"] or 0) if p0 else 0
     has_parse0_signed = bool(p0 and str(p0["human_signed_at"] or "").strip() and goal_md.strip())
 
     closure_state = fetch_closure_state_row(conn) or {
@@ -413,9 +415,12 @@ def schedule_control_plane_snapshot(
         "human_stop_requested_at": None,
         "latest_delivery_id": None,
         "latest_delivery_sha256": None,
+        "frozen_delivery_dir_abs_path": "",
     }
     human_stop_active = bool(closure_state.get("human_stop_requested_at"))
     order_status = get_question_order_status(conn)
+    subproblem_states = fetch_subproblem_states(conn)
+    v03_q = fetch_v03_queues(conn)
 
     qdata = fetch_snapshot_queues_and_tables(conn)
     awaiting_triage = qdata["awaiting_triage"]
@@ -427,13 +432,27 @@ def schedule_control_plane_snapshot(
     ready_to_run: list[dict[str, Any]] = []
     pending_handoff_nodes: list[dict[str, Any]] = []
     blocked_by_requires: list[dict[str, Any]] = []
+    human_paused_nodes: list[dict[str, Any]] = []
+    early_handoff_nodes: list[dict[str, Any]] = []
 
     for node in active_nodes:
         nid = str(node["node_id"])
         bid = str(node["branch_id"])
         qid = str(node["question_id"])
+        ctrl_st = str(node.get("control_state") or "AUTO_RUNNING")
+        q_state = subproblem_states.get(qid, {})
+        q_dispatch = str(q_state.get("dispatch_state") or "DISPATCHING")
+
         if node.get("pending_handoff_mode"):
             pending_handoff_nodes.append(node)
+            continue
+        if ctrl_st == "EARLY_HANDOFF_READY":
+            early_handoff_nodes.append(node)
+            continue
+        if ctrl_st in ("PAUSE_DRAINING", "HUMAN_ACTIVE") or int(node.get("personal_turn_active") or 0) == 1:
+            human_paused_nodes.append(node)
+            continue
+        if q_dispatch != "DISPATCHING":
             continue
         if bid in triage_locked_branches:
             continue
@@ -491,6 +510,7 @@ def schedule_control_plane_snapshot(
         q for q in req_qs
         if order_status.get(q, {}).get("unlocked", True)
         and order_status.get(q, {}).get("full_goal_l3_count", 0) == 0
+        and str(subproblem_states.get(q, {}).get("dispatch_state") or "DISPATCHING") == "DISPATCHING"
         and q not in in_flight_qs
     ]
 
@@ -510,10 +530,6 @@ def schedule_control_plane_snapshot(
         and bool(latest_did)
         and not verifier_matched
     )
-    stage3_supervisory_sign_pending = (
-        closure_state.get("status") == "DELIVERY_EXPORTED"
-        and verifier_matched
-    )
 
     if human_stop_active:
         closure_gate = check_stage2_closure_gate_data(conn, mode="PARTIAL_ON_HUMAN_STOP", human_aborted=True)
@@ -529,6 +545,7 @@ def schedule_control_plane_snapshot(
     return {
         "initialized": True,
         "stage": stage,
+        "autonomy_mode": autonomy_mode,
         "parse0_signed": has_parse0_signed,
         "stage1_works_checked": stage1_works_checked,
         "initial_instruments": initial_instruments,
@@ -540,6 +557,7 @@ def schedule_control_plane_snapshot(
         "question_order": q_order,
         "shared_inputs_rel_paths": shared_inputs,
         "question_order_status": order_status,
+        "subproblem_states": subproblem_states,
         "questions_needing_branch": questions_needing_branch,
         "understaffed_questions": [] if stop_new_dispatch else understaffed_questions,
         "orphaned_blind_review_revisions": [] if stop_new_dispatch else orphaned_revisions,
@@ -560,16 +578,21 @@ def schedule_control_plane_snapshot(
         "awaiting_triage": awaiting_triage,
         "pending_reviews": blind_reviews,
         "pending_handoff_nodes": pending_handoff_nodes,
+        "early_handoff_nodes": early_handoff_nodes,
+        "human_paused_nodes": human_paused_nodes,
         "explorers_needing_briefing": [] if stop_new_dispatch else need_briefing,
         "explorers_ready_to_run": [] if stop_new_dispatch else ready_to_run[:slot_cap],
         "blocked_by_requires_nodes": blocked_by_requires,
-        "stagnation_triggered": non_l1 >= int(cfg.get("stagnation_consecutive_non_l1_handoffs", 8)),
+        "pending_proposals": v03_q["pending_proposals"],
+        "active_conferences": v03_q["active_conferences"],
+        "open_lemma_gaps": v03_q["open_lemma_gaps"],
+        "living_surveys": v03_q["living_surveys"],
+        "pending_effects_count": v03_q["pending_effects_count"],
         "human_stop_active": human_stop_active,
         "closure_state": closure_state,
         "closure_gate": closure_gate,
         "stage3_revision_pending": stage3_revision_pending,
         "stage3_final_audit_pending": stage3_final_audit_pending,
-        "stage3_supervisory_sign_pending": stage3_supervisory_sign_pending,
     }
 
 
@@ -582,6 +605,7 @@ def uninitialized_schedule_snapshot(max_concurrent_workers: int | None = None) -
     return {
         "initialized": False,
         "stage": "STAGE1_PARSE0",
+        "autonomy_mode": "WAVE_CONFIRM",
         "parse0_signed": False,
         "stage1_works_checked": False,
         "initial_instruments": [],
@@ -593,6 +617,7 @@ def uninitialized_schedule_snapshot(max_concurrent_workers: int | None = None) -
         "question_order": [],
         "shared_inputs_rel_paths": [],
         "question_order_status": {},
+        "subproblem_states": {},
         "questions_needing_branch": [],
         "understaffed_questions": [],
         "orphaned_blind_review_revisions": [],
@@ -613,10 +638,16 @@ def uninitialized_schedule_snapshot(max_concurrent_workers: int | None = None) -
         "awaiting_triage": [],
         "pending_reviews": [],
         "pending_handoff_nodes": [],
+        "early_handoff_nodes": [],
+        "human_paused_nodes": [],
         "explorers_needing_briefing": [],
         "explorers_ready_to_run": [],
         "blocked_by_requires_nodes": [],
-        "stagnation_triggered": False,
+        "pending_proposals": [],
+        "active_conferences": [],
+        "open_lemma_gaps": [],
+        "living_surveys": {},
+        "pending_effects_count": 0,
         "human_stop_active": False,
         "closure_state": {"status": "OPEN"},
         "closure_gate": {
@@ -638,5 +669,4 @@ def uninitialized_schedule_snapshot(max_concurrent_workers: int | None = None) -
         },
         "stage3_revision_pending": False,
         "stage3_final_audit_pending": False,
-        "stage3_supervisory_sign_pending": False,
     }

@@ -1,4 +1,12 @@
-"""长城 V6-Up (v3.0) 中央图书馆·隔离沙箱两阶段盲审与打捞工具（library_verifier 5 个窄工具）。"""
+"""GreatWall v0.3 中央图书馆·独立空白沙箱两阶段盲审与一步终签（library_verifier 5 个窄工具）。
+
+v0.3 核心升级：
+- 裁决 3：Stage 1 新增 `PARTIAL_PASS` 推进至 `STAGE2_UNBLIND`；`ACCEPT_NARROWED` 同事务收编 1 条 L3(PARTIAL_OR_LEMMA) + 1 条 L2_FAILURE_RECORD；
+- 裁决 3：Stage 3 终核通过外部不可变冻结目录验证后，写锁外算哈希、写锁内毫秒级比对一致**一步原子结项**；
+- 裁决 4：子题级 `active_spec_revision` 防连坐判定，在写锁内实时核对避免并发改题漏洞；
+- 裁决 2：`LOCAL_LEMMA_SUBMISSION` 一次性盲审绝不锁死也不修改原分支状态；
+- 支持 `publish_tier`（达标与基线两步分离）、`fulfilled_gap_ids` 核销唤醒、`exploit_ticket_payload` 反作弊发单。
+"""
 
 from __future__ import annotations
 
@@ -8,11 +16,17 @@ import uuid
 from typing import Any
 
 from .control_plane.blind_sandbox import stage_blind_review_sandbox
+from .control_plane.delivery_freeze import finalize_stage3_closure_on_verifier_accept
+from .control_plane.subproblem_locks import (
+    evaluate_subproblem_locks,
+    get_subproblem_active_spec_revision,
+)
 from .db_schema import (
     ALLOWED_CLAIMED_EDGE_TYPES,
     ALLOWED_FINAL_VERDICTS,
     ALLOWED_GOAL_COVERAGES,
     ALLOWED_L3_ENTRY_KINDS,
+    ALLOWED_PUBLISH_TIERS,
     ALLOWED_STAGE1_VERDICTS,
     ERR_CONFLICT,
     ERR_INVALID_INPUT,
@@ -25,30 +39,16 @@ from .db_schema import (
 from .mcp_core_helpers import (
     build_tool_receipt,
     enforce_role_tool_permission,
-    load_runtime_config,
     next_prefixed_id,
 )
-
-
-def _require_non_self_review(
-    session_id: str,
-    proposer_session_id: str,
-    *,
-    conn: sqlite3.Connection | None = None,
-    source_node_id: str = "",
-) -> None:
-    sid = str(session_id or "").strip()
-    if not sid:
-        raise FailClosedError(ERR_CONFLICT, "SELF_REVIEW_FORBIDDEN: 审稿会话缺少合法 session_id，严禁匿名自审！")
-    if sid == str(proposer_session_id or "").strip():
-        raise FailClosedError(ERR_CONFLICT, "SELF_REVIEW_FORBIDDEN: 异会话盲审强拦截，严禁提议/打捞会话自审自己提交的手稿或引理！")
-    if conn is not None and source_node_id:
-        prior = conn.execute(
-            "SELECT 1 FROM epistemic_edges WHERE source_id = ? AND session_id = ? AND edge_track = 'FACT_LOG' LIMIT 1",
-            (source_node_id, sid),
-        ).fetchone()
-        if prior is not None:
-            raise FailClosedError(ERR_CONFLICT, "SELF_REVIEW_FORBIDDEN: 异会话盲审强拦截，严禁曾参与该节点探索或交接的会话自审该节点手稿！")
+from .tools_verifier_helpers import (
+    apply_revise_or_exhaust as _apply_revise_or_exhaust,
+    archive_to_l2_and_seal as _archive_to_l2_and_seal,
+    enqueue_exploit_ticket_if_present,
+    fulfill_open_gaps_and_wake_branches,
+    is_local_lemma_review,
+    require_non_self_review as _require_non_self_review,
+)
 
 
 def tool_get_blind_manuscript(
@@ -58,13 +58,13 @@ def tool_get_blind_manuscript(
     session_id: str,
     review_id: str,
 ) -> dict[str, Any]:
-    """Stage 1 盲态拉取：在独立空白沙箱中仅挂载 A 栏、脱敏代码/证明/反例文件与客观 [Obs###]。"""
+    """Stage 1 盲态拉取：在独立空白沙箱中仅挂载 A 栏、脱敏代码/证明与客观 [Obs###]。"""
     enforce_role_tool_permission(conn, caller_role, "get_blind_manuscript", session_id=session_id)
     rev = conn.execute("SELECT * FROM review_queue WHERE review_id = ?", (review_id,)).fetchone()
     if rev is None:
         raise FailClosedError(ERR_NOT_FOUND, f"盲审单 {review_id!r} 不存在")
     if str(rev["review_status"]) != "STAGE1_BLIND":
-        raise FailClosedError(ERR_LOCKED, f"盲审单 {review_id!r} 当前状态为 {rev['review_status']}，Stage 1 盲态拉取仅限 STAGE1_BLIND")
+        raise FailClosedError(ERR_LOCKED, f"盲审单 {review_id!r} 当前状态为 {rev['review_status']}，Stage 1 仅限 STAGE1_BLIND")
     _require_non_self_review(session_id, str(rev["proposer_session_id"]), conn=conn, source_node_id=str(rev["source_node_id"] or ""))
 
     staged = stage_blind_review_sandbox(conn, workspace_root=workspace_root, review_id=review_id)
@@ -88,12 +88,15 @@ def tool_get_blind_manuscript(
                 }
             )
 
-    rev_spec = int(rev["spec_revision"] or 0) if "spec_revision" in rev.keys() else 0
+    rev_spec = int(rev["spec_revision"] or 0)
     return build_tool_receipt(
         conn=conn,
         tool_name="get_blind_manuscript",
         question_id=str(rev["question_id"]),
-        next_step_guidance=f"请按手稿绑定口径 spec_revision=v{rev_spec} 在独立空白盲审沙箱内实跑验证脚本/SymPy/Lean 4，排查 7 类结构漏洞并填写 Evidence Ledger，调 submit_stage1_blind_ledger。",
+        next_step_guidance=(
+            f"请按手稿绑定口径 spec_revision=v{rev_spec} 在独立空白沙箱实跑检验，排查 7 类结构漏洞并填写 Evidence Ledger；"
+            "若主结论击穿但局部引理严密，可判 PARTIAL_PASS 推进至 Stage 2 降级收编。"
+        ),
         data={
             "review_id": review_id,
             "question_id": str(rev["question_id"]),
@@ -109,105 +112,6 @@ def tool_get_blind_manuscript(
     )
 
 
-def _archive_to_l2_and_seal(
-    conn: sqlite3.Connection,
-    *,
-    rev: sqlite3.Row,
-    l2_category: str,
-    title: str,
-    abstract_md: str,
-    refuted_scope: str,
-    now: str,
-) -> str:
-    entry_id = next_prefixed_id(conn, "internal_research_ledger", "entry_id", "L2-")
-    conn.execute(
-        """
-        INSERT INTO internal_research_ledger(
-            entry_id, question_id, ledger_type, l3_entry_kind, goal_coverage, l2_category,
-            title, abstract_md, exact_verified_scope_md, exact_refuted_scope_md,
-            body_proof_or_code_md, bound_obs_ids_json, verified_review_id, is_active, created_at
-        ) VALUES (?, ?, 'L2_FAILURE_RECORD', NULL, NULL, ?, ?, ?, NULL, ?, ?, ?, ?, 1, ?)
-        """,
-        (
-            entry_id,
-            str(rev["question_id"]),
-            l2_category,
-            title or str(rev["manuscript_title"]),
-            abstract_md or refuted_scope,
-            refuted_scope,
-            str(rev["column_a_snapshot_md"] or ""),
-            str(rev["bound_obs_ids_json"] or "[]"),
-            str(rev["review_id"]),
-            now,
-        ),
-    )
-    conn.execute(
-        "UPDATE lineage_nodes SET node_status = 'SEALED', updated_at = ? WHERE node_id = ?",
-        (now, str(rev["source_node_id"])),
-    )
-    return entry_id
-
-
-def _apply_revise_or_exhaust(
-    conn: sqlite3.Connection,
-    *,
-    rev: sqlite3.Row,
-    revision_items: list[str],
-    reason_text: str,
-    now: str,
-) -> dict[str, Any]:
-    """Stage 1 与 Stage 2 共用唯一 revise_count（<=2 轮退回原分支 ACTIVE_REVISING；第 3 次直入 L2 并置 SEALED）。"""
-    cfg = load_runtime_config()
-    max_revise = int(cfg.get("max_revise_rounds_before_l2", 2))
-    node = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ?", (rev["source_node_id"],)).fetchone()
-    cur_revise = int(node["revise_count"] or 0) if node is not None else 0
-
-    if cur_revise < max_revise and node is not None:
-        new_revise = cur_revise + 1
-        conn.execute(
-            """
-            UPDATE review_queue
-            SET review_status = 'CLOSED_REVISE', final_verdict = 'REVISE',
-                final_locked_at = ?, revision_requests_json = ?, updated_at = ?
-            WHERE review_id = ?
-            """,
-            (now, json.dumps(revision_items, ensure_ascii=False), now, rev["review_id"]),
-        )
-        # 原分支从 PENDING_REVIEW 恢复为 ACTIVE_REVISING（供伴随重写看板置顶高亮异议并返工，期间严禁 Auditor 插手！）
-        conn.execute(
-            """
-            UPDATE lineage_nodes
-            SET node_status = 'ACTIVE_REVISING', revise_count = ?, last_revision_requests_json = ?, updated_at = ?
-            WHERE node_id = ?
-            """,
-            (new_revise, json.dumps(revision_items, ensure_ascii=False), now, node["node_id"]),
-        )
-        # 同时清理该节点的旧看板，强制伴随在返工前按新 REVISE 异议重压缩行前看板
-        conn.execute("DELETE FROM lineage_briefings WHERE node_id = ?", (node["node_id"],))
-        return {"exhausted_to_l2": False, "revise_count": new_revise, "node_status": "ACTIVE_REVISING"}
-
-    # 第 3 次送审仍无法通过：服务端直接结案置 SEALED 并写入 L2(UNRESOLVED_OBJECTION)
-    conn.execute(
-        """
-        UPDATE review_queue
-        SET review_status = 'CLOSED_REFUTED', final_verdict = 'REFUTED',
-            final_locked_at = ?, revision_requests_json = ?, updated_at = ?
-        WHERE review_id = ?
-        """,
-        (now, json.dumps(revision_items, ensure_ascii=False), now, rev["review_id"]),
-    )
-    l2_id = _archive_to_l2_and_seal(
-        conn,
-        rev=rev,
-        l2_category="UNRESOLVED_OBJECTION",
-        title=f"[REVISE超限] {rev['manuscript_title']}",
-        abstract_md=reason_text or "; ".join(revision_items) or "超过最大返工轮次仍未解决审稿异议",
-        refuted_scope=reason_text or "; ".join(revision_items) or "返工超限未解异议",
-        now=now,
-    )
-    return {"exhausted_to_l2": True, "revise_count": cur_revise + 1, "created_l2_id": l2_id, "node_status": "SEALED"}
-
-
 def tool_submit_stage1_blind_ledger(
     conn: sqlite3.Connection,
     caller_role: str,
@@ -218,8 +122,9 @@ def tool_submit_stage1_blind_ledger(
     stage1_verdict: str,
     revision_or_refutation_reason: str | None = None,
     exact_refuted_scope_md: str | None = None,
+    exploit_ticket_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """锁定 Stage 1 不可逆 Evidence Ledger，并按 PASS / REVISE / REFUTED 精准分流。"""
+    """锁定 Stage 1 不可逆 Evidence Ledger，按 PASS / PARTIAL_PASS / REVISE / REFUTED 分流。"""
     enforce_role_tool_permission(conn, caller_role, "submit_stage1_blind_ledger", session_id=session_id)
     rev = conn.execute("SELECT * FROM review_queue WHERE review_id = ?", (review_id,)).fetchone()
     if rev is None:
@@ -243,7 +148,7 @@ def tool_submit_stage1_blind_ledger(
     now = utc_now_iso()
     ledger_json = json.dumps(ledger_items, ensure_ascii=False)
 
-    if sv == "PASS":
+    if sv in ("PASS", "PARTIAL_PASS"):
         with rw_immediate_tx(conn):
             conn.execute(
                 """
@@ -253,12 +158,20 @@ def tool_submit_stage1_blind_ledger(
                 """,
                 (ledger_json, now, now, review_id),
             )
+            exploit_tid = enqueue_exploit_ticket_if_present(
+                conn, question_id=question_id, review_id=review_id, exploit_ticket_payload=exploit_ticket_payload, now=now
+            )
+        msg = (
+            "Stage 1 盲审账本已锁定为 PARTIAL_PASS（主结论有缺口但局部引理严密）！请立即调 get_unblinded_manuscript_and_peers 进入 Stage 2 裁定 ACCEPT_NARROWED 同事务收编 L3+L2。"
+            if sv == "PARTIAL_PASS"
+            else "Stage 1 盲审账本已永久锁定并 PASS！请立即调用 get_unblinded_manuscript_and_peers 进入 Stage 2 解盲横审。"
+        )
         return build_tool_receipt(
             conn=conn,
             tool_name="submit_stage1_blind_ledger",
             question_id=question_id,
-            next_step_guidance="Stage 1 盲审账本已永久锁定并 PASS！请立即调用 get_unblinded_manuscript_and_peers 进入 Stage 2 解盲横审。",
-            data={"review_id": review_id, "stage1_verdict": "PASS", "review_status": "STAGE2_UNBLIND"},
+            next_step_guidance=msg,
+            data={"review_id": review_id, "stage1_verdict": sv, "review_status": "STAGE2_UNBLIND", "exploit_ticket_id": exploit_tid},
         )
 
     if sv == "REVISE":
@@ -271,19 +184,26 @@ def tool_submit_stage1_blind_ledger(
                 (ledger_json, now, now, review_id),
             )
             r_info = _apply_revise_or_exhaust(conn, rev=rev, revision_items=[reason], reason_text=reason, now=now)
+            exploit_tid = enqueue_exploit_ticket_if_present(
+                conn, question_id=question_id, review_id=review_id, exploit_ticket_payload=exploit_ticket_payload, now=now
+            )
         return build_tool_receipt(
             conn=conn,
             tool_name="submit_stage1_blind_ledger",
             question_id=question_id,
             next_step_guidance=(
-                f"Stage 1 判 REVISE 但已满最大返工轮次，已直接归档 L2 ({r_info.get('created_l2_id')}) 并置 SEALED。"
-                if r_info["exhausted_to_l2"]
-                else f"Stage 1 判 REVISE（累计返工 {r_info['revise_count']} 次），已将异议退回原分支切回 ACTIVE_REVISING。"
+                "一次性局部引理盲审未通过，意见已留档，原推进分支不受任何打断。"
+                if r_info.get("local_lemma_one_shot")
+                else (
+                    f"Stage 1 判 REVISE 但已满最大返工轮次，已归档 L2 ({r_info.get('created_l2_id')}) 并置 SEALED。"
+                    if r_info["exhausted_to_l2"]
+                    else f"Stage 1 判 REVISE（累计返工 {r_info['revise_count']} 次），原分支已切回 ACTIVE_REVISING。"
+                )
             ),
-            data={"review_id": review_id, "stage1_verdict": "REVISE", **r_info},
+            data={"review_id": review_id, "stage1_verdict": "REVISE", "exploit_ticket_id": exploit_tid, **r_info},
         )
 
-    # REFUTED 短路直入 L2
+    # REFUTED
     reason = str(revision_or_refutation_reason or "").strip()
     scope_ref = str(exact_refuted_scope_md or "").strip()
     if not reason or not scope_ref:
@@ -306,13 +226,23 @@ def tool_submit_stage1_blind_ledger(
             abstract_md=reason,
             refuted_scope=scope_ref,
             now=now,
+            seal_source_node=not is_local_lemma_review(rev),
+        )
+        exploit_tid = enqueue_exploit_ticket_if_present(
+            conn, question_id=question_id, review_id=review_id, exploit_ticket_payload=exploit_ticket_payload, now=now
         )
     return build_tool_receipt(
         conn=conn,
         tool_name="submit_stage1_blind_ledger",
         question_id=question_id,
-        next_step_guidance=f"Stage 1 实测证伪短路结案，已归档 {l2_id} (REFUTED) 并置分支 SEALED（已解锁 Auditor 异会话打捞）。",
-        data={"review_id": review_id, "stage1_verdict": "REFUTED", "created_l2_id": l2_id, "node_status": "SEALED"},
+        next_step_guidance=f"Stage 1 实测证伪短路结案，已归档 {l2_id} (REFUTED)。",
+        data={
+            "review_id": review_id,
+            "stage1_verdict": "REFUTED",
+            "created_l2_id": l2_id,
+            "node_status": "UNCHANGED" if is_local_lemma_review(rev) else "SEALED",
+            "exploit_ticket_id": exploit_tid,
+        },
     )
 
 
@@ -323,10 +253,9 @@ def tool_get_unblinded_manuscript_and_peers(
     session_id: str,
     review_id: str,
 ) -> dict[str, Any]:
-    """Stage 2 解盲横审拉取，或 Stage 3 终核模式 (`STAGE3_FINAL_AUDIT:<delivery_id>`) 五件套核查。"""
+    """Stage 2 解盲横审拉取（附带本题 OPEN 悬赏缺口与子题生效口径），或 Stage 3 冻结包终核。"""
     enforce_role_tool_permission(conn, caller_role, "get_unblinded_manuscript_and_peers", session_id=session_id)
 
-    # Stage 3 终核模式
     if str(review_id).startswith("STAGE3_FINAL_AUDIT:"):
         target_did = str(review_id).split(":", 1)[1].strip()
         closure = conn.execute("SELECT * FROM project_closure_state WHERE id = 1").fetchone()
@@ -342,7 +271,8 @@ def tool_get_unblinded_manuscript_and_peers(
             dict(r)
             for r in conn.execute(
                 """
-                SELECT entry_id, question_id, l3_entry_kind, goal_coverage, title, exact_verified_scope_md, exact_refuted_scope_md
+                SELECT entry_id, question_id, l3_entry_kind, goal_coverage, verified_spec_revision,
+                       title, exact_verified_scope_md, exact_refuted_scope_md
                 FROM internal_research_ledger
                 WHERE ledger_type = 'L3_VERIFIED' AND is_active = 1
                 ORDER BY question_id, entry_id
@@ -353,12 +283,13 @@ def tool_get_unblinded_manuscript_and_peers(
             conn=conn,
             tool_name="get_unblinded_manuscript_and_peers",
             question_id="ALL",
-            next_step_guidance="请在空白沙箱核查五件套总报告未夸大任何 L3 的 exact_verified_scope_md 且复现脚本一致，然后调 submit_stage2_unblind_verdict 落签 ACCEPT 或 REVISE。",
+            next_step_guidance="请在空白沙箱核查不可变冻结包五件套未夸大任何 L3 边界且复现一致，调 submit_stage2_unblind_verdict(ACCEPT) 将直接一步原子结项。",
             data={
                 "mode": "STAGE3_FINAL_AUDIT",
                 "review_id": review_id,
                 "delivery_id": target_did,
                 "delivery_sha256": str(closure["latest_delivery_sha256"]),
+                "frozen_delivery_dir_abs_path": str(closure["frozen_delivery_dir_abs_path"] or ""),
                 "blind_sandbox_abs_path": staged["sandbox_abs_path"],
                 "staged_files": staged["staged_files"],
                 "verified_l3_scopes": l3_scopes,
@@ -377,7 +308,7 @@ def tool_get_unblinded_manuscript_and_peers(
         dict(r)
         for r in conn.execute(
             """
-            SELECT entry_id, l3_entry_kind, goal_coverage, title, abstract_md, exact_verified_scope_md
+            SELECT entry_id, l3_entry_kind, goal_coverage, publish_tier, verified_spec_revision, title, abstract_md, exact_verified_scope_md
             FROM internal_research_ledger
             WHERE question_id = ? AND ledger_type = 'L3_VERIFIED' AND is_active = 1
             ORDER BY entry_id
@@ -385,18 +316,20 @@ def tool_get_unblinded_manuscript_and_peers(
             (qid,),
         ).fetchall()
     ]
+    open_gaps = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT gap_id, blocked_node_id, formal_statement_md, verification_spec_md FROM open_lemma_gaps WHERE question_id = ? AND status = 'OPEN' ORDER BY created_at ASC",
+            (qid,),
+        ).fetchall()
+    ]
     peer_in_review = [
         dict(r)
         for r in conn.execute(
-            """
-            SELECT review_id, source_type, review_status, manuscript_title
-            FROM review_queue
-            WHERE question_id = ? AND review_id != ? AND review_status IN ('STAGE1_BLIND', 'STAGE2_UNBLIND')
-            """,
+            "SELECT review_id, source_type, review_status, manuscript_title FROM review_queue WHERE question_id = ? AND review_id != ? AND review_status IN ('STAGE1_BLIND', 'STAGE2_UNBLIND')",
             (qid, review_id),
         ).fetchall()
     ]
-    # 参考性 FACT_LOG（明确标注仅作参考，严禁因常规公理缺 READ 边而拒稿）
     fact_reads = [
         dict(r)
         for r in conn.execute(
@@ -412,33 +345,33 @@ def tool_get_unblinded_manuscript_and_peers(
         ).fetchall()
     ]
 
-    p0_rev_row = conn.execute(
-        "SELECT latest_spec_revision, latest_ruling_summary_md FROM parse0_contract WHERE contract_id = 'active'"
-    ).fetchone()
-    latest_spec_rev = int(p0_rev_row["latest_spec_revision"] or 0) if p0_rev_row else 0
+    active_spec_rev = get_subproblem_active_spec_revision(conn, qid)
+    p0_rev_row = conn.execute("SELECT latest_ruling_summary_md FROM parse0_contract WHERE contract_id = 'active'").fetchone()
     latest_ruling_summary = str(p0_rev_row["latest_ruling_summary_md"] or "") if p0_rev_row else ""
-    rev_spec = int(rev["spec_revision"] or 0) if "spec_revision" in rev.keys() else 0
-    spec_outdated = rev_spec < latest_spec_rev
+    rev_spec = int(rev["spec_revision"] or 0)
+    spec_outdated = rev_spec < active_spec_rev
 
     return build_tool_receipt(
         conn=conn,
         tool_name="get_unblinded_manuscript_and_peers",
         question_id=qid,
         next_step_guidance=(
-            f"注意：该手稿绑定旧口径 v{rev_spec} < 最新裁决口径 v{latest_spec_rev}；若成立请标明成立口径（exact_verified_scope_md）且禁标最新 FULL_GOAL！"
+            f"注意：该手稿绑定旧口径 v{rev_spec} < 本子题 {qid} 当前生效口径 v{active_spec_rev}，禁止标为 FULL_GOAL！"
             if spec_outdated
-            else "请结合 B 栏、同题 Cross-Draft 快照与参考性 FACT_LOG，调 submit_stage2_unblind_verdict 下达终审裁决与精确边界。"
+            else f"请结合 B 栏、同题 L3 及 {len(open_gaps)} 条 OPEN 悬赏缺口调 submit_stage2_unblind_verdict 下达终判（若满足任一悬赏请填 fulfilled_gap_ids）。"
         ),
         data={
             "review_id": review_id,
             "question_id": qid,
+            "source_type": str(rev["source_type"]),
             "spec_revision": rev_spec,
-            "latest_spec_revision": latest_spec_rev,
+            "active_spec_revision": active_spec_rev,
             "spec_revision_outdated": spec_outdated,
             "latest_ruling_summary_md": latest_ruling_summary,
             "column_b_snapshot_md": str(rev["column_b_snapshot_md"]),
             "stage1_ledger": json.loads(rev["stage1_ledger_json"] or "[]"),
             "peer_l3_entries": peer_l3,
+            "open_lemma_gaps": open_gaps,
             "peer_in_review": peer_in_review,
             "informational_fact_log_reads": fact_reads,
             "declared_reference_edges": declared_edges,
@@ -454,17 +387,20 @@ def tool_submit_stage2_unblind_verdict(
     final_verdict: str,
     l3_entry_kind: str | None = None,
     goal_coverage: str | None = None,
+    publish_tier: str | None = None,
     is_equivalent_reduction: bool = False,
     title: str = "",
     abstract_md: str = "",
     exact_verified_scope_md: str | None = None,
     exact_refuted_scope_md: str | None = None,
+    narrowed_l2_title: str | None = None,
     revision_requests: list[str] | None = None,
     cross_draft_comparison_notes: str = "",
-    cross_pollinate_nomination: dict[str, Any] | None = None,
+    fulfilled_gap_ids: list[str] | None = None,
+    exploit_ticket_payload: dict[str, Any] | None = None,
     edge_type_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Stage 2 三态终判（及 Stage 3 终核落签 `STAGE3_FINAL_AUDIT:<delivery_id>`）。"""
+    """Stage 2 终判与 Stage 3 不可变冻结目录一步原子终签。"""
     enforce_role_tool_permission(conn, caller_role, "submit_stage2_unblind_verdict", session_id=session_id)
     fv = str(final_verdict or "").strip().upper()
     if fv not in ALLOWED_FINAL_VERDICTS:
@@ -472,71 +408,31 @@ def tool_submit_stage2_unblind_verdict(
 
     now = utc_now_iso()
 
-    # 分支 1：Stage 3 绑定版本终核模式（防“审 A 放 B”——核对与落签严格处于同一单写者事务与版本条件内）
+    # 分支 1：Stage 3 不可变冻结目录一步原子终签（裁决 3）
     if str(review_id).startswith("STAGE3_FINAL_AUDIT:"):
         target_did = str(review_id).split(":", 1)[1].strip()
         if fv in ("ACCEPT", "ACCEPT_NARROWED"):
-            with rw_immediate_tx(conn):
-                closure = conn.execute("SELECT * FROM project_closure_state WHERE id = 1").fetchone()
-                if closure is None or str(closure["status"]) != "DELIVERY_EXPORTED":
-                    raise FailClosedError(ERR_LOCKED, "当前项目不处于 DELIVERY_EXPORTED 状态")
-                latest_did = str(closure["latest_delivery_id"] or "")
-                latest_sha = str(closure["latest_delivery_sha256"] or "")
-                if not target_did or target_did != latest_did:
-                    raise FailClosedError(
-                        ERR_CONFLICT,
-                        f"终核落签拦截：审定版本 {target_did!r} != 当前最新导出版本 {latest_did!r}（已过期）",
-                    )
-                cur = conn.execute(
-                    """
-                    UPDATE project_closure_state
-                    SET verifier_audited_delivery_id = ?,
-                        verifier_audited_delivery_sha256 = ?,
-                        verifier_final_audit_passed = 1,
-                        updated_at = ?
-                    WHERE id = 1
-                      AND status = 'DELIVERY_EXPORTED'
-                      AND latest_delivery_id = ?
-                      AND latest_delivery_sha256 = ?
-                    """,
-                    (target_did, latest_sha, now, target_did, latest_sha),
-                )
-                if cur.rowcount != 1:
-                    raise FailClosedError(ERR_CONFLICT, f"终核落签版本冲突：{target_did!r} 已被新交付版本覆盖")
+            closed = finalize_stage3_closure_on_verifier_accept(conn, target_delivery_id=target_did)
             return build_tool_receipt(
                 conn=conn,
                 tool_name="submit_stage2_unblind_verdict",
                 question_id="ALL",
-                next_step_guidance=f"五件套版本 {target_did} 已通过盲审终核绑定落签！现可由 supervisory_committee 签发 CLOSURE_GATE(PASSED) 晋升 CLOSED_VERIFIED。",
-                data={
-                    "mode": "STAGE3_FINAL_AUDIT",
-                    "delivery_id": target_did,
-                    "delivery_sha256": latest_sha,
-                    "verifier_final_audit_passed": True,
-                },
+                next_step_guidance=f"五件套冻结包 {target_did} 已通过终核并原子结项（CLOSED_VERIFIED），全卷子题已置 CLOSED！",
+                data={"mode": "STAGE3_FINAL_AUDIT", **closed},
             )
-        # REVISE / REFUTED 退回馆员修正并重导：同样在单写者事务内绑定 target_did 条件更新
         rev_notes = "; ".join(str(x) for x in (revision_requests or []) if str(x).strip()) or str(abstract_md or "请修正边界表述与复现一致性")
         with rw_immediate_tx(conn):
             closure = conn.execute("SELECT * FROM project_closure_state WHERE id = 1").fetchone()
             if closure is None or str(closure["status"]) != "DELIVERY_EXPORTED":
                 raise FailClosedError(ERR_LOCKED, "当前项目不处于 DELIVERY_EXPORTED 状态")
-            latest_did = str(closure["latest_delivery_id"] or "")
-            if not target_did or target_did != latest_did:
-                raise FailClosedError(
-                    ERR_CONFLICT,
-                    f"终核退修拦截：审定版本 {target_did!r} != 当前最新导出版本 {latest_did!r}（已过期）",
-                )
+            if not target_did or target_did != str(closure["latest_delivery_id"] or ""):
+                raise FailClosedError(ERR_CONFLICT, f"终核退修拦截：审定版本 {target_did!r} != 当前最新版本 {closure['latest_delivery_id']!r}")
             cur = conn.execute(
                 """
                 UPDATE project_closure_state
-                SET status = 'REVISION_REQUESTED',
-                    verifier_final_audit_passed = 0,
-                    verifier_revision_notes = ?,
-                    updated_at = ?
-                WHERE id = 1
-                  AND status = 'DELIVERY_EXPORTED'
-                  AND latest_delivery_id = ?
+                SET status = 'REVISION_REQUESTED', verifier_final_audit_passed = 0,
+                    verifier_revision_notes = ?, updated_at = ?
+                WHERE id = 1 AND status = 'DELIVERY_EXPORTED' AND latest_delivery_id = ?
                 """,
                 (rev_notes[:2000], now, target_did),
             )
@@ -546,7 +442,7 @@ def tool_submit_stage2_unblind_verdict(
             conn=conn,
             tool_name="submit_stage2_unblind_verdict",
             question_id="ALL",
-            next_step_guidance="终核发现边界夸大或复现不一致，已置为 REVISION_REQUESTED 派回 library_surveyor 修正并重新导出新版本五件套。",
+            next_step_guidance="终核退修已置为 REVISION_REQUESTED，派回 library_chronicler 修正并重导新版本冻结包。",
             data={
                 "mode": "STAGE3_FINAL_AUDIT",
                 "delivery_id": target_did,
@@ -564,26 +460,29 @@ def tool_submit_stage2_unblind_verdict(
         raise FailClosedError(ERR_LOCKED, f"审稿单 {review_id!r} 未处于 STAGE2_UNBLIND，不可下达终判")
     _require_non_self_review(session_id, str(rev["proposer_session_id"]), conn=conn, source_node_id=str(rev["source_node_id"] or ""))
 
-    # 由服务端权威从 review_queue 派生 question_id（杜绝串题入库）
     qid = str(rev["question_id"])
     bound_obs = json.loads(rev["bound_obs_ids_json"] or "[]")
+    local_lemma = is_local_lemma_review(rev)
 
     if fv == "REVISE":
         req_items = [str(x).strip() for x in (revision_requests or []) if str(x).strip()]
         if not req_items:
-            raise FailClosedError(ERR_INVALID_INPUT, "Stage 2 判 REVISE 必须提供非空 revision_requests 具体修改要求")
+            raise FailClosedError(ERR_INVALID_INPUT, "Stage 2 判 REVISE 必须提供非空 revision_requests")
         with rw_immediate_tx(conn):
             r_info = _apply_revise_or_exhaust(conn, rev=rev, revision_items=req_items, reason_text="; ".join(req_items), now=now)
+            exploit_tid = enqueue_exploit_ticket_if_present(
+                conn, question_id=qid, review_id=review_id, exploit_ticket_payload=exploit_ticket_payload, now=now
+            )
         return build_tool_receipt(
             conn=conn,
             tool_name="submit_stage2_unblind_verdict",
             question_id=qid,
             next_step_guidance=(
-                f"Stage 2 判 REVISE 但已满最大返工轮次，已归档 L2 ({r_info.get('created_l2_id')}) 并置 SEALED。"
-                if r_info["exhausted_to_l2"]
-                else f"Stage 2 判 REVISE（累计返工 {r_info['revise_count']} 次），原分支已切回 ACTIVE_REVISING 返工。"
+                "局部引理一次性盲审未通过，意见已留档，原推进分支不受任何打断。"
+                if r_info.get("local_lemma_one_shot")
+                else f"Stage 2 判 REVISE（累计返工 {r_info['revise_count']} 次）。"
             ),
-            data={"review_id": review_id, "final_verdict": "REVISE", **r_info},
+            data={"review_id": review_id, "final_verdict": "REVISE", "exploit_ticket_id": exploit_tid, **r_info},
         )
 
     if fv == "REFUTED":
@@ -592,11 +491,7 @@ def tool_submit_stage2_unblind_verdict(
             raise FailClosedError(ERR_INVALID_INPUT, "Stage 2 判 REFUTED 必须填写 exact_refuted_scope_md")
         with rw_immediate_tx(conn):
             conn.execute(
-                """
-                UPDATE review_queue
-                SET review_status = 'CLOSED_REFUTED', final_verdict = 'REFUTED', final_locked_at = ?, updated_at = ?
-                WHERE review_id = ?
-                """,
+                "UPDATE review_queue SET review_status = 'CLOSED_REFUTED', final_verdict = 'REFUTED', final_locked_at = ?, updated_at = ? WHERE review_id = ?",
                 (now, now, review_id),
             )
             l2_id = _archive_to_l2_and_seal(
@@ -607,53 +502,63 @@ def tool_submit_stage2_unblind_verdict(
                 abstract_md=str(abstract_md or "").strip() or ref_scope,
                 refuted_scope=ref_scope,
                 now=now,
+                seal_source_node=not local_lemma,
+            )
+            exploit_tid = enqueue_exploit_ticket_if_present(
+                conn, question_id=qid, review_id=review_id, exploit_ticket_payload=exploit_ticket_payload, now=now
             )
         return build_tool_receipt(
             conn=conn,
             tool_name="submit_stage2_unblind_verdict",
             question_id=qid,
-            next_step_guidance=f"Stage 2 判 REFUTED，已入库 {l2_id} 并置原分支 SEALED（解锁 Auditor 异会话打捞）。",
-            data={"review_id": review_id, "final_verdict": "REFUTED", "created_l2_id": l2_id},
+            next_step_guidance=f"Stage 2 判 REFUTED，已入库 {l2_id}。",
+            data={"review_id": review_id, "final_verdict": "REFUTED", "created_l2_id": l2_id, "exploit_ticket_id": exploit_tid},
         )
 
-    # ACCEPT / ACCEPT_NARROWED -> 严格写入 L3_VERIFIED
+    # ACCEPT / ACCEPT_NARROWED
     kind_u = str(l3_entry_kind or "").strip().upper()
     cov_u = str(goal_coverage or "").strip().upper()
+    ptier_u = str(publish_tier or "BASELINE_UPDATE").strip().upper()
     if kind_u not in ALLOWED_L3_ENTRY_KINDS:
-        raise FailClosedError(ERR_INVALID_INPUT, f"ACCEPT* 必须提供合法 l3_entry_kind {sorted(ALLOWED_L3_ENTRY_KINDS)}，实收 {l3_entry_kind!r}")
+        raise FailClosedError(ERR_INVALID_INPUT, f"ACCEPT* 必须提供合法 l3_entry_kind {sorted(ALLOWED_L3_ENTRY_KINDS)}")
     if cov_u not in ALLOWED_GOAL_COVERAGES:
-        raise FailClosedError(ERR_INVALID_INPUT, f"ACCEPT* 必须提供合法 goal_coverage {sorted(ALLOWED_GOAL_COVERAGES)}，实收 {goal_coverage!r}")
+        raise FailClosedError(ERR_INVALID_INPUT, f"ACCEPT* 必须提供合法 goal_coverage {sorted(ALLOWED_GOAL_COVERAGES)}")
+    if ptier_u not in ALLOWED_PUBLISH_TIERS:
+        raise FailClosedError(ERR_INVALID_INPUT, f"非法 publish_tier={publish_tier!r}，仅允许 {sorted(ALLOWED_PUBLISH_TIERS)}")
     if (fv == "ACCEPT_NARROWED" or bool(is_equivalent_reduction)) and cov_u == "FULL_GOAL":
         raise FailClosedError(
             ERR_INVALID_INPUT,
-            "防伪完成硬护栏：ACCEPT_NARROWED 缩窄特例或 is_equivalent_reduction=true 伪等价归约严禁标为 FULL_GOAL！请设为 PARTIAL_OR_LEMMA 或 EQUIVALENT_REDUCTION。",
+            "防伪完成硬护栏：ACCEPT_NARROWED 或 is_equivalent_reduction=true 严禁标为 FULL_GOAL！请设为 PARTIAL_OR_LEMMA 或 EQUIVALENT_REDUCTION。",
         )
-    p0_rev_row = conn.execute(
-        "SELECT latest_spec_revision FROM parse0_contract WHERE contract_id = 'active'"
-    ).fetchone()
-    latest_spec_rev = int(p0_rev_row["latest_spec_revision"] or 0) if p0_rev_row else 0
-    rev_spec = int(rev["spec_revision"] or 0) if "spec_revision" in rev.keys() else 0
-    if rev_spec < latest_spec_rev and cov_u == "FULL_GOAL":
-        raise FailClosedError(
-            ERR_INVALID_INPUT,
-            f"版本口径防伪完成硬护栏：该手稿绑定旧口径 spec_revision=v{rev_spec} < 最新公开裁决 v{latest_spec_rev}，禁止标为最新 FULL_GOAL！请在 exact_verified_scope_md 标明成立口径（如 v{rev_spec}）并设为 PARTIAL_OR_LEMMA。",
-        )
+
     clean_title = str(title or "").strip()
     clean_abs = str(abstract_md or "").strip()
     clean_scope = str(exact_verified_scope_md or "").strip()
+    clean_refuted = str(exact_refuted_scope_md or "").strip()
     if not clean_title or len(clean_abs) < 40 or not clean_scope:
         raise FailClosedError(ERR_INVALID_INPUT, "ACCEPT* 必须填写非空 title、>=40 字独立 abstract_md 及 exact_verified_scope_md")
+    if fv == "ACCEPT_NARROWED" and not clean_refuted:
+        raise FailClosedError(ERR_INVALID_INPUT, "ACCEPT_NARROWED 必须提供 exact_refuted_scope_md 以同事务落库主命题失灵边界 L2")
+
+    rev_spec = int(rev["spec_revision"] or 0)
+    created_narrowed_l2_id: str | None = None
+    woken_gaps: list[dict[str, Any]] = []
+    exploit_tid: str | None = None
 
     with rw_immediate_tx(conn):
-        # 1. 处理 edge_type_overrides（升级或调整上游承重前提边）
+        # 裁决 4：在单写者写锁内部实时校验子题级 active_spec_revision（防并发改题与防跨题连坐！）
+        active_spec_rev = get_subproblem_active_spec_revision(conn, qid)
+        if rev_spec < active_spec_rev and cov_u == "FULL_GOAL":
+            raise FailClosedError(
+                ERR_INVALID_INPUT,
+                f"子题口径防伪完成硬护栏：该手稿绑定旧口径 v{rev_spec} < 子题 {qid} 当前生效口径 v{active_spec_rev}，禁止标为 FULL_GOAL！",
+            )
+
         if isinstance(edge_type_overrides, dict):
             for ref_dst, new_etype in edge_type_overrides.items():
                 nt = str(new_etype).strip().upper()
                 if nt not in ALLOWED_CLAIMED_EDGE_TYPES:
-                    raise FailClosedError(
-                        ERR_INVALID_INPUT,
-                        f"edge_type_overrides 包含非法边类型: {new_etype!r}，仅允许 {sorted(ALLOWED_CLAIMED_EDGE_TYPES)}",
-                    )
+                    raise FailClosedError(ERR_INVALID_INPUT, f"edge_type_overrides 包含非法边类型: {new_etype!r}")
                 if bound_obs:
                     oph = ",".join("?" for _ in bound_obs)
                     conn.execute(
@@ -661,25 +566,20 @@ def tool_submit_stage2_unblind_verdict(
                         (nt, str(ref_dst), *bound_obs),
                     )
 
-        # 2. 先锁定审稿单终审状态（供 trg_l3_require_verified_review 触发器放行）
         conn.execute(
-            """
-            UPDATE review_queue
-            SET review_status = 'CLOSED_ACCEPTED', final_verdict = ?, final_locked_at = ?, updated_at = ?
-            WHERE review_id = ?
-            """,
+            "UPDATE review_queue SET review_status = 'CLOSED_ACCEPTED', final_verdict = ?, final_locked_at = ?, updated_at = ? WHERE review_id = ?",
             (fv, now, now, review_id),
         )
 
-        # 3. 剥离作者身份写入 L3_VERIFIED（受 trg_l3_require_verified_review + uq_l3_verified_review 保护）
         entry_id = next_prefixed_id(conn, "internal_research_ledger", "entry_id", "L3-")
         conn.execute(
             """
             INSERT INTO internal_research_ledger(
                 entry_id, question_id, ledger_type, l3_entry_kind, goal_coverage, l2_category,
                 title, abstract_md, exact_verified_scope_md, exact_refuted_scope_md,
-                body_proof_or_code_md, bound_obs_ids_json, verified_review_id, is_active, created_at
-            ) VALUES (?, ?, 'L3_VERIFIED', ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                body_proof_or_code_md, bound_obs_ids_json, verified_review_id,
+                verified_spec_revision, publish_tier, is_active, created_at
+            ) VALUES (?, ?, 'L3_VERIFIED', ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             """,
             (
                 entry_id,
@@ -689,14 +589,29 @@ def tool_submit_stage2_unblind_verdict(
                 clean_title,
                 clean_abs,
                 clean_scope,
-                str(exact_refuted_scope_md or "").strip() or None,
+                clean_refuted or None,
                 str(rev["column_a_snapshot_md"] or ""),
                 json.dumps(bound_obs, ensure_ascii=False),
                 review_id,
+                rev_spec,
+                ptier_u,
                 now,
             ),
         )
-        # 将认证的 REQUIRED_PREMISE 同样绑定到新 L3 条目，以便日后精准级联重审
+
+        # 裁决 3：ACCEPT_NARROWED 同事务追加 1 条 L2_FAILURE_RECORD 忠实记录主命题失灵边界
+        if fv == "ACCEPT_NARROWED" and clean_refuted:
+            created_narrowed_l2_id = _archive_to_l2_and_seal(
+                conn,
+                rev=rev,
+                l2_category="REFUTED",
+                title=str(narrowed_l2_title or "").strip() or f"[缩窄失灵边界] {clean_title}",
+                abstract_md=clean_refuted,
+                refuted_scope=clean_refuted,
+                now=now,
+                seal_source_node=False,
+            )
+
         if isinstance(edge_type_overrides, dict):
             for ref_dst, new_etype in edge_type_overrides.items():
                 nt = str(new_etype).strip().upper()
@@ -708,23 +623,47 @@ def tool_submit_stage2_unblind_verdict(
                     (f"ce_{uuid.uuid4().hex[:12]}", entry_id, str(ref_dst), nt, session_id, now),
                 )
 
+        if not local_lemma:
+            conn.execute("UPDATE lineage_nodes SET node_status = 'SEALED', updated_at = ? WHERE node_id = ?", (now, str(rev["source_node_id"])))
+
+        # 清零无 L3 停滞计数
         conn.execute(
-            "UPDATE lineage_nodes SET node_status = 'SEALED', updated_at = ? WHERE node_id = ?",
-            (now, str(rev["source_node_id"])),
+            "UPDATE subproblem_runtime_state SET completed_nodes_since_last_l3 = 0, updated_at = ? WHERE question_id = ?",
+            (now, qid),
         )
+
+        woken_gaps = fulfill_open_gaps_and_wake_branches(
+            conn, question_id=qid, fulfilled_gap_ids=fulfilled_gap_ids, fulfilled_by_l3_id=entry_id, now=now
+        )
+        exploit_tid = enqueue_exploit_ticket_if_present(
+            conn, question_id=qid, review_id=review_id, exploit_ticket_payload=exploit_ticket_payload, now=now
+        )
+
+    # 锁一即刻停派检查（FULL_GOAL 且匹配子题生效口径时立刻停派同题并入队 DRAIN）
+    lock_eval = evaluate_subproblem_locks(conn, question_id=qid)
 
     return build_tool_receipt(
         conn=conn,
         tool_name="submit_stage2_unblind_verdict",
         question_id=qid,
-        next_step_guidance=f"审稿单 {review_id} 终判 {fv}，已正式入库 {entry_id} ({kind_u} / {cov_u}) 并置原分支 SEALED。",
+        next_step_guidance=(
+            f"审稿单 {review_id} 终判 {fv}，已入库 {entry_id} ({kind_u}/{cov_u}/{ptier_u}, v{rev_spec})"
+            + (f" 与失灵边界 {created_narrowed_l2_id}" if created_narrowed_l2_id else "")
+            + (f"，核销并唤醒 {len(woken_gaps)} 条悬赏缺口" if woken_gaps else "")
+            + "。"
+        ),
         data={
             "review_id": review_id,
             "final_verdict": fv,
             "created_l3_id": entry_id,
+            "created_narrowed_l2_id": created_narrowed_l2_id,
             "l3_entry_kind": kind_u,
             "goal_coverage": cov_u,
-            "cross_pollinate_nomination": cross_pollinate_nomination,
+            "publish_tier": ptier_u,
+            "verified_spec_revision": rev_spec,
+            "fulfilled_gaps": woken_gaps,
+            "exploit_ticket_id": exploit_tid,
+            "subproblem_lock_eval": lock_eval.get("evaluated", []),
         },
     )
 
@@ -741,7 +680,7 @@ def tool_propose_salvaged_lemma(
     column_b_scope_notes_md: str,
     bound_obs_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Auditor 废墟引理打捞：强校验原分支不处于 ACTIVE_REVISING 返工期，生成新 STAGE1_BLIND 交异会话复验。"""
+    """沉船遗产打捞：强校验原分支不处于在研/返工态，生成新 STAGE1_BLIND 交异会话复验。"""
     enforce_role_tool_permission(conn, caller_role, "propose_salvaged_lemma", session_id=session_id)
     node = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ?", (source_node_id,)).fetchone()
     if node is None:
@@ -751,7 +690,7 @@ def tool_propose_salvaged_lemma(
     if str(node["node_status"]) in ("ACTIVE_REVISING", "EXPLORING", "PENDING_REVIEW"):
         raise FailClosedError(
             ERR_LOCKED,
-            f"AUDITOR_SALVAGE_FORBIDDEN: 源节点 {source_node_id!r} 当前处于 {node['node_status']}（严禁在原分支返工/在研期间由 Auditor 插手打捞！）",
+            f"AUDITOR_SALVAGE_FORBIDDEN: 源节点 {source_node_id!r} 当前处于 {node['node_status']}，严禁打捞在研或返工中分支！",
         )
 
     clean_obs = [str(o).strip() for o in (bound_obs_ids or []) if str(o).strip()]
@@ -763,7 +702,7 @@ def tool_propose_salvaged_lemma(
         raise FailClosedError(ERR_INVALID_INPUT, "title 与 column_a_self_contained_proof_md 不能为空")
 
     rev_id = next_prefixed_id(conn, "review_queue", "review_id", "rev_")
-    node_spec = int(node["spec_revision"] or 0) if "spec_revision" in node.keys() else 0
+    node_spec = int(node["spec_revision"] or 0)
     now = utc_now_iso()
     with rw_immediate_tx(conn):
         conn.execute(
@@ -794,7 +733,6 @@ def tool_propose_salvaged_lemma(
         conn=conn,
         tool_name="propose_salvaged_lemma",
         question_id=question_id,
-        next_step_guidance=f"打捞引理已生成独立盲审单 {rev_id}（STAGE1_BLIND），须由另一独立 library_verifier 会话在空白沙箱复验通过后方可入 L3。",
+        next_step_guidance=f"沉船遗产引理已建独立盲审单 {rev_id}（STAGE1_BLIND），须由另一独立 library_verifier 会话在空白沙箱复验通过后入 L3。",
         data={"created_review_id": rev_id, "source_node_id": source_node_id, "review_status": "STAGE1_BLIND"},
     )
-

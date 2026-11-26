@@ -43,17 +43,25 @@ def stage_blind_review_sandbox(
     staged_files: list[str] = []
 
     if str(review_id).startswith("STAGE3_FINAL_AUDIT:"):
-        delivery_dir = Path(os.path.realpath(workspace_root)) / "final_delivery"
-        if delivery_dir.is_dir():
-            dst = sandbox_dir / "final_delivery"
-            shutil.copytree(delivery_dir, dst, dirs_exist_ok=True)
-            for fp in sorted(dst.rglob("*")):
-                if fp.is_file():
-                    staged_files.append(fp.relative_to(sandbox_dir).as_posix())
+        # v0.3 防审A放B：盲审官终核强制只读外部不可变冻结目录 frozen_delivery_dir_abs_path（严禁读工作区可变 final_delivery/）
+        closure = conn.execute("SELECT frozen_delivery_dir_abs_path FROM project_closure_state WHERE id = 1").fetchone()
+        frozen_raw = str(closure["frozen_delivery_dir_abs_path"] or "").strip() if closure else ""
+        src_delivery = Path(frozen_raw) if (frozen_raw and Path(frozen_raw).is_dir()) else None
+        if src_delivery is None:
+            raise FailClosedError(
+                ERR_NOT_FOUND,
+                f"Stage 3 不可变冻结目录不存在 ({frozen_raw!r})，拒绝回退读取可变工作区目录！",
+            )
+        dst = sandbox_dir / "final_delivery"
+        shutil.copytree(src_delivery, dst, dirs_exist_ok=True)
+        for fp in sorted(dst.rglob("*")):
+            if fp.is_file():
+                staged_files.append(fp.relative_to(sandbox_dir).as_posix())
         # 同时导出所有活跃 L3 的原始 exact_verified_scope_md 供核查是否夸大
         l3_rows = conn.execute(
             """
-            SELECT entry_id, question_id, l3_entry_kind, goal_coverage, title, exact_verified_scope_md, exact_refuted_scope_md
+            SELECT entry_id, question_id, l3_entry_kind, goal_coverage, verified_spec_revision,
+                   title, exact_verified_scope_md, exact_refuted_scope_md
             FROM internal_research_ledger
             WHERE ledger_type = 'L3_VERIFIED' AND is_active = 1
             ORDER BY question_id, entry_id
@@ -66,7 +74,7 @@ def stage_blind_review_sandbox(
         )
         staged_files.append("verified_l3_scopes.json")
         _set_tree_readonly(sandbox_dir, True)
-        return {"sandbox_abs_path": str(sandbox_dir), "staged_files": staged_files}
+        return {"sandbox_abs_path": str(sandbox_dir), "staged_files": staged_files, "frozen_source_dir": str(src_delivery)}
 
     rev = conn.execute("SELECT * FROM review_queue WHERE review_id = ?", (review_id,)).fetchone()
     if rev is None:
@@ -87,10 +95,10 @@ def stage_blind_review_sandbox(
     ).fetchone()
     art_rel = str(rev["artifact_rel_path"] or (node["candidate_rel_path"] if node else "") or "").strip()
     if node is not None and art_rel:
-        src_base = Path(str(node["retained_snapshot_abs_path"] or ""))
-        if not src_base.is_dir():
-            src_base = Path(str(node["worktree_abs_path"] or ""))
-        if src_base.is_dir():
+        snap_raw = str(node["retained_snapshot_abs_path"] or "").strip()
+        wt_raw = str(node["worktree_abs_path"] or "").strip()
+        src_base = Path(snap_raw) if (snap_raw and Path(snap_raw).is_dir()) else (Path(wt_raw) if wt_raw else None)
+        if src_base is not None and src_base.is_dir():
             cand_src = src_base / art_rel
             if cand_src.is_file():
                 dst = sandbox_dir / art_rel

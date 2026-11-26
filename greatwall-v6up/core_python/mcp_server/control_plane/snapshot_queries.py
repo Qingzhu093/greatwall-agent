@@ -23,29 +23,84 @@ def fetch_closure_state_row(conn: sqlite3.Connection) -> dict[str, Any] | None:
 
 
 def fetch_l3_counts_by_question(conn: sqlite3.Connection) -> tuple[dict[str, int], dict[str, int]]:
-    full_counts = {
-        str(r["question_id"]): int(r["cnt"] or 0)
-        for r in conn.execute(
-            """
-            SELECT question_id, COUNT(*) AS cnt
-            FROM internal_research_ledger
-            WHERE ledger_type = 'L3_VERIFIED' AND is_active = 1 AND goal_coverage = 'FULL_GOAL'
-            GROUP BY question_id
-            """
-        ).fetchall()
+    """按各子题当前生效口径 `subproblem_runtime_state.active_spec_revision` 统计 FULL_GOAL 与总 L3 数（改 Q1 不连坐 Q2）。"""
+    spec_by_q = {
+        str(r["question_id"]): int(r["active_spec_revision"] or 0)
+        for r in conn.execute("SELECT question_id, active_spec_revision FROM subproblem_runtime_state").fetchall()
     }
-    any_counts = {
-        str(r["question_id"]): int(r["cnt"] or 0)
-        for r in conn.execute(
-            """
-            SELECT question_id, COUNT(*) AS cnt
-            FROM internal_research_ledger
-            WHERE ledger_type = 'L3_VERIFIED' AND is_active = 1
-            GROUP BY question_id
-            """
-        ).fetchall()
-    }
+    p0_row = conn.execute("SELECT latest_spec_revision FROM parse0_contract WHERE contract_id = 'active'").fetchone()
+    fallback_rev = int(p0_row["latest_spec_revision"] or 0) if p0_row else 0
+
+    full_counts: dict[str, int] = {}
+    any_counts: dict[str, int] = {}
+    for r in conn.execute(
+        """
+        SELECT question_id, goal_coverage, verified_spec_revision
+        FROM internal_research_ledger
+        WHERE ledger_type = 'L3_VERIFIED' AND is_active = 1
+        """
+    ).fetchall():
+        q = str(r["question_id"])
+        any_counts[q] = any_counts.get(q, 0) + 1
+        req_rev = spec_by_q.get(q, fallback_rev)
+        if str(r["goal_coverage"] or "") == "FULL_GOAL" and int(r["verified_spec_revision"] or 0) >= req_rev:
+            full_counts[q] = full_counts.get(q, 0) + 1
     return full_counts, any_counts
+
+
+def fetch_subproblem_states(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    return {
+        str(r["question_id"]): dict(r)
+        for r in conn.execute("SELECT * FROM subproblem_runtime_state ORDER BY question_id ASC").fetchall()
+    }
+
+
+def fetch_v03_queues(conn: sqlite3.Connection) -> dict[str, Any]:
+    pending_proposals = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT * FROM control_proposals WHERE status = 'PENDING_HUMAN' ORDER BY created_at ASC"
+        ).fetchall()
+    ]
+    active_conferences = [
+        dict(r)
+        for r in conn.execute(
+            """
+            SELECT * FROM wave_conferences
+            WHERE status NOT IN ('COMPLETED','CANCELLED','EXPIRED','FAILED')
+            ORDER BY created_at ASC
+            """
+        ).fetchall()
+    ]
+    open_lemma_gaps = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT * FROM open_lemma_gaps WHERE status = 'OPEN' ORDER BY question_id, created_at ASC"
+        ).fetchall()
+    ]
+    living_surveys: dict[str, dict[str, Any]] = {}
+    for r in conn.execute(
+        """
+        SELECT s.* FROM subproblem_living_surveys s
+        INNER JOIN (
+            SELECT question_id, MAX(revision) AS max_rev
+            FROM subproblem_living_surveys
+            GROUP BY question_id
+        ) m ON s.question_id = m.question_id AND s.revision = m.max_rev
+        ORDER BY s.question_id ASC
+        """
+    ).fetchall():
+        living_surveys[str(r["question_id"])] = dict(r)
+    pending_effects_count = int(
+        conn.execute("SELECT COUNT(*) AS cnt FROM runtime_effects WHERE status IN ('PENDING','RUNNING')").fetchone()["cnt"] or 0
+    )
+    return {
+        "pending_proposals": pending_proposals,
+        "active_conferences": active_conferences,
+        "open_lemma_gaps": open_lemma_gaps,
+        "living_surveys": living_surveys,
+        "pending_effects_count": pending_effects_count,
+    }
 
 
 def fetch_active_branch_family_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -224,7 +279,10 @@ def fetch_snapshot_queues_and_tables(conn: sqlite3.Connection) -> dict[str, Any]
         dict(r)
         for r in conn.execute(
             """
-            SELECT node_id, question_id, branch_id, family_id, generation, node_status,
+            SELECT node_id, question_id, branch_id, family_id, generation, branch_kind,
+                   protection_generations_left, branch_budget_nodes_left, companion_session_id,
+                   briefing_sealed_at, secondary_donor_node_id, node_status, control_state,
+                   control_generation, personal_turn_active, human_modified, artifact_dirty_since_last_obs,
                    worktree_abs_path, requires_json, premise_revoked, pressure_tokens,
                    effective_context_window, spec_revision,
                    first_reflection_unlocked, last_revision_requests_json, lane_assignment,
