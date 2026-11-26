@@ -59,6 +59,27 @@ class TestV03ReviewRemediation(unittest.TestCase):
             autonomy_mode="WAVE_CONFIRM",
         )
 
+    def test_lock_evaluation_observes_pause_committed_before_writer_lock(self) -> None:
+        self._init_stage2(["Q1"])
+        writer = open_rw_connection(self.paths["db_path"], init_schema=False)
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("UPDATE subproblem_runtime_state SET desired_state='PAUSED' WHERE question_id='Q1'")
+
+            # Commit the pending human request just as evaluation asks for its write lock.
+            def release_writer(statement: str) -> None:
+                if statement == "BEGIN IMMEDIATE":
+                    writer.commit()
+
+            self.conn.set_trace_callback(release_writer)
+            result = cp.evaluate_subproblem_locks(self.conn, question_id="Q1")
+            self.assertEqual(result["evaluated"][0]["dispatch_state"], "PAUSED_HUMAN")
+            row = self.conn.execute("SELECT dispatch_state FROM subproblem_runtime_state WHERE question_id='Q1'").fetchone()
+            self.assertEqual(row["dispatch_state"], "PAUSED_HUMAN")
+        finally:
+            self.conn.set_trace_callback(None)
+            writer.close()
+
     def _register_inst(self, question_id: str = "Q1", inst_id: str = "ver_q1") -> None:
         ev_dir = self.ws / "evaluators"
         cal_dir = self.ws / "_hidden_calibrations"

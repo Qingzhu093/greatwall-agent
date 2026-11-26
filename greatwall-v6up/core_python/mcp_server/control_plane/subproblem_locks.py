@@ -215,19 +215,18 @@ def evaluate_subproblem_locks(
     saturation_reason_md: str = "",
 ) -> dict[str, Any]:
     """独立结算子题三道停工锁并按需投递 DRAIN_AND_STOP_NODE / NOTIFY_CHIEF 副作用。"""
-    if question_id:
-        rows = conn.execute(
-            "SELECT * FROM subproblem_runtime_state WHERE question_id = ?",
-            (str(question_id),),
-        ).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM subproblem_runtime_state ORDER BY question_id ASC").fetchall()
-
-    now = utc_now_iso()
-    now_dt = datetime.now(timezone.utc)
     results: list[dict[str, Any]] = []
 
     with rw_immediate_tx(conn):
+        if question_id:
+            rows = conn.execute(
+                "SELECT * FROM subproblem_runtime_state WHERE question_id = ?",
+                (str(question_id),),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM subproblem_runtime_state ORDER BY question_id ASC").fetchall()
+        now = utc_now_iso()
+        now_dt = datetime.now(timezone.utc)
         for r in rows:
             qid = str(r["question_id"])
             desired = str(r["desired_state"])
