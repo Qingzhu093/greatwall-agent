@@ -22,6 +22,8 @@
               includeRuntimeContext: false
           - id: tool-executor-native
             name: '@deepseek-ai/dsh-tool-executor-native'
+          - id: token-meter
+            name: '@deepseek-ai/dsh-token-meter'
           - id: compaction-basic
             name: '@deepseek-ai/dsh-compaction-basic'
 
