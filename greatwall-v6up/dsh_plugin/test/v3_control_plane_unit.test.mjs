@@ -202,6 +202,7 @@ test('3. 双隔离沙箱 Guard：探索Worktree + 动态只读遗嘱 + 空白盲
     // 切至 70% 只读遗嘱态：立刻阻断写文件与 Shell，仍允许只读
     expReadonly = true
     assert.equal(evalExp({ name: 'read', arguments: { file_path: path.join(wt1, 'cand.py') } }), undefined)
+    assert.match(String(evalExp({ name: 'read', arguments: { filePath: '/etc/passwd' } })), /SANDBOX_VIOLATION/)
     assert.match(String(evalExp({ name: 'write', arguments: { file_path: path.join(wt1, 'cand.py') } })), /只读态/)
     assert.match(String(evalExp({ name: 'pwsh', arguments: { command: 'python cand.py' } })), /只读态/)
 
@@ -271,6 +272,7 @@ test('5. GreatwallMcpBridge 分级超时与 Python 31 窄工具实时握手冒�
   const ws = path.join(tmpRoot, 'ws')
   const dataDir = path.join(tmpRoot, 'data')
   fs.mkdirSync(ws, { recursive: true })
+  assert.equal(new GreatwallMcpBridge({ corePythonRoot: CORE_PYTHON_ROOT }).pythonBin, process.platform === 'win32' ? 'python' : 'python3')
   const bridge = new GreatwallMcpBridge({
     corePythonRoot: CORE_PYTHON_ROOT,
     workspaceRoot: ws,
