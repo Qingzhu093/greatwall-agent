@@ -13,6 +13,7 @@ node_modules/
 
 # Local SQLite DBs, logs, compressed sessions & temp artifacts
 *.db
+!greatwall-v6up/tests/fixtures/*.db
 *.db-wal
 *.db-shm
 *.sqlite
