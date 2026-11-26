@@ -315,7 +315,13 @@ def evaluate_subproblem_locks(
                                 block_detail = saturation_reason_md or "已满最低投入窗且大外环确认明确缺口穷尽，等待人类拍板。"
                                 notify_reason = "PAUSED_SATURATED"
 
-            changed = new_dispatch != prev_dispatch or solved_id != r["solved_entry_id"] or block_code != str(r["block_reason_code"] or "")
+            changed = (
+                new_dispatch != prev_dispatch
+                or solved_id != r["solved_entry_id"]
+                or solved_rev != r["solved_at_spec_revision"]
+                or block_code != str(r["block_reason_code"] or "")
+                or block_detail != str(r["block_detail_md"] or "")
+            )
             new_gen = int(r["dispatch_generation"] or 1) + (1 if new_dispatch != prev_dispatch else 0)
             if changed:
                 conn.execute(
