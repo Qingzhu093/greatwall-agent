@@ -59,6 +59,44 @@ class TestV03ReviewRemediation(unittest.TestCase):
             autonomy_mode="WAVE_CONFIRM",
         )
 
+    def test_lock_evaluation_observes_pause_committed_before_writer_lock(self) -> None:
+        self._init_stage2(["Q1"])
+        writer = open_rw_connection(self.paths["db_path"], init_schema=False)
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("UPDATE subproblem_runtime_state SET desired_state='PAUSED' WHERE question_id='Q1'")
+
+            # Commit the pending human request just as evaluation asks for its write lock.
+            def release_writer(statement: str) -> None:
+                if statement == "BEGIN IMMEDIATE":
+                    writer.commit()
+
+            self.conn.set_trace_callback(release_writer)
+            result = cp.evaluate_subproblem_locks(self.conn, question_id="Q1")
+            self.assertEqual(result["evaluated"][0]["dispatch_state"], "PAUSED_HUMAN")
+            row = self.conn.execute("SELECT dispatch_state FROM subproblem_runtime_state WHERE question_id='Q1'").fetchone()
+            self.assertEqual(row["dispatch_state"], "PAUSED_HUMAN")
+        finally:
+            self.conn.set_trace_callback(None)
+            writer.close()
+
+    def test_budget_pause_refreshes_usage_without_changing_generation(self) -> None:
+        self._init_stage2(["Q1"])
+        self.conn.execute(
+            "UPDATE subproblem_runtime_state SET question_token_budget=100, spent_tokens=100 WHERE question_id='Q1'"
+        )
+        cp.evaluate_subproblem_locks(self.conn, question_id="Q1")
+        query = "SELECT dispatch_generation, block_detail_md FROM subproblem_runtime_state WHERE question_id='Q1'"
+        first = self.conn.execute(query).fetchone()
+        self.conn.execute("UPDATE subproblem_runtime_state SET spent_tokens=125 WHERE question_id='Q1'")
+        second = cp.evaluate_subproblem_locks(self.conn, question_id="Q1")["evaluated"][0]
+        latest = self.conn.execute(query).fetchone()
+        self.assertIn("125", latest["block_detail_md"])
+        self.assertEqual(latest["dispatch_generation"], first["dispatch_generation"])
+        self.assertTrue(second["changed"])
+        repeat = cp.evaluate_subproblem_locks(self.conn, question_id="Q1")["evaluated"][0]
+        self.assertFalse(repeat["changed"])
+
     def _register_inst(self, question_id: str = "Q1", inst_id: str = "ver_q1") -> None:
         ev_dir = self.ws / "evaluators"
         cal_dir = self.ws / "_hidden_calibrations"

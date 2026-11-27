@@ -134,51 +134,60 @@ def set_subproblem_state(
     if ds not in ALLOWED_SUBPROBLEM_DESIRED_STATES:
         raise FailClosedError(ERR_INVALID_INPUT, f"非法 desired_state={desired_state!r}")
 
-    row = conn.execute("SELECT * FROM subproblem_runtime_state WHERE question_id = ?", (qid,)).fetchone()
-    if row is None:
-        raise FailClosedError(ERR_NOT_FOUND, f"子题 {qid!r} 尚未在 subproblem_runtime_state 初始化")
-
-    now = utc_now_iso()
-    new_gen = int(row["dispatch_generation"] or 1) + 1
-    if ds == "CLOSED":
-        new_dispatch = "CLOSED"
-    elif ds == "PAUSED":
-        new_dispatch = "PAUSED_HUMAN"
-    else:
-        solved = find_latest_spec_full_goal_l3(conn, qid, required_spec_revision=int(row["active_spec_revision"] or 0))
-        new_dispatch = "STOPPED_SOLVED" if solved is not None else "DISPATCHING"
-
     with rw_immediate_tx(conn):
+        row = conn.execute("SELECT * FROM subproblem_runtime_state WHERE question_id = ?", (qid,)).fetchone()
+        if row is None:
+            raise FailClosedError(ERR_NOT_FOUND, f"子题 {qid!r} 尚未在 subproblem_runtime_state 初始化")
+
+        new_gen = int(row["dispatch_generation"])
+        now = utc_now_iso()
+        if ds == "ACTIVE":
+            if row["desired_state"] != ds:
+                conn.execute(
+                    "UPDATE subproblem_runtime_state SET desired_state = ?, updated_at = ? WHERE question_id = ?",
+                    (ds, now, qid),
+                )
+            result = evaluate_subproblem_locks(conn, question_id=qid, resume_requested=True)["evaluated"][0]
+            return {
+                "question_id": qid, "desired_state": ds, "dispatch_state": result["dispatch_state"],
+                "dispatch_generation": result["dispatch_generation"], "actor_source": actor_source,
+            }
+
+        new_dispatch = "CLOSED" if ds == "CLOSED" else "PAUSED_HUMAN"
+        if row["desired_state"] == ds and row["dispatch_state"] == new_dispatch:
+            return {
+                "question_id": qid, "desired_state": ds, "dispatch_state": new_dispatch,
+                "dispatch_generation": new_gen, "actor_source": actor_source,
+            }
+        new_gen += 1
         conn.execute(
             """
             UPDATE subproblem_runtime_state
             SET desired_state = ?,
                 dispatch_state = ?,
                 dispatch_generation = ?,
-                block_reason_code = CASE WHEN ? = 'DISPATCHING' THEN '' ELSE block_reason_code END,
-                block_detail_md = CASE WHEN ? = 'DISPATCHING' THEN '' ELSE ? END,
+                block_detail_md = ?,
                 updated_at = ?
             WHERE question_id = ?
             """,
-            (ds, new_dispatch, new_gen, new_dispatch, new_dispatch, str(reason or "")[:600], now, qid),
+            (ds, new_dispatch, new_gen, str(reason or "")[:600], now, qid),
         )
-        if new_dispatch in ("PAUSED_HUMAN", "CLOSED", "STOPPED_SOLVED"):
-            # 为该子题所有在跑探索节点入队优雅停工副作用
-            active_nodes = conn.execute(
-                "SELECT node_id, control_generation FROM lineage_nodes WHERE question_id = ? AND node_status IN ('EXPLORING','ACTIVE_REVISING')",
-                (qid,),
-            ).fetchall()
-            for n in active_nodes:
-                enqueue_runtime_effect(
-                    conn,
-                    effect_key=f"drain:{n['node_id']}:qgen{new_gen}",
-                    kind="DRAIN_AND_STOP_NODE",
-                    target_type="NODE",
-                    target_id=str(n["node_id"]),
-                    target_generation=int(n["control_generation"] or 1),
-                    payload={"question_id": qid, "reason": f"SUBPROBLEM_{new_dispatch}", "grace_sec": int(row["drain_grace_sec"] or 60)},
-                    supersede_older_kinds=("SPAWN_PAIR",),
-                )
+        # 为该子题所有在跑探索节点入队优雅停工副作用
+        active_nodes = conn.execute(
+            "SELECT node_id, control_generation FROM lineage_nodes WHERE question_id = ? AND node_status IN ('EXPLORING','ACTIVE_REVISING')",
+            (qid,),
+        ).fetchall()
+        for n in active_nodes:
+            enqueue_runtime_effect(
+                conn,
+                effect_key=f"drain:{n['node_id']}:qgen{new_gen}",
+                kind="DRAIN_AND_STOP_NODE",
+                target_type="NODE",
+                target_id=str(n["node_id"]),
+                target_generation=int(n["control_generation"] or 1),
+                payload={"question_id": qid, "reason": f"SUBPROBLEM_{new_dispatch}", "grace_sec": int(row["drain_grace_sec"] or 60)},
+                supersede_older_kinds=("SPAWN_PAIR",),
+            )
 
     return {
         "question_id": qid,
@@ -213,21 +222,21 @@ def evaluate_subproblem_locks(
     question_id: str | None = None,
     semantic_saturation_requested: bool = False,
     saturation_reason_md: str = "",
+    resume_requested: bool = False,
 ) -> dict[str, Any]:
     """独立结算子题三道停工锁并按需投递 DRAIN_AND_STOP_NODE / NOTIFY_CHIEF 副作用。"""
-    if question_id:
-        rows = conn.execute(
-            "SELECT * FROM subproblem_runtime_state WHERE question_id = ?",
-            (str(question_id),),
-        ).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM subproblem_runtime_state ORDER BY question_id ASC").fetchall()
-
-    now = utc_now_iso()
-    now_dt = datetime.now(timezone.utc)
     results: list[dict[str, Any]] = []
 
     with rw_immediate_tx(conn):
+        if question_id:
+            rows = conn.execute(
+                "SELECT * FROM subproblem_runtime_state WHERE question_id = ?",
+                (str(question_id),),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM subproblem_runtime_state ORDER BY question_id ASC").fetchall()
+        now = utc_now_iso()
+        now_dt = datetime.now(timezone.utc)
         for r in rows:
             qid = str(r["question_id"])
             desired = str(r["desired_state"])
@@ -239,6 +248,12 @@ def evaluate_subproblem_locks(
             block_code = str(r["block_reason_code"] or "")
             block_detail = str(r["block_detail_md"] or "")
             notify_reason = ""
+
+            if resume_requested and desired == "ACTIVE" and qid == question_id:
+                # Reopen soft pauses, then apply current evidence and hard limits before committing.
+                new_dispatch = "DISPATCHING"
+                block_code = ""
+                block_detail = ""
 
             if desired == "CLOSED":
                 new_dispatch = "CLOSED"
@@ -316,7 +331,13 @@ def evaluate_subproblem_locks(
                                 block_detail = saturation_reason_md or "已满最低投入窗且大外环确认明确缺口穷尽，等待人类拍板。"
                                 notify_reason = "PAUSED_SATURATED"
 
-            changed = new_dispatch != prev_dispatch or solved_id != r["solved_entry_id"] or block_code != str(r["block_reason_code"] or "")
+            changed = (
+                new_dispatch != prev_dispatch
+                or solved_id != r["solved_entry_id"]
+                or solved_rev != r["solved_at_spec_revision"]
+                or block_code != str(r["block_reason_code"] or "")
+                or block_detail != str(r["block_detail_md"] or "")
+            )
             new_gen = int(r["dispatch_generation"] or 1) + (1 if new_dispatch != prev_dispatch else 0)
             if changed:
                 conn.execute(
@@ -372,6 +393,7 @@ def evaluate_subproblem_locks(
                     "question_id": qid,
                     "desired_state": desired,
                     "prev_dispatch_state": prev_dispatch,
+                    "dispatch_generation": new_gen,
                     "dispatch_state": new_dispatch,
                     "active_spec_revision": active_rev,
                     "solved_entry_id": solved_id,

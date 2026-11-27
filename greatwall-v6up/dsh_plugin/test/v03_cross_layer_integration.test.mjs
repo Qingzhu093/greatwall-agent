@@ -427,3 +427,35 @@ test('cross-6 (#15): Stage 1 全部熔断时 dispatchStage1Step 返回 handled:t
     env.cleanup()
   }
 })
+
+for (const scenario of ['重复暂停', '预算耗尽后恢复']) {
+  test(`子题控制：${scenario}`, async () => {
+    const env = makeTempEnv()
+    const bridge = new GreatwallMcpBridge({ corePythonRoot: CORE_PYTHON_ROOT, workspaceRoot: env.ws, dataDir: env.dataDir })
+    const state = async (question_id, desired_state) => {
+      const res = await bridge.control('control_plane/set_subproblem_state', { question_id, desired_state })
+      assert.equal(res.ok, true, JSON.stringify(res))
+      return res.data
+    }
+    try {
+      await setupInitializedWorkspace(bridge, env.ws, { subquestions: ['Q1', 'Q2'], totalBudget: { per_question_token_budget: { Q1: 100 } } })
+      if (scenario === '重复暂停') {
+        const first = await state('Q1', 'PAUSED')
+        const retry = await state('Q1', 'PAUSED')
+        assert.equal(retry.dispatch_state, 'PAUSED_HUMAN')
+        assert.equal(retry.dispatch_generation, first.dispatch_generation)
+        assert.equal((await state('Q1', 'ACTIVE')).dispatch_state, 'DISPATCHING')
+      } else {
+        const usage = await bridge.control('control_plane/record_subproblem_tokens', { question_id: 'Q1', delta_tokens: 100 })
+        assert.equal(usage.ok, true, JSON.stringify(usage))
+        assert.equal((await state('Q1', 'ACTIVE')).dispatch_state, 'PAUSED_BLOCKED')
+        await state('Q1', 'PAUSED')
+        assert.equal((await state('Q1', 'ACTIVE')).dispatch_state, 'PAUSED_BLOCKED')
+        assert.equal((await state('Q2', 'ACTIVE')).dispatch_state, 'DISPATCHING')
+      }
+    } finally {
+      await bridge.dispose()
+      env.cleanup()
+    }
+  })
+}
