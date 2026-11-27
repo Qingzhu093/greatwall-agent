@@ -44,7 +44,7 @@ export class GreatwallMcpBridge {
     this.corePythonRoot = path.resolve(opts.corePythonRoot)
     this.projectRoot = path.dirname(this.corePythonRoot)
     this.workspaceRoot = opts.workspaceRoot ? path.resolve(opts.workspaceRoot) : ''
-    this.pythonBin = opts.pythonBin || process.env.GREATWALL_PYTHON || 'python'
+    this.pythonBin = opts.pythonBin || process.env.GREATWALL_PYTHON || (process.platform === 'win32' ? 'python' : 'python3')
     this.dataDir = opts.dataDir || ''
     this.requestTimeoutMs = Number(opts.requestTimeoutMs ?? 60_000)
     this.longToolTimeoutMs = Number(opts.longToolTimeoutMs ?? 300_000)

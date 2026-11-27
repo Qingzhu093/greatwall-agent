@@ -441,7 +441,7 @@ def _run_stage_a_python(
         except RequestCancelledError:
             raise
         except subprocess.TimeoutExpired:
-            return False, {}, f"候选执行超时（>{timeout_sec:.1f}s）"
+            return False, {"_infra_error": True}, f"Stage A 执行超时（>{timeout_sec:.1f}s），按基础设施错误处理"
         except Exception as exc:
             return False, {"_infra_error": True}, f"Stage A 容器启动异常: {exc}"
 

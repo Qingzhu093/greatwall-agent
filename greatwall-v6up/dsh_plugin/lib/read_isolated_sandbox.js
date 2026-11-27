@@ -77,7 +77,7 @@ export const WRITE_TOOL_NAMES = new Set([
   'replace_file_content', 'multi_replace_file_content', 'str_replace_editor',
 ])
 
-export const PATH_ARG_KEYS = ['file_path', 'path', 'target_file', 'file', 'dir', 'directory', 'cwd', 'workdir', 'workingDirectory', 'target_path']
+export const PATH_ARG_KEYS = ['file_path', 'filePath', 'path', 'target_file', 'targetFile', 'file', 'dir', 'directory', 'cwd', 'workdir', 'workingDirectory', 'target_path', 'targetPath']
 export const SHELL_TOOL_NAMES = new Set(['pwsh', 'bash', 'shell', 'run_command'])
 
 const SHELL_WRITE_RE = /(?:>|>>|\bOut-File\b|\bSet-Content\b|\bAdd-Content\b|\bNew-Item\b|\bRemove-Item\b|\bMove-Item\b|\bCopy-Item\b|\btee\b|\brm\s|\bmv\s|\bcp\s|\btouch\s|\bmkdir\s)/i
@@ -126,9 +126,9 @@ export function isInsideRoot(canonicalTarget, canonicalRoot) {
 export function extractPathValues(args) {
   if (!args || typeof args !== 'object') return []
   const found = []
-  for (const key of PATH_ARG_KEYS) {
-    const val = args[key]
-    if (typeof val === 'string' && val.trim()) found.push(val.trim())
+  const allowedKeys = new Set(PATH_ARG_KEYS.map((key) => key.toLowerCase()))
+  for (const [key, val] of Object.entries(args)) {
+    if (allowedKeys.has(key.toLowerCase()) && typeof val === 'string' && val.trim()) found.push(val.trim())
   }
   return found
 }
