@@ -111,7 +111,7 @@ class TestP0ContractsAndCleanroom(unittest.TestCase):
 
     def test_44_tools_schema_consistency_and_enums(self) -> None:
         defs = mcp.TOOL_DEFINITIONS
-        self.assertEqual(len(defs), 44)
+        self.assertEqual(len(defs), 47)
         def_names = {d["name"] for d in defs}
         self.assertEqual(def_names, set(mcp._TOOL_REGISTRY.keys()))
         self.assertEqual(def_names, set(helpers.ALL_TOOL_NAMES))

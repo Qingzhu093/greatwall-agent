@@ -112,7 +112,8 @@ function buildNextStepGuidance(action, raw = {}) {
 export function projectOrchestrateResultForAgent(rawRes = {}) {
   const raw = rawRes && typeof rawRes === 'object' ? rawRes : {}
   const action = String(raw.action || '')
-  const st = raw.status && typeof raw.status === 'object' ? raw.status : {}
+  // 兼容两种返回形状：`init/start/stop` 将状态放在 `raw.status`，`status` 动作则将字段平铺在 `raw` 顶层
+  const st = raw.status && typeof raw.status === 'object' ? raw.status : raw
   const subList = Array.isArray(st.subproblemStates) ? st.subproblemStates : []
 
   const compactSubproblems = subList.map((q) => ({

@@ -148,6 +148,37 @@ def evaluate_auto_triage_eligibility(
     )
 
 
+from .control_plane.operator_policy import active_arrangements, check_question_branch_quota, drain_arrangement
+
+
+def _defer_continuation(conn: sqlite3.Connection, node: sqlite3.Row, family_id: str, now: str) -> dict | None:
+    latest = conn.execute("SELECT node_status,control_state,operator_arrangement_id FROM lineage_nodes WHERE node_id=?",
+                          (node["node_id"],)).fetchone()
+    if latest is None or latest["node_status"] != "AWAITING_TRIAGE":
+        raise FailClosedError(ERR_LOCKED, "节点已离开分诊状态")
+    _, mode = drain_arrangement(active_arrangements(conn), node["question_id"], node["node_id"])
+    finishing = (latest["operator_arrangement_id"] is not None
+                 and latest["control_state"] in ("DRAIN_AFTER_HANDOFF", "HIBERNATED") and mode == "FINISH_CURRENT_HANDOFF")
+    try:
+        if finishing:
+            raise FailClosedError(ERR_LOCKED, "当前班岗交班后停驻")
+        check_question_branch_quota(conn, node["question_id"], family_id=family_id, replacing_branch_id=node["branch_id"])
+    except FailClosedError as exc:
+        if exc.code != ERR_LOCKED:
+            raise
+        if finishing:
+            conn.execute(
+                "UPDATE lineage_nodes SET control_state='HIBERNATED',updated_at=? WHERE node_id=?",
+                (now, node["node_id"]),
+            )
+        return {
+            "question_id": node["question_id"], "node_id": node["node_id"],
+            "guidance": exc.message,
+            "data": {"next_node_id": None, "dispatch_deferred": True, "reason": exc.message},
+        }
+    return None
+
+
 def execute_triage_core(
     conn: sqlite3.Connection,
     *,
@@ -392,6 +423,9 @@ def execute_triage_core(
         next_node_id = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
         exhausted = cur_repairs >= max_repairs
         with rw_immediate_tx(conn):
+            deferred = _defer_continuation(conn, node, eff_repair_fid, now)
+            if deferred:
+                return deferred
             conn.execute(
                 "UPDATE lineage_nodes SET family_id = ?, node_status = 'CLOSED', updated_at = ? WHERE node_id = ?",
                 (eff_repair_fid, now, node_id),
@@ -465,6 +499,9 @@ def execute_triage_core(
         prot_nid = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
         default_prot = int(cfg.get("default_protection_generations", 2))
         with rw_immediate_tx(conn):
+            deferred = _defer_continuation(conn, node, fid, now)
+            if deferred:
+                return deferred
             conn.execute(
                 "UPDATE lineage_nodes SET family_id = ?, node_status = 'CLOSED', retained_snapshot_abs_path = ?, updated_at = ? WHERE node_id = ?",
                 (fid, snap_path, now, node_id),
@@ -532,6 +569,9 @@ def execute_triage_core(
     sync_public_instruments_and_skills_to_worktree(conn, workspace_root, str(node["worktree_abs_path"]))
     next_node_id = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
     with rw_immediate_tx(conn):
+        deferred = _defer_continuation(conn, node, fid, now)
+        if deferred:
+            return deferred
         conn.execute(
             "UPDATE lineage_nodes SET family_id = ?, node_status = 'CLOSED', retained_snapshot_abs_path = ?, updated_at = ? WHERE node_id = ?",
             (fid, snap_path, now, node_id),

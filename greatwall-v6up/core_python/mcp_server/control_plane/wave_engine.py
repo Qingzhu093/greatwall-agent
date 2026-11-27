@@ -360,6 +360,9 @@ def _mount_secondary_donor_readonly(
     return donor_dir.relative_to(target_worktree).as_posix()
 
 
+from .operator_policy import active_arrangements, check_question_branch_quota, effective_policy
+
+
 def execute_approved_wave_verdict(
     conn: sqlite3.Connection,
     *,
@@ -398,6 +401,11 @@ def execute_approved_wave_verdict(
 
             if kind == "OPEN_NEW_BRANCH":
                 fid = str(act_obj.get("family_id") or f"fam_{qid.lower()}_{uuid.uuid4().hex[:6]}").strip()
+                try:
+                    check_question_branch_quota(conn, qid, family_id=fid)
+                except FailClosedError as exc:
+                    skipped.append({"action": kind, "reason": exc.message})
+                    continue
                 sig = str(act_obj.get("mechanism_signature") or act_obj.get("rationale") or "大外环定向开拓新学派").strip()
                 contrast = str(act_obj.get("orthogonal_contrast") or "针对全局总览明确缺口正交开拓").strip()
                 new_bid = f"b_{qid.lower()}_{fid[:10]}_{uuid.uuid4().hex[:5]}"
@@ -431,6 +439,11 @@ def execute_approved_wave_verdict(
                 src = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ? AND question_id = ?", (src_nid, qid)).fetchone()
                 if src is None:
                     skipped.append({"action": kind, "source_node_id": src_nid, "reason": "node_not_found"})
+                    continue
+                try:
+                    check_question_branch_quota(conn, qid, family_id=str(src["family_id"] or ""))
+                except FailClosedError as exc:
+                    skipped.append({"action": kind, "reason": exc.message})
                     continue
                 new_bid = f"b_{qid.lower()}_prot_{uuid.uuid4().hex[:5]}"
                 new_nid = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
@@ -475,6 +488,11 @@ def execute_approved_wave_verdict(
                 sec = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ? AND question_id = ?", (sec_nid, qid)).fetchone()
                 if pri is None or sec is None:
                     skipped.append({"action": kind, "reason": "donor_not_found"})
+                    continue
+                try:
+                    check_question_branch_quota(conn, qid, family_id=str(pri["family_id"] or ""))
+                except FailClosedError as exc:
+                    skipped.append({"action": kind, "reason": exc.message})
                     continue
                 budget = max(1, int(act_obj.get("budget_nodes") or conf["synthesis_budget_nodes"] or 2))
                 new_bid = f"b_{qid.lower()}_syn_{uuid.uuid4().hex[:5]}"
@@ -706,7 +724,8 @@ def submit_wave_verdict_decision(
         raise FailClosedError(ERR_INVALID_INPUT, "verdict_payload.actions 必须为动作数组")
 
     p0 = conn.execute("SELECT autonomy_mode FROM parse0_contract WHERE contract_id = 'active'").fetchone()
-    autonomy = str(p0["autonomy_mode"] or "WAVE_CONFIRM") if p0 else "WAVE_CONFIRM"
+    baseline_autonomy = str(p0["autonomy_mode"] or "WAVE_CONFIRM") if p0 else "WAVE_CONFIRM"
+    autonomy = effective_policy(active_arrangements(conn)).get("autonomy_mode", baseline_autonomy)
     has_high_risk_pause = any(str(a.get("action") or "").upper() == "PAUSE_FOR_HUMAN" for a in actions if isinstance(a, dict))
     need_human = autonomy != "AUTOPILOT" or has_high_risk_pause
 

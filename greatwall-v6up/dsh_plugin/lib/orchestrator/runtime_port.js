@@ -43,7 +43,6 @@ export function buildDispatchRuntimePort(orch) {
     isGovTaskRunning: (taskKey) => orch.isGovTaskRunning(taskKey),
     isBreakerOpen: (key, fp) => orch.isBreakerOpen(key, fp),
     launchGovTask: (taskKey, runner) => orch.launchGovTask(taskKey, runner),
-    launchGovTaskAndAwait: (taskKey, runner) => orch.launchGovTaskAndAwait(taskKey, runner),
     evaluateBreakerAfterTask: (roleLabel, items, extractAfterMap) =>
       orch.evaluateBreakerAfterTask(roleLabel, items, extractAfterMap),
     launchExplorer: (node, snap, sig) => orch.launchExplorer(node, snap, sig),
@@ -53,6 +52,7 @@ export function buildDispatchRuntimePort(orch) {
     getLiveCompanion: (nodeId) => orch.getLiveCompanion(nodeId),
     setLiveCompanion: (nodeId, handle) => orch.setLiveCompanion(nodeId, handle),
     disposeCompanion: (nodeId, status) => orch.disposeCompanion(nodeId, status),
+    settleSessionJobs: (sessionId, opts) => orch.humanTakeover.settleSessionJobs(sessionId, opts),
     setSessionReadonly: (sid, flag) => orch.setSessionReadonly(sid, flag),
     archiveSession: (sid, sess) => orch.archiveSession(sid, sess),
     spawnAndRunAgent: (opts) => orch.spawnAndRunAgent(opts),

@@ -1,10 +1,10 @@
-"""GreatWall Agent v0.3 Superagent (`gw_chief`) 5 个物理剥权窄工具。
+"""GreatWall v0.3.1 科研总控总览、溯源、影响预演和确认单。
 
 设计边界（ARCH_PAPER_01 §5）：
 1. 物理零代码编辑、零终端、零裸写业务库权；
 2. 四级 Inline & Spill + 强外键 Chain of Recall：每个只读查询强制内联下一跳关联外键 ID 与原始 session_id 锚点；
 3. 零副作用推测预演（chief_preview_impact）：仅只读计算影响面与排雷查重，绝不擅自开重型分支；
-4. 唯一有写入副作用的工具为 `chief_propose_control_action`，且只写 `PENDING_HUMAN` 确认单，绝不绕过人类直接执行。
+4. 确认单仅写入 `PENDING_HUMAN`，日常直执在 tools_operator 模块校验人类授权。
 """
 
 from __future__ import annotations
@@ -27,6 +27,10 @@ from .mcp_core_helpers import (
 )
 
 
+from .control_plane.operator_ops import recent_receipts
+from .control_plane.operator_policy import active_arrangements, effective_policy, epoch_id, runtime_slots, validate_arrangement, scoped_to
+
+
 def tool_chief_get_overview_snapshot(
     conn: sqlite3.Connection,
     caller_role: str,
@@ -45,6 +49,8 @@ def tool_chief_get_overview_snapshot(
         q_sql = "SELECT * FROM subproblem_runtime_state WHERE question_id = ?"
         q_params = (qf,)
 
+    arrangements = active_arrangements(conn)
+    slots = runtime_slots(conn)
     subproblems: list[dict[str, Any]] = []
     for r in conn.execute(q_sql, q_params).fetchall():
         qid = str(r["question_id"])
@@ -78,6 +84,7 @@ def tool_chief_get_overview_snapshot(
         subproblems.append(
             {
                 "question_id": qid,
+                **effective_policy(arrangements, qid, base=dict(r)),
                 "desired_state": str(r["desired_state"]),
                 "dispatch_state": str(r["dispatch_state"]),
                 "active_spec_revision": int(r["active_spec_revision"] or 0),
@@ -126,8 +133,23 @@ def tool_chief_get_overview_snapshot(
         question_id=qf,
         next_step_guidance="已按 Inline & Spill 返回骨架视图；如需深查任一条证据或原会话锚点，请调用 chief_trace_entity。",
         data={
+            "epoch_id": epoch_id(conn),
+            "active_arrangements": arrangements if qf == "ALL" else [
+                row for row in arrangements if row["scope_type"] == "PROJECT" or row["target_id"] == qf
+            ],
+            "operation_receipts": recent_receipts(conn, 10),
+            "handbacks": [dict(row) for row in conn.execute(
+                """SELECT handback_id,question_id,source_node_id,origin_human_mandate,created_at,human_request_md
+                   FROM handback_records WHERE epoch_id=? AND status='PENDING_CHIEF'
+                   AND (?='ALL' OR question_id=?) ORDER BY created_at LIMIT 10""", (epoch_id(conn), qf, qf),
+            )],
+            "operator_slot_ledger": {
+                "working": [row for row in slots if row["control_state"] == "AUTO_RUNNING" and row["node_status"] != "RETIRED" and (qf == "ALL" or row["question_id"] == qf)],
+                "draining": [row for row in slots if (row["control_state"] != "AUTO_RUNNING" or row["node_status"] == "RETIRED") and (qf == "ALL" or row["question_id"] == qf)],
+                "hibernated_or_human": [b["node_id"] for state in subproblems for b in state["active_branches"] if b["control_state"] in ("HIBERNATED","HUMAN_ACTIVE")],
+            },
             "stage": str(p0["stage"]) if p0 else "UNINITIALIZED",
-            "autonomy_mode": str(p0["autonomy_mode"]) if p0 else "WAVE_CONFIRM",
+            "autonomy_mode": effective_policy(arrangements).get("autonomy_mode", str(p0["autonomy_mode"]) if p0 else "WAVE_CONFIRM"),
             "latest_spec_revision": int(p0["latest_spec_revision"] or 0) if p0 else 0,
             "closure": dict(closure) if closure else {"status": "OPEN"},
             "subproblems": subproblems,
@@ -399,13 +421,22 @@ def tool_chief_preview_impact(
     question_id: str = "ALL",
     query_text: str = "",
     target_id: str | None = None,
+    arrangement: dict | None = None,
 ) -> dict[str, Any]:
     """零副作用推测预演：只读测算改题影响面、排雷雷达查重或波次调整受影响分支。"""
     enforce_role_tool_permission(conn, caller_role, "chief_preview_impact", session_id=session_id)
     pk = str(preview_kind or "").strip().lower()
     qid = str(question_id or "ALL").strip()
 
-    if pk == "ruling_amendment":
+    if pk == "run_arrangement":
+        scope, target, patch, end_kind, expires = validate_arrangement(arrangement or {})
+        scope_row = {"scope_type": scope, "target_id": target}
+        slots = [row for row in runtime_slots(conn) if scoped_to(scope_row, row["question_id"], row["node_id"])]
+        result = {
+            "preview_kind": pk, "scope_type": scope, "target_id": target, "patch": patch,
+            "ends_on_kind": end_kind, "expires_at": expires, "in_flight_nodes": slots,
+        }
+    elif pk == "ruling_amendment":
         target_qs = (
             [str(r["question_id"]) for r in conn.execute("SELECT question_id FROM subproblem_runtime_state ORDER BY question_id").fetchall()]
             if qid.upper() == "ALL"
@@ -500,6 +531,9 @@ def tool_chief_propose_control_action(
 ) -> dict[str, Any]:
     """生成 8 类宪章正门确认单写入 control_proposals（带单问题 human_action 确认卡元数据）。"""
     enforce_role_tool_permission(conn, caller_role, "chief_propose_control_action", session_id=session_id)
+    payload = dict(payload or {})
+    if str(action_type).upper() == "ADVANCE_EPOCH":
+        payload["expected_epoch_id"] = epoch_id(conn)
     prop = create_control_proposal(
         conn,
         proposed_by="gw_chief",

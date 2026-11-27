@@ -1,6 +1,6 @@
 """GreatWall Agent v0.3 核心 stdio JSON-RPC 2.0 MCP 服务端入口（零第三方依赖）。
 
-完整挂载 10 大角色共 44 个去重单一职责窄工具（单一契约源见 `tool_registry.py`）
+完整挂载 10 大角色共 47 个去重单一职责窄工具（单一契约源见 `tool_registry.py`）
 + Single-Writer 控制面内部原语（`control_plane_dispatch.py`）：
 - 双线程池隔离派发（`fast_pool` 快路径 vs `compute_pool` 慢计算池）；
 - 纯只读查询使用真正只读连接 `open_ro_connection` + `ro_consistent_tx` 一致快照；
@@ -40,7 +40,6 @@ from .tool_registry import (  # noqa: E402
 )
 from .tools_chief import (  # noqa: E402
     tool_chief_get_overview_snapshot,
-    tool_chief_get_wave_digest,
     tool_chief_preview_impact,
     tool_chief_propose_control_action,
     tool_chief_trace_entity,
@@ -77,6 +76,9 @@ from .tools_logistics import (  # noqa: E402
     tool_register_method_family,
     tool_triage_node,
 )
+from .tools_operator import (
+    tool_chief_operate, tool_chief_read, tool_chief_seed_branch, tool_chief_send_branch_note,
+)
 from .tools_supervisory import (  # noqa: E402
     tool_check_stage2_closure_gate,
     tool_get_supervisory_audit_snapshot,
@@ -107,7 +109,7 @@ _PURE_READONLY_TOOLS: frozenset[str] = frozenset(
     {
         "chief_get_overview_snapshot",
         "chief_trace_entity",
-        "chief_get_wave_digest",
+        "chief_read",
         "chief_preview_impact",
         "get_living_survey",
         "query_library_catalog",
@@ -126,6 +128,7 @@ _PURE_READONLY_TOOLS: frozenset[str] = frozenset(
 _COMPUTE_CONTROL_METHODS: frozenset[str] = frozenset(
     {
         "control_plane/recover_heavy_jobs",
+        "control_plane/operator_finish_node_jobs",
         "control_plane/stage_blind_sandbox",
         "control_plane/cleanup_blind_sandbox",
     }
@@ -135,7 +138,10 @@ _TOOL_HANDLERS: dict[str, Any] = {
     # gw_chief (5)
     "chief_get_overview_snapshot": tool_chief_get_overview_snapshot,
     "chief_trace_entity": tool_chief_trace_entity,
-    "chief_get_wave_digest": tool_chief_get_wave_digest,
+    "chief_read": tool_chief_read,
+    "chief_operate": tool_chief_operate,
+    "chief_send_branch_note": tool_chief_send_branch_note,
+    "chief_seed_branch": tool_chief_seed_branch,
     "chief_preview_impact": tool_chief_preview_impact,
     "chief_propose_control_action": tool_chief_propose_control_action,
     # explorer & 共享 Pull (7)
@@ -244,6 +250,7 @@ def dispatch_tool_call(
     workspace_root: str = "",
     caller_role: str = "",
     session_id: str = "",
+    host_meta: dict[str, Any] | None = None,
     cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     """统一执行全部窄工具入口：剥离模型伪造身份，注入可信宿主 _meta 并处理 FailClosedError 与取消信号。"""
@@ -261,9 +268,11 @@ def dispatch_tool_call(
     if not isinstance(meta, dict):
         meta = {}
 
-    for spoof_k in ("workspace_root", "caller_role", "role", "session_id"):
+    for spoof_k in ("workspace_root", "caller_role", "role", "session_id", "human_rpc_id", "human_message", "session_epoch_id"):
         raw_args.pop(spoof_k, None)
 
+    if host_meta is not None:
+        meta = {}
     eff_ws = str(workspace_root or meta.get("workspace_root", "") or os.environ.get("GREATWALL_WORKSPACE_ROOT", "")).strip()
     eff_role = str(caller_role or meta.get("caller_role", "") or meta.get("role", "")).strip()
     eff_sid = str(session_id or meta.get("session_id", "")).strip()
@@ -276,6 +285,10 @@ def dispatch_tool_call(
             "session_id": eff_sid,
             **raw_args,
         }
+        if name in ("chief_operate", "chief_send_branch_note", "chief_seed_branch", "handback_to_chief"):
+            base_kwargs["human_rpc_id"] = str((host_meta or {}).get("human_rpc_id") or "")
+        if name == "handback_to_chief":
+            base_kwargs["human_message"] = str((host_meta or {}).get("human_message") or "")
         if accepts_cancel:
             base_kwargs["cancel_event"] = cancel_event
 
@@ -288,6 +301,12 @@ def dispatch_tool_call(
 
         paths = resolve_storage_paths(eff_ws)
         conn = open_rw_connection(paths["db_path"], init_schema=True)
+        if host_meta is not None and name not in _PURE_READONLY_TOOLS:
+            from .control_plane.operator_policy import epoch_id
+            from .db.enums import ERR_STALE_EPOCH
+            received = int(host_meta.get("session_epoch_id") or 1)
+            if received != epoch_id(conn):
+                raise FailClosedError(ERR_STALE_EPOCH, "此会话属于旧纪元，请打开当前纪元的会话")
         if needs_ws:
             base_kwargs["workspace_root"] = eff_ws or str(paths["data_dir"])
         return fn(conn=conn, **base_kwargs)
@@ -398,6 +417,7 @@ def handle_jsonrpc_message(
             workspace_root=str(top_meta.get("workspace_root", "") or ""),
             caller_role=str(top_meta.get("caller_role", "") or top_meta.get("role", "") or ""),
             session_id=str(top_meta.get("session_id", "") or ""),
+            host_meta=top_meta,
             cancel_event=cancel_event,
         )
         return {

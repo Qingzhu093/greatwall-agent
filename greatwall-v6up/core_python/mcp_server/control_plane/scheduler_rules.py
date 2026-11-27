@@ -136,8 +136,7 @@ def compute_topology_and_revision_health(
     slot_cap: int | None = None,
 ) -> dict[str, Any]:
     """纯查 SQLite (<15ms) 计算全卷或指定子题的 Worktree 拓扑健康度、断代分支、孤儿盲审返工单与缺编正交学派。"""
-    cfg = load_runtime_config()
-    eff_slot_cap = int(slot_cap or cfg.get("max_concurrent_workers", 6))
+    eff_slot_cap = slot_cap or worker_slot_cap(effective_policy(active_arrangements(conn)))
     qf = str(question_filter or "ALL").strip()
     order_status = get_question_order_status(conn)
 
@@ -145,7 +144,7 @@ def compute_topology_and_revision_health(
     fam_rows = raw["fam_rows"]
     all_nodes = raw["all_nodes"]
     rev_rows = raw["rev_rows"]
-    total_live_branches = raw["total_live_branches"]
+    occupied = sum(slot["slot_tier"] == "normal" for slot in runtime_slots(conn))
     reviewed_source_nodes = raw["reviewed_source_nodes"]
 
     active_families_by_q: dict[str, list[str]] = {}
@@ -162,7 +161,7 @@ def compute_topology_and_revision_health(
         if str(d["node_status"]) in live_statuses:
             branch_has_live_node.add(bid)
 
-    free_slots = max(0, eff_slot_cap - total_live_branches)
+    free_slots = max(0, eff_slot_cap - occupied)
 
     active_parent_ids = {
         str(r["parent_node_id"])
@@ -273,7 +272,7 @@ def compute_topology_and_revision_health(
 
     return {
         "slot_utilization": {
-            "active_branches_count": total_live_branches,
+            "active_branches_count": occupied,
             "slot_cap": eff_slot_cap,
             "free_slots": free_slots,
         },
@@ -382,6 +381,10 @@ def check_stage2_closure_gate_data(
     }
 
 
+from .operator_ops import recent_receipts
+from .operator_policy import active_arrangements, effective_policy, epoch_id, runtime_slots, worker_slot_cap
+
+
 def schedule_control_plane_snapshot(
     conn: sqlite3.Connection,
     max_concurrent_workers: int | None = None,
@@ -390,10 +393,10 @@ def schedule_control_plane_snapshot(
 ) -> dict[str, Any]:
     """纯查 SQLite（<50ms，零写盘零哈希副作用）生成两级公平调度快照。"""
     _ = workspace_root
-    cfg = load_runtime_config()
-    hard_cap = int(cfg.get("max_concurrent_workers_hard_cap", 10))
-    wanted = int(max_concurrent_workers or cfg.get("max_concurrent_workers", 6))
-    slot_cap = max(1, min(hard_cap, wanted))
+    arrangements = active_arrangements(conn)
+    project_policy = effective_policy(arrangements)
+    slot_cap = worker_slot_cap(project_policy, max_concurrent_workers)
+    live_slots = runtime_slots(conn)
 
     p0 = fetch_active_parse0_row(conn)
     req_qs = json.loads(p0["subquestions_json"]) if p0 else []
@@ -404,6 +407,7 @@ def schedule_control_plane_snapshot(
     latest_spec_revision = int(p0.get("latest_spec_revision") or 0) if p0 else 0
     latest_ruling_summary_md = str(p0.get("latest_ruling_summary_md") or "") if p0 else ""
     autonomy_mode = str(p0.get("autonomy_mode") or "WAVE_CONFIRM") if p0 else "WAVE_CONFIRM"
+    autonomy_mode = project_policy.get("autonomy_mode", autonomy_mode)
     missing_initial_instruments = compute_missing_initial_instruments(conn) if p0 else []
     goal_md = str(p0["goal_and_completion_md"] or "") if p0 else ""
     stage = str(p0["stage"]) if p0 else "STAGE1_PARSE0"
@@ -420,11 +424,20 @@ def schedule_control_plane_snapshot(
     human_stop_active = bool(closure_state.get("human_stop_requested_at"))
     order_status = get_question_order_status(conn)
     subproblem_states = fetch_subproblem_states(conn)
+    subproblem_states = {
+        qid: {**row, **effective_policy(arrangements, qid, base=row)}
+        for qid, row in subproblem_states.items()
+    }
+    human_named = {row["target_id"]: row["target_generation"] for row in conn.execute(
+        """SELECT target_id, target_generation FROM runtime_effects
+           WHERE kind='SPAWN_PAIR' AND status NOT IN ('CANCELLED','FAILED')
+             AND json_extract(payload_json,'$.operator_named')=1 ORDER BY seq"""
+    )}
     v03_q = fetch_v03_queues(conn)
 
     qdata = fetch_snapshot_queues_and_tables(conn)
-    awaiting_triage = qdata["awaiting_triage"]
-    triage_locked_branches = {str(r["branch_id"]) for r in awaiting_triage}
+    triage_locked_branches = {r["branch_id"] for r in qdata["awaiting_triage"]}
+    awaiting_triage = [row for row in qdata["awaiting_triage"] if row["control_state"] != "HIBERNATED"]
     active_nodes = qdata["active_nodes"]
     latest_briefings = qdata["latest_briefings"]
 
@@ -442,6 +455,12 @@ def schedule_control_plane_snapshot(
         ctrl_st = str(node.get("control_state") or "AUTO_RUNNING")
         q_state = subproblem_states.get(qid, {})
         q_dispatch = str(q_state.get("dispatch_state") or "DISPATCHING")
+        node_policy = effective_policy(arrangements, qid, nid, base=q_state)
+        named = human_named.get(nid) == int(node.get("control_generation") or 1)
+        if ctrl_st in ("HIBERNATED", "DRAIN_AFTER_TURN", "DRAIN_AFTER_HANDOFF"):
+            if ctrl_st == "DRAIN_AFTER_HANDOFF" and node.get("pending_handoff_mode"):
+                pending_handoff_nodes.append(node)
+            continue
 
         if node.get("pending_handoff_mode"):
             pending_handoff_nodes.append(node)
@@ -454,6 +473,9 @@ def schedule_control_plane_snapshot(
             continue
         if q_dispatch != "DISPATCHING":
             continue
+        if node_policy["dispatch_policy"] != "NORMAL" and not (named and node_policy["dispatch_policy"] == "NO_NEW_DISPATCH"):
+            continue
+        node = {**node, "operator_named": named}
         if bid in triage_locked_branches:
             continue
         if not order_status.get(qid, {}).get("unlocked", True):
@@ -464,25 +486,44 @@ def schedule_control_plane_snapshot(
         if not sat:
             blocked_by_requires.append({**node, "unmet_requires": unmet})
             continue
-        if nid not in latest_briefings:
+        named_seed = named and node["branch_kind"] == "HUMAN_SEEDED" and node["generation"] == 1
+        if nid not in latest_briefings and not named_seed:
             need_briefing.append(node)
         else:
-            ready_to_run.append({**node, "briefing_snapshot_md": latest_briefings[nid]})
+            ready_to_run.append({**node, "briefing_snapshot_md": latest_briefings.get(nid, "")})
 
-    q_counts: dict[str, int] = {}
-    qf_counts: dict[tuple[str, str], int] = {}
-    for r in ready_to_run:
-        q = str(r["question_id"])
-        f = str(r["family_id"] or "unclassified")
-        q_counts[q] = q_counts.get(q, 0) + 1
-        qf_counts[(q, f)] = qf_counts.get((q, f), 0) + 1
-    ready_to_run.sort(
-        key=lambda r: (
-            q_counts.get(str(r["question_id"]), 0),
-            qf_counts.get((str(r["question_id"]), str(r["family_id"] or "unclassified")), 0),
-            str(r["node_id"]),
-        )
-    )
+    def dispatch_order(node: dict) -> tuple:
+        qid = node["question_id"]
+        return -int(subproblem_states.get(qid, {}).get("priority_weight", 100)), qid
+
+    need_briefing.sort(key=dispatch_order)
+    ready_to_run.sort(key=lambda node: (not node["operator_named"], *dispatch_order(node)))
+
+    current_nodes = {row["node_id"] for row in live_slots}
+    physical_per_q: dict[str, int] = {}
+    for row in live_slots:
+        physical_per_q[row["question_id"]] = physical_per_q.get(row["question_id"], 0) + 1
+    ordinary_free = max(0, slot_cap - sum(row["slot_tier"] == "normal" for row in live_slots))
+    reserve_free = not any(row["slot_tier"] == "human_reserve" for row in live_slots)
+    selected_ready = []
+    for node in ready_to_run:
+        if node["node_id"] in current_nodes:
+            continue
+        qid = node["question_id"]
+        q_policy = subproblem_states.get(qid, {})
+        cap = int(q_policy.get("max_active_branches", 3))
+        if physical_per_q.get(qid, 0) >= cap:
+            continue
+        if node["operator_named"] and reserve_free:
+            reserve_free = False
+            tier = "human_reserve"
+        elif ordinary_free:
+            ordinary_free -= 1
+            tier = "normal"
+        else:
+            continue
+        selected_ready.append({**node, "slot_tier": tier})
+        physical_per_q[qid] = physical_per_q.get(qid, 0) + 1
 
     blind_reviews = qdata["blind_reviews"]
     active_instruments = qdata["active_instruments"]
@@ -511,8 +552,11 @@ def schedule_control_plane_snapshot(
         if order_status.get(q, {}).get("unlocked", True)
         and order_status.get(q, {}).get("full_goal_l3_count", 0) == 0
         and str(subproblem_states.get(q, {}).get("dispatch_state") or "DISPATCHING") == "DISPATCHING"
+        and subproblem_states.get(q, {}).get("dispatch_policy", "NORMAL") == "NORMAL"
         and q not in in_flight_qs
     ]
+
+    questions_needing_branch.sort(key=lambda q: (-int(subproblem_states.get(q, {}).get("priority_weight", 100)), q))
 
     latest_did = str(closure_state.get("latest_delivery_id") or "")
     latest_sha = str(closure_state.get("latest_delivery_sha256") or "")
@@ -549,6 +593,23 @@ def schedule_control_plane_snapshot(
 
     return {
         "initialized": True,
+        "operator_plane": True,
+        "epoch_id": epoch_id(conn),
+        "active_arrangements": arrangements,
+        "operation_receipts": recent_receipts(conn),
+        "handbacks": [dict(row) for row in conn.execute(
+            """SELECT * FROM handback_records
+               WHERE epoch_id=? AND status='PENDING_CHIEF' ORDER BY created_at LIMIT 20""", (epoch_id(conn),),
+        )],
+        "pinned_notes": [dict(row) for row in conn.execute(
+            "SELECT * FROM chief_pinned_notes WHERE epoch_id=? AND is_active=1 ORDER BY updated_at", (epoch_id(conn),),
+        )],
+        "operator_slot_ledger": {
+            "working": [row for row in live_slots if row["control_state"] == "AUTO_RUNNING" and row["node_status"] != "RETIRED"],
+            "draining": [row for row in live_slots if row["control_state"] != "AUTO_RUNNING" or row["node_status"] == "RETIRED"],
+            "hibernated_or_human": [row["node_id"] for row in active_nodes
+                                    if row["node_id"] not in current_nodes and row["control_state"] in ("HIBERNATED", "HUMAN_ACTIVE")],
+        },
         "stage": stage,
         "autonomy_mode": autonomy_mode,
         "parse0_signed": has_parse0_signed,
@@ -565,7 +626,10 @@ def schedule_control_plane_snapshot(
         "subproblem_states": subproblem_states,
         "subproblem_runtime_state": subproblem_runtime_list,
         "questions_needing_branch": questions_needing_branch,
-        "understaffed_questions": [] if stop_new_dispatch else understaffed_questions,
+        "understaffed_questions": [] if stop_new_dispatch else [
+            row for row in understaffed_questions
+            if subproblem_states.get(row["question_id"], {}).get("dispatch_policy", "NORMAL") == "NORMAL"
+        ],
         "orphaned_blind_review_revisions": [] if stop_new_dispatch else orphaned_revisions,
         "stalled_or_aborted_branches": stalled_branches,
         "slot_utilization": topology_health.get("slot_utilization") or {"active_branches_count": 0, "slot_cap": slot_cap, "free_slots": slot_cap},
@@ -574,6 +638,7 @@ def schedule_control_plane_snapshot(
         "active_instruments": active_instruments,
         "active_instruments_fingerprint": active_instruments_fingerprint,
         "slot_cap": slot_cap,
+        "max_worker_slots": load_runtime_config()["max_concurrent_workers_hard_cap"],
         "triage_locked_branches": sorted(triage_locked_branches),
         "family_concentration_alerts": family_concentration_alerts,
         "ambiguous_spec_alerts": qdata["ambiguous_alerts"],
@@ -587,7 +652,7 @@ def schedule_control_plane_snapshot(
         "early_handoff_nodes": early_handoff_nodes,
         "human_paused_nodes": human_paused_nodes,
         "explorers_needing_briefing": [] if stop_new_dispatch else need_briefing,
-        "explorers_ready_to_run": [] if stop_new_dispatch else ready_to_run[:slot_cap],
+        "explorers_ready_to_run": [] if stop_new_dispatch else selected_ready,
         "blocked_by_requires_nodes": blocked_by_requires,
         "pending_proposals": v03_q["pending_proposals"],
         "active_conferences": active_confs,
@@ -612,6 +677,12 @@ def uninitialized_schedule_snapshot(max_concurrent_workers: int | None = None) -
     slot_cap = max(1, min(hard_cap, wanted))
     return {
         "initialized": False,
+        "epoch_id": 1,
+        "operator_plane": False,
+        "max_worker_slots": hard_cap,
+        "active_arrangements": [],
+        "operation_receipts": [],
+        "operator_slot_ledger": {"working": [], "draining": [], "hibernated_or_human": []},
         "stage": "STAGE1_PARSE0",
         "autonomy_mode": "WAVE_CONFIRM",
         "parse0_signed": False,

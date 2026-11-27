@@ -196,16 +196,6 @@ def fetch_topology_raw_data(conn: sqlite3.Connection, question_filter: str = "AL
             ).fetchall()
         ]
 
-    total_live_branches = int(
-        conn.execute(
-            """
-            SELECT COUNT(DISTINCT branch_id) AS cnt
-            FROM lineage_nodes
-            WHERE node_status IN ('EXPLORING', 'ACTIVE_REVISING', 'AWAITING_TRIAGE', 'PENDING_REVIEW')
-            """
-        ).fetchone()["cnt"]
-        or 0
-    )
     reviewed_source_nodes = {
         str(r["source_node_id"])
         for r in conn.execute("SELECT source_node_id FROM review_queue").fetchall()
@@ -214,7 +204,6 @@ def fetch_topology_raw_data(conn: sqlite3.Connection, question_filter: str = "AL
         "fam_rows": fam_rows,
         "all_nodes": all_nodes,
         "rev_rows": rev_rows,
-        "total_live_branches": total_live_branches,
         "reviewed_source_nodes": reviewed_source_nodes,
     }
 
@@ -271,7 +260,7 @@ def fetch_snapshot_queues_and_tables(conn: sqlite3.Connection) -> dict[str, Any]
         dict(r)
         for r in conn.execute(
             """
-            SELECT node_id, question_id, branch_id, family_id, evidence_grade, mechanism_summary
+            SELECT node_id, question_id, branch_id, family_id, evidence_grade, mechanism_summary, control_state
             FROM lineage_nodes
             WHERE node_status = 'AWAITING_TRIAGE'
             ORDER BY updated_at ASC

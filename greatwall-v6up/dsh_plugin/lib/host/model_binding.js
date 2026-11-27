@@ -5,7 +5,7 @@
  * @module dsh-greatwall-v6up/host/model_binding
  */
 import crypto from 'node:crypto'
-import { resolvePlatformShellTool } from '../prompts.js'
+import { CANONICAL_ROLES, resolvePlatformAllowedTools } from '../prompts.js'
 
 export function createUserTextMessage(text, label = 'user') {
   return {
@@ -68,41 +68,16 @@ export function extractLastAssistantText(surfaceSnap) {
  */
 export function assertRequiredNativeTools(role, mountedToolNames, platform = process.platform) {
   const mounted = new Set(mountedToolNames || [])
-  const expectedShell = resolvePlatformShellTool(platform)
-  const missing = []
-
-  if (role === 'explorer' || role === 'works_engineer') {
-    for (const req of ['read', 'write', expectedShell]) {
-      if (!mounted.has(req)) missing.push(req)
-    }
-  } else if (role === 'library_verifier') {
-    for (const req of ['read', expectedShell]) {
-      if (!mounted.has(req)) missing.push(req)
-    }
-    if (mounted.has('write') || mounted.has('edit')) {
-      throw new Error(`角色 library_verifier 严禁挂载写工具 (write/edit)，当前已挂载: ${[...mounted].join(', ')}`)
-    }
-  } else if (role === 'lineage_companion') {
-    const forbidden = ['write', 'edit', 'pwsh', 'bash', 'web_search', 'web_fetch'].filter((n) => mounted.has(n))
-    if (forbidden.length > 0) {
-      throw new Error(`伴随角色 lineage_companion 严禁挂载写/终端/外网工具: ${forbidden.join(', ')}`)
-    }
-  } else if (role === 'external_surveyor') {
-    const forbidden = ['read', 'write', 'edit', 'pwsh', 'bash'].filter((n) => mounted.has(n))
-    if (forbidden.length > 0) {
-      throw new Error(`对外采编角色 external_surveyor 严禁挂载本地文件/终端工具: ${forbidden.join(', ')}`)
-    }
-  } else if (
-    role === 'gw_chief' ||
-    role === 'logistics_coordinator' ||
-    role === 'supervisory_committee' ||
-    role === 'library_chronicler' ||
-    role === 'conference_chair'
-  ) {
-    const forbidden = ['read', 'write', 'edit', 'pwsh', 'bash', 'web_search', 'web_fetch'].filter((n) => mounted.has(n))
-    if (forbidden.length > 0) {
-      throw new Error(`纯 DB 治理/总控角色 ${role} 严禁挂载原生工具: ${forbidden.join(', ')}`)
-    }
+  const allowed = new Set(resolvePlatformAllowedTools(role, platform))
+  const knownNative = new Set(CANONICAL_ROLES.flatMap((name) => [
+    ...resolvePlatformAllowedTools(name, 'win32'), ...resolvePlatformAllowedTools(name, 'linux'),
+  ]))
+  const forbidden = [...mounted].filter((name) => knownNative.has(name) && !allowed.has(name))
+  const missing = [...allowed].filter((name) => !mounted.has(name))
+  if (forbidden.length) {
+    const label = allowed.size === 0 ? `纯 DB 治理角色 ${role}` : `角色 ${role}`
+    const kind = forbidden.every((name) => name === 'write' || name === 'edit') ? '写工具' : '原生工具'
+    throw new Error(`${label} 严禁挂载${kind}: ${forbidden.join(', ')}${missing.length ? `，另缺少 ${missing.join(', ')}` : ''}`)
   }
 
   if (missing.length > 0) {

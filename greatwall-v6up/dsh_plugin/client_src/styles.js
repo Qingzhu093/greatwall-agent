@@ -5,6 +5,11 @@ const STATUS_API = "/api/greatwall.status";
 const CONTROL_API = "/api/greatwall.control";
 
 const CSS_TEXT = [
+  ".gw-operator { padding: 10px; }",
+  ".gw-operator fieldset { display: grid; gap: 6px; margin-bottom: 10px; }",
+  ".gw-operator label { display: grid; grid-template-columns: minmax(85px, 1fr) minmax(125px, 1.5fr); align-items: center; gap: 8px; }",
+  ".gw-operator input:not([type=checkbox]) { min-width: 0; max-width: 100%; }",
+  ".gw-operator li { overflow-wrap: anywhere; margin: 4px 0; }",
   ".gw-root{box-sizing:border-box;display:flex;flex-direction:column;height:100%;overflow:hidden;color:var(--dsw-alias-label-primary);font-size:12px;line-height:1.45}",
   ".gw-hdr{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-l4);flex:none;flex-wrap:wrap}",
   ".gw-title-wrap{display:flex;align-items:center;flex-wrap:wrap;gap:5px;min-width:0}",
@@ -65,7 +70,7 @@ function mountConsoleStyles() {
 function stateBadgeClass(st) {
   const s = String(st || "").toUpperCase();
   if (s.includes("RUN") || s === "DISPATCHING" || s === "STOPPED_SOLVED" || s === "CLOSED_VERIFIED" || s === "APPROVED_EXECUTED") return "gw-badge gw-b-run";
-  if (s.includes("PAUSE") || s.includes("HUMAN") || s.includes("PENDING") || s.includes("BLOCKED") || s === "EARLY_HANDOFF_READY") return "gw-badge gw-b-warn";
+  if (s.includes("PAUSE") || s.includes("DRAIN") || s.includes("HUMAN") || s.includes("PENDING") || s.includes("BLOCKED") || s === "EARLY_HANDOFF_READY") return "gw-badge gw-b-warn";
   if (s.includes("ERR") || s.includes("FAIL") || s.includes("REFUTED") || s === "UNHEALTHY") return "gw-badge gw-b-err";
   return "gw-badge gw-b-info";
 }
@@ -94,8 +99,11 @@ function readableStage(st) {
 function readableControlState(st) {
   const s = String(st || "").toUpperCase();
   if (s === "AUTO_RUNNING") return "自动托管";
-  if (s === "PAUSE_DRAINING") return "让权停机中";
-  if (s === "HUMAN_ACTIVE") return "等待人类接管";
+  if (s === "PAUSE_DRAINING") return "让权收尾中";
+  if (s === "DRAIN_AFTER_TURN") return "当前回合收尾中";
+  if (s === "DRAIN_AFTER_HANDOFF") return "本班交班收尾中";
+  if (s === "HUMAN_ACTIVE") return "人工接管 · 0 槽";
+  if (s === "HIBERNATED") return "已休眠 · 0 槽";
   if (s === "EARLY_HANDOFF_READY") return "已授权提前交班";
   return s || "";
 }
@@ -110,6 +118,10 @@ function readableDispatchState(st) {
   if (s === "STOPPED_SOLVED") return "已通关";
   if (s === "CLOSED") return "已结题";
   return s || "未知";
+}
+
+function readableReceiptStatus(status) {
+  return { SETTLED: "已生效", DRAINING: "收尾中", PARTIAL_FAILED: "有失败项", SUPERSEDED: "已被覆盖" }[status] || status;
 }
 
 function readableActionLabel(act) {

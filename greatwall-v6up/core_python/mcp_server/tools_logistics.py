@@ -270,6 +270,9 @@ def tool_triage_node(
     )
 
 
+from .control_plane.operator_policy import check_question_branch_quota
+
+
 def tool_fork_branch(
     conn: sqlite3.Connection,
     workspace_root: str,
@@ -295,6 +298,8 @@ def tool_fork_branch(
     fam = conn.execute("SELECT * FROM method_families WHERE family_id = ? AND question_id = ?", (fid, question_id)).fetchone()
     if fam is None:
         raise FailClosedError(ERR_NOT_FOUND, f"方法学派 {fid!r} 尚未在子题 {question_id} 登记")
+
+    check_question_branch_quota(conn, question_id, family_id=fid)
 
     if str(fam["family_status"]) == "BLOCKED" and not str(new_mechanism_note or "").strip():
         raise FailClosedError(
@@ -409,6 +414,7 @@ def tool_fork_branch(
     now = utc_now_iso()
 
     with rw_immediate_tx(conn):
+        check_question_branch_quota(conn, question_id, family_id=fid)
         if str(fam["family_status"]) == "BLOCKED" and str(new_mechanism_note or "").strip():
             conn.execute("UPDATE method_families SET family_status = 'ACTIVE' WHERE family_id = ?", (fid,))
         conn.execute(

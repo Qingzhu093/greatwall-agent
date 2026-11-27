@@ -86,7 +86,7 @@ export function selectDispatchableExplorers(
     if (runningExplorerIds.has(node.node_id)) return false
     if (node.branch_id && lockedBranches.has(node.branch_id)) return false
     const cs = String(node.control_state || 'AUTO_RUNNING')
-    if (cs === 'PAUSE_DRAINING' || cs === 'HUMAN_ACTIVE') return false
+    if (['PAUSE_DRAINING', 'HUMAN_ACTIVE', 'HIBERNATED', 'DRAIN_AFTER_TURN', 'DRAIN_AFTER_HANDOFF'].includes(cs)) return false
     const qState = subStates.get(node.question_id)
     if (qState && qState !== 'DISPATCHING') return false
     return true

@@ -119,89 +119,34 @@ test('v0.3-3: transient_retry 瞬时 429/5xx 重试 vs 401/CONTENT_REFUSED 立�
   assert.equal(fatalAttempts, 1, '401 认证错误严禁重试')
 })
 
-test('v0.3-4: HumanTakeoverCoordinator source.rpcId 人类插话让权、白名单免误判与 ctx.jobs 清理/降级', async () => {
-  const controlCalls = []
-  const killedJobs = []
-  let sessionEventCb = null
-
-  const ctxWithJobs = {
-    get(name) {
-      if (name === 'jobs') {
-        return {
-          list: async () => [
-            { id: 'job_mine', status: 'running' },
-            { id: 'job_done', status: 'completed' },
-          ],
-          kill: async (id) => { killedJobs.push(id) },
-        }
-      }
-      return null
-    },
+test('node takeover waits for RC5 jobs to exit before recording yield', async () => {
+  const calls = []
+  const job = { id: 'job_mine', owner: 'gw-exp-n1', status: 'running' }
+  let finish
+  const stopping = new Promise((resolve) => { finish = resolve })
+  const jobs = {
+    list: () => [job, { id: 'global_job', status: 'running' }],
+    kill: (id) => { calls.push(id); return 'requested' },
+    wait: () => stopping,
   }
-  const fakeBridge = {
-    async control(method, params) {
-      controlCalls.push({ method, params })
-      return { ok: true, data: {} }
-    },
-  }
-  const coord = new HumanTakeoverCoordinator({
-    ctx: ctxWithJobs,
-    bridge: fakeBridge,
-    workspaceRoot: '/tmp/ws_ht',
-    telemetry: { recordEvent() {} },
+  const bridge = { async control(method) { calls.push(method); return { ok: true } } }
+  const coord = new HumanTakeoverCoordinator({ ctx: { get: () => jobs }, bridge, workspaceRoot: '/tmp/ws_ht' })
+  await coord.recordHumanChat('n1', job.owner, '等一下，我来改参数')
+  const draining = coord.drainAndYieldNode({
+    nodeId: 'n1', sessionId: job.owner,
+    liveHandle: { agent: { cancel: () => { calls.push('cancel') }, whenIdle: async () => {} } },
   })
-
-  const fakeSession = {
-    id: 'gw-exp-n1',
-    on(ev, fn) {
-      if (ev === 'event') sessionEventCb = fn
-      return () => {}
-    },
-  }
-  let takeoverCallbackFired = false
-  coord.watchExplorerSession('n1', fakeSession, { onHumanTakeover: () => { takeoverCallbackFired = true } })
-  assert.ok(typeof sessionEventCb === 'function')
-
-  // 1) 插件自发白名单消息 -> 绝不误触发人工接管
-  coord.markPluginMessage('gw-exp-n1', '自动续推 prompt')
-  sessionEventCb({ type: 'user/message', data: { text: '自动续推 prompt', source: { kind: 'user', rpcId: 'rpc_internal' } } })
-  assert.equal(takeoverCallbackFired, false)
-  assert.equal(controlCalls.length, 0)
-
-  // 2) 人类在子节点聊天窗亲手发言（携带 source.rpcId）-> 立即触发 record_human_chat_detected
-  sessionEventCb({ type: 'user/message', data: { text: '等一下，我来改一下参数', source: { kind: 'user', rpcId: 'rpc_ui_99' } } })
-  assert.equal(takeoverCallbackFired, true)
-  assert.ok(controlCalls.some((c) => c.method === 'control_plane/record_human_chat_detected' && c.params.node_id === 'n1'))
-
-  // 3) 45% 暂停让权：取消活跃回合 + ctx.jobs 清理仅 running 作业 + 落库 mark_node_yielded
-  let cancelCount = 0
-  const drainRes = await coord.drainAndYieldNode({
-    nodeId: 'n1',
-    sessionId: 'gw-exp-n1',
-    liveHandle: { agent: { cancel: () => { cancelCount += 1 } } },
-    keepSessionForHuman: true,
-    reason: 'HUMAN_PAUSE',
-  })
-  assert.equal(cancelCount, 1)
-  assert.deepEqual(drainRes.killedJobIds, ['job_mine'])
-  assert.ok(controlCalls.some((c) => c.method === 'control_plane/mark_node_yielded' && c.params.node_id === 'n1'))
-
-  // 4) 无 ctx.jobs 服务时优雅降级不崩溃
-  const coordNoJobs = new HumanTakeoverCoordinator({
-    ctx: { get: () => null },
-    bridge: fakeBridge,
-    workspaceRoot: '/tmp/ws_ht',
-    telemetry: { recordEvent() {} },
-  })
-  const fallbackRes = await coordNoJobs.drainAndYieldNode({ nodeId: 'n1', sessionId: 'gw-exp-n1', keepSessionForHuman: false })
-  assert.deepEqual(fallbackRes.killedJobIds, [])
-  coord.disposeAll()
+  await new Promise(setImmediate)
+  assert.deepEqual(calls, ['control_plane/record_human_chat_detected', 'cancel', 'job_mine'])
+  finish({ ...job, status: 'killed' })
+  assert.deepEqual((await draining).killedJobIds, ['job_mine'])
+  assert.equal(calls.at(-1), 'control_plane/mark_node_yielded')
 })
 
 test('v0.3-5: ChiefRuntime 弹性锚点卡字数公式、高信噪比收件箱与原生 Action Card 注册/降级', async () => {
-  assert.equal(computeChiefAnchorBudgetChars(1), 400)
-  assert.equal(computeChiefAnchorBudgetChars(4), 580)
-  assert.equal(computeChiefAnchorBudgetChars(20), 1200)
+  assert.equal(computeChiefAnchorBudgetChars(1), 500)
+  assert.equal(computeChiefAnchorBudgetChars(4), 720)
+  assert.equal(computeChiefAnchorBudgetChars(20), 1500)
   assert.equal(computeChiefAnchorBudgetChars(20, 900), 900)
 
   const anchor = buildChiefAnchorCard({
@@ -355,7 +300,7 @@ test('v0.3-7: RuntimeEffectsConsumer 租约领取、副作用路由与 ack', asy
               claimed: [
                 { seq: 11, kind: 'NOTIFY_POLICY_CHANGED', target_type: 'NODE', target_id: 'n1', payload: { new_spec_revision: 1 } },
                 { seq: 12, kind: 'NOTIFY_CHIEF', target_type: 'PROJECT', target_id: 'active', payload: { kind: 'SUBPROBLEM_SOLVED' } },
-              ],
+              ].filter((effect) => params.kinds.includes(effect.kind)),
             },
           }
         }
@@ -375,7 +320,7 @@ test('v0.3-7: RuntimeEffectsConsumer 租约领取、副作用路由与 ack', asy
   })
   const res = await consumer.drainOnce({ limit: 10 })
   assert.equal(res.claimedCount, 2)
-  assert.equal(res.handledCount, 2)
+  await consumer.whenIdle()
   assert.deepEqual(handled, [
     ['policy', 11, 1],
     ['chief', 12, 'SUBPROBLEM_SOLVED'],
@@ -442,7 +387,47 @@ test('v0.3-8: greatwall_orchestrate 仅保留 4 个薄入口且绝不暴露 huma
   const skillPath = path.resolve(PLUGIN_ROOT, '..', 'core_python', 'skills', 'greatwall-research-loop', 'SKILL.md')
   const skillText = fs.readFileSync(skillPath, 'utf8')
   assert.ok(!skillText.includes('action: "init" | "start" | "status" | "pause"'), 'SKILL.md 不得残留 v0.2 已废除动作')
+  assert.ok(!skillText.includes('物理剥夺了文件读写权'), 'SKILL.md 必须与裁决一同步，不得残留 gw-chief 剥夺文件读权禁令')
   assert.ok(skillText.includes('gw-chief'))
+
+  // 回归：control_service(action="status") 将字段平铺在顶层（无 raw.status），投影必须完整保留所有字段
+  const flatStatusRaw = {
+    ok: true,
+    action: 'status',
+    callerSource: 'agent_tool',
+    chiefPendingNotificationsCount: 0,
+    poolState: 'running',
+    state: 'running',
+    kernelAlive: true,
+    initialized: true,
+    stage: 'STAGE1_PARSE0',
+    autonomyMode: 'WAVE_CONFIRM',
+    closureStatus: 'OPEN',
+    humanStopActive: false,
+    latestSpecRevision: 0,
+    runningExplorersCount: 1,
+    runningExplorers: [{ nodeId: 'n1', questionId: 'Q1', sessionId: 's1' }],
+    runningGovernanceTasks: ['stage1:works_check'],
+    pendingProposalsCount: 0,
+    pendingHandoffNodes: [],
+    closureAllowed: false,
+    subproblemStates: tenSubs.slice(0, 4),
+    modelBinding: { ok: true, provider: 'deepseek-account', model: 'deepseek-flash' },
+    effectiveContextWindow: 500000,
+    snapshot: { goal_and_completion_md: 'G'.repeat(18000) },
+    telemetry: { sessions: {} },
+  }
+  const flatProj = projectOrchestrateResultForAgent(flatStatusRaw)
+  assert.equal(flatProj.ok, true)
+  assert.equal(flatProj.poolState, 'running')
+  assert.equal(flatProj.kernelAlive, true, '平铺 status 不可丢失 kernelAlive')
+  assert.equal(flatProj.initialized, true, '平铺 status 不可丢失 initialized')
+  assert.equal(flatProj.stage, 'STAGE1_PARSE0', '平铺 status 不可丢失 stage')
+  assert.equal(flatProj.subproblemStates.length, 4, '平铺 status 不可丢失 subproblemStates')
+  assert.equal(flatProj.runningExplorersCount, 1)
+  assert.deepEqual(flatProj.runningGovernanceTasks, ['stage1:works_check'])
+  assert.equal(flatProj.snapshot, undefined)
+  assert.equal(flatProj.telemetry, undefined)
 })
 
 test('v0.3-9: Config 动态探测/回退、前端编译产物零禁令依赖与三问视图齐全', () => {
@@ -477,14 +462,10 @@ test('v0.3-10: 全部 10 份角色 System Prompt 具备 Tool Guidance + Guardrai
 
   const chiefMd = fs.readFileSync(path.join(agentsDir, 'gw_chief.md'), 'utf8')
   for (const act of [
-    'SET_SUBPROBLEM_STATE',
-    'AUTHORIZE_EARLY_HANDOFF',
     'AMEND_RULING_DRAFT',
     'AUTHORIZE_PARTIAL_DELIVERY',
     'APPROVE_WAVE_VERDICT',
-    'SEED_HUMAN_BRANCH',
-    'SUBMIT_WORKS_OR_SURVEY_TICKET',
-    'SET_AUTONOMY_MODE',
+    'ADVANCE_EPOCH',
   ]) {
     assert.ok(chiefMd.includes(act), `gw_chief.md 缺少真实提案枚举: ${act}`)
   }

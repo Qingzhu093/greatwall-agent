@@ -21,7 +21,6 @@ import {
 } from './prompts.js'
 import { CONFIG_SCHEMA_BACKEND, Config, DEFAULT_PLUGIN_CONFIG, resolvePluginConfig } from './config.js'
 import { loadSkillLedger, loadSkillPack, registerSkillPack } from './skillpack.js'
-import { registerPresetsOnRegistry } from './presets.js'
 import { GreatwallControlService } from './control_service.js'
 import { registerOrchestrateTool } from './orchestrate_tool.js'
 import { registerGreatwallConsoleRoutes } from './console_routes.js'
@@ -41,19 +40,6 @@ export function apply(ctx, rawConfig = {}) {
   const coreRoot = config.corePythonRoot
   const skillsDir = path.join(coreRoot, 'skills')
 
-  // 1. 幂等热注册单源 8 套 Preset（10 角色）
-  let disposeRegisteredPresets = () => {}
-  if (typeof ctx?.inject === 'function') {
-    const disposeApInject = ctx.inject(['agentPresets'], (apCtx) => {
-      const regHandle = registerPresetsOnRegistry(apCtx, apCtx.agentPresets, { logger })
-      return () => {
-        void regHandle.then((h) => h?.disposeAll?.()).catch(() => {})
-      }
-    })
-    if (typeof disposeApInject === 'function') disposeRegisteredPresets = disposeApInject
-  }
-
-  // 2. 注册学术主流程 SOP 技能包
   let disposeSkills = () => {}
   const skillsSvc = ctx?.get?.('skills')
   if (skillsSvc && typeof skillsSvc.register === 'function') {
@@ -65,10 +51,11 @@ export function apply(ctx, rawConfig = {}) {
     else if (registered.length) logger.info?.(`[dsh-greatwall-v6up] registered skills: ${registered.join(', ')}`)
   }
 
-  // 3. 统一控制服务（One Operation, Two Callers）
   const controlService = new GreatwallControlService({ ctx, config, logger })
+  const disposeAdoption = ctx.on?.('agent/created', ({ agent, source }) => {
+    return controlService.adoptManualChief(agent, source)
+  })
 
-  // 4. 注册极简 4 动作入口工具、原生 Action Card 与鉴权控制台路由
   const disposeEntryTool = registerOrchestrateTool(ctx, controlService)
   const actionCardReg = registerProposalActionCard(ctx, controlService, { logger })
   const disposeConsoleRoutes = registerGreatwallConsoleRoutes(ctx, {
@@ -107,11 +94,11 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   const cleanupAll = async () => {
+    try { disposeAdoption?.() } catch {}
     try { disposeEntryTool() } catch {}
     try { actionCardReg.dispose() } catch {}
     try { disposeConsoleRoutes() } catch {}
     try { disposeSkills() } catch {}
-    try { disposeRegisteredPresets() } catch {}
     try { await controlService.disposeAll() } catch {}
   }
 

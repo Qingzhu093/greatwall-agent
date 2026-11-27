@@ -15,6 +15,9 @@ export async function dispatchStage1Step(port, snap, sig) {
     return { handled: true, waitMs: 500 }
   }
 
+  if (['stage1:works_check', 'stage1:external_surveyor', 'stage1:logistics_init']
+    .some((key) => port.isGovTaskRunning?.(key))) return { handled: true, waitMs: 300 }
+
   // 1.1 科研仪器科初始仪器就绪核查
   if (!snap.stage1_works_checked) {
     const missingInsts = snap.missing_initial_instruments || []
@@ -27,7 +30,7 @@ export async function dispatchStage1Step(port, snap, sig) {
     const activeStage1Items = stage1WorksItems.filter((it) => !port.isBreakerOpen(it.key, it.beforeFp))
 
     if (activeStage1Items.length > 0) {
-      await port.launchGovTaskAndAwait('stage1:works_check', async () => {
+      port.launchGovTask('stage1:works_check', async () => {
         await port.spawnAndRunAgent({
           role: 'works_engineer',
           uiLabel: missingInsts.length > 0 ? `[科研仪器科] 初始仪器锻造 (${missingInsts.length}项)` : '[科研仪器科] Stage1 核查',
@@ -66,7 +69,7 @@ export async function dispatchStage1Step(port, snap, sig) {
     const s1Key = 'stage1:external_surveyor'
     const s1Fp = 'ext_count=0'
     if (!port.isBreakerOpen(s1Key, s1Fp)) {
-      await port.launchGovTaskAndAwait('stage1:external_surveyor', async () => {
+      port.launchGovTask('stage1:external_surveyor', async () => {
         await port.spawnAndRunAgent({
           role: 'external_surveyor',
           uiLabel: '[对外采编] 开局外藏文献建卡',
@@ -90,7 +93,7 @@ export async function dispatchStage1Step(port, snap, sig) {
     const branchItems = snap.questions_needing_branch.map((q) => ({ key: `stage1:branch:${q}`, beforeFp: `need:${q}` }))
     const activeBranchItems = branchItems.filter((it) => !port.isBreakerOpen(it.key, it.beforeFp))
     if (activeBranchItems.length > 0) {
-      await port.launchGovTaskAndAwait('stage1:logistics_init', async () => {
+      port.launchGovTask('stage1:logistics_init', async () => {
         await port.spawnAndRunAgent({
           role: 'logistics_coordinator',
           uiLabel: '[后勤总管] 开局正交学派建枝',

@@ -19,6 +19,11 @@ window.__ModuleLoader__.load({
 		const CONTROL_API = "/api/greatwall.control";
 
 		const CSS_TEXT = [
+		  ".gw-operator { padding: 10px; }",
+		  ".gw-operator fieldset { display: grid; gap: 6px; margin-bottom: 10px; }",
+		  ".gw-operator label { display: grid; grid-template-columns: minmax(85px, 1fr) minmax(125px, 1.5fr); align-items: center; gap: 8px; }",
+		  ".gw-operator input:not([type=checkbox]) { min-width: 0; max-width: 100%; }",
+		  ".gw-operator li { overflow-wrap: anywhere; margin: 4px 0; }",
 		  ".gw-root{box-sizing:border-box;display:flex;flex-direction:column;height:100%;overflow:hidden;color:var(--dsw-alias-label-primary);font-size:12px;line-height:1.45}",
 		  ".gw-hdr{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-l4);flex:none;flex-wrap:wrap}",
 		  ".gw-title-wrap{display:flex;align-items:center;flex-wrap:wrap;gap:5px;min-width:0}",
@@ -79,7 +84,7 @@ window.__ModuleLoader__.load({
 		function stateBadgeClass(st) {
 		  const s = String(st || "").toUpperCase();
 		  if (s.includes("RUN") || s === "DISPATCHING" || s === "STOPPED_SOLVED" || s === "CLOSED_VERIFIED" || s === "APPROVED_EXECUTED") return "gw-badge gw-b-run";
-		  if (s.includes("PAUSE") || s.includes("HUMAN") || s.includes("PENDING") || s.includes("BLOCKED") || s === "EARLY_HANDOFF_READY") return "gw-badge gw-b-warn";
+		  if (s.includes("PAUSE") || s.includes("DRAIN") || s.includes("HUMAN") || s.includes("PENDING") || s.includes("BLOCKED") || s === "EARLY_HANDOFF_READY") return "gw-badge gw-b-warn";
 		  if (s.includes("ERR") || s.includes("FAIL") || s.includes("REFUTED") || s === "UNHEALTHY") return "gw-badge gw-b-err";
 		  return "gw-badge gw-b-info";
 		}
@@ -108,8 +113,11 @@ window.__ModuleLoader__.load({
 		function readableControlState(st) {
 		  const s = String(st || "").toUpperCase();
 		  if (s === "AUTO_RUNNING") return "自动托管";
-		  if (s === "PAUSE_DRAINING") return "让权停机中";
-		  if (s === "HUMAN_ACTIVE") return "等待人类接管";
+		  if (s === "PAUSE_DRAINING") return "让权收尾中";
+		  if (s === "DRAIN_AFTER_TURN") return "当前回合收尾中";
+		  if (s === "DRAIN_AFTER_HANDOFF") return "本班交班收尾中";
+		  if (s === "HUMAN_ACTIVE") return "人工接管 · 0 槽";
+		  if (s === "HIBERNATED") return "已休眠 · 0 槽";
 		  if (s === "EARLY_HANDOFF_READY") return "已授权提前交班";
 		  return s || "";
 		}
@@ -124,6 +132,10 @@ window.__ModuleLoader__.load({
 		  if (s === "STOPPED_SOLVED") return "已通关";
 		  if (s === "CLOSED") return "已结题";
 		  return s || "未知";
+		}
+
+		function readableReceiptStatus(status) {
+		  return { SETTLED: "已生效", DRAINING: "收尾中", PARTIAL_FAILED: "有失败项", SUPERSEDED: "已被覆盖" }[status] || status;
 		}
 
 		function readableActionLabel(act) {
@@ -555,6 +567,7 @@ window.__ModuleLoader__.load({
 		  if (s === "BLOCKED_L4B") return "缺引理挂起";
 		  if (s === "SEALED") return "已封存";
 		  if (s === "CLOSED") return "已关闭";
+		  if (s === "RETIRED") return "已撤编";
 		  return s || "未知";
 		}
 
@@ -562,7 +575,6 @@ window.__ModuleLoader__.load({
 		  const [expandedNodes, setExpandedNodes] = React.useState({});
 		  const [showHistorical, setShowHistorical] = React.useState(false);
 		  const [feedback, setFeedback] = React.useState("");
-		  const [confirmEarlyNodeId, setConfirmEarlyNodeId] = React.useState("");
 
 		  const poolState = String(data?.status?.poolState || "idle").toLowerCase();
 		  const isPoolRunning = poolState === "running";
@@ -572,6 +584,7 @@ window.__ModuleLoader__.load({
 		  const families = insp.method_families || [];
 		  const activeSessions = data?.status?.activeSessions || [];
 		  const runningExplorers = data?.status?.runningExplorers || [];
+		  const drainingIds = new Set((insp.snapshot?.operator_slot_ledger?.draining || []).map((slot) => slot.node_id));
 		  const liveByNode = {};
 		  for (const r of runningExplorers) {
 		    if (r?.nodeId) liveByNode[r.nodeId] = { nodeId: r.nodeId, sessionId: r.sessionId, startedAt: r.startedAt || null };
@@ -667,7 +680,11 @@ window.__ModuleLoader__.load({
 		                            const isExpanded = Boolean(expandedNodes[n.node_id]);
 		                            const needsToggle = summary.length > 90;
 		                            const displaySummary = needsToggle && !isExpanded ? `${summary.slice(0, 90)}…` : summary;
-		                            const isPausedForHuman = ctrlSt === "PAUSE_DRAINING" || ctrlSt === "HUMAN_ACTIVE";
+		                            const draining = drainingIds.has(n.node_id);
+		                            const canResume = canIntervene && ["HUMAN_ACTIVE", "PAUSE_DRAINING", "HIBERNATED"].includes(ctrlSt);
+		                            const intervene = (mode, extra = {}) => onControl("operator_command", {
+		                              operation: "node_intervene", node_action: { node_ids: [n.node_id], mode, ...extra },
+		                            });
 
 		                            const expExists = !knownSessions || Boolean(knownSessions[expSid]) || Boolean(liveInfo);
 		                            const compExists = !knownSessions || Boolean(knownSessions[compSid]);
@@ -677,7 +694,7 @@ window.__ModuleLoader__.load({
 		                                  ? (poolState === "paused" ? "PAUSED" : "INFO")
 		                                  : n.node_status);
 		                            const badgeLabel = isTrulyRunning
-		                              ? "运行中"
+		                              ? "运行占槽"
 		                              : (canIntervene && ctrlSt === "AUTO_RUNNING"
 		                                  ? (isPoolRunning
 		                                      ? "排队等槽位"
@@ -712,8 +729,8 @@ window.__ModuleLoader__.load({
 		                                          className: stateBadgeClass(badgeStatusKey),
 		                                          children: badgeLabel
 		                                        }),
-		                                        ctrlSt !== "AUTO_RUNNING"
-		                                          ? jsx("span", { className: stateBadgeClass(ctrlSt), title: ctrlSt, children: readableControlState(ctrlSt) })
+		                                        draining || (ctrlSt !== "AUTO_RUNNING" && n.node_status !== "RETIRED")
+		                                          ? jsx("span", { className: stateBadgeClass(draining ? "DRAINING" : ctrlSt), children: draining ? "收尾退场 · 占槽" : readableControlState(ctrlSt) })
 		                                          : null
 		                                      ]
 		                                    })
@@ -773,56 +790,33 @@ window.__ModuleLoader__.load({
 		                                          children: "暂停接管"
 		                                        })
 		                                      : null,
-		                                    canIntervene && isPausedForHuman
+		                                    canResume
 		                                      ? jsx("button", {
 		                                          className: "gw-btn gw-btn-ok",
 		                                          disabled: busy,
-		                                          onClick: () => {
-		                                            setConfirmEarlyNodeId("");
-		                                            void onControl("resume_node", { node_id: n.node_id });
-		                                          },
-		                                          children: "交还托管(SHA对账)"
+		                                          onClick: () => intervene("resume"),
+		                                          children: ctrlSt === "HIBERNATED" ? "恢复托管" : "交还托管（SHA 对账）"
 		                                        })
 		                                      : null,
-		                                    canIntervene && isPausedForHuman
+		                                    canIntervene && ctrlSt === "HUMAN_ACTIVE"
 		                                      ? jsx("button", {
 		                                          className: "gw-btn",
 		                                          disabled: busy,
-		                                          onClick: () => setConfirmEarlyNodeId((cur) => (cur === n.node_id ? "" : n.node_id)),
+		                                          onClick: () => intervene("early_handoff"),
 		                                          children: "授权提前交班"
 		                                        })
-		                                      : null
+		                                      : null,
+		                                    canIntervene && ctrlSt !== "HIBERNATED" && jsx("button", {
+		                                      className: "gw-btn", disabled: busy, onClick: () => intervene("hibernate"), children: "休眠腾槽",
+		                                    }),
+		                                    (canIntervene || n.node_status === "BLOCKED_L4B") && jsx("button", {
+		                                      className: "gw-btn", disabled: busy, onClick: () => intervene("retire"), children: "撤编归档",
+		                                    }),
+		                                    n.node_status === "RETIRED" && jsx("button", {
+		                                      className: "gw-btn", disabled: busy, onClick: () => intervene("reactivate"), children: "重新激活",
+		                                    }),
 		                                  ]
-		                                }),
-		                                confirmEarlyNodeId === n.node_id && canIntervene && isPausedForHuman
-		                                  ? jsxs("div", {
-		                                      className: "gw-confirm-bar",
-		                                      style: { borderRadius: "6px", border: "1px solid rgba(220,38,38,.3)" },
-		                                      children: [
-		                                        jsx("span", { children: "确认提前结束本代探索并交由伴随封存遗嘱？" }),
-		                                        jsxs("div", {
-		                                          className: "gw-actions",
-		                                          children: [
-		                                            jsx("button", {
-		                                              className: "gw-btn gw-btn-danger",
-		                                              disabled: busy,
-		                                              onClick: () => {
-		                                                setConfirmEarlyNodeId("");
-		                                                void onControl("authorize_early_handoff", { node_id: n.node_id });
-		                                              },
-		                                              children: "确认提前交班"
-		                                            }),
-		                                            jsx("button", {
-		                                              className: "gw-btn",
-		                                              disabled: busy,
-		                                              onClick: () => setConfirmEarlyNodeId(""),
-		                                              children: "取消"
-		                                            })
-		                                          ]
-		                                        })
-		                                      ]
-		                                    })
-		                                  : null
+		                                })
 		                              ]
 		                            }, n.node_id);
 		                          })
@@ -838,6 +832,225 @@ window.__ModuleLoader__.load({
 		  });
 		}
 
+		// --- module: client_src/components/OperatorPlaneView.js ---
+		/** GreatWall v0.3.1 运行安排状态大盘（轻量只读态势为主，高级直控表单按需折叠）。 */
+		function safeParseIsoTimestamp(raw) {
+		  const text = String(raw || "").trim();
+		  if (!text) return { ok: true, value: null };
+		  const ms = Date.parse(text);
+		  if (Number.isNaN(ms)) return { ok: false, value: null };
+		  return { ok: true, value: new Date(ms).toISOString() };
+		}
+
+		function safeFormatLocalTime(raw) {
+		  const ms = Date.parse(String(raw || ""));
+		  if (Number.isNaN(ms)) return String(raw || "");
+		  return new Date(ms).toLocaleString();
+		}
+
+		function OperatorPlaneView({ data, busy, onControl }) {
+		  const [form, setForm] = React.useState({ scope: "PROJECT", target: "ALL", policy: "", priority: "", cap: "", workers: "", drain: "", expires: "", untilBatch: false });
+		  const [dateErr, setDateErr] = React.useState("");
+		  const [nodeIds, setNodeIds] = React.useState([]);
+		  const [nodeMode, setNodeMode] = React.useState("");
+		  const [archive, setArchive] = React.useState(false);
+		  const [alsoApply, setAlsoApply] = React.useState(false);
+		  const [inheritLit, setInheritLit] = React.useState(false);
+		  const [inheritInstruments, setInheritInstruments] = React.useState(false);
+		  const snap = data?.inspector?.snapshot || data?.status?.snapshot || {};
+		  if (!snap.operator_plane) return jsx("div", { className: "gw-card gw-muted", children: "签署课题后可查看与调整运行安排。" });
+
+		  const states = snap.subproblem_runtime_state || [];
+		  const nodes = (data?.inspector?.lineage_nodes || []).filter((n) =>
+		    ["EXPLORING", "ACTIVE_REVISING", "BLOCKED_L4B", "RETIRED"].includes(n.node_status));
+		  const ledger = snap.operator_slot_ledger || {};
+		  const arrangements = snap.active_arrangements || [];
+		  const receipts = snap.operation_receipts || [];
+		  const assign = (key) => (e) => {
+		    if (key === "expires") setDateErr("");
+		    setForm({ ...form, [key]: e.target.value });
+		  };
+		  const cmd = (operation, payload) => onControl("operator_command", { operation, ...payload });
+		  const hasPatch = Boolean(form.policy || form.cap || form.priority || (form.scope === "PROJECT" && form.workers) || form.drain);
+		  const field = (label, input) => jsxs("label", { children: [jsx("span", { children: label }), input] });
+		  const select = (items, props) => jsx("select", {
+		    className: "gw-select", ...props, children: items.map(([value, label]) => jsx("option", { value, children: label }, value)),
+		  });
+		  const number = (key, min, max) => jsx("input", { type: "number", min, max, value: form[key], onChange: assign(key) });
+		  const button = (label, onClick, disabled = busy) => jsx("button", { type: "button", className: "gw-btn", onClick, disabled, children: label });
+
+		  const submitArrangement = (event) => {
+		    event.preventDefault();
+		    if (!hasPatch || busy) return;
+		    const parsedExp = safeParseIsoTimestamp(form.expires);
+		    if (!parsedExp.ok) {
+		      setDateErr("到期时间格式无效，请重新选择或留空。");
+		      return;
+		    }
+		    const arrangement = {
+		      scope_type: form.scope,
+		      target_id: form.target,
+		      ...(form.policy ? { dispatch_policy: form.policy } : {}),
+		      ...(form.cap ? { max_active_branches: Number(form.cap) } : {}),
+		      ...(form.priority ? { priority_weight: Number(form.priority) } : {}),
+		      ...(form.scope === "PROJECT" && form.workers ? { max_concurrent_workers: Number(form.workers) } : {}),
+		      ...(form.drain ? { inflight_drain_mode: form.drain } : {}),
+		      ...(parsedExp.value ? { ends_on_kind: "AT_TIME", expires_at: parsedExp.value }
+		        : form.untilBatch ? { ends_on_kind: "AFTER_INFLIGHT_BATCH" } : {}),
+		    };
+		    const payload = { arrangement };
+		    if (alsoApply && nodeIds.length && nodeMode) {
+		      payload.node_action = { node_ids: nodeIds, mode: nodeMode, archive_family: archive };
+		    }
+		    void cmd("apply_arrangement", payload);
+		  };
+
+		  return jsxs("section", {
+		    className: "gw-operator",
+		    style: { display: "flex", flexDirection: "column", gap: "9px" },
+		    children: [
+		      // 1. 纪元与占槽态势总览 + 快捷唤起 gw-chief
+		      jsxs("div", {
+		        className: "gw-card",
+		        children: [
+		          jsxs("div", {
+		            className: "gw-card-hd",
+		            children: [
+		              jsx("span", { children: `运行安排 · 纪元 ${snap.epoch_id ?? 1}` }),
+		              jsx("button", {
+		                type: "button",
+		                className: "gw-btn gw-btn-pri",
+		                disabled: busy,
+		                onClick: () => onControl("open_chief", {}),
+		                children: "在 gw-chief 下令",
+		              }),
+		            ],
+		          }),
+		          jsx("div", {
+		            className: "gw-muted",
+		            children: `执行中 ${ledger.working?.length || 0} · 收尾占槽 ${ledger.draining?.length || 0} · 挂起/人工接管 ${ledger.hibernated_or_human?.length || 0}`,
+		          }),
+		          states.length === 0
+		            ? jsx("div", { className: "gw-muted", children: "暂无子题运行态。" })
+		            : jsx("ul", {
+		                children: states.map((q) => jsx("li", {
+		                  children: `${q.question_id} · ${q.dispatch_state} · ${q.dispatch_policy} · 优先级 ${q.priority_weight} · 分支上限 ${q.max_active_branches}`,
+		                }, q.question_id)),
+		              }),
+		        ],
+		      }),
+
+		      // 2. 当前生效中的临时安排（支持一键撤销）
+		      jsxs("div", {
+		        className: "gw-card",
+		        children: [
+		          jsxs("div", {
+		            className: "gw-card-hd",
+		            children: [
+		              jsx("span", { children: `生效中的运行安排 (${arrangements.length})` }),
+		            ],
+		          }),
+		          arrangements.length === 0
+		            ? jsx("div", { className: "gw-muted", children: "当前按默认策略推进；可直接在 gw-chief 对话下令调整优先级、停新派或到期恢复。" })
+		            : jsx("ul", {
+		                children: arrangements.map((a) => jsxs("li", {
+		                  children: [
+		                    `${a.target_id} · v${a.arrangement_version} · ${a.summary_md || Object.entries(a.patch || {}).map(([k, v]) => `${k}=${v}`).join("，")}`,
+		                    a.expires_at ? ` · ${safeFormatLocalTime(a.expires_at)} 到期` : "",
+		                    a.ends_on_kind === "AFTER_INFLIGHT_BATCH" ? ` · 等待本批次 ${(a.watch_node_ids || []).length} 条` : "",
+		                    " ",
+		                    button("撤销", () => cmd("revoke_arrangement", { details: { arrangement_id: a.arrangement_id } })),
+		                  ],
+		                }, a.arrangement_id)),
+		              }),
+		        ],
+		      }),
+
+		      // 3. 最近操作回执
+		      jsxs("div", {
+		        className: "gw-card",
+		        children: [
+		          jsx("div", { className: "gw-card-hd", children: jsx("span", { children: `近期操作回执 (${receipts.length})` }) }),
+		          receipts.length === 0
+		            ? jsx("div", { className: "gw-muted", children: "尚无运行操作回执。" })
+		            : jsx("ul", {
+		                children: receipts.slice(0, 8).map((op) => jsxs("li", {
+		                  children: [
+		                    `${readableReceiptStatus(op.status)} · ${op.summary_md}`,
+		                    op.pending_targets?.length ? jsx("div", { className: "gw-muted", children: `仍在收尾：${op.pending_targets.join("，")}` }) : null,
+		                    ...(op.failed_items || []).map((item) => jsx("div", {
+		                      className: "gw-muted",
+		                      children: `${item.target_id} · ${item.error}${item.retry_hint ? ` · ${item.retry_hint}` : ""}`,
+		                    }, item.target_id)),
+		                  ],
+		                }, op.op_id)),
+		              }),
+		        ],
+		      }),
+
+		      // 4. 折叠式高级直控区（默认收起，保持窄侧栏简洁）
+		      jsxs("details", {
+		        className: "gw-card",
+		        children: [
+		          jsx("summary", { style: { cursor: "pointer", fontWeight: 600 }, children: "高级直控表单（调整安排 / 点名分支 / 推进纪元）" }),
+		          jsxs("div", {
+		            style: { display: "flex", flexDirection: "column", gap: "8px", marginTop: "8px" },
+		            children: [
+		              jsx("form", {
+		                onSubmit: submitArrangement,
+		                children: jsxs("fieldset", {
+		                  disabled: busy,
+		                  children: [
+		                    jsx("legend", { children: "调整运行安排" }),
+		                    field("范围", select([["ALL", "全院"], ...states.map((q) => [q.question_id, q.question_id])], {
+		                      value: form.target, onChange: (e) => setForm({ ...form, target: e.target.value, scope: e.target.value === "ALL" ? "PROJECT" : "QUESTION" }),
+		                    })),
+		                    field("派工", select([["", "沿用"], ["NORMAL", "正常派发"], ["NO_NEW_DISPATCH", "停止新派"], ["PAUSED_ALL", "全面暂停"]], { value: form.policy, onChange: assign("policy") })),
+		                    field("优先级", number("priority", -10000, 10000)),
+		                    field("每题分支上限", number("cap", 1, 100)),
+		                    form.scope === "PROJECT" && field("普通执行槽", number("workers", 1, snap.max_worker_slots || 10)),
+		                    field("在途收尾", select([["", "按策略默认"], ["FINISH_CURRENT_TURN", "本回合后挂起"], ["FINISH_CURRENT_HANDOFF", "本班交班后停驻"], ["IMMEDIATE_YIELD", "尽快让出执行槽"]], { value: form.drain, onChange: assign("drain") })),
+		                    field("到期时间", jsx("input", { type: "datetime-local", value: form.expires, onChange: assign("expires") })),
+		                    dateErr ? jsx("div", { className: "gw-banner gw-banner-err", children: dateErr }) : null,
+		                    field("本批退出后到期", jsx("input", { type: "checkbox", checked: form.untilBatch, disabled: Boolean(form.expires), onChange: (e) => setForm({ ...form, untilBatch: e.target.checked }) })),
+		                    field("同时执行下方分支操作", jsx("input", { type: "checkbox", checked: alsoApply, onChange: (e) => setAlsoApply(e.target.checked) })),
+		                    jsx("button", { type: "submit", className: "gw-btn gw-btn-pri", disabled: !hasPatch || (alsoApply && (!nodeIds.length || !nodeMode)), children: "应用运行安排" }),
+		                  ],
+		                }),
+		              }),
+		              jsxs("fieldset", {
+		                disabled: busy,
+		                children: [
+		                  jsx("legend", { children: "点名操作分支" }),
+		                  field("目标分支", jsx("select", {
+		                    className: "gw-select", multiple: true, value: nodeIds,
+		                    onChange: (e) => setNodeIds(Array.from(e.target.selectedOptions).map((o) => o.value)),
+		                    children: nodes.map((n) => jsx("option", { value: n.node_id, children: `${n.question_id} · ${n.node_id} · ${n.node_status} / ${n.control_state}` }, n.node_id)),
+		                  })),
+		                  field("动作", select([["", "请选择"], ["retire", "撤编"], ["hibernate", "挂起"], ["pause_takeover", "人工接管"], ["resume", "恢复托管"], ["early_handoff", "提前交班"], ["reactivate", "重新激活"]], { value: nodeMode, onChange: (e) => setNodeMode(e.target.value) })),
+		                  nodeMode === "retire" && field("同时归档无保留分支的学派", jsx("input", { type: "checkbox", checked: archive, onChange: (e) => setArchive(e.target.checked) })),
+		                  button("执行分支操作", () => cmd("node_intervene", { node_action: { node_ids: nodeIds, mode: nodeMode, archive_family: archive } }), busy || !nodeIds.length || !nodeMode),
+		                ],
+		              }),
+		              jsxs("fieldset", {
+		                disabled: busy,
+		                children: [
+		                  jsx("legend", { children: "推进新纪元（归档旧库）" }),
+		                  field("继承外藏文献", jsx("input", { type: "checkbox", checked: inheritLit, onChange: (e) => setInheritLit(e.target.checked) })),
+		                  field("继承健康仪器", jsx("input", { type: "checkbox", checked: inheritInstruments, onChange: (e) => setInheritInstruments(e.target.checked) })),
+		                  button("生成纪元确认单", () => onControl("propose_epoch", {
+		                    inherit_external_literature: inheritLit, inherit_instruments: inheritInstruments,
+		                  })),
+		                ],
+		              }),
+		            ],
+		          }),
+		        ],
+		      }),
+		    ],
+		  });
+		}
+
 		// --- module: client_src/index.js ---
 		/** GreatWall v0.3 右侧科研指挥舱顶层容器与 DSH RC5 插件挂载入口。 */
 		function GreatwallTitle() {
@@ -850,7 +1063,10 @@ window.__ModuleLoader__.load({
 		function GreatwallConsoleBody({ getUiWorkspace }) {
 		  const [tab, setTab] = React.useState("overview");
 		  const [selectedWs, setSelectedWs] = React.useState(() => readPersistedWs());
-		  const [data, setData] = React.useState(null);
+		  const [snapshot, setData] = React.useState(null);
+		  const selectedWsRef = React.useRef(selectedWs);
+		  const isSwitchingWs = Boolean(selectedWs && snapshot?.workspaceRoot && snapshot.workspaceRoot !== selectedWs);
+		  const data = !selectedWs || snapshot?.workspaceRoot === selectedWs ? snapshot : null;
 		  const [busy, setBusy] = React.useState(false);
 		  const [banner, setBanner] = React.useState(null);
 		  const [confirmHumanStop, setConfirmHumanStop] = React.useState(false);
@@ -890,6 +1106,7 @@ window.__ModuleLoader__.load({
 		      if (res && res.ok) {
 		        setData(res);
 		        if (!ws && res.workspaceRoot) {
+		          selectedWsRef.current = res.workspaceRoot;
 		          setSelectedWs(res.workspaceRoot);
 		          persistSelectedWs(res.workspaceRoot);
 		        }
@@ -907,24 +1124,34 @@ window.__ModuleLoader__.load({
 		  }, [refresh]);
 
 		  const handleControl = async (action, payload = {}) => {
+		    const ws = selectedWsRef.current || data?.workspaceRoot;
+		    if (!ws || data?.workspaceRoot !== ws) {
+		      showBanner("info", "正在切换项目快照，请稍候再试。", 3000);
+		      return;
+		    }
 		    setBusy(true);
 		    showBanner("info", "", 0);
 		    try {
-		      const ws = data?.workspaceRoot || selectedWs;
-		      const res = await postGreatwallControl(action, { workspaceRoot: ws, ...payload });
+		      const res = await postGreatwallControl(action, { ...payload, workspaceRoot: ws });
+		      if (selectedWsRef.current && selectedWsRef.current !== ws) return;
 		      const label = readableActionLabel(action);
 		      if (res?.ok === false) {
 		        showBanner("err", `${label}失败: ${res.error || "未知错误"}`);
 		      } else if (action === "open_chief" && res?.sessionId) {
 		        const opened = openNativeSession(getUiWorkspace, res.sessionId, (msg) => showBanner("err", msg));
 		        if (opened) showBanner("ok", `已唤醒科研总控会话`);
+		      } else if (action === "propose_epoch") {
+		        showBanner("ok", "确认单已生成。请在总览的待拍板提案中核对后签署。");
+		        setTab("overview");
+		      } else if (action === "approve_proposal" && res?.data?.execution?.epoch_id) {
+		        showBanner("ok", `已归档旧纪元，当前为纪元 ${res.data.execution.epoch_id}。调度已停止。`);
 		      } else if (action === "pause") {
 		        const cnt = Array.isArray(res?.pausedNodeIds) ? res.pausedNodeIds.length : 0;
 		        showBanner("ok", cnt > 0 ? `已全局暂停，${cnt} 条在跑分支已切入等待人类接管` : "已全局暂停，系统进入等待人类接管态");
 		      } else if (action === "resume") {
 		        const cnt = Array.isArray(res?.resumedNodeIds) ? res.resumedNodeIds.length : 0;
 		        showBanner("ok", cnt > 0 ? `已对 ${cnt} 条接管分支完成 SHA 对账并恢复全面托管` : "已恢复全面托管运行");
-		      } else {
+		      } else if (!res?.data?.op_id) {
 		        showBanner("ok", `已完成：${label}`);
 		      }
 		      await refresh(ws);
@@ -939,7 +1166,8 @@ window.__ModuleLoader__.load({
 		  const stage = data?.status?.stage || "";
 		  const isClosed = stage === "CLOSED_VERIFIED" || data?.status?.closureStatus === "CLOSED_VERIFIED";
 		  const humanStopActive = Boolean(data?.status?.humanStopActive);
-		  const knownWorkspaces = data?.knownWorkspaces || [];
+		  const knownWorkspaces = snapshot?.knownWorkspaces || [];
+		  const [latestReceipt] = (data?.inspector?.snapshot || data?.status?.snapshot)?.operation_receipts || [];
 
 		  return jsxs("div", {
 		    className: "gw-root",
@@ -950,7 +1178,7 @@ window.__ModuleLoader__.load({
 		          jsxs("div", {
 		            className: "gw-title-wrap",
 		            children: [
-		              jsx("strong", { children: "GreatWall v0.3" }),
+		              jsx("strong", { children: "GreatWall v0.3.1" }),
 		              jsx("span", { className: stateBadgeClass(poolState), title: poolState, children: readablePoolState(poolState) }),
 		              stage ? jsx("span", { className: "gw-badge gw-b-info", title: stage, children: readableStage(stage) }) : null
 		            ]
@@ -1012,10 +1240,12 @@ window.__ModuleLoader__.load({
 		            style: { padding: "6px 10px", borderBottom: "1px solid var(--dsw-alias-border-l4)" },
 		            children: jsx("select", {
 		              className: "gw-select",
-		              value: data?.workspaceRoot || selectedWs,
+		              value: selectedWs || data?.workspaceRoot,
 		              onChange: (e) => {
 		                const next = e.target.value;
 		                setConfirmHumanStop(false);
+		                selectedWsRef.current = next;
+		                showBanner("info", "");
 		                setSelectedWs(next);
 		                persistSelectedWs(next);
 		                void refresh(next);
@@ -1024,6 +1254,17 @@ window.__ModuleLoader__.load({
 		            })
 		          })
 		        : null,
+		      data?.chiefMountError
+		        ? jsx("div", { className: "gw-banner gw-banner-err", children: `科研总控挂载失败 · ${data.chiefMountError}` })
+		        : null,
+		      latestReceipt && (!selectedWs || data?.workspaceRoot === selectedWs) && jsxs("div", {
+		        className: "gw-row", role: "status",
+		        children: [
+		          jsx("span", { className: stateBadgeClass(latestReceipt.status), children: readableReceiptStatus(latestReceipt.status) }),
+		          latestReceipt.summary_md,
+		          latestReceipt.pending_targets?.length ? ` · ${latestReceipt.pending_targets.length} 条在途` : "",
+		        ],
+		      }),
 		      banner
 		        ? jsxs("div", {
 		            className: `gw-banner gw-banner-${banner.kind || "info"}`,
@@ -1038,12 +1279,17 @@ window.__ModuleLoader__.load({
 		        children: [
 		          jsx("button", { className: tab === "overview" ? "gw-tab gw-tab-on" : "gw-tab", onClick: () => setTab("overview"), children: "三大问题总览" }),
 		          jsx("button", { className: tab === "survey" ? "gw-tab gw-tab-on" : "gw-tab", onClick: () => setTab("survey"), children: "全局总览与圆桌" }),
+		          jsx("button", { className: tab === "operator" ? "gw-tab gw-tab-on" : "gw-tab", onClick: () => setTab("operator"), children: "运行安排" }),
 		          jsx("button", { className: tab === "branches" ? "gw-tab gw-tab-on" : "gw-tab", onClick: () => setTab("branches"), children: "分支与人工接管" })
 		        ]
 		      }),
 		      jsx("div", {
 		        className: "gw-scroll",
-		        children: tab === "overview"
+		        children: isSwitchingWs
+		          ? jsx("div", { className: "gw-card gw-muted", children: "正在切换并加载所选项目快照..." })
+		          : tab === "operator"
+		          ? jsx(OperatorPlaneView, { data, busy, onControl: handleControl }, selectedWs)
+		          : tab === "overview"
 		          ? jsx(ThreeQuestionsView, { data, busy, onControl: handleControl, getUiWorkspace })
 		          : (tab === "survey"
 		              ? jsx(LivingSurveyView, { data })

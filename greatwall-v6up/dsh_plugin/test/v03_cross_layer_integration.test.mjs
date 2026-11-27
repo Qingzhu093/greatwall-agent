@@ -360,7 +360,7 @@ test('cross-5 (#13 & #14): gw-chief 收件箱出队与 onBeforeStep 动态刷新
     const chiefRes = await ensureChiefSession(fakeController, { chiefInbox: inbox })
     assert.equal(chiefRes.drainedEventsCount, 1)
     assert.equal(inbox.peekCount(), 0, '打开 gw-chief 时必须消费收件箱批次')
-    assert.ok(capturedPrompt.includes('PENDING_HUMAN_PROPOSAL'))
+    assert.equal(capturedPrompt ?? '', '', '打开总控无需启动模型回合')
     assert.ok(capturedProvider().includes(prop.data.proposal_id))
 
     // 批准提案后触发 onBeforeStep，锚点卡必须动态刷新为已无待拍板提案！

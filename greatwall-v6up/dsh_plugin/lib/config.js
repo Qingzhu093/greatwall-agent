@@ -13,7 +13,7 @@ export const DEFAULT_PLUGIN_CONFIG = Object.freeze({
   dataDir: '',
   requestTimeoutMs: 60_000,
   longToolTimeoutMs: 300_000,
-  chiefAnchorHardCapChars: 1200,
+  chiefAnchorHardCapChars: 1500,
   defaultAgentOptions: Object.freeze({}),
 })
 
@@ -47,8 +47,8 @@ export const CONFIG_SCHEMA_DESCRIPTOR = Object.freeze({
     },
     chiefAnchorHardCapChars: {
       type: 'number',
-      default: 1200,
-      description: 'gw-chief 现况锚点卡弹性字数硬上限（默认 1200 字，公式 max(400, 180 + 100 * 子题数)）。',
+      default: DEFAULT_PLUGIN_CONFIG.chiefAnchorHardCapChars,
+      description: 'gw-chief 现况锚点卡字数上限，按子题数在上限内伸缩。',
     },
     defaultAgentOptions: {
       type: 'object',
@@ -154,7 +154,8 @@ try {
       dataDir: Schema.string().default('').description(CONFIG_SCHEMA_DESCRIPTOR.properties.dataDir.description),
       requestTimeoutMs: Schema.number().min(1000).default(60_000).description(CONFIG_SCHEMA_DESCRIPTOR.properties.requestTimeoutMs.description),
       longToolTimeoutMs: Schema.number().min(1000).default(300_000).description(CONFIG_SCHEMA_DESCRIPTOR.properties.longToolTimeoutMs.description),
-      chiefAnchorHardCapChars: Schema.number().min(400).max(4000).default(1200).description(CONFIG_SCHEMA_DESCRIPTOR.properties.chiefAnchorHardCapChars.description),
+      chiefAnchorHardCapChars: Schema.number().min(400).max(4000).default(DEFAULT_PLUGIN_CONFIG.chiefAnchorHardCapChars)
+        .description(CONFIG_SCHEMA_DESCRIPTOR.properties.chiefAnchorHardCapChars.description),
       defaultAgentOptions: Schema.object({
         provider: Schema.string().description('默认模型提供方'),
         model: Schema.string().description('默认模型 ID'),

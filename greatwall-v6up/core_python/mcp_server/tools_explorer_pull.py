@@ -452,6 +452,7 @@ def tool_handback_to_chief(
     question_id: str,
     human_request_md: str,
     reason: str,
+    *, human_rpc_id: str = "", human_message: str = "",
 ) -> dict[str, Any]:
     """越界退回权：将人类在本探索节点提出的全局/跨分支诉求原样退回 gw_chief 收件箱。"""
     enforce_role_tool_permission(conn, caller_role, "handback_to_chief", session_id=session_id, node_id=node_id)
@@ -465,16 +466,36 @@ def tool_handback_to_chief(
     if len(req_md) < 3 or len(rsn) < 3:
         raise FailClosedError(ERR_INVALID_INPUT, "human_request_md 与 reason 均不能为空")
 
+    from .control_plane.operator_policy import epoch_id
+    handback_id = f"hb_{uuid.uuid4().hex}"
     eff_res: dict[str, Any] = {}
     with rw_immediate_tx(conn):
+        if human_rpc_id and human_message.strip():
+            req_md = human_message.strip()
+            existing = conn.execute(
+                "SELECT handback_id FROM handback_records WHERE source_node_id=? AND origin_human_rpc_id=?",
+                (node_id, human_rpc_id),
+            ).fetchone()
+            if existing:
+                return {"ok": True, "data": {"handback_id": existing["handback_id"], "handed_back": True}}
+        else:
+            human_rpc_id = ""
+        conn.execute(
+            """INSERT INTO handback_records(handback_id,epoch_id,source_node_id,question_id,human_request_md,
+               explorer_reason_md,origin_human_rpc_id,origin_human_mandate,created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (handback_id, epoch_id(conn), node_id, question_id, req_md[:8000], rsn[:600], human_rpc_id,
+             int(bool(human_rpc_id)), utc_now_iso()),
+        )
         eff_res = enqueue_runtime_effect(
             conn,
-            effect_key=f"handback:{node_id}:{uuid.uuid4().hex[:8]}",
+            effect_key=f"handback:{handback_id}",
             kind="NOTIFY_CHIEF",
             target_type="PROJECT",
             target_id="gw-chief",
             payload={
                 "event_type": "EXPLORER_HANDBACK",
+                "handback_id": handback_id,
+                "origin_human_mandate": bool(human_rpc_id),
                 "node_id": node_id,
                 "branch_id": str(node["branch_id"]),
                 "question_id": question_id,
@@ -488,5 +509,5 @@ def tool_handback_to_chief(
         question_id=question_id,
         node_id=node_id,
         next_step_guidance="已将该全局/跨分支诉求原样退回科研总控 gw-chief 收件箱，请告知用户前往主控窗确认，本节点切勿越权执行。",
-        data={"effect_seq": eff_res.get("seq"), "node_id": node_id, "question_id": question_id, "handed_back": True},
+        data={"handback_id": handback_id, "effect_seq": eff_res.get("seq"), "node_id": node_id, "question_id": question_id, "handed_back": True},
     )

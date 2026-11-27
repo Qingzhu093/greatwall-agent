@@ -9,12 +9,7 @@ import { installFactLogMiddleware } from '../fact_log_middleware.js'
 import { installLiveClockObservers, registerScopedMcpTools } from '../clock_and_turn_gap.js'
 import { buildBlackboxTrajectorySummary } from '../blackbox_projection.js'
 
-const ZERO_NATIVE_ROLES = new Set([
-  'logistics_coordinator',
-  'supervisory_committee',
-  'library_chronicler',
-  'conference_chair',
-])
+const READONLY_NATIVE_TOOLS = new Set(['read', 'glob', 'grep'])
 
 export function mountCapabilitiesOnAgentSession(
   hostDeps,
@@ -34,11 +29,11 @@ export function mountCapabilitiesOnAgentSession(
     cleanupFns = [],
     turnSignals = [],
     onNativeThresholdHit = null,
+    sessionEpochId = 1,
   },
 ) {
-  const allowNative = readonly
-    ? (ZERO_NATIVE_ROLES.has(role) || role === 'external_surveyor' ? [] : ['read', 'glob', 'grep'])
-    : resolvePlatformAllowedTools(role, process.platform)
+  const nativeTools = resolvePlatformAllowedTools(role, process.platform)
+  const allowNative = readonly ? nativeTools.filter((name) => READONLY_NATIVE_TOOLS.has(name)) : nativeTools
 
   const mcpToolNames = readonly
     ? []
@@ -80,29 +75,17 @@ export function mountCapabilitiesOnAgentSession(
     }),
   )
 
-  cleanupFns.push(
-    installFactLogMiddleware(agentCtx, {
-      workspaceRoot: hostDeps.workspaceRoot,
-      role,
-      sessionId: agent.id,
-      nodeId,
-      bridge: hostDeps.bridge,
-    }),
-  )
-
-  cleanupFns.push(
-    installLiveClockObservers({
-      rootCtx: hostDeps.rootCtx,
-      agentCtx,
-      agent,
-      bridge: hostDeps.bridge,
-      workspaceRoot: hostDeps.workspaceRoot,
-      nodeId,
-      role,
-      contextWindowTokens: hostDeps.effectiveContextWindow,
-      onNativeThresholdHit,
-    }),
-  )
+  if (!readonly) {
+    cleanupFns.push(
+      installFactLogMiddleware(agentCtx, {
+        workspaceRoot: hostDeps.workspaceRoot, role, sessionId: agent.id, nodeId, bridge: hostDeps.bridge,
+      }),
+      installLiveClockObservers({
+        rootCtx: hostDeps.rootCtx, agentCtx, agent, bridge: hostDeps.bridge, workspaceRoot: hostDeps.workspaceRoot,
+        nodeId, role, contextWindowTokens: hostDeps.effectiveContextWindow, onNativeThresholdHit,
+      }),
+    )
+  }
 
   const rolePromptText = hostDeps.rolePrompts?.[role] || `# Role: ${role}`
   cleanupFns.push(
@@ -179,6 +162,14 @@ export function mountCapabilitiesOnAgentSession(
         nodeId,
         contextWindowTokens: hostDeps.effectiveContextWindow,
         onTurnSignal: (sig) => turnSignals.push(sig),
+        sessionEpochId,
+        onOperatorReceipt: hostDeps.onOperatorReceipt,
+        onHumanMessage: role === 'explorer' && nodeId && hostDeps.humanTakeover
+          ? ({ text }) => {
+              void hostDeps.humanTakeover.recordHumanChat(nodeId, agent.id, text).catch((error) =>
+                hostDeps.humanTakeover.telemetry?.recordEvent('human_chat_error', { nodeId, error: String(error) }))
+            }
+          : undefined,
       }),
     )
   }

@@ -563,6 +563,7 @@ def recover_pending_heavy_jobs(
     *,
     workspace_root: str,
     cancel_event: Any = None,
+    node_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """宿主重启恢复：仅将本进程未活跃占用的孤儿 `RUNNING` 复位为 `QUEUED`，再按统一领取通道续跑（严禁抢夺活跃作业）。"""
     now = utc_now_iso()
@@ -570,7 +571,7 @@ def recover_pending_heavy_jobs(
         with _ACTIVE_HEAVY_LOCK:
             active_snapshot = set(_ACTIVE_HEAVY_JOB_IDS)
         running_rows = conn.execute(
-            "SELECT job_id FROM async_eval_jobs WHERE status = 'RUNNING' AND obs_id IS NULL ORDER BY created_at ASC"
+            "SELECT job_id FROM async_eval_jobs WHERE status = 'RUNNING' AND obs_id IS NULL AND (? IS NULL OR node_id=?) ORDER BY created_at ASC", (node_id, node_id)
         ).fetchall()
         for r in running_rows:
             jid = str(r["job_id"])
@@ -580,7 +581,14 @@ def recover_pending_heavy_jobs(
                     (now, jid),
                 )
         queued_rows = conn.execute(
-            "SELECT job_id FROM async_eval_jobs WHERE status = 'QUEUED' AND obs_id IS NULL ORDER BY created_at ASC"
+            """SELECT j.job_id FROM async_eval_jobs j JOIN lineage_nodes n ON n.node_id=j.node_id
+               WHERE j.status='QUEUED' AND j.obs_id IS NULL AND (? IS NULL OR j.node_id=?)
+                 AND n.node_status<>'RETIRED'
+                 AND n.control_state NOT IN ('HIBERNATED','HUMAN_ACTIVE','PAUSE_DRAINING')
+                 AND NOT EXISTS (
+                   SELECT 1 FROM runtime_effects e WHERE e.target_type='NODE' AND e.target_id=n.node_id
+                     AND e.target_generation=n.control_generation AND e.kind IN ('CANCEL_NODE_SESSION','DRAIN_AND_STOP_NODE')
+                 ) ORDER BY j.created_at""", (node_id, node_id),
         ).fetchall()
 
     out: list[dict[str, Any]] = []

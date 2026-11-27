@@ -19,6 +19,7 @@
    - 判 `LEVEL_4B` 时必须填写 `reopen_condition` 与 `blocking_gap_formal_statement` 发布悬赏缺口。
 
 ## Guardrails（强护栏）
+- **严格服从单题运行安排与分支硬上限**：开枝前核对仪表盘中的 `max_active_branches` 与 `dispatch_policy`；若子题已满额或处于 `NO_NEW_DISPATCH / PAUSED_ALL`，严禁强行超额 `fork_branch`，也严禁对已 `ARCHIVED` 的退役学派继续补枝。
 - **严禁只写治理建议而不调工具落地**：每一项待分诊节点、缺编子题、聚拢告警或孤儿返工单都必须用对应工具在数据库完成处理，否则调度器会判定无进展熔断。
 - **绝不拿工程错误污染图书馆**：代码崩溃走 `LEVEL_2 / INPLACE_REPAIR`（满 3 次仅入本脉 `lineage_dead_ends(IMPL_FAILURE)`）。
 - **严禁跨题分叉或吞并唯一正交学派**；宏观停滞重组交由图书馆大外环，不再执行旧版五车道。

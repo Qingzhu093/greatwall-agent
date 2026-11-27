@@ -286,6 +286,7 @@ export async function driveExplorerCompanionPair(
     publicInputsList.length ? `### 只读公开题面与裁决文档目录 (inputs/)\n${publicInputsList.map((p) => `- \`${p}\``).join('\n')}` : '',
     donorMounts.length ? `### 只读次供体源码挂载目录（严禁修改，仅供借鉴融合）\n${donorMounts.map((d) => `- \`${d}\``).join('\n')}` : '',
     toolsManifest.length ? `### 本工作树 tools/ 已有模块清单\n${JSON.stringify(toolsManifest, null, 2)}` : '',
+    node.branch_kind === 'HUMAN_SEEDED' ? '### 人类研究蓝图\n请先完整读取 inputs/human_seed_blueprint.md，再按当前任务验证其中的推导。' : '',
     node.briefing_snapshot_md ? `### Lineage Briefing 五段看板\n${node.briefing_snapshot_md}` : '',
   ].filter(Boolean)
 
@@ -314,6 +315,7 @@ export async function driveExplorerCompanionPair(
   let terminatedExternally = false
   let yieldedToHuman = false
   let pausedByHost = false
+  let finishCurrentTurn = false
   let earlyHandoffAuthorized = false
   let explorerWillText = ''
   let reflectedDone = Boolean(node.first_reflection_unlocked)
@@ -382,6 +384,11 @@ export async function driveExplorerCompanionPair(
       if (ctrlState === 'PAUSE_DRAINING' || ctrlState === 'HUMAN_ACTIVE') {
         yieldedToHuman = true
         orchestrator.recordEvent?.('explorer_yielded_to_human', { nodeId: node.node_id, controlState: ctrlState })
+        return false
+      }
+      if (ctrlState === 'DRAIN_AFTER_TURN' || ctrlState === 'HIBERNATED') {
+        finishCurrentTurn = ctrlState === 'DRAIN_AFTER_TURN'
+        pausedByHost = true
         return false
       }
       if (ctrlState === 'EARLY_HANDOFF_READY') {
@@ -495,7 +502,11 @@ export async function driveExplorerCompanionPair(
     const disposeStatus = yieldedToHuman
       ? 'yielded_to_human'
       : (pausedByHost ? 'paused_by_host' : (terminatedExternally ? 'terminated_external' : (interrupted ? 'interrupted_unclaimed' : 'completed')))
-    await expRes.dispose(disposeStatus, expRes.turnEndReason, { archive: keepUnarchived ? false : undefined }).catch(() => {})
+    try {
+      if (finishCurrentTurn) await orchestrator.settleSessionJobs(expSessionId, { signal })
+    } finally {
+      await expRes.dispose(disposeStatus, expRes.turnEndReason, { archive: keepUnarchived ? false : undefined })
+    }
     if (terminatedExternally) {
       await disposeNodeCompanion(orchestrator, node.node_id, 'terminated_external')
     }

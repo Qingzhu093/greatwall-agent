@@ -8,6 +8,9 @@ V03_SCHEMA_SQL = """
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS subproblem_runtime_state (
     question_id TEXT PRIMARY KEY,
+    priority_weight INTEGER NOT NULL DEFAULT 100,
+    max_active_branches INTEGER NOT NULL DEFAULT 3,
+    dispatch_policy TEXT NOT NULL DEFAULT 'NORMAL',
     contract_id TEXT NOT NULL DEFAULT 'active' REFERENCES parse0_contract(contract_id),
     desired_state TEXT NOT NULL DEFAULT 'ACTIVE'
         CHECK(desired_state IN ('ACTIVE', 'PAUSED', 'CLOSED')),
@@ -54,9 +57,9 @@ CREATE TABLE IF NOT EXISTS node_interventions (
         'HUMAN_CHAT_DETECTED',
         'CODE_RECONCILED',
         'RESUME_REQUESTED',
-        'EARLY_HANDOFF_AUTHORIZED'
+        'EARLY_HANDOFF_AUTHORIZED', 'ADVISOR_NOTE_SENT', 'NODE_HIBERNATED', 'NODE_RETIRED', 'NODE_REACTIVATED'
     )),
-    actor_source TEXT NOT NULL CHECK(actor_source IN ('human_ui', 'control_plane', 'chief_approved')),
+    actor_source TEXT NOT NULL CHECK(actor_source IN ('human_ui', 'control_plane', 'chief_approved', 'chief_direct')),
     prev_candidate_sha256 TEXT NOT NULL DEFAULT '',
     curr_candidate_sha256 TEXT NOT NULL DEFAULT '',
     prev_tools_sha256 TEXT NOT NULL DEFAULT '',
@@ -82,7 +85,7 @@ CREATE TABLE IF NOT EXISTS runtime_effects (
         'REFRESH_LIVING_SURVEY',
         'RUN_WAVE_CONFERENCE',
         'NOTIFY_POLICY_CHANGED',
-        'NOTIFY_CHIEF'
+        'NOTIFY_CHIEF', 'DELIVER_BRANCH_NOTE', 'DELIVER_HANDBACK_RECEIPT'
     )),
     target_type TEXT NOT NULL CHECK(target_type IN ('NODE', 'QUESTION', 'PROJECT')),
     target_id TEXT NOT NULL,
@@ -136,7 +139,7 @@ CREATE TABLE IF NOT EXISTS control_proposals (
         'APPROVE_WAVE_VERDICT',
         'SEED_HUMAN_BRANCH',
         'SUBMIT_WORKS_OR_SURVEY_TICKET',
-        'SET_AUTONOMY_MODE'
+        'SET_AUTONOMY_MODE', 'ADVANCE_EPOCH'
     )),
     target_id TEXT NOT NULL,
     payload_json TEXT NOT NULL DEFAULT '{}',

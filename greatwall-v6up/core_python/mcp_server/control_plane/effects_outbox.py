@@ -221,6 +221,30 @@ def claim_runtime_effects(
     return {"owner_instance_id": owner, "claimed": claimed, "count": len(claimed)}
 
 
+def runtime_effect_is_current(
+    conn: sqlite3.Connection, seq: int, effect_key: str, target_generation: int,
+) -> bool:
+    row = conn.execute(
+        """SELECT e.kind,e.target_type,e.status,e.payload_json,n.control_generation,n.question_id
+           FROM runtime_effects e LEFT JOIN lineage_nodes n
+             ON e.target_type='NODE' AND n.node_id=e.target_id
+           WHERE e.seq=? AND e.effect_key=? AND e.target_generation=?""",
+        (seq, effect_key, target_generation),
+    ).fetchone()
+    if row is None or row["status"] != "RUNNING":
+        return False
+    if row["target_type"] == "NODE" and row["kind"] in ("SPAWN_PAIR", "DRAIN_AND_STOP_NODE", "CANCEL_NODE_SESSION"):
+        return row["control_generation"] == target_generation
+    if row["kind"] == "NOTIFY_POLICY_CHANGED":
+        payload = json.loads(row["payload_json"])
+        revision = payload.get("new_spec_revision")
+        if revision is not None:
+            state = conn.execute("SELECT active_spec_revision FROM subproblem_runtime_state WHERE question_id=?",
+                                 (payload.get("question_id") or row["question_id"],)).fetchone()
+            return state is not None and state["active_spec_revision"] == revision
+    return True
+
+
 def renew_runtime_effect_lease(
     conn: sqlite3.Connection,
     *,
@@ -251,6 +275,9 @@ def complete_runtime_effect(
     last_error: str = "",
     retry_delay_sec: int = 0,
     external_handle_id: str | None = None,
+    effect_key: str | None = None,
+    target_generation: int | None = None,
+    claim_attempt: int | None = None,
 ) -> dict[str, Any]:
     """标记副作用完成、取消、失败或延迟退避重试（仅允许当前租约持有者结案）。"""
     st_u = str(status or "DONE").strip().upper()
@@ -271,6 +298,14 @@ def complete_runtime_effect(
                 "updated": False,
                 "reason": "lease_owner_mismatch",
             }
+
+        if effect_key is not None and (
+            row["effect_key"] != effect_key or row["target_generation"] != target_generation
+            or row["attempts"] != claim_attempt or row["status"] != "RUNNING"
+        ):
+            return {"seq": int(seq), "status": str(row["status"]), "updated": False, "reason": "claim_mismatch"}
+        if effect_key is not None and not runtime_effect_is_current(conn, seq, effect_key, target_generation):
+            st_u = "CANCELLED"
 
         eff_handle = str(external_handle_id) if external_handle_id is not None else str(row["external_handle_id"] or "")
         if st_u == "PENDING" and retry_delay_sec > 0:

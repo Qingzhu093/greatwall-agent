@@ -161,7 +161,7 @@ function checkToolContractsSync(pySnapshot) {
   if (!pySnapshot) {
     return {
       id: 'tool_contracts_sync',
-      title: 'Python ↔ Node 44 窄工具与 10 角色跨层契约同步',
+      title: 'Python ↔ Node 47 窄工具与 10 角色跨层契约同步',
       status: 'error',
       required: true,
       detail: '因 Python 运行时检查失败，无法比对跨层契约',
@@ -197,7 +197,7 @@ function checkToolContractsSync(pySnapshot) {
   if (mismatches.length > 0) {
     return {
       id: 'tool_contracts_sync',
-      title: 'Python ↔ Node 44 窄工具与 10 角色跨层契约同步',
+      title: 'Python ↔ Node 47 窄工具与 10 角色跨层契约同步',
       status: 'error',
       required: true,
       detail: `发现 ${mismatches.length} 处跨层契约漂移: ${mismatches.map((m) => m.field).join(', ')}`,
@@ -207,7 +207,7 @@ function checkToolContractsSync(pySnapshot) {
 
   return {
     id: 'tool_contracts_sync',
-    title: 'Python ↔ Node 44 窄工具与 10 角色跨层契约同步',
+    title: 'Python ↔ Node 47 窄工具与 10 角色跨层契约同步',
     status: 'ok',
     required: true,
     detail: `${ALL_MCP_TOOLS.size} 窄工具 / ${CANONICAL_ROLES.length} 角色路由 / ${READONLY_BLOCKED_MCP_TOOLS.size} 只读禁写 / ${LONG_RUNNING_MCP_TOOLS.size} 长耗时 / ${TURN_CONCLUDING_TOOLS.size} 回合收尾工具全部 100% 同步`,
@@ -253,11 +253,16 @@ function checkPresetsIntegrity() {
     if (!pluginNames.has('@deepseek-ai/dsh-tool-executor-native')) {
       issues.push(`${pid} 缺少 @deepseek-ai/dsh-tool-executor-native`)
     }
-    if (pid === 'greatwall-explorer' && pluginNames.has('@deepseek-ai/dsh-compaction-tool-result-pruner')) {
-      issues.push('红线违规：greatwall-explorer 严禁挂载 dsh-compaction-tool-result-pruner')
-    }
     if (pluginNames.has('@deepseek-ai/dsh-compaction-basic') || pluginNames.has('@deepseek-ai/dsh-token-meter')) {
-      issues.push(`${pid} 隔离域严禁挂载全局服务 dsh-compaction-basic / dsh-token-meter（会触发 leakedServices 导致加载失败）`)
+      issues.push(`${pid} 将压缩或计量服务直接挂在 Preset 顶层`)
+    }
+    const compaction = def.plugins.find((p) => p.isolate?.compaction)
+    if (pid === 'greatwall-chief' && !compaction?.config?.some((p) => p.name === '@deepseek-ai/dsh-command-compact')) {
+      issues.push(`${pid} 缺少隔离的 /compact 命令`)
+    }
+    if (pid === 'greatwall-explorer' && (compaction || def.plugins.some((p) =>
+      p.isolate?.toolResultPruner || p.name === '@deepseek-ai/dsh-compaction-tool-result-pruner'))) {
+      issues.push(`${pid} 声明了压缩或裁剪能力`)
     }
   }
   const ok = presetIds.length === 8 && declared.length === 8 && issues.length === 0

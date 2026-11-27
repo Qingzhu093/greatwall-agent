@@ -1,7 +1,7 @@
 {
   "name": "dsh-greatwall-v6up",
   "version": "0.3.0-alpha.3",
-  "description": "GreatWall Agent v0.3：面向长周期自主科学发现的 DSH 0.2.2-rc.5 人机协同总控 × 10 角色物理分权 × Outbox 副作用队列 × 宏观大外环波次圆桌 × Python Single-Writer 44 窄工具科研引擎。",
+  "description": "GreatWall Agent v0.3：面向长周期自主科学发现的 DSH 0.2.2-rc.5 人机协同总控 × 10 角色物理分权 × Outbox 副作用队列 × 宏观大外环波次圆桌 × Python Single-Writer 47 窄工具科研引擎。",
   "keywords": [
     "dsh-plugin",
     "deepseek-harness",

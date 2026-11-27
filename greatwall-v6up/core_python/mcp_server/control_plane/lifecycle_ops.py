@@ -309,7 +309,7 @@ def sync_session_pressure(
     """将宿主 DSH TokenMeter 采样的真实压力水位与模型有效窗口 W = min(500k, model_window) 同步至 SQLite，并返回实时 node_status 与 control_state。"""
     row = conn.execute(
         """
-        SELECT node_id, question_id, node_status, control_state, control_generation,
+        SELECT node_id, question_id, node_status, control_state, control_generation, pressure_tokens,
                personal_turn_active, human_modified, artifact_dirty_since_last_obs,
                first_reflection_unlocked, effective_context_window
         FROM lineage_nodes
@@ -327,17 +327,12 @@ def sync_session_pressure(
         node_window=row["effective_context_window"],
         explicit_window=explicit_win,
     )
-    now = utc_now_iso()
-    with rw_immediate_tx(conn):
-        if explicit_win is not None:
+    if row["pressure_tokens"] != pt or (explicit_win is not None and row["effective_context_window"] != eff_win):
+        with rw_immediate_tx(conn):
             conn.execute(
-                "UPDATE lineage_nodes SET pressure_tokens = ?, effective_context_window = ?, updated_at = ? WHERE node_id = ?",
-                (pt, eff_win, now, node_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE lineage_nodes SET pressure_tokens = ?, updated_at = ? WHERE node_id = ?",
-                (pt, now, node_id),
+                """UPDATE lineage_nodes SET pressure_tokens=?, effective_context_window=COALESCE(?,effective_context_window),
+                   updated_at=? WHERE node_id=?""",
+                (pt, eff_win if explicit_win is not None else None, utc_now_iso(), node_id),
             )
     qrow = conn.execute(
         "SELECT dispatch_state, desired_state FROM subproblem_runtime_state WHERE question_id = ?",

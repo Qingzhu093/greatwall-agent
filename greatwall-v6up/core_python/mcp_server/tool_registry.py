@@ -70,9 +70,31 @@ def _spec(
     }
 
 
+_SCOPE_SCHEMA = {
+    "scope_type": {"type": "string", "enum": ["PROJECT", "QUESTION", "NODE"]},
+    "target_id": {"type": "string"},
+}
+_ARRANGEMENT_SCHEMA = _schema(
+    {
+        **_SCOPE_SCHEMA,
+        "priority_weight": {"type": "integer"},
+        "max_active_branches": {"type": "integer"},
+        "max_concurrent_workers": {"type": "integer"},
+        "autonomy_mode": {"type": "string", "enum": ["AUTOPILOT", "WAVE_CONFIRM"]},
+        "dispatch_policy": {"type": "string", "enum": ["NORMAL", "NO_NEW_DISPATCH", "PAUSED_ALL"]},
+        "inflight_drain_mode": {"type": "string", "enum": ["FINISH_CURRENT_TURN", "FINISH_CURRENT_HANDOFF", "IMMEDIATE_YIELD"]},
+        "ends_on_kind": {"type": "string", "enum": ["MANUAL", "AT_TIME", "AFTER_INFLIGHT_BATCH"]},
+        "expires_at": {"type": ["string", "null"]},
+        "summary_md": {"type": "string"},
+        "watch_batch_scope": {**_schema(_SCOPE_SCHEMA, list(_SCOPE_SCHEMA)), "type": ["object", "null"]},
+    },
+    list(_SCOPE_SCHEMA),
+)
+
+
 _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     # ========================================================================
-    # 1. gw_chief (Superagent, 5 个物理零代码/零终端窄工具)
+    # 1. gw_chief（内核 8 个窄工具，另有宿主 Watchdog）
     # ========================================================================
     _spec(
         name="chief_get_overview_snapshot",
@@ -95,17 +117,40 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
         ),
     ),
     _spec(
-        name="chief_get_wave_digest",
-        roles="gw_chief",
-        access="read",
-        description="[gw_chief] 读取指定子题或会议的波次圆桌纪要、最新 1500 字子题全局总览与宏观调整建议摘要。",
-        input_schema=_schema(
-            {
-                "question_id": {"type": "string"},
-                "conference_id": {"type": ["string", "null"], "default": None},
-            },
-            ["question_id"],
-        ),
+        name="chief_read", roles="gw_chief", access="read",
+        description="按 UTF-16 游标分页阅读 survey、node manuscript/briefing/transcript、review ledger、conference minutes、entry 或 receipt。",
+        input_schema=_schema({"resource": {"type": "string"}, "offset": {"type": "integer", "default": 0}, "limit": {"type": "integer", "default": 4000}}, ["resource"]),
+    ),
+    _spec(
+        name="chief_operate", roles="gw_chief", access="write", needs_workspace_root=True,
+        description="人类当面授权或一次性转办授权下，组合执行运行安排和分支动作。返回可持续查询的回执。",
+        input_schema=_schema({
+            "operation": {"type": "string", "enum": ["apply_arrangement", "revoke_arrangement", "node_intervene", "family_manage", "approve_wave_verdict", "submit_ticket", "recover_queue", "pin_note"]},
+            "arrangement": {**_ARRANGEMENT_SCHEMA, "type": ["object", "null"]},
+            "arrangements": {"type": ["array", "null"], "items": _ARRANGEMENT_SCHEMA},
+            "node_action": {"type": ["object", "null"], "properties": {
+                "node_ids": {"type": "array", "items": {"type": "string"}},
+                "mode": {"type": "string", "enum": ["retire", "hibernate", "pause_takeover", "resume", "early_handoff", "reactivate"]},
+                "archive_family": {"type": "boolean"}, "reason": {"type": "string"},
+            }, "required": ["node_ids", "mode"]},
+            "handback_id": {"type": ["string", "null"]},
+            "details": {"type": ["object", "null"], "properties": {
+                "arrangement_id": {"type": "string"}, "family_id": {"type": "string"}, "mode": {"type": "string"},
+                "proposal_id": {"type": "string"}, "question_id": {"type": "string"}, "ticket_type": {"type": "string"},
+                "instrument_id": {"type": "string"}, "description": {"type": "string"}, "note_id": {"type": "string"},
+                "content_md": {"type": "string"}, "summary_md": {"type": "string"},
+            }},
+        }, ["operation"]),
+    ),
+    _spec(
+        name="chief_send_branch_note", roles="gw_chief", access="write",
+        description="经当面人类授权发导师便签，在线温和注入，离线交由下一回合领取。",
+        input_schema=_schema({"node_id": {"type": "string"}, "note_md": {"type": "string"}}, ["node_id", "note_md"]),
+    ),
+    _spec(
+        name="chief_seed_branch", roles="gw_chief", access="write", needs_workspace_root=True,
+        description="经当面人类授权种植探索分支，保存完整 10–8000 字研究蓝图，动用人类保留槽。",
+        input_schema=_schema({key: {"type": "string"} for key in ("question_id", "family_signature", "blueprint_md", "orthogonal_contrast")}, ["question_id", "family_signature", "blueprint_md", "orthogonal_contrast"]),
     ),
     _spec(
         name="chief_preview_impact",
@@ -114,7 +159,8 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
         description="[gw_chief] 零副作用推测预演：只读测算改题影响面、排雷视图查重或波次调整受影响分支清单，绝不改库、绝不开重型分支。",
         input_schema=_schema(
             {
-                "preview_kind": {"type": "string"},
+                "preview_kind": {"type": "string", "enum": ["run_arrangement", "ruling_amendment", "avoidance_check", "wave_verdict", "subproblem_budget"]},
+                "arrangement": {**_ARRANGEMENT_SCHEMA, "type": ["object", "null"]},
                 "question_id": {"type": "string", "default": "ALL"},
                 "query_text": {"type": "string", "default": ""},
                 "target_id": {"type": ["string", "null"], "default": None},
@@ -126,10 +172,10 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
         name="chief_propose_control_action",
         roles="gw_chief",
         access="write",
-        description="[gw_chief] 唯一结构化提案提交口：将人类自然语言意图整理为 8 类宪章正门确认单写入 control_proposals，等待人类经原生卡片或 UI 显式落签。",
+        description="[gw_chief] 唯一结构化提案提交口：将人类自然语言意图整理为 4 类宪章正门确认单写入 control_proposals，等待人类经原生卡片或 UI 显式落签。",
         input_schema=_schema(
             {
-                "action_type": {"type": "string"},
+                "action_type": {"type": "string", "enum": ["AMEND_RULING_DRAFT", "AUTHORIZE_PARTIAL_DELIVERY", "ADVANCE_EPOCH", "APPROVE_WAVE_VERDICT"]},
                 "target_id": {"type": "string"},
                 "payload": {"type": "object", "default": {}},
                 "rationale_md": {"type": "string"},
@@ -629,7 +675,7 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
         access="write",
         needs_workspace_root=True,
         long_running=True,
-        description="[works_engineer] 注册新科研仪器（VERDICT 强跑独立校准集 100% 匹配自声明预期；PROBE/ENV 可免校准集）。",
+        description='[works_engineer] 注册新科研仪器（PROBE/ENV 可传 null 免校准集；VERDICT 须提供校准集 JSON 数组：[{"case_id":"c1","artifact_rel_path":"...","spec":{},"expected_status":"OK","expected_verdict":"PASS"}]）。',
         input_schema=_schema(
             {
                 "question_id": {"type": "string"},

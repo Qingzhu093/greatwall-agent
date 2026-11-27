@@ -80,16 +80,54 @@ _TOOL_PROP_PATCHES: dict[str, dict[str, dict[str, Any]]] = {
         },
         "entity_id": {"description": "目标实体唯一编号（如 Q1 / node_xxx / rev_001 / L3-001 / wc_xxx / prop_xxx）。"},
     },
+    "chief_read": {
+        "resource": {
+            "description": "统一资源 URI：survey/<Q> | node/<id>/manuscript | node/<id>/briefing | node/<id>/transcript | review/<id>/ledger | conference/<id>/minutes | entry/<id> | receipt/<op_id> | archive/<epoch_id>/<上述任一路径>。",
+        },
+        "offset": {"minimum": 0, "description": "UTF-16 字符起始偏移（沿上一次返回的 next_offset 续读）。"},
+        "limit": {"minimum": 1, "maximum": 16000, "description": "单页最大读取字符数（默认 4000）。"},
+    },
+    "chief_operate": {
+        "operation": {
+            "enum": [
+                "apply_arrangement",
+                "revoke_arrangement",
+                "node_intervene",
+                "family_manage",
+                "approve_wave_verdict",
+                "submit_ticket",
+                "recover_queue",
+                "pin_note",
+            ],
+            "description": "8 类日常运维直执原语枚举。",
+        },
+        "arrangement": {"description": "单条运行安排补丁（含 scope_type、target_id、dispatch_policy、priority_weight、max_active_branches、max_concurrent_workers、inflight_drain_mode、ends_on_kind/expires_at 等）。"},
+        "arrangements": {"description": "多条运行安排列表（同一人类意图涉及多个子题时一次原子提交）。"},
+        "node_action": {"description": "点名分支动作（node_ids + mode: retire|hibernate|pause_takeover|resume|early_handoff|reactivate + 可选 archive_family/reason）。"},
+        "handback_id": {"description": "可选：人类在探索者窗口发起并转办至总控的一次性授权凭证 ID。"},
+        "details": {"description": "扩展操作参数（如 revoke_arrangement 的 arrangement_id、family_manage 的 family_id/mode、submit_ticket 的 ticket_type/description、pin_note 的 content_md 等）。"},
+    },
+    "chief_send_branch_note": {
+        "node_id": {"description": "接收导师点拨的目标探索节点 ID。"},
+        "note_md": {"minLength": 2, "description": "导师指导便签正文（Markdown），在线温和注入、离线下一回合自动送达。"},
+    },
+    "chief_seed_branch": {
+        "question_id": {"description": "目标子题编号（如 Q1）。"},
+        "family_signature": {"description": "新学派核心机制签名（简明唯一标识该研究路线）。"},
+        "blueprint_md": {"minLength": 10, "maxLength": 8000, "description": "完整研究蓝图正文（10–8000 字，完整保留推导与验证要点，不作摘要压缩）。"},
+        "orthogonal_contrast": {"description": "与现有学派的正交差异说明。"},
+    },
     "chief_preview_impact": {
         "preview_kind": {
-            "enum": ["ruling_amendment", "avoidance_check", "wave_verdict", "subproblem_budget"],
-            "description": "零副作用推测预演类型：改题影响面 / 排雷雷达查重 / 波次调整受影响分支 / 子题预算测算。",
+            "enum": ["run_arrangement", "ruling_amendment", "avoidance_check", "wave_verdict", "subproblem_budget"],
+            "description": "零副作用推测预演类型：运行安排影响 / 改题影响面 / 排雷雷达查重 / 波次调整受影响分支 / 子题预算测算。",
         },
+        "arrangement": {"description": "preview_kind='run_arrangement' 时待预演的运行安排草案。"},
     },
     "chief_propose_control_action": {
         "action_type": {
-            "enum": sorted(ALLOWED_PROPOSAL_ACTIONS),
-            "description": "8 类宪章正门确认单动作枚举。",
+            "enum": ["AMEND_RULING_DRAFT", "AUTHORIZE_PARTIAL_DELIVERY", "ADVANCE_EPOCH", "APPROVE_WAVE_VERDICT"],
+            "description": "4 类宪章正门确认单动作枚举（改题升版 / 部分结题 / 推进纪元 / 后台圆桌拍板）。",
         },
         "target_id": {"description": "受影响目标 ID（子题号 / 节点 ID / 会议 ID / 自主档位等）。"},
         "rationale_md": {"minLength": 5, "description": "给人类审阅的简明依据与影响范围说明（>=5 字）。"},

@@ -45,6 +45,9 @@ export const VERIFIER_NETWORK_CMD_RE = /\b(?:curl|wget|Invoke-WebRequest|Invoke-
 /** 全部写类 MCP 窄工具集合（与 Python tool_registry.py READONLY_BLOCKED_MCP_TOOLS 100% 同步）。 */
 export const READONLY_BLOCKED_MCP_TOOLS = new Set([
   'chief_propose_control_action',
+  'chief_operate',
+  'chief_send_branch_note',
+  'chief_seed_branch',
   'run_isolated_eval',
   'request_literature_survey',
   'handback_to_chief',

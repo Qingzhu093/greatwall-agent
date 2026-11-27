@@ -3,13 +3,13 @@
  *
  * 铁律：
  * - 普通后台自主探索分支仅可占用 `maxWorkers` 普通槽；
- * - 人类交还托管的分支（`human_modified=1`）或人类种子分支（`branch_kind='HUMAN_SEEDED'`）
- *   允许动用 `+1` 人类优先保留槽，确保人类刚动过手的研究枝条永远毫秒级优先启动、不被满载池饿死。
+ * - 持有本次点名派工凭证的分支优先使用人类保留槽。
  * @module dsh-greatwall-v6up/runtime/worker_slots
  */
 
 export function isHumanPriorityNode(node) {
   if (!node || typeof node !== 'object') return false
+  if (Object.hasOwn(node, 'operator_named')) return node.operator_named === true
   return (
     String(node.branch_kind || '').toUpperCase() === 'HUMAN_SEEDED' ||
     Boolean(Number(node.human_modified || 0) === 1) ||
@@ -58,27 +58,23 @@ export class WorkerSlotAllocator {
   }
 
   canAcquire(node) {
-    if (!node?.node_id) return false
-    if (this._active.has(node.node_id)) return false
-    if (this.normalActiveCount < this.maxWorkers) return true
-    if (isHumanPriorityNode(node) && this.humanReserveActiveCount < this.humanReserveSlots) {
-      return true
+    return Boolean(node?.node_id && !this.has(node.node_id) && this.availableTier(node))
+  }
+
+  availableTier(node) {
+    if (node.slot_tier !== 'normal' && isHumanPriorityNode(node) && this.humanReserveActiveCount < this.humanReserveSlots) {
+      return 'human_reserve'
     }
-    return false
+    return node.slot_tier !== 'human_reserve' && this.normalActiveCount < this.maxWorkers ? 'normal' : null
   }
 
   acquire(node) {
     if (!node?.node_id) return null
-    if (this._active.has(node.node_id)) return this._active.get(node.node_id).priority
-    if (this.normalActiveCount < this.maxWorkers) {
-      this._active.set(node.node_id, { priority: 'normal', acquiredAt: Date.now() })
-      return 'normal'
-    }
-    if (isHumanPriorityNode(node) && this.humanReserveActiveCount < this.humanReserveSlots) {
-      this._active.set(node.node_id, { priority: 'human_reserve', acquiredAt: Date.now() })
-      return 'human_reserve'
-    }
-    return null
+    const current = this._active.get(node.node_id)
+    if (current) return current.priority
+    const priority = this.availableTier(node)
+    if (priority) this._active.set(node.node_id, { priority, acquiredAt: Date.now() })
+    return priority
   }
 
   release(nodeId) {

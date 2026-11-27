@@ -1,13 +1,14 @@
-# dsh-greatwall-v6up（`v0.3.0-alpha.1`）
+# dsh-greatwall-v6up（`v0.3.1`）
 
 长城科研共同体 **GreatWall Agent V6-Up** 的 DeepSeek Harness Cordis 插件包，最低宿主版本为 **`0.2.2-rc.5`**。
 
-## `v0.3.0-alpha.1` 核心升级亮点
+## `v0.3.1` 核心升级亮点
 
-1. **Superagent 科研总控 (`gw-chief`) 与双端幂等确认单**：
-   - 新增独立 Preset **`greatwall-chief`（「长城 · 科研总控 (gw-chief)」）**：物理零写码/零终端/零外网，启用 DSH 原生 `@deepseek-ai/dsh-compaction-basic` 与弹性字数「全院现况锚点卡」（`min(hardCap, max(400, 180 + 100 * 子题数))`，默认硬封顶 1200 字，压缩后自动重注零断链）；
-   - 通过 [`lib/sessions/chief_runtime.js`](./lib/sessions/chief_runtime.js) 注册 DSH RC5 原生 `actionCards`（`greatwall_proposal`），与右侧工作台待拍板卡共享同一单写者乐观锁事务，任一端点击均幂等防重；
-   - [`lib/orchestrate_tool.js`](./lib/orchestrate_tool.js) 精简为 `init / start / status / stop` 4 个极简薄入口供 Headless 自动化与冷启动拉起，严禁任何模型工具伪造 `human_ui`。
+1. **常驻科研总控 (`gw-chief`) 与人类运行安排闭环**：
+   - 独立 Preset **`greatwall-chief`（「长城 · 科研总控 (gw-chief)」）**：物理零写码/零终端/零外网，通过 `cordis:group` 隔离启用 `@deepseek-ai/dsh-compaction-basic` 与弹性字数「全院现况锚点卡」（防压缩断链），支持手开会话自动收编；
+   - 人类在总控当面下令即可直执 **版本化 `run_arrangements`**（主次优先级、`NO_NEW_DISPATCH`、单题分支硬上限、在途收尾策略、到期/批次结束后自动恢复）、分支撤编/挂起/接管、导师便签与完整蓝图种枝，并返回四态 `operation_receipts`；
+   - 仅 4 类高危宪章动作（改题升版 / 部分结题 / 推进新纪元归档 / 后台圆桌拍板）走双端幂等确认单，通过 [`lib/sessions/chief_runtime.js`](./lib/sessions/chief_runtime.js) 注册 DSH RC5 原生 `actionCards`（`greatwall_proposal`）；
+   - [`lib/orchestrate_tool.js`](./lib/orchestrate_tool.js) 保持 `init / start / status / stop` 4 个极简薄入口供 Headless 与冷启动拉起。
 2. **设施运行底座升级（`lib/runtime/` & `lib/sessions/`）**：
    - `instance_lock.js`：`host.lock` 单实例独占锁防双活 + 死 PID 自动回收；
    - `worker_slots.js`：`maxWorkers` 普通槽 + `+1` 人类优先保留槽；
@@ -22,7 +23,7 @@
 
 ## 8 套单源角色 Preset（[`cordis.patch.yml`](./cordis.patch.yml)）
 
-覆盖全院 10 大角色与 44 个窄 MCP 工具，全量挂载 `@deepseek-ai/dsh-tool-executor-native`：
+覆盖全院 10 大角色与 47 个窄 MCP 工具，全量挂载 `@deepseek-ai/dsh-tool-executor-native`：
 
 - `greatwall-chief`：Superagent 总控（零写/零终端/零外网，启用 `dsh-compaction-basic`）
 - `greatwall-explorer`：一线探索者（读写 fs + search + 平台 Shell，锁在分支 worktree，严禁开启 `pruner`）
@@ -42,6 +43,6 @@
 
 ```bash
 npm run build:client   # 从 client_src/ 重新生成 lib/client.js
-npm test               # 运行 48 项 Node 单测、v0.3 运行时/总控/圆桌测试与 L2 假模型全链路沙盘
-npm run doctor         # 运行 8 项环境、44 工具 × 10 角色跨层契约、8 套 Preset 与红线一键体检
+npm test               # 运行 62+ 项 Node 单测、v0.3.1 运行安排/总控/圆桌测试与 L2 假模型全链路沙盘
+npm run doctor         # 运行 8 项环境、47 工具 × 10 角色跨层契约、8 套 Preset 与红线一键体检
 ```

@@ -10,6 +10,12 @@
  * @module dsh-greatwall-v6up/runtime/effects_consumer
  */
 
+const SLOW_KINDS = ['DRAIN_AND_STOP_NODE', 'REFRESH_LIVING_SURVEY', 'RUN_WAVE_CONFERENCE']
+const FAST_KINDS = [
+  'NOTIFY_CHIEF', 'CANCEL_NODE_SESSION', 'NOTIFY_POLICY_CHANGED',
+  'WAKE_BLOCKED_BRANCH', 'SPAWN_PAIR', 'DELIVER_BRANCH_NOTE', 'DELIVER_HANDBACK_RECEIPT',
+]
+
 export class RuntimeEffectsConsumer {
   constructor({
     bridge,
@@ -28,37 +34,55 @@ export class RuntimeEffectsConsumer {
     this.renewIntervalMs = Math.max(5_000, Number(renewIntervalMs) || 20_000)
     this.telemetry = telemetry
     this._draining = false
+    this._inflight = new Map()
   }
 
   /** 拉取并处理一批到期或崩溃过期的 Outbox 副作用。 */
   async drainOnce({ limit = 12, signal = null } = {}) {
-    if (this._draining || signal?.aborted) return { claimedCount: 0, handledCount: 0 }
+    if (this._draining || signal?.aborted) return { claimedCount: 0 }
     this._draining = true
-    let claimedCount = 0
-    let handledCount = 0
     try {
-      const claimRes = await this.bridge.control('control_plane/claim_runtime_effects', {
-        workspace_root: this.workspaceRoot,
-        owner_instance_id: this.ownerInstanceId,
-        lease_sec: this.leaseSec,
-        limit,
-      })
-      const items = Array.isArray(claimRes?.data?.claimed) ? claimRes.data.claimed : []
-      claimedCount = items.length
-      for (const eff of items) {
-        if (signal?.aborted) break
-        await this._executeSingleEffect(eff, signal)
-        handledCount += 1
-      }
-      return { claimedCount, handledCount }
+      const [fast, slow] = await Promise.all([
+        this._claimLane(FAST_KINDS, limit, signal),
+        this._claimLane(SLOW_KINDS, 6, signal),
+      ])
+      return { claimedCount: fast + slow }
     } finally {
       this._draining = false
     }
   }
 
+  async _claimLane(kinds, limit, signal) {
+    const running = [...this._inflight.values()].filter((e) => kinds.includes(e.kind)).length
+    if (running >= limit) return 0
+    const response = await this.bridge.control('control_plane/claim_runtime_effects', {
+      workspace_root: this.workspaceRoot, owner_instance_id: this.ownerInstanceId,
+      lease_sec: this.leaseSec, limit: limit - running, kinds,
+    })
+    const items = response?.data?.claimed || []
+    for (const effect of items) {
+      if (this._inflight.has(effect.seq)) continue
+      const prior = [...this._inflight.values()].filter((e) => e.target === effect.target_id && e.type === effect.target_type && [
+        'DRAIN_AND_STOP_NODE', 'CANCEL_NODE_SESSION',
+      ].includes(e.kind) && ['DRAIN_AND_STOP_NODE', 'CANCEL_NODE_SESSION'].includes(effect.kind))
+      const task = Promise.allSettled(prior.map((e) => e.task))
+        .then(() => this._executeSingleEffect(effect, signal))
+        .finally(() => this._inflight.delete(effect.seq))
+      this._inflight.set(effect.seq, { kind: effect.kind, type: effect.target_type, target: effect.target_id, task })
+    }
+    return items.length
+  }
+
+  async whenIdle() {
+    await Promise.allSettled([...this._inflight.values()].map((e) => e.task))
+  }
+
   async _executeSingleEffect(eff, signal) {
     const seq = Number(eff.seq)
     const kind = String(eff.kind || '').toUpperCase()
+    const fence = eff.effect_key ? {
+      effect_key: eff.effect_key, target_generation: eff.target_generation, claim_attempt: eff.attempts,
+    } : {}
     const payload = eff.payload && typeof eff.payload === 'object' ? eff.payload : {}
     let renewTimer = setInterval(() => {
       void this.bridge
@@ -83,6 +107,7 @@ export class RuntimeEffectsConsumer {
             workspace_root: this.workspaceRoot,
             seq,
             owner_instance_id: this.ownerInstanceId,
+            ...fence,
             status: 'PENDING',
             retry_delay_sec: Number(res.retryDelaySec),
             last_error: String(res.reason || 'deferred_retry'),
@@ -95,6 +120,7 @@ export class RuntimeEffectsConsumer {
         workspace_root: this.workspaceRoot,
         seq,
         owner_instance_id: this.ownerInstanceId,
+        ...fence,
         status: 'DONE',
         external_handle_id: externalHandleId,
       })
@@ -108,6 +134,7 @@ export class RuntimeEffectsConsumer {
           workspace_root: this.workspaceRoot,
           seq,
           owner_instance_id: this.ownerInstanceId,
+          ...fence,
           status: shouldRetry ? 'PENDING' : 'FAILED',
           retry_delay_sec: shouldRetry ? 15 * attempts : 0,
           last_error: msg.slice(0, 600),

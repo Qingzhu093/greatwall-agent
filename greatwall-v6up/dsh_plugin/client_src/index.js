@@ -9,7 +9,10 @@ function GreatwallTitle() {
 function GreatwallConsoleBody({ getUiWorkspace }) {
   const [tab, setTab] = React.useState("overview");
   const [selectedWs, setSelectedWs] = React.useState(() => readPersistedWs());
-  const [data, setData] = React.useState(null);
+  const [snapshot, setData] = React.useState(null);
+  const selectedWsRef = React.useRef(selectedWs);
+  const isSwitchingWs = Boolean(selectedWs && snapshot?.workspaceRoot && snapshot.workspaceRoot !== selectedWs);
+  const data = !selectedWs || snapshot?.workspaceRoot === selectedWs ? snapshot : null;
   const [busy, setBusy] = React.useState(false);
   const [banner, setBanner] = React.useState(null);
   const [confirmHumanStop, setConfirmHumanStop] = React.useState(false);
@@ -49,6 +52,7 @@ function GreatwallConsoleBody({ getUiWorkspace }) {
       if (res && res.ok) {
         setData(res);
         if (!ws && res.workspaceRoot) {
+          selectedWsRef.current = res.workspaceRoot;
           setSelectedWs(res.workspaceRoot);
           persistSelectedWs(res.workspaceRoot);
         }
@@ -66,24 +70,34 @@ function GreatwallConsoleBody({ getUiWorkspace }) {
   }, [refresh]);
 
   const handleControl = async (action, payload = {}) => {
+    const ws = selectedWsRef.current || data?.workspaceRoot;
+    if (!ws || data?.workspaceRoot !== ws) {
+      showBanner("info", "正在切换项目快照，请稍候再试。", 3000);
+      return;
+    }
     setBusy(true);
     showBanner("info", "", 0);
     try {
-      const ws = data?.workspaceRoot || selectedWs;
-      const res = await postGreatwallControl(action, { workspaceRoot: ws, ...payload });
+      const res = await postGreatwallControl(action, { ...payload, workspaceRoot: ws });
+      if (selectedWsRef.current && selectedWsRef.current !== ws) return;
       const label = readableActionLabel(action);
       if (res?.ok === false) {
         showBanner("err", `${label}失败: ${res.error || "未知错误"}`);
       } else if (action === "open_chief" && res?.sessionId) {
         const opened = openNativeSession(getUiWorkspace, res.sessionId, (msg) => showBanner("err", msg));
         if (opened) showBanner("ok", `已唤醒科研总控会话`);
+      } else if (action === "propose_epoch") {
+        showBanner("ok", "确认单已生成。请在总览的待拍板提案中核对后签署。");
+        setTab("overview");
+      } else if (action === "approve_proposal" && res?.data?.execution?.epoch_id) {
+        showBanner("ok", `已归档旧纪元，当前为纪元 ${res.data.execution.epoch_id}。调度已停止。`);
       } else if (action === "pause") {
         const cnt = Array.isArray(res?.pausedNodeIds) ? res.pausedNodeIds.length : 0;
         showBanner("ok", cnt > 0 ? `已全局暂停，${cnt} 条在跑分支已切入等待人类接管` : "已全局暂停，系统进入等待人类接管态");
       } else if (action === "resume") {
         const cnt = Array.isArray(res?.resumedNodeIds) ? res.resumedNodeIds.length : 0;
         showBanner("ok", cnt > 0 ? `已对 ${cnt} 条接管分支完成 SHA 对账并恢复全面托管` : "已恢复全面托管运行");
-      } else {
+      } else if (!res?.data?.op_id) {
         showBanner("ok", `已完成：${label}`);
       }
       await refresh(ws);
@@ -98,7 +112,8 @@ function GreatwallConsoleBody({ getUiWorkspace }) {
   const stage = data?.status?.stage || "";
   const isClosed = stage === "CLOSED_VERIFIED" || data?.status?.closureStatus === "CLOSED_VERIFIED";
   const humanStopActive = Boolean(data?.status?.humanStopActive);
-  const knownWorkspaces = data?.knownWorkspaces || [];
+  const knownWorkspaces = snapshot?.knownWorkspaces || [];
+  const [latestReceipt] = (data?.inspector?.snapshot || data?.status?.snapshot)?.operation_receipts || [];
 
   return jsxs("div", {
     className: "gw-root",
@@ -109,7 +124,7 @@ function GreatwallConsoleBody({ getUiWorkspace }) {
           jsxs("div", {
             className: "gw-title-wrap",
             children: [
-              jsx("strong", { children: "GreatWall v0.3" }),
+              jsx("strong", { children: "GreatWall v0.3.1" }),
               jsx("span", { className: stateBadgeClass(poolState), title: poolState, children: readablePoolState(poolState) }),
               stage ? jsx("span", { className: "gw-badge gw-b-info", title: stage, children: readableStage(stage) }) : null
             ]
@@ -171,10 +186,12 @@ function GreatwallConsoleBody({ getUiWorkspace }) {
             style: { padding: "6px 10px", borderBottom: "1px solid var(--dsw-alias-border-l4)" },
             children: jsx("select", {
               className: "gw-select",
-              value: data?.workspaceRoot || selectedWs,
+              value: selectedWs || data?.workspaceRoot,
               onChange: (e) => {
                 const next = e.target.value;
                 setConfirmHumanStop(false);
+                selectedWsRef.current = next;
+                showBanner("info", "");
                 setSelectedWs(next);
                 persistSelectedWs(next);
                 void refresh(next);
@@ -183,6 +200,17 @@ function GreatwallConsoleBody({ getUiWorkspace }) {
             })
           })
         : null,
+      data?.chiefMountError
+        ? jsx("div", { className: "gw-banner gw-banner-err", children: `科研总控挂载失败 · ${data.chiefMountError}` })
+        : null,
+      latestReceipt && (!selectedWs || data?.workspaceRoot === selectedWs) && jsxs("div", {
+        className: "gw-row", role: "status",
+        children: [
+          jsx("span", { className: stateBadgeClass(latestReceipt.status), children: readableReceiptStatus(latestReceipt.status) }),
+          latestReceipt.summary_md,
+          latestReceipt.pending_targets?.length ? ` · ${latestReceipt.pending_targets.length} 条在途` : "",
+        ],
+      }),
       banner
         ? jsxs("div", {
             className: `gw-banner gw-banner-${banner.kind || "info"}`,
@@ -197,12 +225,17 @@ function GreatwallConsoleBody({ getUiWorkspace }) {
         children: [
           jsx("button", { className: tab === "overview" ? "gw-tab gw-tab-on" : "gw-tab", onClick: () => setTab("overview"), children: "三大问题总览" }),
           jsx("button", { className: tab === "survey" ? "gw-tab gw-tab-on" : "gw-tab", onClick: () => setTab("survey"), children: "全局总览与圆桌" }),
+          jsx("button", { className: tab === "operator" ? "gw-tab gw-tab-on" : "gw-tab", onClick: () => setTab("operator"), children: "运行安排" }),
           jsx("button", { className: tab === "branches" ? "gw-tab gw-tab-on" : "gw-tab", onClick: () => setTab("branches"), children: "分支与人工接管" })
         ]
       }),
       jsx("div", {
         className: "gw-scroll",
-        children: tab === "overview"
+        children: isSwitchingWs
+          ? jsx("div", { className: "gw-card gw-muted", children: "正在切换并加载所选项目快照..." })
+          : tab === "operator"
+          ? jsx(OperatorPlaneView, { data, busy, onControl: handleControl }, selectedWs)
+          : tab === "overview"
           ? jsx(ThreeQuestionsView, { data, busy, onControl: handleControl, getUiWorkspace })
           : (tab === "survey"
               ? jsx(LivingSurveyView, { data })

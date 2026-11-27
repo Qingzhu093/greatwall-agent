@@ -1,6 +1,6 @@
 # dsh-greatwall-v6up v0.3 Cordis Bundle 声明（DSH 0.2.2-rc.5 唯一权威 Preset 来源）
 # - 注册 8 套角色专用 Preset 覆盖全院 10 大角色，物理落实零代码写/零终端/零外网隔离
-# - greatwall-chief 直接复用 Profile 根上挂载的 @deepseek-ai/dsh-compaction-basic 自动压缩（Preset 隔离域禁挂全局 Service；严禁给 explorer 开启 pruner）
+# - greatwall-chief 复用根压缩服务，Web Profile 未启用根服务时使用总控专属压缩组
 # - 仅 greatwall-external-surveyor 挂载 @deepseek-ai/dsh-tool-web（唯一联网，物理禁读院内成果）
 - insert:
     - id: greatwall-v6up
@@ -32,6 +32,17 @@
             name: '@deepseek-ai/dsh-tool-fs-search'
             config:
               sampleOverCapGlobResults: false
+          - id: compaction
+            name: cordis:group
+            group: true
+            disabled: !!js Boolean(ctx.root.get('compaction'))
+            isolate:
+              compaction: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
 
     - id: preset-greatwall-explorer
       name: '@deepseek-ai/dsh-agent-preset'

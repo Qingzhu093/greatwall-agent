@@ -11,6 +11,10 @@
  */
 import { TURN_CONCLUDING_TOOLS } from './prompts.js'
 import { normalizeSchemaForDsh } from './bridge/dsh_schema_adapter.js'
+import { watchHumanMandate } from './sessions/human_mandate.js'
+import { readChiefTranscript } from './sessions/chief_transcript.js'
+
+const DIRECT_CHIEF_TOOLS = new Set(['chief_operate', 'chief_send_branch_note', 'chief_seed_branch'])
 
 /**
  * 采样指定 Agent Session 当前上下文 Token 压力水位。
@@ -175,6 +179,7 @@ export function installLiveClockObservers({
       lastTriggerEmitted = 'REFLECT_37'
       onNativeThresholdHit?.({ trigger: 'REFLECT_37', pressurePct, sourceHook })
     }
+    return rowData
   }
 
   try {
@@ -189,7 +194,8 @@ export function installLiveClockObservers({
 
   try {
     const dStep = agentCtx.on('agent/pre-step', async (_payload, next) => {
-      await checkAndSync('agent/pre-step', { force: false })
+      const node = await checkAndSync('agent/pre-step', { force: true })
+      if (node?.control_state === 'DRAIN_AFTER_TURN') return { kind: 'reject' }
       return next()
     })
     if (typeof dStep === 'function') disposers.push(dStep)
@@ -238,8 +244,21 @@ export function registerScopedMcpTools({
   nodeId = '',
   contextWindowTokens = 500_000,
   onTurnSignal,
+  sessionEpochId = 1,
+  onOperatorReceipt = null,
+  onHumanMessage,
 }) {
   const disposers = []
+  const gate = ['explorer', 'gw_chief'].includes(role) ? watchHumanMandate(rootCtx, agent.session, onHumanMessage) : null
+  if (gate) disposers.push(() => gate.dispose())
+  if (role === 'gw_chief' && typeof agentCtx.tools?.guard === 'function') {
+    disposers.push(agentCtx.tools.guard((call) => {
+      if (!DIRECT_CHIEF_TOOLS.has(call?.name) || gate.current()) return undefined
+      const handback = call.arguments?.handback_id
+      if (call.name === 'chief_operate' && typeof handback === 'string' && handback.trim()) return undefined
+      return 'ERR_AUTH: 请由人在科研总控会话直接下令，或提供待核销的分支转办单。'
+    }))
+  }
   const allowedSet = new Set(allowedToolNames || [])
   const schemaByName = new Map((toolSchemas || []).map((t) => [t.name, t]))
 
@@ -277,15 +296,25 @@ export function registerScopedMcpTools({
 
         // 基础设施/RPC/取消/超时故障由 bridge.callTool 直接 throw，交由 DSH 管线如实记录工具失败；
         // 科研/制度返回（{ ok: false, error_code, ... }）保留为结构化 JSON 收据供模型消费自纠。
-        const res = await bridge.callTool(toolName, args, {
+        let res = await bridge.callTool(toolName, args, {
           workspaceRoot,
           role,
           sessionId: agent.id,
+          sessionEpochId,
+          humanMandate: gate?.current(),
           signal: execSignal,
         })
 
+        if (toolName === 'chief_read' && res?.data?.session_id) {
+          res = await readChiefTranscript(rootCtx, res.data.session_id, args)
+        }
+
         if (!res || typeof res !== 'object') {
           throw new Error(`MCP 工具 ${toolName} 返回非法非对象响应`)
+        }
+
+        if (res.ok && (DIRECT_CHIEF_TOOLS.has(toolName) || toolName === 'handback_to_chief')) {
+          onOperatorReceipt?.(toolName)
         }
 
         if (role === 'explorer' && toolName === 'run_isolated_eval' && res?.ok) {

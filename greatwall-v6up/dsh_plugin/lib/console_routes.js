@@ -240,6 +240,7 @@ export function registerGreatwallConsoleRoutes(
                 source: 'live_controller',
                 workspaceRoot: ctrl.workspaceRoot,
                 knownWorkspaces,
+                chiefMountError: ctrl.chiefMountError || null,
                 status,
                 inspector,
                 nodeConversations,
@@ -351,42 +352,15 @@ export function registerGreatwallConsoleRoutes(
             sessionCwd,
             allowFallback: false,
           })
-          // 允许 init / start / resume / human_stop 与 v0.3 人类单写者落签/接管动作在指定目标工作区时按需拉起控制器；其余控制动作无匹配控制器一律 409 拒绝
-          const autoCreateActions = new Set([
-            'init',
-            'start',
-            'resume',
-            'human_stop',
-            'approve_proposal',
-            'pause_node',
-            'resume_node',
-            'authorize_early_handoff',
-            'set_subproblem_state',
-            'set_autonomy_mode',
-            'open_chief',
-          ])
-          const resolvedInitWs = autoCreateActions.has(action) ? (reqWs || sessionCwd) : ''
-          if (!ctrl && !resolvedInitWs) {
-            return Response.json(
-              {
-                ok: false,
-                error: reqWs
-                  ? `未找到目标工作区 (${reqWs}) 对应的活跃长城控制器，已拒绝回退以防误操作其他工作区。`
-                  : '当前暂无运行中的长城编排控制器。请先在主控对话中调用 greatwall_orchestrate(action="start", ...) 启动任务。',
-              },
-              { status: 409 },
-            )
-          }
-
           const res = await controlService.execute({
             caller: 'human_ui',
             action,
-            workspaceRoot: ctrl ? ctrl.workspaceRoot : path.resolve(resolvedInitWs),
+            workspaceRoot: ctrl?.workspaceRoot || reqWs || sessionCwd,
             controller: ctrl || null,
             payload: body,
           })
           const errText = String(res?.error || '')
-          const statusCode =
+          const statusCode = res?.error_code === 'WORKSPACE_INACTIVE' ? 409 :
             res?.ok === false && (errText.includes('无权') || errText.includes('未知 action'))
               ? 400
               : 200

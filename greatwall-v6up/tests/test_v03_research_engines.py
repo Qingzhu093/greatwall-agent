@@ -76,7 +76,7 @@ class TestV03ResearchEngines(unittest.TestCase):
 
     def test_01_registry_10_roles_44_tools_and_external_isolation(self) -> None:
         self.assertEqual(len(CANONICAL_ROLES), 10)
-        self.assertEqual(len(TOOL_SPECS), 44)
+        self.assertEqual(len(TOOL_SPECS), 47)
         # 废弃五车道已彻底移除
         tool_names = {s["name"] for s in TOOL_SPECS}
         self.assertNotIn("dispatch_stagnation_five_lanes", tool_names)

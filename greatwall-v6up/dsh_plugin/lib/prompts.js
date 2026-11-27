@@ -1,5 +1,5 @@
 /**
- * GreatWall Agent v0.3 十大标准角色契约、44 个去重窄工具路由表与平台感知原生工具白名单。
+ * GreatWall Agent v0.3 十大标准角色契约、47 个去重窄工具路由表与平台感知原生工具白名单。
  * 权威单一契约源位于 `core_python/mcp_server/tool_registry.py`，由跨层架构测试与 doctor 强制校验 100% 同步。
  * @module dsh-greatwall-v6up/prompts
  */
@@ -32,12 +32,15 @@ export const ROLE_EFFORT_MAP = Object.freeze({
   supervisory_committee: 'low',
 })
 
-/** 10 角色授权 MCP 窄工具精确白名单（总去重 44 个，与 Python tool_registry.py 100% 一致）。 */
+/** 10 角色授权 MCP 窄工具精确白名单（总去重 47 个，与 Python tool_registry.py 100% 一致）。 */
 export const ROLE_MCP_TOOLS = Object.freeze({
   gw_chief: Object.freeze([
     'chief_get_overview_snapshot',
     'chief_trace_entity',
-    'chief_get_wave_digest',
+    'chief_read',
+    'chief_operate',
+    'chief_send_branch_note',
+    'chief_seed_branch',
     'chief_preview_impact',
     'chief_propose_control_action',
   ]),
@@ -123,9 +126,9 @@ export function resolvePlatformShellTool(platform = process.platform) {
  * 平台感知的 10 角色原生 DSH 工具允许清单：
  * - `explorer` / `works_engineer`: 读写 fs + search + 平台 Shell
  * - `library_verifier`: 只读 fs + search + 平台 Shell（挂载独立空白盲审沙箱）
- * - `lineage_companion`: 只读 fs + search
+ * - `lineage_companion` / `gw_chief`: 只读 fs + search
  * - `external_surveyor`: 仅 web_search / web_fetch（唯一联网，零本地 fs 防院内泄露）
- * - `gw_chief` / `library_chronicler` / `conference_chair` / `logistics_coordinator` / `supervisory_committee`: `[]`（物理 0 原生工具）
+ * - `library_chronicler` / `conference_chair` / `logistics_coordinator` / `supervisory_committee`: `[]`（物理 0 原生工具）
  */
 export function resolvePlatformAllowedTools(role, platform = process.platform) {
   const shell = resolvePlatformShellTool(platform)

@@ -84,6 +84,7 @@ export class GreatwallOrchestrator {
       telemetry: this.telemetry,
     })
 
+    this.host.onOperatorReceipt = () => this.notifyOperator()
     this.effectsConsumer = new RuntimeEffectsConsumer({
       bridge,
       workspaceRoot: this.workspaceRoot,
@@ -108,42 +109,46 @@ export class GreatwallOrchestrator {
   }
 
   _buildEffectHandlers() {
+    const isCurrent = async (effect) => {
+      const result = await this.bridge.control('control_plane/operator_effect_current', {
+        workspace_root: this.workspaceRoot, seq: effect.seq,
+        effect_key: effect.effect_key, target_generation: effect.target_generation,
+      })
+      if (!result.ok) throw new Error(result.error)
+      return result.data.current
+    }
+    const stopNode = async (effect, payload, { signal }) => {
+      const nodeId = effect.target_id
+      const running = this._runningExplorers.get(nodeId)
+      const sessionId = running?.sessionId || `gw-exp-${nodeId}`
+      const agent = this.liveSessions.get(sessionId)?.handle.agent ?? this.ctx?.get?.('agents')?.get(sessionId)
+      const result = await this.humanTakeover.drainAndYieldNode({
+        nodeId, sessionId, liveHandle: { agent }, livePromise: running?.promise, signal,
+        graceSec: payload.grace_sec, keepSessionForHuman: Boolean(payload.keep_session_for_human),
+        reason: payload.reason || effect.kind, expectedGeneration: effect.target_generation,
+        isCurrent: () => isCurrent(effect),
+      })
+      if (result.stale || effect.kind !== 'CANCEL_NODE_SESSION') return
+      await running?.promise
+      await disposeNodeCompanion(this, nodeId, 'terminated_external')
+      if (payload.reason === 'OPERATOR_RETIRE' && this.telemetry.getSessionIdentity(sessionId)) {
+        const archive = await this.host.archiveSession(sessionId)
+        if (archive.error) throw new Error(archive.error)
+        this.telemetry.recordSessionEnd({ sessionId, status: 'retired', archived: archive.archived })
+      }
+    }
     return {
-      DRAIN_AND_STOP_NODE: async (eff, payload) => {
-        const nid = String(eff.target_id || '')
-        const running = this._runningExplorers.get(nid)
-        const sid = running?.sessionId || `gw-exp-${nid}`
-        const liveEntry = this.liveSessions.get(sid)
-        await this.humanTakeover.drainAndYieldNode({
-          nodeId: nid,
-          sessionId: sid,
-          liveHandle: liveEntry?.handle || null,
-          livePromise: running?.promise || null,
-          graceSec: Number(payload?.grace_sec || 0),
-          keepSessionForHuman: Boolean(payload?.keep_session_for_human),
-          reason: String(payload?.reason || 'DRAIN_AND_STOP_NODE'),
-        })
-      },
-      CANCEL_NODE_SESSION: async (eff, payload) => {
-        const nid = String(eff.target_id || '')
-        const running = this._runningExplorers.get(nid)
-        const sid = running?.sessionId || `gw-exp-${nid}`
-        const liveEntry = this.liveSessions.get(sid)
-        await this.humanTakeover.drainAndYieldNode({
-          nodeId: nid,
-          sessionId: sid,
-          liveHandle: liveEntry?.handle || null,
-          keepSessionForHuman: false,
-          reason: String(payload?.reason || 'CANCEL_NODE_SESSION'),
-        })
-      },
+      DRAIN_AND_STOP_NODE: stopNode,
+      CANCEL_NODE_SESSION: stopNode,
       NOTIFY_POLICY_CHANGED: async (eff, payload) => {
         const nid = String(eff.target_id || '')
         const running = this._runningExplorers.get(nid)
-        if (!running) return
+        if (!running || (eff.effect_key && !(await isCurrent(eff)))) return
         const notice = `[新公开裁决口径 v${payload?.new_spec_revision || '?'}] 人类已修订子题 ${payload?.question_id || ''} 口径：${payload?.summary_md || ''}（详见 ${payload?.ruling_file || 'rulings/'}）。你当前在途思路仍可自然收尾，但若需达最新 FULL_GOAL 请对齐新口径。`
         this.host.injectPolicyChange(running.sessionId, notice)
       },
+      DELIVER_BRANCH_NOTE: (effect, payload) => this._deliverBranchMessage(effect, payload),
+      DELIVER_HANDBACK_RECEIPT: (effect, payload) => this._deliverBranchMessage(effect, payload),
       NOTIFY_CHIEF: async (eff, payload) => {
         this.telemetry.recordEvent('chief_notification_received', { seq: eff.seq, targetId: eff.target_id, payload })
         if (typeof this._onChiefNotify === 'function') {
@@ -155,6 +160,18 @@ export class GreatwallOrchestrator {
       RUN_WAVE_CONFERENCE: async () => { this._wakeLoop() },
       REFRESH_LIVING_SURVEY: async () => { this._wakeLoop() },
     }
+  }
+
+  async _deliverBranchMessage(effect, payload) {
+    const nid = String(effect.target_id)
+    const id = String(payload.note_id || effect.effect_key)
+    const text = String(payload.message || '')
+    const sid = this._runningExplorers.get(nid)?.sessionId || `gw-exp-${nid}`
+    if (this.host.injectPolicyChange(sid, `[${id}] ${text}`).injected) return
+    const queued = await this.bridge.control('control_plane/operator_queue_note', {
+      workspace_root: this.workspaceRoot, node_id: nid, note: { id, text },
+    })
+    if (!queued?.ok) throw new Error(queued?.error || '便签入队失败')
   }
 
   get liveSessions() { return this.host.liveSessions }
@@ -170,7 +187,6 @@ export class GreatwallOrchestrator {
   isGovTaskRunning(taskKey) { return this._runningGov.has(taskKey) }
   isBreakerOpen(key, fp) { return this._itemBreaker.isBroken(key, fp) }
   launchGovTask(taskKey, runner) { return this._launchGovTask(taskKey, runner) }
-  launchGovTaskAndAwait(taskKey, runner) { return this._launchGovTaskAndAwaitIfSync(taskKey, runner) }
   evaluateBreakerAfterTask(roleLabel, items, extractAfterMap) { return this._evaluateBreakerAfterTask(roleLabel, items, extractAfterMap) }
   launchExplorer(node, snap, sig) { return this._launchExplorerWorker(node, snap, sig) }
   runBlindReview(rev, sig) { return this._runBlindReviewWithSandbox(rev, sig) }
@@ -194,8 +210,10 @@ export class GreatwallOrchestrator {
   getAvailableBriefSlots(snap, maxConcurrentWorkers = null) {
     const effCap = Math.max(1, Number(maxConcurrentWorkers || snap?.slot_cap || this.slotAllocator.maxWorkers))
     const runningBriefings = [...this._runningGov.keys()].filter((k) => k.startsWith('brief:')).length
-    const readyWaitingCount = (snap?.explorers_ready_to_run || []).filter((n) => !this._runningExplorers.has(n.node_id)).length
-    return Math.max(0, effCap + 1 - this._runningExplorers.size - runningBriefings - readyWaitingCount)
+    const readyWaitingCount = (snap.explorers_ready_to_run || [])
+      .filter((n) => n.slot_tier !== 'human_reserve' && !this._runningExplorers.has(n.node_id)).length
+    const free = snap.operator_plane ? snap.slot_utilization.free_slots : effCap - this._runningExplorers.size
+    return Math.max(0, free - runningBriefings - readyWaitingCount)
   }
 
   getLiveCompanion(nodeId) {
@@ -532,6 +550,12 @@ export class GreatwallOrchestrator {
     return { woken: false, restarted: false }
   }
 
+  notifyOperator() {
+    const task = this._backgroundTask ? Promise.resolve() : this.effectsConsumer.drainOnce()
+    void task.then(() => this.wakeOrRestartIfIdle()).catch((error) =>
+      this.telemetry.recordEvent('operator_wake_error', { error: String(error) }))
+  }
+
   async humanStop(note = 'HUMAN_UI_OR_CLI_STOP', { callerSource = 'unknown' } = {}) {
     const res = await this.bridge.control('control_plane/record_human_stop', {
       workspace_root: this.workspaceRoot,
@@ -570,12 +594,31 @@ export class GreatwallOrchestrator {
       await Promise.race([this._backgroundTask.catch(() => {}), new Promise((r) => setTimeout(r, 2500))])
     }
     for (const nid of [...this._nodeCompanionSessions.keys()]) await disposeNodeCompanion(this, nid, 'aborted')
-    const leftovers = [...this.liveSessions.values()]
+    const leftovers = [...this.liveSessions.values()].filter((entry) => !entry.adopted)
     if (leftovers.length > 0) {
       await Promise.allSettled(leftovers.map((entry) => entry.handleDispose('aborted', { kind: 'aborted' })))
     }
     this.instanceLock.release()
     return { stopped: true, state: this._poolState }
+  }
+
+  async awaitEpochQuiescence(timeoutMs = 10_000) {
+    const active = [
+      this._backgroundTask,
+      ...[...this._runningExplorers.values()].map((job) => job.promise),
+      ...this._runningGov.values(),
+      ...[...this.liveSessions.values()].filter((entry) => entry.adopted).map((entry) => entry.handle.agent.whenIdle()),
+      this.effectsConsumer.whenIdle(),
+    ]
+    let timer
+    try {
+      return await Promise.race([
+        Promise.allSettled(active).then(() => true),
+        new Promise((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs) }),
+      ])
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   async getControlStatus() {
@@ -644,12 +687,6 @@ export class GreatwallOrchestrator {
     return true
   }
 
-  async _launchGovTaskAndAwaitIfSync(taskKey, fn) {
-    this._launchGovTask(taskKey, fn)
-    const p = this._runningGov.get(taskKey)
-    if (p) await p
-  }
-
   async _evaluateBreakerAfterTask(roleLabel, dispatchedItems, extractAfterMap) {
     if (!dispatchedItems?.length) return []
     try {
@@ -681,7 +718,19 @@ export class GreatwallOrchestrator {
     if (!slotTier) return
     const expSessionId = `gw-exp-${nid}`
     let failed = false
-    const p = driveExplorerCompanionPair(this.createDispatchRuntimePort(), node, snap, expSessionId, { signal: sig })
+    const slotKey = { workspace_root: this.workspaceRoot, node_id: nid, owner_id: this.instanceLock.ownerId, launch_id: crypto.randomUUID() }
+    let admitted = false
+    const p = Promise.resolve().then(async () => {
+      if (snap?.operator_plane) {
+        const result = await this.bridge.control('control_plane/operator_slot_admit', {
+          ...slotKey, control_generation: Number(node.control_generation || 1), slot_tier: slotTier, slot_cap: snap.slot_cap,
+        })
+        if (!result?.ok) throw new Error(result?.error || '分支席位登记失败')
+        admitted = result.data?.admitted === true
+        if (!admitted) return
+      }
+      await driveExplorerCompanionPair(this.createDispatchRuntimePort(), node, snap, expSessionId, { signal: sig })
+    })
       .catch((err) => {
         if (err?.code !== 'GREATWALL_RUN_ABORTED') {
           failed = true
@@ -689,7 +738,14 @@ export class GreatwallOrchestrator {
           this.telemetry.recordEvent('explorer_worker_error', { nodeId: nid, error: String(err?.message || err) })
         }
       })
-      .finally(() => {
+      .finally(async () => {
+        if (admitted) {
+          const released = await this.bridge.control('control_plane/operator_slot_release', slotKey).catch(() => null)
+          if (released?.data?.pending_quiescence) {
+            void this.bridge.control('control_plane/operator_finish_node_jobs', slotKey, { signal: sig }).catch(() => {})
+          }
+          if (!released?.ok) this.telemetry.recordEvent('operator_slot_release_failed', { nodeId: nid, error: released?.error || 'bridge unavailable' })
+        }
         this._runningExplorers.delete(nid)
         this.slotAllocator.release(nid)
         this._syncSlotsToTelemetry()
@@ -731,19 +787,30 @@ export class GreatwallOrchestrator {
     const sig = this._loopAbortController.signal
     let idleStreak = 0
     let snapshotErrorStreak = 0
+    let nextOperatorTick = 0
 
     // 重型实验崩溃恢复放到后台异步执行，绝不阻塞主循环消费 Outbox 快控制
     void this.bridge.control('control_plane/recover_heavy_jobs', { workspace_root: this.workspaceRoot }, { signal: sig }).catch(() => {})
 
+    await this.bridge.control('control_plane/operator_slot_recover', {
+      workspace_root: this.workspaceRoot, owner_id: this.instanceLock.ownerId,
+      live_node_ids: [...this._runningExplorers.keys()],
+    }).catch(() => {})
+
     while (!sig.aborted && this._poolState !== 'stopped') {
       // 每轮（含全局暂停态）先消费 Outbox 副作用队列，确保节点让权、新口径热通知与总控通知不被暂停卡死
-      await this.effectsConsumer.drainOnce({ limit: 12, signal: sig }).catch(() => {})
+      await this.effectsConsumer.drainOnce({ signal: sig }).catch(() => {})
 
+      if (Date.now() >= nextOperatorTick) {
+        nextOperatorTick = Date.now() + 500
+        await this.bridge.control('control_plane/operator_tick', { workspace_root: this.workspaceRoot }).catch(() => {})
+      }
       if (this._poolState === 'paused') {
         await this._waitWakeOrTimeout(400)
         continue
       }
 
+      const runningGovCount = this._runningGov.size
       const snapRes = await this.bridge.control('control_plane/schedule_snapshot', {
         workspace_root: this.workspaceRoot,
         max_concurrent_workers: maxConcurrentWorkers,
@@ -764,8 +831,11 @@ export class GreatwallOrchestrator {
         continue
       }
       snapshotErrorStreak = 0
+      // 读取期间完成的治理任务可能已经改写了待办列表。
+      if (this._runningGov.size !== runningGovCount || this._poolState === 'paused') continue
 
       const snap = snapRes.data
+      if (snap.operator_plane && snap.slot_cap) this.slotAllocator.setMaxWorkers(snap.slot_cap)
       if (Array.isArray(snap.shared_inputs_rel_paths)) this.host.sharedInputPaths = snap.shared_inputs_rel_paths
       if (snap.stage === 'CLOSED_VERIFIED' || snap?.closure_state?.status === 'CLOSED_VERIFIED' || this._stage3Done) {
         this.telemetry.setOrchestratorState('idle', 'CLOSED_VERIFIED')
@@ -795,7 +865,7 @@ export class GreatwallOrchestrator {
         continue
       }
 
-      const s2 = await dispatchStage2Step(port, snap, sig, maxConcurrentWorkers)
+      const s2 = await dispatchStage2Step(port, snap, sig, snap.operator_plane ? snap.slot_cap : maxConcurrentWorkers)
       if (s2.dispatched) dispatchedSomething = true
       if (s2.continueImmediate) continue
 
@@ -805,6 +875,10 @@ export class GreatwallOrchestrator {
         : (Array.isArray(snap.active_conferences) ? snap.active_conferences : [])
       const hasPendingHumanWait =
         (snap.pending_proposals || []).length > 0 ||
+        (snap.active_arrangements || []).some((a) => a.ends_on_kind !== 'MANUAL') ||
+        (snap.pending_effects_count || 0) > 0 ||
+        (snap.operation_receipts || []).some((op) => op.status === 'DRAINING') ||
+        (snap.operator_slot_ledger?.draining?.length || 0) > 0 ||
         (snap.human_paused_nodes || []).length > 0 ||
         activeConfs.some((c) => String(c?.status || '') === 'PENDING_HUMAN_APPROVAL')
 
@@ -864,7 +938,6 @@ export class GreatwallOrchestrator {
 
   async disposeAll() {
     await this.stopBackground('DISPOSE_ALL')
-    this.humanTakeover.disposeAll()
     await this.host.disposeAllSessions()
     this.instanceLock.release()
   }

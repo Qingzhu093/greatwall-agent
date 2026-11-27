@@ -1,4 +1,4 @@
-# GreatWall V6-Up 模块地图（MODULE_MAP · `v0.3.0-alpha.2`）
+# GreatWall V6-Up 模块地图（MODULE_MAP · `v0.3.1`）
 
 面向人类协作者与后续接手 AI Agent 的一页架构导航：快速定位代码边界、四大工程分层红线与整机验收命令。顶层设计论文见 [`../docs/agent_kb_v0_3/`](../docs/agent_kb_v0_3/)。
 
@@ -6,16 +6,16 @@
 
 ## 1. Python 核心与单写真相源（`core_python/`）
 
-> **并发与一致性铁律（`v0.3.0-alpha.2`）**：**并发纯只读（`open_ro_connection` + `ro_consistent_tx`）+ 并发纯外部隔离计算（锁外 100% 并行，含 Stage 3 不可变冻结目录 SHA-256 计算）+ 严格进程级单写者短锁记总账（`_SINGLE_WRITER_LOCK` + `rw_immediate_tx`）+ 持久化事务 Outbox (`runtime_effects`) 驱动异步副作用**。
+> **并发与一致性铁律（`v0.3.1`）**：**并发纯只读（`open_ro_connection` + `ro_consistent_tx`）+ 并发纯外部隔离计算（锁外 100% 并行，含 Stage 3 不可变冻结目录 SHA-256 计算）+ 严格进程级单写者短锁记总账（`_SINGLE_WRITER_LOCK` + `rw_immediate_tx`）+ 持久化事务 Outbox (`runtime_effects`) 双车道驱动异步副作用**。
 
 | 路径 | 职责 | 禁止放入 / 边界红线 |
 | --- | --- | --- |
-| `mcp_server/db/` | 模块化数据底座：`enums.py`（全量权威枚举）、`schema_base.py`（核心 19 表）、`schema_v03.py`（v0.3 新增 6 表 + 排雷视图 + 封存不可变触发器）、`migrations.py`（`v0.2.0-alpha.1` 无损原地迁移 + FTS5 自动重建 + 外键校验） | 禁止直接 `ALTER RENAME` 不开 `PRAGMA legacy_alter_table = ON`；严禁破坏防自审/L3 审核硬触发器 |
+| `mcp_server/db/` | 模块化数据底座：`enums.py`（全量权威枚举）、`schema_base.py`（核心 19 表）、`schema_v03.py`（v0.3 新增 6 表）、`schema_v031.py`（v0.3.1 `run_arrangements` / `operation_receipts` / `operator_runtime_slots` / `branch_notes` / `project_epochs`）、`migrations.py`（无损原地迁移 + FTS5 自动重建 + 外键校验） | 禁止直接 `ALTER RENAME` 不开 `PRAGMA legacy_alter_table = ON`；严禁破坏防自审/L3 审核硬触发器 |
 | `mcp_server/db_runtime.py` & `db_schema.py` | 真只读连接、进程级单写者锁 `_SINGLE_WRITER_LOCK`、异常安全连接关闭与薄聚合门面 | 写短事务内禁止包含耗时子进程或大目录哈希计算 |
-| `mcp_server/tool_registry.py` | **44 窄工具 × 10 角色单一契约源**：`gw_chief`、`explorer`、`lineage_companion`、`logistics_coordinator`、`external_surveyor`、`library_chronicler`、`conference_chair`、`library_verifier`、`works_engineer`、`supervisory_committee` | 严禁 import 业务实现 `tools_*.py` 或 `control_plane/` |
-| `mcp_server/greatwall_core_mcp.py` & `control_plane_dispatch.py` | 双池并发 stdio JSON-RPC 2.0 入口（`fast_pool` / `compute_pool`）、`$/cancelRequest` 真取消注册表、44 窄工具与 30+ 控制面原语分发 | 严禁堆砌 SQL 事务或重复手写工具 Schema |
-| `mcp_server/mcp_core_helpers.py` & `mcp_schema_docs.py` | RBAC 鉴权、路径安全、统一回执外壳与 44 工具全量中文 Schema/枚举增强 | 严禁反向依赖 `tools_*.py` 或 `control_plane/` |
-| `mcp_server/control_plane/` | 12 个无环单写者子域：`effects_outbox`、`subproblem_locks`（锁一/锁二/锁三与子题级 `active_spec_revision`）、`node_interventions`（45% 暂停/让权/SHA-256 对账恢复/提前交班）、`proposals`（宪章正门确认单 + `AMEND_RULING_DRAFT`）、`wave_engine`（宏观大外环四拍与代码硬对账）、`delivery_freeze`（外部不可变冻结包 + 一步终签）、`blind_sandbox`、`lifecycle_ops`、`workspace_sync`、`snapshot_queries`、`scheduler_rules`、`ui_projection` | 严禁反向 import `tools_*.py`；单文件保持 `<1000` 行；已废除扫盘自动静默升版暗门 |
+| `mcp_server/tool_registry.py` | **47 窄工具 × 10 角色单一契约源**：`gw_chief`、`explorer`、`lineage_companion`、`logistics_coordinator`、`external_surveyor`、`library_chronicler`、`conference_chair`、`library_verifier`、`works_engineer`、`supervisory_committee` | 严禁 import 业务实现 `tools_*.py` 或 `control_plane/` |
+| `mcp_server/greatwall_core_mcp.py` & `control_plane_dispatch.py` | 双池并发 stdio JSON-RPC 2.0 入口（`fast_pool` / `compute_pool`）、`$/cancelRequest` 真取消注册表、47 窄工具与控制面原语分发 | 严禁堆砌 SQL 事务或重复手写工具 Schema |
+| `mcp_server/mcp_core_helpers.py` & `mcp_schema_docs.py` | RBAC 鉴权、路径安全、统一回执外壳与 47 工具全量中文 Schema/枚举增强 | 严禁反向依赖 `tools_*.py` 或 `control_plane/` |
+| `mcp_server/control_plane/` | 无环单写者子域：`operator_policy`（版本化运行安排与独立槽位账本）、`operator_ops`（日常直执与四态回执）、`epochs`（在线 `sqlite3.backup()` 纪元归档）、`effects_outbox`、`subproblem_locks`、`node_interventions`、`proposals`（4 类宪章正门确认单）、`wave_engine`、`delivery_freeze`、`blind_sandbox`、`lifecycle_ops`、`workspace_sync`、`snapshot_queries`、`scheduler_rules`、`ui_projection` | 严禁反向 import `tools_*.py`；单文件保持 `<1000` 行；已废除扫盘自动静默升版暗门 |
 | `mcp_server/tools_*.py` & `triage_core.py` | 10 角色窄工具实现：`tools_chief`、`tools_explorer_eval` + `tools_explorer_pull`、`tools_companion`（支持 `recommended_triage` 确定性直落与 `local_lemma_submissions` 一次性盲审）、`triage_core`、`tools_logistics`、`tools_library_roles`（外搜 `external_surveyor` / 综述终稿 `library_chronicler` / 圆桌主席 `conference_chair`）、`tools_verifier` + `tools_verifier_helpers`（Stage 1 `PARTIAL_PASS` + `ACCEPT_NARROWED` + Stage 3 一步终签）、`tools_works`、`tools_supervisory` | 禁止恢复已退役的 `library_surveyor` 与 `dispatch_stagnation_five_lanes`；严禁 `external_surveyor` 访问院内成果 |
 | `evaluators/isolated_runner.py` | 三档（`probe`/`official`/`heavy`）四态隔离仪器执行器、校准门禁与 `cancel_event` 实时强杀子进程树 | 严禁向探索者泄露 `_hidden_calibrations/` 或评测源码 |
 | `agents/*.md` & `config.json` | 10 份 v0.3 角色系统提示词与全局参数（弹性锚点卡预算、保护期、圆桌阈值、瞬时退避） | 修改工具名须同步更新对应 `.md`（架构门禁强制校验） |

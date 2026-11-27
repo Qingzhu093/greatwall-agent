@@ -98,6 +98,17 @@ def dispatch_control_call(
     eff_ws = str(p.pop("workspace_root", "") or os.environ.get("GREATWALL_WORKSPACE_ROOT", "")).strip()
     conn = None
     try:
+        if method == "control_plane/session_epoch":
+            paths = resolve_storage_paths(eff_ws, create_dirs=False)
+            if not paths["db_path"].is_file():
+                return {"ok": True, "data": {"epoch_id": 1}}
+
+            def resolve_epoch(rconn):
+                from .control_plane.operator_policy import epoch_id
+                node = rconn.execute("SELECT session_epoch_id FROM lineage_nodes WHERE node_id=?", (p.get("node_id"),)).fetchone() if p.get("node_id") else None
+                return int(node["session_epoch_id"]) if node else epoch_id(rconn)
+
+            return {"ok": True, "data": {"epoch_id": run_readonly_query(paths["db_path"], resolve_epoch)}}
         if method in ("control_plane/schedule_snapshot", "control_plane/recover_heavy_jobs", "control_plane/ui_inspector"):
             probe_paths = resolve_storage_paths(eff_ws, create_dirs=False)
             if not probe_paths["db_path"].is_file():
@@ -151,6 +162,10 @@ def dispatch_control_call(
         conn = open_rw_connection(paths["db_path"], init_schema=True)
 
         if method in ("control_plane/init_parse0", "control_plane/init_epoch"):
+            active = conn.execute("SELECT epoch_id FROM parse0_contract WHERE contract_id='active'").fetchone()
+            requested_epoch = int(p.get("epoch_id") or (active["epoch_id"] if active else 1))
+            if active and requested_epoch != active["epoch_id"]:
+                raise FailClosedError(ERR_LOCKED, "更换纪元需要人类签署 ADVANCE_EPOCH")
             res = init_parse0_contract(
                 conn,
                 goal_and_completion_md=str(p.get("goal_and_completion_md") or p.get("goal_md") or ""),
@@ -163,11 +178,50 @@ def dispatch_control_call(
                 delivery_spec_md=str(p.get("delivery_spec_md") or ""),
                 shared_inputs_rel_paths=p.get("shared_inputs_rel_paths"),
                 stage=p.get("stage") if p.get("stage") else None,
-                epoch_id=int(p.get("epoch_id", 1)),
+                epoch_id=requested_epoch,
                 human_signed_at=p.get("human_signed_at"),
                 autonomy_mode=p.get("autonomy_mode"),
             )
             return {"ok": True, "data": res}
+
+        if method.startswith("control_plane/operator_"):
+            from .control_plane import operator_ops
+            operation = method.removeprefix("control_plane/operator_")
+            if operation == "command":
+                return {"ok": True, "data": operator_ops.operator_command(
+                    conn, operation=str(p.get("operation") or ""), actor_source="human_ui",
+                    arrangement=p.get("arrangement"), arrangements=p.get("arrangements"), node_action=p.get("node_action"),
+                    details=p.get("details"), workspace_root=eff_ws,
+                )}
+            if operation in ("notes", "ack_note", "queue_note"):
+                return {"ok": True, "data": operator_ops.branch_notes(conn, str(p["node_id"]), operation, p.get("note"))}
+            if operation == "effect_current":
+                from .control_plane.effects_outbox import runtime_effect_is_current
+                return {"ok": True, "data": {"current": runtime_effect_is_current(
+                    conn, int(p["seq"]), str(p["effect_key"]), int(p["target_generation"]),
+                )}}
+            if operation == "slot_admit":
+                return {"ok": True, "data": operator_ops.admit_runtime_slot(
+                    conn, str(p["node_id"]), str(p["owner_id"]), str(p["launch_id"]), int(p["control_generation"]),
+                    str(p.get("slot_tier") or "normal"), int(p.get("slot_cap") or 6),
+                )}
+            if operation == "finish_node_jobs":
+                recover_pending_heavy_jobs(conn, workspace_root=eff_ws, cancel_event=cancel_event, node_id=str(p["node_id"]))
+                return {"ok": True}
+            if operation == "slot_release":
+                return {"ok": True, "data": operator_ops.release_runtime_slot(
+                    conn, str(p["node_id"]), str(p["owner_id"]), str(p["launch_id"]),
+                )}
+            if operation == "slot_recover":
+                return {"ok": True, "data": operator_ops.recover_runtime_slots(conn, str(p["owner_id"]), p.get("live_node_ids") or [])}
+            if operation == "tick":
+                with rw_immediate_tx(conn):
+                    operator_ops._expire_and_settle(conn)
+                return {"ok": True}
+
+        if method == "control_plane/control_proposal_kind":
+            row = conn.execute("SELECT action_type,status FROM control_proposals WHERE proposal_id=?", (p.get("proposal_id"),)).fetchone()
+            return {"ok": bool(row), "data": dict(row) if row else None}
 
         if method == "control_plane/sync_pressure":
             res = sync_session_pressure(
@@ -254,13 +308,13 @@ def dispatch_control_call(
             return {"ok": True, "data": pause_node(conn, node_id=str(p["node_id"]), actor_source=str(p.get("actor_source", "human_ui")), reason=str(p.get("reason", "HUMAN_PAUSE")))}
 
         if method == "control_plane/mark_node_yielded":
-            return {"ok": True, "data": mark_node_yielded(conn, node_id=str(p["node_id"]), details=p.get("details") if isinstance(p.get("details"), dict) else None)}
+            return {"ok": True, "data": mark_node_yielded(conn, node_id=str(p["node_id"]), details=p.get("details") if isinstance(p.get("details"), dict) else None, expected_generation=p.get("expected_generation"))}
 
         if method == "control_plane/record_human_chat_detected":
             return {"ok": True, "data": record_human_chat_detected(conn, node_id=str(p["node_id"]), session_id=str(p.get("session_id", "")), message_preview=str(p.get("message_preview", "")))}
 
         if method == "control_plane/resume_node":
-            return {"ok": True, "data": resume_node(conn, node_id=str(p["node_id"]), actor_source=str(p.get("actor_source", "human_ui")), cross_branch_note=str(p.get("cross_branch_note") or p.get("human_note_md") or ""))}
+            return {"ok": True, "data": resume_node(conn, node_id=str(p["node_id"]), actor_source=str(p.get("actor_source", "human_ui")), cross_branch_note=str(p.get("cross_branch_note") or p.get("human_note_md") or ""), operator_named=bool(p.get("operator_named")))}
 
         if method == "control_plane/authorize_early_handoff":
             return {"ok": True, "data": authorize_early_handoff(conn, node_id=str(p["node_id"]), actor_source=str(p.get("actor_source", "human_ui")), reason=str(p.get("reason", "HUMAN_EARLY_HANDOFF")), cross_branch_note=str(p.get("cross_branch_note") or ""))}
@@ -344,9 +398,9 @@ def dispatch_control_call(
             }
 
         if method == "control_plane/complete_runtime_effect":
-            return {
-                "ok": True,
-                "data": complete_runtime_effect(
+            from .control_plane.operator_ops import _expire_and_settle
+            with rw_immediate_tx(conn):
+                result = complete_runtime_effect(
                     conn,
                     seq=int(p.get("seq", p.get("effect_id", 0))),
                     owner_instance_id=str(p.get("owner_instance_id") or p.get("lease_owner") or "dsh-host"),
@@ -354,8 +408,13 @@ def dispatch_control_call(
                     last_error=str(p.get("last_error") or p.get("error_text") or ""),
                     retry_delay_sec=int(p.get("retry_delay_sec", 0)),
                     external_handle_id=p.get("external_handle_id"),
-                ),
-            }
+                    effect_key=p.get("effect_key"),
+                    target_generation=p.get("target_generation"),
+                    claim_attempt=p.get("claim_attempt"),
+                )
+                if result.get("updated") and result["status"] in ("DONE", "CANCELLED", "FAILED"):
+                    _expire_and_settle(conn)
+            return {"ok": True, "data": result}
 
         if method == "control_plane/fact_edge":
             with rw_immediate_tx(conn):

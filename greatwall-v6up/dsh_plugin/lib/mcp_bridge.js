@@ -21,6 +21,7 @@ export const LONG_RUNNING_MCP_TOOLS = Object.freeze(new Set([
 
 export const LONG_RUNNING_CONTROL_METHODS = Object.freeze(new Set([
   'control_plane/recover_heavy_jobs',
+  'control_plane/operator_finish_node_jobs',
 ]))
 
 function createAbortError(message = 'MCP 请求已取消') {
@@ -318,6 +319,9 @@ export class GreatwallMcpBridge {
       workspace_root: trustedCtx.workspaceRoot || this.workspaceRoot,
       caller_role: trustedCtx.role,
       session_id: trustedCtx.sessionId,
+      session_epoch_id: trustedCtx.sessionEpochId,
+      human_rpc_id: trustedCtx.humanMandate?.rpcId || '',
+      human_message: trustedCtx.humanMandate?.text || '',
     }
     const timeoutMs = this.resolveToolTimeoutMs(name, cleanArgs)
     const rpcRes = await this._rpc(

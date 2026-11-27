@@ -18,6 +18,7 @@ const MODULES_ORDER = [
   'components/ThreeQuestionsView.js',
   'components/LivingSurveyView.js',
   'components/BranchDetailDrawer.js',
+  'components/OperatorPlaneView.js',
   'index.js',
 ]
 

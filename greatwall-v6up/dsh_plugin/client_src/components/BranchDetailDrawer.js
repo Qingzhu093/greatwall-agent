@@ -26,6 +26,7 @@ function readableNodeStatus(st) {
   if (s === "BLOCKED_L4B") return "缺引理挂起";
   if (s === "SEALED") return "已封存";
   if (s === "CLOSED") return "已关闭";
+  if (s === "RETIRED") return "已撤编";
   return s || "未知";
 }
 
@@ -33,7 +34,6 @@ function BranchDetailDrawer({ data, busy, onControl, getUiWorkspace }) {
   const [expandedNodes, setExpandedNodes] = React.useState({});
   const [showHistorical, setShowHistorical] = React.useState(false);
   const [feedback, setFeedback] = React.useState("");
-  const [confirmEarlyNodeId, setConfirmEarlyNodeId] = React.useState("");
 
   const poolState = String(data?.status?.poolState || "idle").toLowerCase();
   const isPoolRunning = poolState === "running";
@@ -43,6 +43,7 @@ function BranchDetailDrawer({ data, busy, onControl, getUiWorkspace }) {
   const families = insp.method_families || [];
   const activeSessions = data?.status?.activeSessions || [];
   const runningExplorers = data?.status?.runningExplorers || [];
+  const drainingIds = new Set((insp.snapshot?.operator_slot_ledger?.draining || []).map((slot) => slot.node_id));
   const liveByNode = {};
   for (const r of runningExplorers) {
     if (r?.nodeId) liveByNode[r.nodeId] = { nodeId: r.nodeId, sessionId: r.sessionId, startedAt: r.startedAt || null };
@@ -138,7 +139,11 @@ function BranchDetailDrawer({ data, busy, onControl, getUiWorkspace }) {
                             const isExpanded = Boolean(expandedNodes[n.node_id]);
                             const needsToggle = summary.length > 90;
                             const displaySummary = needsToggle && !isExpanded ? `${summary.slice(0, 90)}…` : summary;
-                            const isPausedForHuman = ctrlSt === "PAUSE_DRAINING" || ctrlSt === "HUMAN_ACTIVE";
+                            const draining = drainingIds.has(n.node_id);
+                            const canResume = canIntervene && ["HUMAN_ACTIVE", "PAUSE_DRAINING", "HIBERNATED"].includes(ctrlSt);
+                            const intervene = (mode, extra = {}) => onControl("operator_command", {
+                              operation: "node_intervene", node_action: { node_ids: [n.node_id], mode, ...extra },
+                            });
 
                             const expExists = !knownSessions || Boolean(knownSessions[expSid]) || Boolean(liveInfo);
                             const compExists = !knownSessions || Boolean(knownSessions[compSid]);
@@ -148,7 +153,7 @@ function BranchDetailDrawer({ data, busy, onControl, getUiWorkspace }) {
                                   ? (poolState === "paused" ? "PAUSED" : "INFO")
                                   : n.node_status);
                             const badgeLabel = isTrulyRunning
-                              ? "运行中"
+                              ? "运行占槽"
                               : (canIntervene && ctrlSt === "AUTO_RUNNING"
                                   ? (isPoolRunning
                                       ? "排队等槽位"
@@ -183,8 +188,8 @@ function BranchDetailDrawer({ data, busy, onControl, getUiWorkspace }) {
                                           className: stateBadgeClass(badgeStatusKey),
                                           children: badgeLabel
                                         }),
-                                        ctrlSt !== "AUTO_RUNNING"
-                                          ? jsx("span", { className: stateBadgeClass(ctrlSt), title: ctrlSt, children: readableControlState(ctrlSt) })
+                                        draining || (ctrlSt !== "AUTO_RUNNING" && n.node_status !== "RETIRED")
+                                          ? jsx("span", { className: stateBadgeClass(draining ? "DRAINING" : ctrlSt), children: draining ? "收尾退场 · 占槽" : readableControlState(ctrlSt) })
                                           : null
                                       ]
                                     })
@@ -244,56 +249,33 @@ function BranchDetailDrawer({ data, busy, onControl, getUiWorkspace }) {
                                           children: "暂停接管"
                                         })
                                       : null,
-                                    canIntervene && isPausedForHuman
+                                    canResume
                                       ? jsx("button", {
                                           className: "gw-btn gw-btn-ok",
                                           disabled: busy,
-                                          onClick: () => {
-                                            setConfirmEarlyNodeId("");
-                                            void onControl("resume_node", { node_id: n.node_id });
-                                          },
-                                          children: "交还托管(SHA对账)"
+                                          onClick: () => intervene("resume"),
+                                          children: ctrlSt === "HIBERNATED" ? "恢复托管" : "交还托管（SHA 对账）"
                                         })
                                       : null,
-                                    canIntervene && isPausedForHuman
+                                    canIntervene && ctrlSt === "HUMAN_ACTIVE"
                                       ? jsx("button", {
                                           className: "gw-btn",
                                           disabled: busy,
-                                          onClick: () => setConfirmEarlyNodeId((cur) => (cur === n.node_id ? "" : n.node_id)),
+                                          onClick: () => intervene("early_handoff"),
                                           children: "授权提前交班"
                                         })
-                                      : null
+                                      : null,
+                                    canIntervene && ctrlSt !== "HIBERNATED" && jsx("button", {
+                                      className: "gw-btn", disabled: busy, onClick: () => intervene("hibernate"), children: "休眠腾槽",
+                                    }),
+                                    (canIntervene || n.node_status === "BLOCKED_L4B") && jsx("button", {
+                                      className: "gw-btn", disabled: busy, onClick: () => intervene("retire"), children: "撤编归档",
+                                    }),
+                                    n.node_status === "RETIRED" && jsx("button", {
+                                      className: "gw-btn", disabled: busy, onClick: () => intervene("reactivate"), children: "重新激活",
+                                    }),
                                   ]
-                                }),
-                                confirmEarlyNodeId === n.node_id && canIntervene && isPausedForHuman
-                                  ? jsxs("div", {
-                                      className: "gw-confirm-bar",
-                                      style: { borderRadius: "6px", border: "1px solid rgba(220,38,38,.3)" },
-                                      children: [
-                                        jsx("span", { children: "确认提前结束本代探索并交由伴随封存遗嘱？" }),
-                                        jsxs("div", {
-                                          className: "gw-actions",
-                                          children: [
-                                            jsx("button", {
-                                              className: "gw-btn gw-btn-danger",
-                                              disabled: busy,
-                                              onClick: () => {
-                                                setConfirmEarlyNodeId("");
-                                                void onControl("authorize_early_handoff", { node_id: n.node_id });
-                                              },
-                                              children: "确认提前交班"
-                                            }),
-                                            jsx("button", {
-                                              className: "gw-btn",
-                                              disabled: busy,
-                                              onClick: () => setConfirmEarlyNodeId(""),
-                                              children: "取消"
-                                            })
-                                          ]
-                                        })
-                                      ]
-                                    })
-                                  : null
+                                })
                               ]
                             }, n.node_id);
                           })

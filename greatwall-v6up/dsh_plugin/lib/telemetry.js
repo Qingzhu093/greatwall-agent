@@ -137,6 +137,7 @@ export class TelemetryCollector {
     sandboxAbsPath = '',
     workspaceRoot = '',
     crossCwd = false,
+    sessionEpochId = 1,
     shortTransaction = true,
     title = '',
   }) {
@@ -152,6 +153,7 @@ export class TelemetryCollector {
       sandboxAbsPath,
       workspaceRoot: workspaceRoot || this.workspaceRoot,
       crossCwd: Boolean(crossCwd),
+      sessionEpochId: this.state.sessions[sessionId]?.sessionEpochId ?? sessionEpochId,
       shortTransaction: Boolean(shortTransaction),
       readonly: false,
       title,

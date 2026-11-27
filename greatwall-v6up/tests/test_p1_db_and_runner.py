@@ -652,6 +652,23 @@ def evaluate(artifact, spec, tier="official"):
         self.assertIn("stage", snap)
         self.assertLess(elapsed_ms, 50.0, f"只读轮询耗时过高: {elapsed_ms:.2f}ms")
 
+    def test_8_env_upgrade_requires_calibration(self) -> None:
+        _write_file(
+            self.ws / "evaluators" / "env.py",
+            'def evaluate(artifact, spec, tier="official"):\n    return {"status": "OK", "verdict": "PASS", "tracks": {}, "details": ""}\n',
+        )
+        registered = self._call(
+            "register_question_instrument", "works_engineer", "register_env",
+            question_id="ALL", instrument_id="test_env", instrument_role="ENV",
+            instrument_rel_path="evaluators/env.py",
+        )
+        self.assertTrue(registered["ok"], registered)
+        upgrade = self._call(
+            "upgrade_instrument_with_calibration", "works_engineer", "upgrade_env",
+            question_id="ALL", instrument_id="test_env", new_instrument_rel_path="evaluators/env.py",
+        )
+        self.assertEqual(upgrade.get("error_code"), "ERR_INVALID_INPUT")
+
 
 if __name__ == "__main__":
     unittest.main()

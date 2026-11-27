@@ -70,6 +70,7 @@ def _run_subprocess_cancellable(
     popen_kwargs: dict[str, Any] = {
         "cwd": cwd,
         "env": env,
+        "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
@@ -77,7 +78,11 @@ def _run_subprocess_cancellable(
         "errors": "replace",
     }
     if os.name == "nt":
-        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        # 脱离父进程（如 DSH MCP Bridge）的隐藏 conhost 并独立进程组，避免 Windows 子进程继承管道/控制台死锁
+        popen_kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        )
     else:
         popen_kwargs["start_new_session"] = True
 

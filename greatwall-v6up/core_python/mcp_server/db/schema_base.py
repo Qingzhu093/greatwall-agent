@@ -150,10 +150,13 @@ CREATE TABLE IF NOT EXISTS lineage_nodes (
     secondary_donor_node_id TEXT,
     node_status TEXT NOT NULL DEFAULT 'EXPLORING' CHECK(node_status IN (
         'EXPLORING','AWAITING_TRIAGE','PENDING_REVIEW','ACTIVE_REVISING',
-        'BLOCKED_L4B','SEALED','CLOSED'
+        'BLOCKED_L4B','SEALED','CLOSED','RETIRED'
     )),
     control_state TEXT NOT NULL DEFAULT 'AUTO_RUNNING',
     control_generation INTEGER NOT NULL DEFAULT 1,
+    session_epoch_id INTEGER NOT NULL DEFAULT 1,
+    pending_advisor_notes_json TEXT NOT NULL DEFAULT '[]',
+    operator_arrangement_id TEXT,
     personal_turn_active INTEGER NOT NULL DEFAULT 0,
     human_modified INTEGER NOT NULL DEFAULT 0,
     artifact_dirty_since_last_obs INTEGER NOT NULL DEFAULT 0,
@@ -386,7 +389,7 @@ CREATE TABLE IF NOT EXISTS method_families (
     question_id TEXT NOT NULL,
     mechanism_signature TEXT NOT NULL,
     orthogonal_contrast TEXT NOT NULL,
-    family_status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(family_status IN ('ACTIVE','BLOCKED')),
+    family_status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(family_status IN ('ACTIVE','BLOCKED','ARCHIVED')),
     blocking_lemma TEXT,
     created_at TEXT NOT NULL
 );

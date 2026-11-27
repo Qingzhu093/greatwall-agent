@@ -149,6 +149,7 @@ def pause_node(
             """
             UPDATE lineage_nodes
             SET control_state = 'PAUSE_DRAINING',
+                operator_arrangement_id = NULL,
                 control_generation = ?,
                 last_reconciled_candidate_sha256 = ?,
                 last_reconciled_tools_sha256 = ?,
@@ -198,6 +199,7 @@ def mark_node_yielded(
     *,
     node_id: str,
     details: dict[str, Any] | None = None,
+    expected_generation: int | None = None,
 ) -> dict[str, Any]:
     """当在途旧回合与后台作业归静默后，正式标注机器已让出操作权（HUMAN_ACTIVE）。"""
     node = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ?", (str(node_id),)).fetchone()
@@ -207,8 +209,8 @@ def mark_node_yielded(
     with rw_immediate_tx(conn):
         # 仅当节点仍处于 PAUSE_DRAINING 时才落盘为 HUMAN_ACTIVE，防止迟到的暂停回执把人类已交还的节点覆写回暂停
         cur = conn.execute(
-            "UPDATE lineage_nodes SET control_state = 'HUMAN_ACTIVE', updated_at = ? WHERE node_id = ? AND control_state = 'PAUSE_DRAINING'",
-            (now, str(node_id)),
+            "UPDATE lineage_nodes SET control_state = 'HUMAN_ACTIVE', updated_at = ? WHERE node_id = ? AND control_state = 'PAUSE_DRAINING' AND (? IS NULL OR control_generation = ?)",
+            (now, str(node_id), expected_generation, expected_generation),
         )
         if cur.rowcount == 0:
             latest = conn.execute("SELECT control_state FROM lineage_nodes WHERE node_id = ?", (str(node_id),)).fetchone()
@@ -234,17 +236,20 @@ def record_human_chat_detected(
     message_preview: str = "",
 ) -> dict[str, Any]:
     """检测到人类在探索子会话中亲手发言，立即触发对话让权（不与人类抢麦）。"""
-    node = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ?", (str(node_id),)).fetchone()
-    if node is None:
-        raise FailClosedError(ERR_NOT_FOUND, f"节点 {node_id!r} 不存在")
     now = utc_now_iso()
-    new_gen = int(node["control_generation"] or 1) + 1
     with rw_immediate_tx(conn):
+        node = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ?", (str(node_id),)).fetchone()
+        if node is None:
+            raise FailClosedError(ERR_NOT_FOUND, f"节点 {node_id!r} 不存在")
+        if node["node_status"] not in ("EXPLORING", "ACTIVE_REVISING"):
+            return {"node_id": str(node_id), "control_state": node["control_state"], "skipped_stale": True}
+        new_gen = int(node["control_generation"] or 1) + 1
         conn.execute(
             """
             UPDATE lineage_nodes
             SET control_state = 'HUMAN_ACTIVE',
                 personal_turn_active = 1,
+                operator_arrangement_id = NULL,
                 control_generation = ?,
                 updated_at = ?
             WHERE node_id = ?
@@ -275,6 +280,7 @@ def resume_node(
     node_id: str,
     actor_source: str = "human_ui",
     cross_branch_note: str = "",
+    operator_named: bool = False,
 ) -> dict[str, Any]:
     """人类点击「交还托管」：强制执行候选文件与 tools/ SHA-256 对账，旧观测永久保留，切回 AUTO_RUNNING。"""
     node = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ?", (str(node_id),)).fetchone()
@@ -293,6 +299,7 @@ def resume_node(
             """
             UPDATE lineage_nodes
             SET control_state = 'AUTO_RUNNING',
+                operator_arrangement_id = NULL,
                 personal_turn_active = 0,
                 control_generation = ?,
                 human_modified = CASE WHEN ? = 1 THEN 1 ELSE human_modified END,
@@ -345,10 +352,23 @@ def resume_node(
             payload={
                 "question_id": str(node["question_id"]),
                 "resumed_after_human": True,
+                "operator_named": operator_named,
                 "artifact_dirty": dirty,
                 "cross_branch_note": str(cross_branch_note or "")[:600],
             },
         )
+
+        if dirty or str(cross_branch_note).strip():
+            enqueue_runtime_effect(
+                conn, effect_key=f"chief:worktree-reconciled:{node_id}:g{new_gen}", kind="NOTIFY_CHIEF",
+                target_type="PROJECT", target_id="gw-chief",
+                payload={"event_type": "HUMAN_WORKTREE_RECONCILED", "node_id": str(node_id),
+                         "question_id": str(node["question_id"]), "last_valid_obs_id": hashes["last_valid_obs_id"],
+                         "candidate_changed": hashes["prev_candidate_sha256"] != hashes["curr_candidate_sha256"],
+                         "tools_changed": hashes["prev_tools_sha256"] != hashes["curr_tools_sha256"],
+                         "candidate_rel_path": hashes["resolved_candidate_rel_path"],
+                         "artifact_dirty": dirty, "note": str(cross_branch_note)[:600]},
+            )
 
     return {
         "node_id": str(node_id),

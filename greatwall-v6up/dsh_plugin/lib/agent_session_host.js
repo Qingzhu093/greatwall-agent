@@ -69,7 +69,6 @@ export class AgentSessionHost {
     this.liveSessions = new Map()
     this._sessionReadonlyFlags = new Map()
     this._setupHandledAgentIds = new Set()
-    this._cachedToolSchemas = null
     this._latestGovernanceSessions = new Map()
     this._resumeListenerDisposer = this._installResumeAutoRemountListener()
   }
@@ -88,7 +87,6 @@ export class AgentSessionHost {
     const entry = this.liveSessions.get(sessionId)
     if (!entry?.handle?.agent) return { injected: false, reason: 'session_not_live' }
     const msg = createUserTextMessage(noticeText, 'user')
-    this.humanTakeover?.markPluginMessage?.(sessionId, noticeText)
     if (typeof entry.handle.agent.inject === 'function') {
       entry.handle.agent.inject(msg)
       return { injected: true, method: 'inject' }
@@ -98,36 +96,80 @@ export class AgentSessionHost {
 
   _installResumeAutoRemountListener() {
     if (!this.ctx?.on) return () => {}
-    return this.ctx.on('agent/created', ({ agent }) => {
-      try {
-        if (!agent?.session || !agent?.ctx) return
-        if (this._setupHandledAgentIds.has(agent.id)) return
-        const ident = this._readGreatwallIdentityFromSession(agent.session)
-        if (!ident || !ident.role) return
-        if (ident.workspaceRoot && path.resolve(ident.workspaceRoot) !== this.workspaceRoot) return
-        const settled = this._isSessionSettled(agent.session)
-        const cachedSchemas = this._cachedToolSchemas || []
-        const cleanups = []
-        this.mountCapabilitiesOnAgent(agent.ctx, agent, {
-          role: ident.role,
-          nodeId: ident.nodeId || '',
-          cwd: ident.worktreeAbsPath || this.workspaceRoot,
-          sandboxAbsPath: ident.sandboxAbsPath || '',
-          toolSchemas: cachedSchemas,
-          readonly: settled || Boolean(ident.readonly),
-          taskContextText: settled
-            ? '⚠️ 注意：该节点短事务已结案或已封存，当前处于只读追问/审计模式（严禁写磁盘或篡改库状态）。'
-            : '',
-          cleanupFns: cleanups,
-          turnSignals: [],
-        })
-        agent.ctx.effect?.(() => () => {
-          for (const fn of cleanups.splice(0)) {
-            try { fn() } catch {}
-          }
-        }, 'greatwall:resumeCleanup')
-      } catch {}
+    return this.ctx.on('agent/created', async ({ agent }) => {
+      const ident = this._readGreatwallIdentityFromSession(agent.session)
+      if (!ident || ident.role === 'gw_chief' || this.hasSessionSetup(agent)) return
+      if (ident.workspaceRoot && this._isCrossCwd(ident.workspaceRoot)) return
+      const sessionEpochId = Number(ident.sessionEpochId ?? 1)
+      const epoch = await this.readSessionEpoch()
+      const readonly = this._isSessionSettled(agent.session) || sessionEpochId !== epoch
+      this.mountCapabilitiesOnAgent(agent.ctx, agent, {
+        role: ident.role,
+        nodeId: ident.nodeId,
+        cwd: ident.worktreeAbsPath || this.workspaceRoot,
+        sandboxAbsPath: ident.sandboxAbsPath,
+        toolSchemas: readonly ? [] : await this.bridge.listTools(),
+        readonly,
+        sessionEpochId,
+        taskContextText: readonly ? '该会话为只读档案。' : '',
+      })
     })
+  }
+
+  hasSessionSetup(agent) {
+    return this._setupHandledAgentIds.has(agent.id)
+  }
+
+  async readSessionEpoch() {
+    const result = await this.bridge.control('control_plane/session_epoch', { workspace_root: this.workspaceRoot })
+    if (result?.ok === false) throw new Error(result.error)
+    return Number(result?.data?.epoch_id ?? 1)
+  }
+
+  async adoptChief(agent, { epochId, readonly, extraContextProvider, onBeforeStep, onDispose }) {
+    const sid = agent.session.id
+    if (this.hasSessionSetup(agent)) return false
+    this._setupHandledAgentIds.add(agent.id)
+    const cleanupFns = []
+    try {
+      this.mountCapabilitiesOnAgent(agent.ctx, agent, {
+        role: 'gw_chief', toolSchemas: readonly ? [] : await this.bridge.listTools(), sessionEpochId: epochId,
+        readonly, extraContextProvider, onBeforeStep, cleanupFns,
+        taskContextText: readonly ? '此科研总控属于已归档的纪元。' : '',
+      })
+      const entry = {
+        handle: { agent }, role: 'gw_chief', adopted: true, sessionEpochId: epochId,
+        handleDispose: () => {
+          if (this.liveSessions.get(sid) !== entry) return
+          this.liveSessions.delete(sid)
+          this._setupHandledAgentIds.delete(agent.id)
+          this._sessionReadonlyFlags.delete(sid)
+          for (const clean of cleanupFns.splice(0)) { try { clean() } catch {} }
+          onDispose?.()
+        },
+      }
+      this.liveSessions.set(sid, entry)
+      agent.ctx.effect?.(() => entry.handleDispose, 'greatwall:adopted-chief-cleanup')
+      if (!readonly) {
+        this.telemetry.recordSessionStart({
+          sessionId: sid, role: 'gw_chief', workspaceRoot: this.workspaceRoot,
+          sessionEpochId: epochId, shortTransaction: false, title: '[科研总控] gw-chief',
+        })
+      }
+      return true
+    } catch (error) {
+      this._setupHandledAgentIds.delete(agent.id)
+      for (const clean of cleanupFns.splice(0)) { try { clean() } catch {} }
+      throw error
+    }
+  }
+
+  async archiveAdoptedChiefs(currentEpoch) {
+    for (const entry of [...this.liveSessions.values()]) {
+      if (!entry.adopted || entry.sessionEpochId === currentEpoch || this.isSessionReadonly(entry.handle.agent.id)) continue
+      entry.handleDispose()
+      await this.adoptChief(entry.handle.agent, { epochId: entry.sessionEpochId, readonly: true })
+    }
   }
 
   _readGreatwallIdentityFromSession(session) {
@@ -200,6 +242,12 @@ export class AgentSessionHost {
   }
 
   mountCapabilitiesOnAgent(agentCtx, agent, mountOpts) {
+    const cleanupFns = mountOpts.cleanupFns ?? []
+    agentCtx.effect?.(() => async () => {
+      await Promise.allSettled(cleanupFns.splice(0).map(async (dispose) => dispose?.()))
+      this._setupHandledAgentIds.delete(agent.id)
+      this._sessionReadonlyFlags.delete(agent.id)
+    }, 'greatwall:session-capabilities')
     return mountCapabilitiesOnAgentSession(
       {
         rootCtx: this.ctx,
@@ -210,12 +258,14 @@ export class AgentSessionHost {
         sharedInputPaths: this.sharedInputPaths,
         effectiveContextWindow: this.effectiveContextWindow,
         liveSessions: this.liveSessions,
+        onOperatorReceipt: this.onOperatorReceipt,
+        humanTakeover: this.humanTakeover,
         setSessionReadonly: (sid, flag) => this.setSessionReadonly(sid, flag),
         isSessionReadonly: (sid) => this.isSessionReadonly(sid),
       },
       agentCtx,
       agent,
-      mountOpts,
+      { ...mountOpts, cleanupFns },
     )
   }
 
@@ -325,6 +375,8 @@ export class AgentSessionHost {
   async resumeOrSpawnAgent(opts) {
     const sid = String(opts?.sessionId || '').trim()
     if (sid && this.liveSessions.has(sid) && !opts.allowedMcpOverride) {
+      const live = this.liveSessions.get(sid)
+      if (!opts.prompt) return { sessionId: sid, role: live.role, nodeId: live.nodeId, handle: live.handle }
       return this.continueAliveAgent(sid, opts.prompt, { signal: opts.signal })
     }
     return this.spawnAndRunAgent({ ...opts, preferResume: Boolean(sid) })
@@ -361,15 +413,17 @@ export class AgentSessionHost {
       throw err
     }
 
-    const toolSchemas = await this.bridge.listTools()
-    this._cachedToolSchemas = toolSchemas
-
     const effSid = sessionId || `gw_${role}_${crypto.randomUUID().slice(0, 8)}`
     const effWorktree = (role === 'explorer' || role === 'lineage_companion') && cwd ? path.resolve(cwd) : this.workspaceRoot
     const effSandbox = role === 'library_verifier' && sandboxAbsPath ? path.resolve(sandboxAbsPath) : ''
     if (role === 'library_verifier' && !effSandbox) {
       throw new Error('BLIND_SANDBOX_REQUIRED: library_verifier 必须挂载独立空白盲审沙箱 sandboxAbsPath！')
     }
+    const epochId = await this.readSessionEpoch()
+    const knownSession = this.telemetry.getSessionIdentity?.(effSid)
+    const sessionEpochId = knownSession ? Number(knownSession.sessionEpochId ?? 1) : epochId
+    const readonly = sessionEpochId !== epochId
+    const toolSchemas = readonly ? [] : await this.bridge.listTools()
     // 裁决二 & 三：探索者与伴随的 header.cwd 归入主工作区根目录（确保显示在主工作区左侧栏且可直接点开历史伴随对话），
     // 创建后立刻通过 DSH 原生 workingDirectory.set(agent, effWorktree) 切入隔离 Worktree，并继续叠加沙箱 Guard 物理锁死！
     const metaCwd = role === 'library_verifier' ? effSandbox : this.workspaceRoot
@@ -415,6 +469,8 @@ export class AgentSessionHost {
         nodeId,
         cwd: effWorktree,
         sandboxAbsPath: effSandbox,
+        sessionEpochId,
+        readonly,
         toolSchemas,
         taskContextText,
         extraContextProvider,
@@ -430,7 +486,7 @@ export class AgentSessionHost {
           }
         },
       })
-      if (typeof agentPresetsSvc?.register === 'function') {
+      if (resolvedPresetId && !readonly) {
         const mountedNames = (agentCtx.tools?.schemas?.(agent) || []).map((s) => s.name)
         assertRequiredNativeTools(role, mountedNames, process.platform)
       }
@@ -459,8 +515,9 @@ export class AgentSessionHost {
         resumedFromDisk = true
       } catch (resumeErr) {
         const msg = String(resumeErr?.message || resumeErr)
-        this.telemetry?.recordEvent?.('session_resume_fallback', { sessionId: effSid, role, error: msg })
-        handle = null
+        // 首次建会时磁盘尚无会话属预期常态（not found / enoent），静默回退 create；仅在异常恢复失败时记录遥测
+        this._setupHandledAgentIds.delete(effSid)
+        if (!/(?:not\s*found|enoent|does\s*not\s*exist|no\s*such|unknown session)/i.test(msg)) throw resumeErr
       }
     }
     if (!handle) {
@@ -493,17 +550,13 @@ export class AgentSessionHost {
       sandboxAbsPath: effSandbox,
       workspaceRoot: this.workspaceRoot,
       crossCwd,
+      sessionEpochId,
       shortTransaction,
       resumedFromDisk,
       title: sessionTitle,
     })
 
     await this.attachAndNameSession(handle.agent.session, sessionTitle, { crossCwd })
-
-    if (role === 'explorer' && nodeId && this.humanTakeover) {
-      const unwatch = this.humanTakeover.watchExplorerSession(nodeId, handle.agent.session)
-      cleanupFns.push(unwatch)
-    }
 
     if (!shortTransaction && ['logistics_coordinator', 'works_engineer', 'external_surveyor', 'library_chronicler', 'supervisory_committee'].includes(role)) {
       const prevSid = this._latestGovernanceSessions.get(role)
@@ -555,7 +608,7 @@ export class AgentSessionHost {
       handleDispose: disposeAll,
     })
 
-    if (prompt) {
+    if (prompt && !readonly) {
       await this._runFollowupTurn(effSid, handle, prompt, signal, role)
     }
 
@@ -599,6 +652,15 @@ export class AgentSessionHost {
   }
 
   async _runFollowupTurn(sessionId, handle, promptText, signal, role) {
+    const live = this.liveSessions.get(sessionId)
+    let notes = []
+    if (role === 'explorer' && live?.nodeId && typeof this.bridge.control === 'function') {
+      const queued = await this.bridge.control('control_plane/operator_notes', {
+        workspace_root: this.workspaceRoot, node_id: live.nodeId,
+      }).catch(() => null)
+      notes = queued?.data?.notes || []
+      promptText += notes.map((note) => `\n\n[分支通知 ${note.id}]\n${note.text}`).join('')
+    }
     const onAbortSignal = () => {
       try { handle.agent.cancel?.({ kind: 'parent' }) } catch {}
     }
@@ -610,10 +672,14 @@ export class AgentSessionHost {
       await runWithTransientRetry(
         async () => {
           if (signal?.aborted) return
-          this.humanTakeover?.markPluginMessage?.(sessionId, promptText)
           handle.agent.followup(createUserTextMessage(promptText, 'user'))
           await createAbortGraceRace(signal, handle.agent.whenIdle())
           const reason = await this.inspectLastTurnEndReason(sessionId, handle?.agent?.session)
+          if (!signal?.aborted && reason?.kind !== 'aborted' && reason?.kind !== 'error' && notes.length) {
+            await Promise.allSettled(notes.map((note) => this.bridge.control('control_plane/operator_ack_note', {
+              workspace_root: this.workspaceRoot, node_id: live.nodeId, note: { id: note.id },
+            })))
+          }
           if (reason?.kind === 'error' && reason?.error) {
             const err = new Error(String(reason.error.message || reason.error.code || 'turn_error'))
             err.code = reason.error.code

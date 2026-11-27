@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from ..db_runtime import rw_immediate_tx
 from .enums import ERR_STORAGE, FailClosedError
 from .schema_base import BASE_SCHEMA_SQL
+from .schema_v031 import V031_SCHEMA_SQL
 from .schema_v03 import SEALED_HANDOFF_TRIGGER_SQL, V03_SCHEMA_SQL
 
 
@@ -464,6 +465,39 @@ def _backfill_v03_data(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_operator_plane_constraints(conn: sqlite3.Connection) -> None:
+    for table, marker, schema in (
+        ("lineage_nodes", "RETIRED", BASE_SCHEMA_SQL),
+        ("method_families", "ARCHIVED", BASE_SCHEMA_SQL),
+        ("runtime_effects", "DELIVER_BRANCH_NOTE", V03_SCHEMA_SQL),
+        ("node_interventions", "ADVISOR_NOTE_SENT", V03_SCHEMA_SQL),
+        ("control_proposals", "ADVANCE_EPOCH", V03_SCHEMA_SQL),
+    ):
+        previous_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,),
+        ).fetchone()["sql"]
+        if f"'{marker}'" in previous_sql:
+            continue
+
+        def rebuild(c: sqlite3.Connection) -> None:
+            objects = c.execute(
+                "SELECT sql FROM sqlite_master WHERE tbl_name = ? AND type IN ('index','trigger') AND sql IS NOT NULL",
+                (table,),
+            ).fetchall()
+            previous = f"_{table}_before_operator_plane"
+            c.execute(f"ALTER TABLE {table} RENAME TO {previous}")
+            ddl = schema.split(f"CREATE TABLE IF NOT EXISTS {table} (", 1)[1].split(";", 1)[0]
+            c.execute(f"CREATE TABLE {table} ({ddl}")
+            new_cols = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
+            common = ", ".join(f'"{r["name"]}"' for r in c.execute(f"PRAGMA table_info({previous})") if r["name"] in new_cols)
+            c.execute(f"INSERT INTO {table} ({common}) SELECT {common} FROM {previous}")
+            c.execute(f"DROP TABLE {previous}")
+            for obj in objects:
+                c.execute(obj["sql"])
+
+        _rebuild_table_without_fk(conn, rebuild)
+
+
 def init_database_schema(conn: sqlite3.Connection) -> None:
     """幂等初始化 v0.3 全量 Schema 并完成 v0.2 旧库无损迁移。"""
     _detect_legacy_v2_database(conn)
@@ -479,6 +513,23 @@ def init_database_schema(conn: sqlite3.Connection) -> None:
         if col not in existing:
             conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {col_def}")
 
+    for tbl, col, definition in (
+        ("subproblem_runtime_state", "priority_weight", "INTEGER NOT NULL DEFAULT 100"),
+        ("subproblem_runtime_state", "max_active_branches", "INTEGER NOT NULL DEFAULT 3"),
+        ("subproblem_runtime_state", "dispatch_policy", "TEXT NOT NULL DEFAULT 'NORMAL'"),
+        ("lineage_nodes", "session_epoch_id", "INTEGER NOT NULL DEFAULT 1"),
+        ("lineage_nodes", "pending_advisor_notes_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("lineage_nodes", "operator_arrangement_id", "TEXT"),
+    ):
+        if col not in {r["name"] for r in conn.execute(f"PRAGMA table_info({tbl})")}:
+            conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {definition}")
+    _migrate_operator_plane_constraints(conn)
+    conn.executescript(V031_SCHEMA_SQL)
+    slot_columns = {row["name"] for row in conn.execute("PRAGMA table_info(operator_runtime_slots)")}
+    if "slot_tier" not in slot_columns:
+        conn.execute("ALTER TABLE operator_runtime_slots ADD COLUMN slot_tier TEXT NOT NULL DEFAULT 'normal'")
+    if "worker_exited" not in slot_columns:
+        conn.execute("ALTER TABLE operator_runtime_slots ADD COLUMN worker_exited INTEGER NOT NULL DEFAULT 0")
     conn.executescript(SEALED_HANDOFF_TRIGGER_SQL)
     # 若旧库已有内/外藏数据而新补建了 FTS5 表，先 rebuild 索引再执行 UPDATE 回填，避免 FTS5 AFTER UPDATE 触发器索引失步
     conn.execute("INSERT INTO internal_research_fts(internal_research_fts) VALUES('rebuild')")

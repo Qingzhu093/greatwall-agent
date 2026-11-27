@@ -11,7 +11,11 @@ import path from 'node:path'
 import { GreatwallMcpBridge } from './mcp_bridge.js'
 import { GreatwallOrchestrator } from './orchestrator.js'
 import { resolveTelemetryFilePath } from './telemetry.js'
-import { ChiefEventInbox, ensureChiefSession } from './sessions/chief_runtime.js'
+import { ChiefEventInbox, chiefAnchorProvider, ensureChiefSession } from './sessions/chief_runtime.js'
+import { createUserTextMessage } from './host/model_binding.js'
+
+const WORKSPACE_ENTRY_ACTIONS = new Set(['init', 'start', 'resume', 'open_chief'])
+const NODE_MODES = { pause_node: 'pause_takeover', resume_node: 'resume', authorize_early_handoff: 'early_handoff' }
 
 export const CALLER_ALLOWED_ACTIONS = Object.freeze({
   agent_tool: Object.freeze([
@@ -38,6 +42,8 @@ export const CALLER_ALLOWED_ACTIONS = Object.freeze({
     'set_subproblem_state',
     'set_autonomy_mode',
     'open_chief',
+    'operator_command',
+    'propose_epoch',
   ]),
 })
 
@@ -58,7 +64,7 @@ export function normalizeInitParse0Payload(args = {}) {
   const rawSeeds = src.seed_families ?? src.seedFamilies
   const rawBudget = src.total_budget ?? src.totalBudget
   const rawShared = src.shared_inputs_rel_paths ?? src.sharedInputsRelPaths
-  const rawEpochId = src.epoch_id ?? src.epochId ?? 1
+  const rawEpochId = src.epoch_id ?? src.epochId
   return {
     goalAndCompletionMd: goalText,
     subquestions: subQs,
@@ -70,7 +76,7 @@ export function normalizeInitParse0Payload(args = {}) {
     deliverySpecMd: String(src.delivery_spec_md ?? src.deliverySpecMd ?? ''),
     sharedInputsRelPaths: Array.isArray(rawShared) ? rawShared : [],
     stage: src.stage ? String(src.stage) : null,
-    epochId: Number.isFinite(Number(rawEpochId)) ? Number(rawEpochId) : 1,
+    epochId: rawEpochId == null ? null : Number(rawEpochId),
     humanSignedAt: normalizeHumanSignedAt(src.human_signed_at ?? src.humanSignedAt ?? null),
     autonomyMode: src.autonomy_mode ?? src.autonomyMode ?? null,
   }
@@ -84,7 +90,60 @@ export class GreatwallControlService {
     this.controllers = new Set()
     this.activeControllersByWs = new Map()
     this._wsLocks = new Map()
-    this.chiefInbox = new ChiefEventInbox()
+  }
+
+  async adoptManualChief(agent, source) {
+    const { session } = agent
+    const { header, id: sessionId } = session
+    const preset = this.ctx.get?.('agentPresets')?.presetForSession?.(session) ?? header.agentPreset
+    if (preset !== 'greatwall-chief' || !header.cwd) return
+    const ctrl = this.ensureController(header.cwd, { createIfMissing: true })
+    const { host, telemetry } = ctrl.orchestrator
+    if (host.hasSessionSetup(agent)) return
+    try {
+      const current = await ctrl.scheduleSnapshot()
+      if (!current.ok) throw new Error(current.error)
+      const currentEpoch = Number(current.data.epoch_id ?? 1)
+      const known = telemetry.getSessionIdentity(sessionId)
+      const epochId = Number(known?.sessionEpochId ?? (known || source === 'resume' ? 1 : currentEpoch))
+      const readonly = epochId !== currentEpoch
+      const anchor = readonly ? {} : chiefAnchorProvider(ctrl, current.data, { hardCapChars: this.config.chiefAnchorHardCapChars })
+      const adopted = await host.adoptChief(agent, {
+        ...anchor, epochId, readonly,
+        onDispose: () => { if (ctrl.adoptedChief?.sessionId === sessionId) ctrl.adoptedChief = null },
+      })
+      if (adopted && !readonly) {
+        ctrl.adoptedChief = { sessionId, epochId }
+        ctrl.chiefMountError = null
+      }
+    } catch (error) {
+      this._recordChiefMountError(ctrl, error)
+    }
+  }
+
+  _recordChiefMountError(controller, error) {
+    controller.chiefMountError = String(error?.message || error)
+    controller.orchestrator.telemetry.recordEvent('chief_mount_error', { error: controller.chiefMountError })
+  }
+
+  _mountChief(controller) {
+    if (controller.chiefMount) return controller.chiefMount
+    const orchestrator = controller.orchestrator
+    const task = (async () => {
+      if (!controller.adoptedChief && !orchestrator._modelBinding?.ok) {
+        const binding = await orchestrator._resolveAndLockModelBinding()
+        if (!binding.ok) throw new Error('MISSING_MODEL_BINDING: 科研总控需要已选模型或插件默认模型')
+      }
+      return ensureChiefSession(controller, { hardCapChars: this.config.chiefAnchorHardCapChars })
+    })().then((result) => {
+      controller.chiefMountError = null
+      return result
+    }).catch((error) => {
+      this._recordChiefMountError(controller, error)
+      throw error
+    }).finally(() => { controller.chiefMount = null })
+    controller.chiefMount = task
+    return task
   }
 
   async _withWorkspaceLock(wsKey, fn) {
@@ -116,6 +175,7 @@ export class GreatwallControlService {
     const wsDataRoot = path.dirname(resolveTelemetryFilePath({ dataDir, workspaceRoot }))
     const protectedDirs = [...new Set([wsDataRoot, ...(opts.protectedDirs || [])])]
 
+    const chiefInbox = new ChiefEventInbox()
     const orchestrator = new GreatwallOrchestrator({
       ctx: this.ctx,
       bridge,
@@ -125,7 +185,16 @@ export class GreatwallControlService {
       parentAgent: opts.parentAgent || null,
       defaultAgentOptions: opts.defaultAgentOptions || this.config.defaultAgentOptions || {},
       protectedDirs,
-      onChiefNotify: (ev) => this.chiefInbox.ingest(ev),
+      onChiefNotify: async (ev) => {
+        chiefInbox.ingest(ev)
+        const handback = ev?.payload
+        if (handback?.event_type === 'EXPLORER_HANDBACK') {
+          const { sessionId } = await this._mountChief(controller)
+          orchestrator.liveSessions.get(sessionId).handle.agent.steer(createUserTextMessage(
+            `转办 ${handback.handback_id}：请先查询待办，按原始人类请求处理并核销。`,
+          ))
+        }
+      },
     })
 
     const wsKey = workspaceRoot.toLowerCase()
@@ -134,6 +203,9 @@ export class GreatwallControlService {
       corePythonRoot: this.config.corePythonRoot,
       bridge,
       orchestrator,
+      chiefInbox,
+      chiefMount: null,
+      chiefMountError: null,
       async initParse0(rawPayload = {}) {
         const norm = normalizeInitParse0Payload(rawPayload)
         const res = await bridge.control('control_plane/init_parse0', {
@@ -148,7 +220,7 @@ export class GreatwallControlService {
           delivery_spec_md: norm.deliverySpecMd,
           shared_inputs_rel_paths: norm.sharedInputsRelPaths,
           stage: norm.stage,
-          epoch_id: norm.epochId,
+          ...(Number.isInteger(norm.epochId) ? { epoch_id: norm.epochId } : {}),
           ...(norm.humanSignedAt ? { human_signed_at: norm.humanSignedAt } : {}),
           ...(norm.autonomyMode ? { autonomy_mode: norm.autonomyMode } : {}),
         })
@@ -223,22 +295,9 @@ export class GreatwallControlService {
       return { ok: false, action: act, callerSource: caller, error: `调用方 ${caller} 无权执行动作 ${act}` }
     }
 
-    const AUTO_CREATE_UI_ACTIONS = new Set([
-      'init',
-      'start',
-      'resume',
-      'human_stop',
-      'approve_proposal',
-      'pause_node',
-      'resume_node',
-      'authorize_early_handoff',
-      'set_subproblem_state',
-      'set_autonomy_mode',
-      'open_chief',
-    ])
-    const createIfMissing = caller === 'agent_tool' || AUTO_CREATE_UI_ACTIONS.has(act)
+    const createIfMissing = WORKSPACE_ENTRY_ACTIONS.has(act)
     const ctrl = controller || (workspaceRoot ? this.ensureController(workspaceRoot, { callerAgent, createIfMissing }) : null)
-    if (!ctrl) return { ok: false, action: act, callerSource: caller, error: '未找到目标工作区对应的活跃长城控制器。' }
+    if (!ctrl) return { ok: false, action: act, callerSource: caller, error_code: 'WORKSPACE_INACTIVE', error: '目标工作区的长城控制器尚未启动。' }
 
     const ws = ctrl.workspaceRoot
     const wsKey = ws.toLowerCase()
@@ -276,11 +335,7 @@ export class GreatwallControlService {
         })
         // 裁决一：start 成功后自动异步拉起 gw-chief 出现在主工作区左侧栏，不再逼用户去右侧 UI 手动点按钮
         if (startRes?.started && !startRes?.alreadyRunning && typeof this.ctx?.agents?.create === 'function') {
-          void ensureChiefSession(ctrl, {
-            prompt: '',
-            hardCapChars: this.config.chiefAnchorHardCapChars ?? 1200,
-            chiefInbox: this.chiefInbox,
-          }).catch(() => {})
+          void this._mountChief(ctrl).catch(() => {})
         }
         return { ok: Boolean(startRes?.started), action: act, callerSource: caller, ...startRes }
       })
@@ -338,62 +393,51 @@ export class GreatwallControlService {
         ok: true,
         action: act,
         callerSource: caller,
-        chiefPendingNotificationsCount: this.chiefInbox.peekCount(),
+        chiefPendingNotificationsCount: ctrl.chiefInbox?.peekCount() ?? 0,
+        chiefMountError: ctrl.chiefMountError ?? null,
         ...(await ctrl.orchestrator.getControlStatus()),
       }
     }
 
     // === v0.3 新增 human_ui 专享高危与人工接管控制动作 ===
     if (act === 'approve_proposal') {
+      const proposalId = String(payload.proposal_id ?? payload.proposalId ?? '')
+      const proposal = await ctrl.bridge.control('control_plane/control_proposal_kind', {
+        workspace_root: ws, proposal_id: proposalId,
+      })
+      const advancing = proposal?.data?.action_type === 'ADVANCE_EPOCH' &&
+        proposal.data.status === 'PENDING_HUMAN' && String(payload.decision || 'APPROVE').toUpperCase() === 'APPROVE'
+      if (advancing) {
+        return this._withWorkspaceLock(wsKey, async () => {
+          await ctrl.chiefMount?.catch(() => {})
+          await ctrl.orchestrator.stopBackground('ADVANCE_EPOCH')
+          const orchestrator = ctrl.orchestrator
+          if (!(await orchestrator.awaitEpochQuiescence())) {
+            return { ok: false, action: act, callerSource: caller, error: '旧纪元任务仍在退出，确认单仍可重试。' }
+          }
+          const lock = orchestrator.instanceLock.acquire()
+          if (!lock.ok) return { ok: false, action: act, callerSource: caller, error: lock.error }
+          try {
+            const outcome = await ctrl.bridge.control('control_plane/approve_control_proposal', {
+              workspace_root: ws, proposal_id: proposalId, decision: 'APPROVE', approved_by_source: 'human_ui',
+            })
+            if (outcome?.ok && outcome.data?.execution?.epoch_id) {
+              ctrl.chiefInbox?.drainBatch()
+              ctrl.chiefSessionId = null
+              ctrl.chiefMountError = null
+              await orchestrator.host.archiveAdoptedChiefs(outcome.data.execution.epoch_id)
+            }
+            return { ok: Boolean(outcome?.ok), action: act, callerSource: caller, data: outcome?.data, error: outcome?.error }
+          } finally {
+            orchestrator.instanceLock.release()
+          }
+        })
+      }
       const res = await ctrl.bridge.control('control_plane/approve_control_proposal', {
         workspace_root: ws,
-        proposal_id: String(payload.proposal_id ?? payload.proposalId ?? ''),
+        proposal_id: proposalId,
         decision: String(payload.decision || 'APPROVE'),
         approved_by_source: String(payload.approved_by_source || 'human_ui'),
-      })
-      if (res?.ok) await ctrl.orchestrator.wakeOrRestartIfIdle?.()
-      return { ok: Boolean(res?.ok), action: act, callerSource: caller, data: res?.data || null, error: res?.ok ? null : res?.error }
-    }
-    if (act === 'pause_node') {
-      const nid = String(payload.node_id ?? payload.nodeId ?? '')
-      const res = await ctrl.bridge.control('control_plane/pause_node', {
-        workspace_root: ws,
-        node_id: nid,
-        actor_source: 'human_ui',
-        reason: String(payload.reason || 'HUMAN_UI_PAUSE'),
-      })
-      if (res?.ok) {
-        // 若事件池当前未运行或该节点不在运行槽位中，同步落盘 mark_node_yielded 防止永久卡死在 PAUSE_DRAINING
-        const isRunning = ctrl.orchestrator.getPoolState?.() === 'running'
-        const hasLiveWorker = Boolean(ctrl.orchestrator._runningExplorers?.has?.(nid))
-        if (!isRunning || !hasLiveWorker) {
-          await ctrl.bridge.control('control_plane/mark_node_yielded', {
-            workspace_root: ws,
-            node_id: nid,
-            yield_reason: 'DIRECT_YIELD_NOT_RUNNING',
-          }).catch(() => {})
-        }
-        ctrl.orchestrator._wakeLoop?.()
-      }
-      return { ok: Boolean(res?.ok), action: act, callerSource: caller, data: res?.data || null, error: res?.ok ? null : res?.error }
-    }
-    if (act === 'resume_node') {
-      const res = await ctrl.bridge.control('control_plane/resume_node', {
-        workspace_root: ws,
-        node_id: String(payload.node_id ?? payload.nodeId ?? ''),
-        actor_source: 'human_ui',
-        cross_branch_note: String(payload.cross_branch_note ?? payload.note ?? ''),
-      })
-      if (res?.ok) await ctrl.orchestrator.wakeOrRestartIfIdle?.()
-      return { ok: Boolean(res?.ok), action: act, callerSource: caller, data: res?.data || null, error: res?.ok ? null : res?.error }
-    }
-    if (act === 'authorize_early_handoff') {
-      const res = await ctrl.bridge.control('control_plane/authorize_early_handoff', {
-        workspace_root: ws,
-        node_id: String(payload.node_id ?? payload.nodeId ?? ''),
-        actor_source: 'human_ui',
-        reason: String(payload.reason || 'HUMAN_UI_EARLY_HANDOFF'),
-        cross_branch_note: String(payload.cross_branch_note ?? ''),
       })
       if (res?.ok) await ctrl.orchestrator.wakeOrRestartIfIdle?.()
       return { ok: Boolean(res?.ok), action: act, callerSource: caller, data: res?.data || null, error: res?.ok ? null : res?.error }
@@ -421,13 +465,46 @@ export class GreatwallControlService {
       if (res?.ok) ctrl.orchestrator._wakeLoop?.()
       return { ok: Boolean(res?.ok), action: act, callerSource: caller, data: res?.data || null, error: res?.ok ? null : res?.error }
     }
-    if (act === 'open_chief') {
-      await ctrl.orchestrator._resolveAndLockModelBinding?.().catch(() => {})
-      const chiefRes = await ensureChiefSession(ctrl, {
-        prompt: String(payload.prompt || ''),
-        hardCapChars: this.config.chiefAnchorHardCapChars || 1200,
-        chiefInbox: this.chiefInbox,
+    if (act === 'propose_epoch') {
+      const current = await ctrl.scheduleSnapshot()
+      if (!current?.data?.parse0_signed) return { ok: false, action: act, error: '当前工作区没有可归档的已签署纪元' }
+      const res = await ctrl.bridge.control('control_plane/create_control_proposal', {
+        workspace_root: ws, action_type: 'ADVANCE_EPOCH', target_id: 'ALL', proposed_by: 'human_ui',
+        rationale_md: `归档纪元 ${current.data.epoch_id}，按所选资产继承设置开启新纪元。`,
+        payload: {
+          expected_epoch_id: current.data.epoch_id,
+          inherit_external_literature: payload.inherit_external_literature === true,
+          inherit_instruments: payload.inherit_instruments === true,
+        },
       })
+      return { ok: Boolean(res?.ok), action: act, data: res?.data, error: res?.error }
+    }
+    const mode = NODE_MODES[act]
+    if (act === 'operator_command' || mode) {
+      const nodeAction = mode ? {
+        mode, node_ids: [String(payload.node_id ?? payload.nodeId ?? '')],
+        reason: payload.reason, cross_branch_note: payload.cross_branch_note ?? payload.note,
+      } : payload.node_action
+      const res = await ctrl.bridge.control('control_plane/operator_command', {
+        workspace_root: ws,
+        operation: mode ? 'node_intervene' : payload.operation, arrangement: payload.arrangement,
+        arrangements: payload.arrangements, node_action: nodeAction, details: payload.details,
+      })
+      if (res?.ok) ctrl.orchestrator.notifyOperator()
+      return { ok: Boolean(res?.ok), action: act, data: res?.data, error: res?.error }
+    }
+    if (act === 'open_chief') {
+      let chiefRes
+      try {
+        chiefRes = await this._mountChief(ctrl)
+      } catch (error) {
+        return { ok: false, action: act, callerSource: caller, error: String(error?.message || error) }
+      }
+      const prompt = String(payload.prompt || '').trim()
+      if (prompt) {
+        void ctrl.orchestrator.resumeOrSpawnAgent({ role: 'gw_chief', sessionId: chiefRes.sessionId, prompt })
+          .catch((error) => this.logger?.warn?.('[dsh-greatwall-v6up] chief followup failed', String(error?.message || error)))
+      }
       return {
         ok: true,
         action: act,

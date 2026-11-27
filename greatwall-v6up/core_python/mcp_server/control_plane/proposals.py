@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import uuid
 from pathlib import Path
 from typing import Any
@@ -147,7 +148,9 @@ def apply_approved_ruling_amendment(
     if not clean_md:
         raise FailClosedError(ERR_INVALID_INPUT, "ruling_markdown 不能为空")
 
-    new_rev = int(p0["latest_spec_revision"] or 0) + 1
+    current_rev = int(p0["latest_spec_revision"] or 0)
+    archived_rev = int(conn.execute("SELECT COALESCE(MAX(last_spec_revision),0) FROM epoch_archives").fetchone()[0])
+    new_rev = max(current_rev, archived_rev) + 1
     now = utc_now_iso()
     ws = Path(os.path.realpath(workspace_root or os.getcwd()))
     rulings_dir = ws / "rulings"
@@ -165,8 +168,8 @@ def apply_approved_ruling_amendment(
     rev_snap_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_files: dict[str, Any] = {}
-    if new_rev > 1:
-        prev_snap_dir = paths["ruling_revisions_dir"] / f"v{new_rev - 1}"
+    if current_rev > 0:
+        prev_snap_dir = paths["ruling_revisions_dir"] / f"v{current_rev}"
         if prev_snap_dir.is_dir():
             prev_manifest_fp = prev_snap_dir / "_manifest.json"
             if prev_manifest_fp.is_file():
@@ -294,8 +297,8 @@ def _execute_seed_human_branch(
     if not qid:
         raise FailClosedError(ERR_INVALID_INPUT, "SEED_HUMAN_BRANCH 缺少 question_id")
     seed_idea = str(payload.get("seed_idea_md") or payload.get("mechanism_signature") or "").strip()
-    if len(seed_idea) < 10:
-        raise FailClosedError(ERR_INVALID_INPUT, "SEED_HUMAN_BRANCH 必须提供 >=10 字的 seed_idea_md")
+    if not 10 <= len(seed_idea) <= 8000:
+        raise FailClosedError(ERR_INVALID_INPUT, "SEED_HUMAN_BRANCH 必须提供 10–8000 字的 seed_idea_md")
 
     fid = str(payload.get("family_id") or f"fam_{qid.lower()}_human_{uuid.uuid4().hex[:5]}").strip()
     now = utc_now_iso()
@@ -305,22 +308,37 @@ def _execute_seed_human_branch(
         "SELECT active_spec_revision FROM subproblem_runtime_state WHERE question_id = ?",
         (qid,),
     ).fetchone()
-    spec_rev = int(q_rev_row["active_spec_revision"] or 0) if q_rev_row else 0
+    if q_rev_row is None:
+        raise FailClosedError(ERR_NOT_FOUND, f"未登记子题 {qid}")
+    from .operator_policy import check_question_branch_quota, epoch_id
+    check_question_branch_quota(conn, qid, family_id=fid, human_named=True)
+    spec_rev = int(q_rev_row["active_spec_revision"] or 0)
 
     new_bid = f"b_{qid.lower()}_hseed_{uuid.uuid4().hex[:5]}"
     new_nid = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
     wt_dir = Path(os.path.realpath(workspace_root)) / "worktrees" / new_bid
-    wt_dir.mkdir(parents=True, exist_ok=True)
+    wt_dir.mkdir(parents=True)
+    # 独立仓库的 Git 元数据与工作树在同一沙箱内。
+    subprocess.run(
+        ["git", f"--git-dir={wt_dir / '.git'}", f"--work-tree={wt_dir}", "init", "--quiet", "--template="],
+        check=True, timeout=5, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
     sync_approved_public_inputs(workspace_root, wt_dir, shared_rels, spec_revision=spec_rev, question_id=qid)
     sync_public_instruments_and_skills_to_worktree(conn, workspace_root, wt_dir)
 
+    blueprints = wt_dir / "inputs"
+    blueprints.mkdir(exist_ok=True)
+    (blueprints / "human_seed_blueprint.md").write_text(seed_idea + "\n", encoding="utf-8")
+    signature = str(payload.get("mechanism_signature") or seed_idea).strip()
+
     with rw_immediate_tx(conn):
+        check_question_branch_quota(conn, qid, family_id=fid, human_named=True)
         conn.execute(
             """
             INSERT OR IGNORE INTO method_families(family_id, question_id, mechanism_signature, orthogonal_contrast, family_status, created_at)
             VALUES (?, ?, ?, ?, 'ACTIVE', ?)
             """,
-            (fid, qid, seed_idea[:240], str(payload.get("orthogonal_contrast") or "人类研究者注入的新先验思路"), now),
+            (fid, qid, signature[:240], str(payload.get("orthogonal_contrast") or "人类研究者注入的新先验思路"), now),
         )
         conn.execute(
             """
@@ -328,8 +346,8 @@ def _execute_seed_human_branch(
                 node_id, question_id, branch_id, family_id, parent_node_id, generation,
                 branch_kind, protection_generations_left, companion_session_id,
                 node_status, worktree_abs_path, mechanism_summary, will_md, spec_revision,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, NULL, 1, 'HUMAN_SEEDED', 2, ?, 'EXPLORING', ?, ?, ?, ?, ?, ?)
+                created_at, updated_at, session_epoch_id
+            ) VALUES (?, ?, ?, ?, NULL, 1, 'HUMAN_SEEDED', 2, ?, 'EXPLORING', ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 new_nid,
@@ -339,10 +357,11 @@ def _execute_seed_human_branch(
                 f"gw-comp-{new_nid}",
                 str(wt_dir),
                 seed_idea[:99],
-                f"[Human-Seeded Prior] {seed_idea}",
+                "[Human-Seeded Prior] 完整蓝图见 inputs/human_seed_blueprint.md",
                 spec_rev,
                 now,
                 now,
+                epoch_id(conn),
             ),
         )
         enqueue_runtime_effect(
@@ -353,9 +372,9 @@ def _execute_seed_human_branch(
             target_id=new_nid,
             target_generation=1,
             external_handle_id=f"gw-exp-{new_nid}",
-            payload={"question_id": qid, "branch_kind": "HUMAN_SEEDED"},
+            payload={"question_id": qid, "branch_kind": "HUMAN_SEEDED", "operator_named": True},
         )
-    return {"question_id": qid, "branch_id": new_bid, "node_id": new_nid, "family_id": fid, "branch_kind": "HUMAN_SEEDED"}
+    return {"question_id": qid, "branch_id": new_bid, "node_id": new_nid, "family_id": fid, "branch_kind": "HUMAN_SEEDED", "worktree_abs_path": str(wt_dir)}
 
 
 def approve_control_proposal(
@@ -367,7 +386,7 @@ def approve_control_proposal(
     approved_by_source: str = "human_ui",
 ) -> dict[str, Any]:
     """人类落签批准或驳回 control_proposals（乐观锁防双端重复点击）。"""
-    if approved_by_source not in ("human_ui", "action_card_human"):
+    if approved_by_source not in ("human_ui", "action_card_human", "gw_chief_human", "branch_handback"):
         raise FailClosedError(ERR_AUTH, f"非法确认来源 {approved_by_source!r}，仅允许真实人类交互落签")
     dec = str(decision or "APPROVE").strip().upper()
     if dec not in ("APPROVE", "REJECT"):
@@ -378,6 +397,8 @@ def approve_control_proposal(
         row = conn.execute("SELECT * FROM control_proposals WHERE proposal_id = ?", (str(proposal_id),)).fetchone()
         if row is None:
             raise FailClosedError(ERR_NOT_FOUND, f"提案 {proposal_id!r} 不存在")
+        if approved_by_source in ("gw_chief_human", "branch_handback") and row["action_type"] != "APPROVE_WAVE_VERDICT":
+            raise FailClosedError(ERR_AUTH, "此提案需要人类确认界面签署")
         cur_status = str(row["status"])
         if cur_status != "PENDING_HUMAN":
             return {
@@ -499,6 +520,9 @@ def approve_control_proposal(
                     description=str(payload.get("description") or row["rationale_md"]),
                     source="chief_approved",
                 )
+        elif act == "ADVANCE_EPOCH":
+            from .epochs import advance_epoch
+            exec_result = advance_epoch(conn, proposal_id=str(proposal_id), payload=payload)
         elif act == "SET_AUTONOMY_MODE":
             exec_result = set_autonomy_mode(
                 conn,

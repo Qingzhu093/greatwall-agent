@@ -268,6 +268,7 @@ export async function dispatchStage2Step(port, snap, sig, maxConcurrentWorkers =
     snap.stage === 'STAGE2_EVOLVE' &&
     closureSt === 'OPEN' &&
     port.getRunningExplorerCount() === 0 &&
+    !(snap.operator_slot_ledger?.draining?.length || 0) &&
     !port.isGovTaskRunning('stage3:export')
   ) {
     const deliveryMode = snap.closure_gate?.mode || (snap.human_stop_active ? 'PARTIAL_ON_HUMAN_STOP' : 'FULL')
@@ -275,7 +276,7 @@ export async function dispatchStage2Step(port, snap, sig, maxConcurrentWorkers =
     const expFp = `export:${deliveryMode}:OPEN`
     if (!port.isBreakerOpen(expKey, expFp)) {
       dispatchedSomething = true
-      await port.launchGovTaskAndAwait('stage3:export', async () => {
+      port.launchGovTask('stage3:export', async () => {
         await port.spawnAndRunAgent({
           role: 'library_chronicler',
           uiLabel: `[综述终稿官] Stage3 冻结五件套导出 (${deliveryMode})`,
