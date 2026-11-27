@@ -107,25 +107,16 @@ export async function dispatchStage1Step(port, snap, sig) {
     }
   }
 
-  // 1.4 监察委员会签发 PARSE0_GATE 放行进入 STAGE2_EVOLVE
-  const gateKey = 'stage1:gate'
-  const gateFp = `stage:${snap.stage}`
-  if (!port.isBreakerOpen(gateKey, gateFp)) {
-    await port.launchGovTaskAndAwait('stage1:gate', async () => {
-      await port.spawnAndRunAgent({
-        role: 'supervisory_committee',
-        uiLabel: '[监察委员会] Parse0 立项门禁',
-        shortTransaction: false,
-        signal: sig,
-        prompt: '请调用 get_supervisory_audit_snapshot 核验 Parse 0 契约与开局就绪，调用 record_compliance_check(stage="PARSE0_GATE", status="PASSED", blocking_questions=[], notes="Parse 0 合规放行") 进入 STAGE2_EVOLVE。',
+  // 1.4 裁决五：Python 确定性 PARSE0_GATE 硬门禁放行（取代原 supervisory_committee 空壳 LLM 会话，零 Token 毫秒级晋升 STAGE2_EVOLVE）
+  if (typeof port.control === 'function') {
+    const gateRes = await port.control('control_plane/pass_stage1_parse0_gate', { workspace_root: port.workspaceRoot }).catch(() => null)
+    if (gateRes?.ok && gateRes?.data?.passed) {
+      port.recordEvent('stage1_deterministic_gate_passed', {
+        stage: gateRes.data.stage || 'STAGE2_EVOLVE',
+        alertId: gateRes.data.alert_id || null,
       })
-      await port.evaluateBreakerAfterTask('supervisory_committee', [{ key: gateKey, beforeFp: gateFp }], (nextSnap) => {
-        const m = new Map()
-        if (nextSnap?.stage === 'STAGE1_PARSE0') m.set(gateKey, `stage:${nextSnap.stage}`)
-        return m
-      })
-    })
-    return { handled: true }
+      return { handled: true }
+    }
   }
 
   port.recordEvent('stage1_waiting_or_circuit_broken', {

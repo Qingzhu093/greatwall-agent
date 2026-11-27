@@ -7,9 +7,9 @@ import { ROLE_MCP_TOOLS, resolvePlatformAllowedTools } from '../prompts.js'
 import { installRoleSandboxGuard } from '../read_isolated_sandbox.js'
 import { installFactLogMiddleware } from '../fact_log_middleware.js'
 import { installLiveClockObservers, registerScopedMcpTools } from '../clock_and_turn_gap.js'
+import { buildBlackboxTrajectorySummary } from '../blackbox_projection.js'
 
 const ZERO_NATIVE_ROLES = new Set([
-  'gw_chief',
   'logistics_coordinator',
   'supervisory_committee',
   'library_chronicler',
@@ -181,5 +181,49 @@ export function mountCapabilitiesOnAgentSession(
         onTurnSignal: (sig) => turnSignals.push(sig),
       }),
     )
+  }
+
+  // 裁决一：为 gw_chief 挂载只读 Watchdog 实时轨迹工具（Inline & Spill，默认 <=3200 字，杜绝盲判在跑探索者为卡死）
+  if (role === 'gw_chief' && !readonly && typeof agentCtx.tools?.register === 'function') {
+    const disposeActivityTool = agentCtx.tools.register({
+      name: 'chief_get_node_recent_activity',
+      description: '只读 Watchdog 工具：查看某个在跑或历史探索者/伴随会话最近 5-8 步黑盒行动摘要（最近调用的工具、耗时与实时活跃状态），遵循 Inline & Spill 绝不灌爆主窗。',
+      parameters: {
+        type: 'object',
+        properties: {
+          session_id: { type: 'string', description: '目标会话 ID（如 gw-exp-node_q1_xxx），可从锚点卡或 chief_trace_entity 获取' },
+          node_id: { type: 'string', description: '可选：目标节点 ID（若未填 session_id，自动拼接 gw-exp-<node_id>）' },
+          max_chars: { type: 'integer', description: '可选：摘要最大字符数（默认 3200，上限 6000）' },
+        },
+        additionalProperties: false,
+      },
+      output: {
+        schema: { type: 'object', additionalProperties: true },
+        render(_a, val) {
+          return [{ type: 'text', text: JSON.stringify(val) }]
+        },
+      },
+      async execute(args) {
+        const sid = String(args?.session_id || (args?.node_id ? `gw-exp-${String(args.node_id).trim()}` : '')).trim()
+        if (!sid) return { ok: false, error: '必须提供 session_id 或 node_id' }
+        const maxChars = Math.min(6000, Math.max(800, Number(args?.max_chars || 3200)))
+        const liveEntry = hostDeps.liveSessions?.get?.(sid) || null
+        let summary = ''
+        try {
+          summary = await buildBlackboxTrajectorySummary(hostDeps.rootCtx, sid, maxChars)
+        } catch (err) {
+          summary = `(提取轨迹异常: ${String(err?.message || err)})`
+        }
+        return {
+          ok: true,
+          session_id: sid,
+          is_live_running: Boolean(liveEntry),
+          elapsed_sec: liveEntry ? Math.max(0, Math.round((Date.now() - Number(liveEntry.startedAt || Date.now())) / 1000)) : null,
+          role: liveEntry?.role || null,
+          recent_activity_summary: summary || '(该会话暂无已落盘轨迹事件)',
+        }
+      },
+    })
+    if (typeof disposeActivityTool === 'function') cleanupFns.push(disposeActivityTool)
   }
 }

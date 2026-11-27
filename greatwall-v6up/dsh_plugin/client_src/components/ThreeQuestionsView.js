@@ -2,11 +2,25 @@
 function ThreeQuestionsView({ data, busy, onControl, getUiWorkspace }) {
   const status = data?.status || {};
   const insp = data?.inspector || {};
+  const poolState = String(status.poolState || "idle").toLowerCase();
+  const isPoolRunning = poolState === "running";
+  const isClosed = String(status.stage || "").toUpperCase() === "CLOSED_VERIFIED" || String(status.closureStatus || "").toUpperCase() === "CLOSED_VERIFIED";
+  const humanStopActive = Boolean(status.humanStopActive);
   const rawSubs = insp.subproblem_runtime_state || status.subproblemStates || insp.subproblem_states || [];
   const subproblems = Array.isArray(rawSubs) ? rawSubs : Object.values(rawSubs || {});
   const proposals = insp.pending_proposals || [];
-  const l3List = (insp.internal_ledger || []).filter((x) => x.ledger_type === "L3_VERIFIED" && Number(x.is_active) === 1);
+  const l3List = (insp.internal_ledger || []).filter((x) => x.ledger_type === "L3_VERIFIED" && Number(x.is_active ?? 1) === 1);
   const autonomyMode = status.autonomyMode || insp.snapshot?.autonomy_mode || "WAVE_CONFIRM";
+
+  const emptyProposalHint = isClosed
+    ? "课题已验收结题，全部成果已冻结交付。"
+    : (humanStopActive
+        ? "已触发人类收工，正在推进 Stage 3 终稿打包与核验。"
+        : (isPoolRunning
+            ? "当前无待拍板提案，系统正按授权全面托管推进中。"
+            : (poolState === "paused"
+                ? "当前无待拍板提案；系统处于「等待人类接管」态，点击顶部「全面托管」恢复推进。"
+                : `当前无待拍板提案；编排器当前未运行（${typeof readablePoolState === "function" ? readablePoolState(poolState) : poolState}），点击顶部「恢复托管」即可继续推进。`)));
 
   return jsxs("div", {
     style: { display: "flex", flexDirection: "column", gap: "9px" },
@@ -47,8 +61,16 @@ function ThreeQuestionsView({ data, busy, onControl, getUiWorkspace }) {
                     jsxs("div", {
                       className: "gw-row",
                       children: [
-                        jsxs("strong", { children: [`${s.question_id} · v${s.active_spec_revision || 0}`] }),
-                        jsx("span", { className: stateBadgeClass(s.dispatch_state), children: s.dispatch_state })
+                        jsxs("strong", { children: [`${s.question_id} · 口径 v${s.active_spec_revision || 0}`] }),
+                        jsx("span", {
+                          className: !isPoolRunning && s.dispatch_state === "DISPATCHING"
+                            ? (poolState === "paused" ? "gw-badge gw-b-warn" : "gw-badge gw-b-info")
+                            : stateBadgeClass(s.dispatch_state),
+                          title: `${s.dispatch_state} (pool=${poolState})`,
+                          children: !isPoolRunning && s.dispatch_state === "DISPATCHING"
+                            ? (poolState === "paused" ? "总池已暂停" : "待恢复(未运行)")
+                            : (typeof readableDispatchState === "function" ? readableDispatchState(s.dispatch_state) : s.dispatch_state)
+                        })
                       ]
                     }),
                     jsxs("div", {
@@ -87,7 +109,7 @@ function ThreeQuestionsView({ data, busy, onControl, getUiWorkspace }) {
             ]
           }),
           proposals.length === 0
-            ? jsx("div", { className: "gw-muted", children: "当前无待拍板提案，系统正按授权自主推进。" })
+            ? jsx("div", { className: "gw-muted", children: emptyProposalHint })
             : proposals.map((p) =>
                 jsxs("div", {
                   className: "gw-item",

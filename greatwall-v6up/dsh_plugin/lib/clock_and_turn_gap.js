@@ -137,10 +137,19 @@ export function installLiveClockObservers({
   }
   const disposers = []
   let lastTriggerEmitted = ''
+  let lastSyncAtMs = 0
+  const THROTTLE_MS = 15_000
 
-  const checkAndSync = async (sourceHook) => {
-    const syncRes = await syncLivePressureToDb(rootCtx, agent, bridge, workspaceRoot, nodeId, contextWindowTokens)
+  const checkAndSync = async (sourceHook, { force = false } = {}) => {
+    const nowMs = Date.now()
     const sample = sampleAgentContextPressure(rootCtx, agent, contextWindowTokens)
+    const estPct = sample.pressureTokens / Math.max(1, sample.contextWindow || contextWindowTokens || 500_000)
+    // 裁决五：每步工具调用间隙按 >=15s 节流写库（跨 37%/70% 阈值或 force 时立即写），避免争抢单写者锁同时消除长回合盲区
+    if (!force && nowMs - lastSyncAtMs < THROTTLE_MS && estPct < 0.37) {
+      return
+    }
+    lastSyncAtMs = nowMs
+    const syncRes = await syncLivePressureToDb(rootCtx, agent, bridge, workspaceRoot, nodeId, contextWindowTokens)
     const rowData = syncRes?.data ?? syncRes ?? {}
     const nodeStatus = String(rowData.node_status || '')
     if (nodeStatus && nodeStatus !== 'EXPLORING' && nodeStatus !== 'ACTIVE_REVISING') {
@@ -172,7 +181,7 @@ export function installLiveClockObservers({
     const dResult = agentCtx.on('tools/result', (exec) => {
       const tname = String(exec?.name || '')
       if (tname && tname !== 'run_isolated_eval') {
-        void checkAndSync(`tools/result:${tname}`)
+        void checkAndSync(`tools/result:${tname}`, { force: false })
       }
     })
     if (typeof dResult === 'function') disposers.push(dResult)
@@ -180,7 +189,7 @@ export function installLiveClockObservers({
 
   try {
     const dStep = agentCtx.on('agent/pre-step', async (_payload, next) => {
-      await checkAndSync('agent/pre-step')
+      await checkAndSync('agent/pre-step', { force: false })
       return next()
     })
     if (typeof dStep === 'function') disposers.push(dStep)

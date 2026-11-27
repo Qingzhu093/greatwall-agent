@@ -280,6 +280,12 @@ export function registerGreatwallConsoleRoutes(
           const nodeConversations = await extractNodeConversations(connCtx, diskData, activeNid)
           const governanceSessions = extractGovernanceSessions(diskData)
           const snap = inspector?.snapshot || null
+          // disk_telemetry 意味着当前进程内无活跃控制器，严禁原样透传强杀前残留的 running/starting/paused 造成假运行幻觉
+          const rawDiskState = String(diskData?.orchestratorState || 'archived')
+          const normalizedDiskState = ['running', 'starting', 'paused'].includes(rawDiskState) ? 'stopped' : rawDiskState
+          const diskSubproblems = Array.isArray(snap?.subproblem_runtime_state)
+            ? snap.subproblem_runtime_state
+            : Object.values(snap?.subproblem_states || {})
           return Response.json(
             {
               ok: true,
@@ -291,15 +297,21 @@ export function registerGreatwallConsoleRoutes(
               governanceSessions,
               status: diskData || snap
                 ? {
-                    poolState: diskData?.orchestratorState || 'archived',
-                    state: diskData?.orchestratorState || 'archived',
+                    poolState: normalizedDiskState,
+                    state: normalizedDiskState,
                     kernelAlive: Boolean(snap),
                     initialized: Boolean(snap?.initialized),
                     stage: snap?.stage || diskData?.stage || 'STAGE1_PARSE0',
+                    autonomyMode: snap?.autonomy_mode || 'WAVE_CONFIRM',
                     closureStatus: snap?.closure_state?.status || 'OPEN',
+                    humanStopActive: Boolean(snap?.human_stop_active),
                     latestSpecRevision: Number(snap?.latest_spec_revision || 0),
-                    runningExplorers: diskData?.activeExplorers || [],
-                    runningGovernanceTasks: diskData?.activeGovernance || [],
+                    runningExplorersCount: 0,
+                    runningExplorers: [],
+                    runningGovernanceTasks: [],
+                    activeSessions: [],
+                    pendingProposalsCount: (snap?.pending_proposals || []).length,
+                    subproblemStates: diskSubproblems,
                     snapshot: snap,
                   }
                 : null,
@@ -339,9 +351,12 @@ export function registerGreatwallConsoleRoutes(
             sessionCwd,
             allowFallback: false,
           })
-          // 允许 init 与 v0.3 人类单写者落签/接管动作在指定目标工作区时按需拉起控制器；其余控制动作无匹配控制器一律 409 拒绝
+          // 允许 init / start / resume / human_stop 与 v0.3 人类单写者落签/接管动作在指定目标工作区时按需拉起控制器；其余控制动作无匹配控制器一律 409 拒绝
           const autoCreateActions = new Set([
             'init',
+            'start',
+            'resume',
+            'human_stop',
             'approve_proposal',
             'pause_node',
             'resume_node',

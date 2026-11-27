@@ -20,8 +20,10 @@ import {
   registerProposalActionCard,
 } from '../lib/sessions/chief_runtime.js'
 import { WaveConferenceRunner } from '../lib/orchestrator/wave_conference_runner.js'
-import { ORCHESTRATE_TOOL_SCHEMA } from '../lib/orchestrate_tool.js'
-import { SEALED_COMPANION_CONFERENCE_TOOLS } from '../lib/prompts.js'
+import { ORCHESTRATE_TOOL_SCHEMA, projectOrchestrateResultForAgent } from '../lib/orchestrate_tool.js'
+import { normalizeSchemaForDsh } from '../lib/bridge/dsh_schema_adapter.js'
+import { CANONICAL_ROLES, ROLE_MCP_TOOLS, SEALED_COMPANION_CONFERENCE_TOOLS } from '../lib/prompts.js'
+import { createSandboxCallEvaluator } from '../lib/read_isolated_sandbox.js'
 import { Config, resolvePluginConfig } from '../lib/config.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -386,6 +388,61 @@ test('v0.3-7: RuntimeEffectsConsumer 租约领取、副作用路由与 ack', asy
 
 test('v0.3-8: greatwall_orchestrate 仅保留 4 个薄入口且绝不暴露 human_ui 绕过口', () => {
   assert.deepEqual(ORCHESTRATE_TOOL_SCHEMA.properties.action.enum, ['init', 'start', 'status', 'stop'])
+  const adapted = normalizeSchemaForDsh(ORCHESTRATE_TOOL_SCHEMA, { toolName: 'greatwall_orchestrate' })
+  assert.ok(adapted?.properties?.total_budget?.properties?.max_total_handoffs)
+  assert.ok(adapted?.properties?.initial_instruments?.items?.properties?.instrument_id)
+  assert.ok(adapted?.properties?.seed_families?.items?.properties?.family_id)
+
+  // 验证 Inline & Spill 投影：剔除 20KB+ 重型 snapshot/telemetry，同时零损失保留全部 10 个子题骨架
+  const tenSubs = Array.from({ length: 10 }, (_, i) => ({
+    question_id: `Q${i + 1}`,
+    desired_state: 'ACTIVE',
+    dispatch_state: 'DISPATCHING',
+    active_spec_revision: 2,
+    completed_waves: i,
+    spent_tokens: 1000 * (i + 1),
+    extra_huge_blob: 'X'.repeat(1200),
+  }))
+  const hugeRaw = {
+    ok: true,
+    action: 'start',
+    started: true,
+    status: {
+      poolState: 'running',
+      kernelAlive: true,
+      initialized: true,
+      stage: 'STAGE2_EVOLVE',
+      autonomyMode: 'WAVE_CONFIRM',
+      closureStatus: 'OPEN',
+      humanStopActive: false,
+      latestSpecRevision: 2,
+      runningExplorersCount: 1,
+      runningExplorers: [{ nodeId: 'n1', questionId: 'Q1', sessionId: 's1' }],
+      runningGovernanceTasks: [],
+      pendingProposalsCount: 0,
+      pendingHandoffNodes: [],
+      closureAllowed: false,
+      subproblemStates: tenSubs,
+      modelBinding: { ok: true, provider: 'deepseek-account', model: 'deepseek-chat' },
+      effectiveContextWindow: 128000,
+      snapshot: { goal_and_completion_md: 'G'.repeat(18000), huge_dup: tenSubs },
+      telemetry: { sessions: { s1: { trace: 'T'.repeat(8000) } } },
+    },
+  }
+  const projected = projectOrchestrateResultForAgent(hugeRaw)
+  const serialized = JSON.stringify(projected)
+  assert.equal(projected.ok, true)
+  assert.equal(projected.started, true)
+  assert.equal(projected.subproblemStates.length, 10, '绝不能砍掉任何一个子题')
+  assert.equal(projected.snapshot, undefined)
+  assert.equal(projected.telemetry, undefined)
+  assert.ok(serialized.length < 4096, `投影体积必须远小于 8192 截断线，实测 ${serialized.length}`)
+  assert.ok(projected.next_step_guidance.includes('gw-chief'))
+
+  const skillPath = path.resolve(PLUGIN_ROOT, '..', 'core_python', 'skills', 'greatwall-research-loop', 'SKILL.md')
+  const skillText = fs.readFileSync(skillPath, 'utf8')
+  assert.ok(!skillText.includes('action: "init" | "start" | "status" | "pause"'), 'SKILL.md 不得残留 v0.2 已废除动作')
+  assert.ok(skillText.includes('gw-chief'))
 })
 
 test('v0.3-9: Config 动态探测/回退、前端编译产物零禁令依赖与三问视图齐全', () => {
@@ -403,4 +460,193 @@ test('v0.3-9: Config 动态探测/回退、前端编译产物零禁令依赖与�
   assert.ok(!clientRaw.includes('dsh-client-ui-primitives'), 'lib/client.js 严禁引用 dsh-client-ui-primitives')
   assert.ok(clientRaw.includes('--dsw-alias-'), 'lib/client.js 必须使用 DSH 原生 --dsw-alias-* 主题令牌')
   assert.ok(clientRaw.includes('ThreeQuestionsView') && clientRaw.includes('LivingSurveyView') && clientRaw.includes('BranchDetailDrawer'))
+})
+
+test('v0.3-10: 全部 10 份角色 System Prompt 具备 Tool Guidance + Guardrails 且精确覆盖全部工具与权威枚举', () => {
+  const agentsDir = path.resolve(PLUGIN_ROOT, '..', 'core_python', 'agents')
+  for (const role of CANONICAL_ROLES) {
+    const fp = path.join(agentsDir, `${role}.md`)
+    assert.equal(fs.existsSync(fp), true, `缺失角色提示词: ${role}.md`)
+    const text = fs.readFileSync(fp, 'utf8')
+    assert.ok(text.includes('Tool Guidance'), `${role}.md 必须包含 Tool Guidance 章节`)
+    assert.ok(text.includes('Guardrails'), `${role}.md 必须包含 Guardrails 章节`)
+    for (const toolName of ROLE_MCP_TOOLS[role] || []) {
+      assert.ok(text.includes(toolName), `${role}.md 缺少授权工具说明: ${toolName}`)
+    }
+  }
+
+  const chiefMd = fs.readFileSync(path.join(agentsDir, 'gw_chief.md'), 'utf8')
+  for (const act of [
+    'SET_SUBPROBLEM_STATE',
+    'AUTHORIZE_EARLY_HANDOFF',
+    'AMEND_RULING_DRAFT',
+    'AUTHORIZE_PARTIAL_DELIVERY',
+    'APPROVE_WAVE_VERDICT',
+    'SEED_HUMAN_BRANCH',
+    'SUBMIT_WORKS_OR_SURVEY_TICKET',
+    'SET_AUTONOMY_MODE',
+  ]) {
+    assert.ok(chiefMd.includes(act), `gw_chief.md 缺少真实提案枚举: ${act}`)
+  }
+
+  const chairMd = fs.readFileSync(path.join(agentsDir, 'conference_chair.md'), 'utf8')
+  for (const act of ['OPEN_NEW_BRANCH', 'PROTECT', 'SPAWN_SYNTHESIS', 'HIBERNATE', 'DISCRIMINATOR', 'PAUSE_FOR_HUMAN']) {
+    assert.ok(chairMd.includes(act), `conference_chair.md 缺少真实圆桌裁决枚举: ${act}`)
+  }
+
+  const survMd = fs.readFileSync(path.join(agentsDir, 'external_surveyor.md'), 'utf8')
+  for (const rd of ['full_text', 'specified_sections', 'abstract_only']) {
+    assert.ok(survMd.includes(rd), `external_surveyor.md 缺少真实 read_depth 枚举: ${rd}`)
+  }
+})
+
+test('v0.3-11: 裁决一 & 二安全红线——gw_chief 只读工作区/分支代码但禁写禁终端禁读隐藏集；主工作区归属探索者仍锁死 Worktree', () => {
+  const tmpWs = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_v03_sec_'))
+  const dataDir = path.join(tmpWs, '..', 'gw_plugin_data_ext')
+  const wtDir = path.join(tmpWs, 'worktrees', 'b_q1_fam')
+  const hiddenDir = path.join(tmpWs, 'evaluators', '_hidden_calibrations')
+  fs.mkdirSync(wtDir, { recursive: true })
+  fs.mkdirSync(hiddenDir, { recursive: true })
+  fs.mkdirSync(dataDir, { recursive: true })
+  fs.writeFileSync(path.join(tmpWs, 'problem.md'), '# B题', 'utf8')
+  fs.writeFileSync(path.join(wtDir, 'solve.py'), 'print(1)', 'utf8')
+  fs.writeFileSync(path.join(hiddenDir, 'secret.json'), '{}', 'utf8')
+  try {
+    const chiefEval = createSandboxCallEvaluator({
+      role: 'gw_chief',
+      workspaceRoot: tmpWs,
+      protectedDirs: [dataDir],
+    })
+    assert.equal(chiefEval({ name: 'read', arguments: { path: path.join(tmpWs, 'problem.md') } }), undefined, 'gw_chief 应可只读工作区题面')
+    assert.equal(chiefEval({ name: 'read', arguments: { path: path.join(wtDir, 'solve.py') } }), undefined, 'gw_chief 应可只读分支源码')
+    assert.ok(chiefEval({ name: 'write', arguments: { path: path.join(wtDir, 'solve.py') } }), 'gw_chief 严禁写文件')
+    assert.ok(chiefEval({ name: 'pwsh', arguments: { command: 'ls' } }), 'gw_chief 严禁终端')
+    assert.ok(chiefEval({ name: 'read', arguments: { path: path.join(hiddenDir, 'secret.json') } }), 'gw_chief 严禁读隐藏校准集')
+    assert.ok(chiefEval({ name: 'read', arguments: { path: path.join(dataDir, 'greatwall.db') } }), 'gw_chief 严禁读数据库')
+
+    const expEval = createSandboxCallEvaluator({
+      role: 'explorer',
+      workspaceRoot: tmpWs,
+      worktreeAbsPath: wtDir,
+      protectedDirs: [dataDir],
+    })
+    assert.equal(expEval({ name: 'read', arguments: { path: 'solve.py' } }), undefined, '探索者应可读写本 Worktree 相对路径')
+    assert.ok(expEval({ name: 'read', arguments: { path: path.join(tmpWs, 'evaluators', 'inst.py') } }), '探索者严禁越界读 evaluators')
+    assert.ok(expEval({ name: 'read', arguments: { path: path.join(hiddenDir, 'secret.json') } }), '探索者严禁读隐藏校准集')
+
+    const anchor = buildChiefAnchorCard(
+      { initialized: true, stage: 'STAGE2_EVOLVE', autonomy_mode: 'WAVE_CONFIRM', latest_spec_revision: 0, closure_state: { status: 'OPEN' }, subproblem_runtime_state: [] },
+      { liveRuntime: { runningExplorers: [{ nodeId: 'node_q1_1', questionId: 'Q1', sessionId: 'gw-exp-node_q1_1', elapsedSec: 42 }], runningGovernanceTasks: [] } },
+    )
+    assert.ok(anchor.includes('实时活跃探索者(1') && anchor.includes('node_q1_1'), '锚点卡必须内联实时在跑探索者')
+  } finally {
+    fs.rmSync(tmpWs, { recursive: true, force: true })
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('v0.3-12: 全局暂停=全部等待人类接管 & 全局恢复=批量 SHA 对账全面托管，且非运行态暂停不再谎报成功', async () => {
+  const { GreatwallOrchestrator } = await import('../lib/orchestrator.js')
+  const { GreatwallControlService } = await import('../lib/control_service.js')
+  const tmpWs = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_v03_pause_unify_'))
+  const controlCalls = []
+  const fakeBridge = {
+    async control(method, params) {
+      controlCalls.push({ method, params })
+      if (method === 'control_plane/schedule_snapshot') {
+        return { ok: true, data: { human_paused_nodes: [{ node_id: 'node_q1_a' }, { node_id: 'node_q1_b' }] } }
+      }
+      return { ok: true, data: {} }
+    },
+    async dispose() {},
+  }
+  try {
+    const orch = new GreatwallOrchestrator({
+      ctx: {},
+      bridge: fakeBridge,
+      corePythonRoot: path.resolve(__dirname, '..', '..', 'core_python'),
+      workspaceRoot: tmpWs,
+      dataDir: path.join(tmpWs, '.data'),
+    })
+    // 1. 模拟运行中带 2 条活跃探索者，调用全局 pauseBackground -> 批量触发 pause_node
+    orch._poolState = 'running'
+    orch._runningExplorers.set('node_q1_a', { node: { node_id: 'node_q1_a', question_id: 'Q1' }, sessionId: 'gw-exp-node_q1_a' })
+    orch._runningExplorers.set('node_q1_b', { node: { node_id: 'node_q1_b', question_id: 'Q1' }, sessionId: 'gw-exp-node_q1_b' })
+    const pRes = await orch.pauseBackground()
+    assert.equal(pRes.paused, true)
+    assert.equal(orch._poolState, 'paused')
+    assert.deepEqual(pRes.pausedNodeIds, ['node_q1_a', 'node_q1_b'])
+    assert.equal(controlCalls.filter((c) => c.method === 'control_plane/pause_node').length, 2)
+
+    // 2. 调用全局 resumeBackground -> 批量触发 resume_node (SHA 对账) 并切回 running
+    const rRes = await orch.resumeBackground()
+    assert.equal(rRes.resumed, true)
+    assert.equal(orch._poolState, 'running')
+    assert.deepEqual(rRes.resumedNodeIds, ['node_q1_a', 'node_q1_b'])
+    assert.equal(controlCalls.filter((c) => c.method === 'control_plane/resume_node').length, 2)
+
+    // 3. ControlService 在 idle 态调用 pause 绝不谎报 ok: true
+    const svc = new GreatwallControlService({
+      ctx: {},
+      config: { corePythonRoot: path.resolve(__dirname, '..', '..', 'core_python'), dataDir: path.join(tmpWs, '.data') },
+    })
+    const ctrl = svc.createSessionController({ workspaceRoot: tmpWs })
+    const idlePause = await svc.execute({ caller: 'human_ui', action: 'pause', workspaceRoot: tmpWs, controller: ctrl })
+    assert.equal(idlePause.ok, false, 'idle 态暂停必须返回 ok:false 而非谎报成功')
+    await svc.disposeAll()
+  } finally {
+    fs.rmSync(tmpWs, { recursive: true, force: true })
+  }
+})
+
+test('v0.3-13: 三层对齐回归——TelemetryCollector 保留 stage/events/modelBinding + 停机态 UI 联合投影绝不误报攻关中', async () => {
+  const { TelemetryCollector } = await import('../lib/telemetry.js')
+  const vm = await import('node:vm')
+  const tmpWs = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_v03_align_'))
+  const dataDir = path.join(tmpWs, '.data')
+  try {
+    // 1. TelemetryCollector 重建必须保留 stage / startedAt / recentEvents / lastModelBinding
+    const t1 = new TelemetryCollector({ workspaceRoot: tmpWs, dataDir })
+    t1.setOrchestratorState('running', 'STAGE2_EVOLVE')
+    t1.setModelBinding({ provider: 'deepseek-account', model: 'deepseek-flash', effectiveContextWindow: 272000 })
+    t1.recordEvent('test_ev', { ok: true })
+    const t2 = new TelemetryCollector({ workspaceRoot: tmpWs, dataDir })
+    assert.equal(t2.state.stage, 'STAGE2_EVOLVE')
+    assert.equal(t2.state.lastModelBinding?.model, 'deepseek-flash')
+    assert.equal(t2.state.recentEvents.length, 1)
+
+    // 2. 前端 ThreeQuestionsView & BranchDetailDrawer 在 poolState='stopped' 下绝不显示「攻关中」与「系统正按授权自主推进」
+    const stylesSrc = fs.readFileSync(path.resolve(__dirname, '..', 'client_src', 'styles.js'), 'utf8')
+    const threeSrc = fs.readFileSync(path.resolve(__dirname, '..', 'client_src', 'components', 'ThreeQuestionsView.js'), 'utf8')
+    const branchSrc = fs.readFileSync(path.resolve(__dirname, '..', 'client_src', 'components', 'BranchDetailDrawer.js'), 'utf8')
+    const sb = {
+      jsx: (tag, props) => ({ tag, props }),
+      jsxs: (tag, props) => ({ tag, props }),
+      React: { useState: (init) => [typeof init === 'function' ? init() : init, () => {}] },
+      openNativeSession: () => true,
+    }
+    vm.createContext(sb)
+    vm.runInContext(`${stylesSrc}\n${threeSrc}\n${branchSrc}`, sb)
+    const sampleData = {
+      status: { poolState: 'stopped', stage: 'STAGE2_EVOLVE', activeSessions: [], runningExplorers: [] },
+      inspector: {
+        subproblem_runtime_state: [{ question_id: 'Q1', dispatch_state: 'DISPATCHING', desired_state: 'ACTIVE', active_spec_revision: 0 }],
+        pending_proposals: [],
+        internal_ledger: [{ entry_id: 'L3-001', question_id: 'Q1', ledger_type: 'L3_VERIFIED', is_active: 1, title: '定理一', exact_verified_scope_md: '已验证' }],
+        lineage_nodes: [{ node_id: 'node_q1_1', question_id: 'Q1', family_id: 'F1', node_status: 'EXPLORING', control_state: 'AUTO_RUNNING', generation: 1 }],
+        method_families: [{ family_id: 'F1', mechanism_signature: '几何法' }],
+      },
+      telemetryState: { sessions: {} },
+    }
+    const threeOut = JSON.stringify(sb.ThreeQuestionsView({ data: sampleData, busy: false, onControl: () => {} }))
+    assert.ok(threeOut.includes('待恢复(未运行)'), '停机态子题必须显示待恢复而非攻关中')
+    assert.ok(!threeOut.includes('系统正按授权全面托管推进中'), '停机态绝不可声称正在自主推进')
+    assert.ok(threeOut.includes('L3-001') && threeOut.includes('定理一'), 'L3 列表必须正常渲染')
+
+    const branchOut = JSON.stringify(sb.BranchDetailDrawer({ data: sampleData, busy: false, onControl: () => {}, getUiWorkspace: () => null }))
+    assert.ok(branchOut.includes('已停机待续'), '停机态分支必须显示已停机待续而非攻关中')
+    assert.ok(!branchOut.includes('暂停接管'), '停机态绝不可显示单节点暂停接管按钮')
+  } finally {
+    fs.rmSync(tmpWs, { recursive: true, force: true })
+  }
 })

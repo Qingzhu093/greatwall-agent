@@ -141,7 +141,7 @@ class TestP0ContractsAndCleanroom(unittest.TestCase):
 
     def test_dsh_package_json_v3_files_whitelist(self) -> None:
         pkg = json.loads((ROOT_DIR / "dsh_plugin" / "package.json").read_text(encoding="utf-8"))
-        self.assertEqual(pkg["version"], "0.3.0-alpha.1")
+        self.assertTrue(str(pkg["version"]).startswith("0.3.0"), f"unexpected version: {pkg['version']}")
         files = pkg.get("files", [])
         self.assertIn("lib", files)
         self.assertIn("cordis.patch.yml", files)

@@ -186,6 +186,10 @@ def dispatch_control_call(
         if method == "control_plane/mark_stage1_works_checked":
             return {"ok": True, "data": mark_stage1_works_checked(conn)}
 
+        if method == "control_plane/pass_stage1_parse0_gate":
+            from .control_plane.lifecycle_ops import pass_stage1_parse0_gate
+            return {"ok": True, "data": pass_stage1_parse0_gate(conn)}
+
         if method == "control_plane/sync_public_rulings":
             res = sync_public_rulings(conn, workspace_root=eff_ws)
             refreshed_worktrees: list[str] = []

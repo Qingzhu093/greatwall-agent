@@ -1,5 +1,8 @@
 /** GreatWall v0.3 子题活体全局总览（<=1500字）、OPEN 悬赏缺口与大外环圆桌视图。 */
 function LivingSurveyView({ data }) {
+  const [expandedWaves, setExpandedWaves] = (typeof React !== "undefined" && typeof React.useState === "function")
+    ? React.useState({})
+    : [{}, () => {}];
   const insp = data?.inspector || {};
   const rawSurveys = insp.living_surveys_list || insp.living_surveys || [];
   const surveys = Array.isArray(rawSurveys) ? rawSurveys : Object.values(rawSurveys || {});
@@ -80,7 +83,25 @@ function LivingSurveyView({ data }) {
                         jsx("span", { className: stateBadgeClass(w.status), children: w.status })
                       ]
                     }),
-                    w.minutes_md ? jsx("div", { className: "gw-muted", children: String(w.minutes_md).slice(0, 220) }) : null
+                    w.minutes_md
+                      ? jsxs("div", {
+                          children: [
+                            jsx("div", {
+                              className: "gw-summary",
+                              children: expandedWaves[w.conference_id] || String(w.minutes_md).length <= 180
+                                ? String(w.minutes_md)
+                                : `${String(w.minutes_md).slice(0, 180)}…`
+                            }),
+                            String(w.minutes_md).length > 180
+                              ? jsx("button", {
+                                  className: "gw-link-btn",
+                                  onClick: () => setExpandedWaves((prev) => ({ ...prev, [w.conference_id]: !prev[w.conference_id] })),
+                                  children: expandedWaves[w.conference_id] ? "收起纪要" : "展开完整纪要"
+                                })
+                              : null
+                          ]
+                        })
+                      : null
                   ]
                 }, w.conference_id)
               )

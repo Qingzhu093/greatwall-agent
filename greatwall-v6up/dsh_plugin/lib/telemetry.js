@@ -39,6 +39,10 @@ export class TelemetryCollector {
     this.filePath = resolveTelemetryFilePath({ dataDir, workspaceRoot })
     let persistedSessions = {}
     let persistedCounters = {}
+    let persistedModelBinding = null
+    let persistedStage = 'STAGE1_PARSE0'
+    let persistedStartedAt = null
+    let persistedRecentEvents = []
     try {
       if (fs.existsSync(this.filePath)) {
         const prev = JSON.parse(fs.readFileSync(this.filePath, 'utf8'))
@@ -48,6 +52,30 @@ export class TelemetryCollector {
         if (prev?.countersByRole && typeof prev.countersByRole === 'object') {
           persistedCounters = prev.countersByRole
         }
+        if (typeof prev?.stage === 'string' && prev.stage.trim()) {
+          persistedStage = prev.stage.trim()
+        }
+        if (typeof prev?.startedAt === 'string' && prev.startedAt.trim()) {
+          persistedStartedAt = prev.startedAt.trim()
+        }
+        if (Array.isArray(prev?.recentEvents)) {
+          persistedRecentEvents = prev.recentEvents.slice(-80)
+        }
+        if (prev?.lastModelBinding?.provider && prev?.lastModelBinding?.model) {
+          persistedModelBinding = prev.lastModelBinding
+        } else if (Array.isArray(prev?.recentEvents)) {
+          for (let i = prev.recentEvents.length - 1; i >= 0; i--) {
+            const ev = prev.recentEvents[i]
+            if (ev?.kind === 'model_binding_locked' && ev.provider && ev.provider !== '(none)' && ev.model && ev.model !== '(none)') {
+              persistedModelBinding = {
+                provider: String(ev.provider),
+                model: String(ev.model),
+                effectiveContextWindow: Number(ev.effectiveContextWindow || 0) || 0,
+              }
+              break
+            }
+          }
+        }
       }
     } catch {}
     this.state = {
@@ -55,14 +83,25 @@ export class TelemetryCollector {
       workspaceRoot,
       updatedAt: new Date().toISOString(),
       orchestratorState: 'idle',
-      stage: 'STAGE1_PARSE0',
-      startedAt: null,
+      stage: persistedStage,
+      startedAt: persistedStartedAt,
+      lastModelBinding: persistedModelBinding,
       activeExplorers: [],
       activeGovernance: [],
       countersByRole: persistedCounters,
       sessions: persistedSessions,
-      recentEvents: [],
+      recentEvents: persistedRecentEvents,
     }
+  }
+
+  setModelBinding(binding) {
+    if (!binding?.provider || !binding?.model) return
+    this.state.lastModelBinding = {
+      provider: String(binding.provider),
+      model: String(binding.model),
+      effectiveContextWindow: Number(binding.effectiveContextWindow || 0) || 0,
+    }
+    this.flush()
   }
 
   setOrchestratorState(orchestratorState, stage = '') {

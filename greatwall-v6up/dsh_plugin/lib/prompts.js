@@ -136,10 +136,10 @@ export function resolvePlatformAllowedTools(role, platform = process.platform) {
     case 'library_verifier':
       return ['read', 'glob', 'grep', shell]
     case 'lineage_companion':
+    case 'gw_chief':
       return ['read', 'glob', 'grep']
     case 'external_surveyor':
       return ['web_search', 'web_fetch']
-    case 'gw_chief':
     case 'library_chronicler':
     case 'conference_chair':
     case 'logistics_coordinator':

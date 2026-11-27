@@ -101,6 +101,7 @@ export class GreatwallOrchestrator {
     this._runningExplorers = new Map()
     this._runningGov = new Map()
     this._govCooldownUntil = new Map()
+    this._explorerCooldownUntil = new Map()
     this._nodeCompanionSessions = new Map()
     this._seenAmbiguousAlertIds = new Set()
     this._stage3Done = false
@@ -240,16 +241,23 @@ export class GreatwallOrchestrator {
   }
 
   async _resolveAndLockModelBinding({ explicitOptions = {}, callerAgent = null } = {}) {
+    const fallbackSessionIds = Object.values(this.telemetry?.state?.sessions || {})
+      .filter((s) => s?.sessionId)
+      .sort((a, b) => String(b.startedAt || '').localeCompare(String(a.startedAt || '')))
+      .map((s) => String(s.sessionId))
     const binding = await resolveAuthoritativeModelBinding({
       explicitOptions,
       callerAgent: callerAgent || this.parentAgent,
       ctx: this.ctx,
       configDefaultOptions: this.defaultAgentOptions,
+      persistedBinding: this.telemetry?.state?.lastModelBinding || null,
+      fallbackSessionIds,
       runtimeDefaultWindow: this._windowCapTokens,
     })
     if (!binding.ok && this._requireExplicitModelBinding) return binding
     if (binding.ok) {
       this.defaultAgentOptions = { ...this.defaultAgentOptions, provider: binding.provider, model: binding.model }
+      this.telemetry.setModelBinding(binding)
     }
     this.host.effectiveContextWindow = binding.effectiveContextWindow || this._windowCapTokens
     this._modelBinding = binding
@@ -366,16 +374,94 @@ export class GreatwallOrchestrator {
     return this._startingPromise
   }
 
-  pauseBackground() {
-    if (this._poolState !== 'running') return { paused: false, state: this._poolState }
+  async _resumeAllHumanPausedNodes(note = 'GLOBAL_RESUME_FULL_AUTOPILOT') {
+    const resumedNodeIds = []
+    try {
+      const snapRes = await this.bridge.control('control_plane/schedule_snapshot', { workspace_root: this.workspaceRoot })
+      const pausedNodes = Array.isArray(snapRes?.data?.human_paused_nodes) ? snapRes.data.human_paused_nodes : []
+      for (const n of pausedNodes) {
+        const nid = String(n?.node_id || '').trim()
+        if (!nid) continue
+        const r = await this.bridge.control('control_plane/resume_node', {
+          workspace_root: this.workspaceRoot,
+          node_id: nid,
+          actor_source: 'human_ui',
+          cross_branch_note: note,
+        }).catch(() => null)
+        if (r?.ok) resumedNodeIds.push(nid)
+      }
+    } catch {}
+    return resumedNodeIds
+  }
+
+  async pauseBackground() {
+    if (this._poolState !== 'running') {
+      return { paused: false, state: this._poolState, pausedNodeIds: [], error: `当前处于 ${this._poolState} 状态，无需暂停` }
+    }
     this._poolState = 'paused'
     this.telemetry.setOrchestratorState('paused')
+
+    // 统一状态机：全局暂停 = 将所有在跑及排队中的活跃探索节点同步切入「等待人类接管 (PAUSE_DRAINING -> HUMAN_ACTIVE)」
+    const targetIds = new Set()
+    for (const running of this._runningExplorers.values()) {
+      const nid = String(running?.node?.node_id || '').trim()
+      if (nid) targetIds.add(nid)
+    }
+    try {
+      const snapRes = await this.bridge.control('control_plane/schedule_snapshot', { workspace_root: this.workspaceRoot })
+      for (const n of snapRes?.data?.dispatchable_explorers || []) {
+        const nid = String(n?.node_id || '').trim()
+        if (nid) targetIds.add(nid)
+      }
+    } catch {}
+
+    const pausedNodeIds = []
+    for (const nid of targetIds) {
+      try {
+        const res = await this.bridge.control('control_plane/pause_node', {
+          workspace_root: this.workspaceRoot,
+          node_id: nid,
+          actor_source: 'human_ui',
+          reason: 'GLOBAL_PAUSE_HUMAN_TAKEOVER',
+        })
+        if (res?.ok) {
+          pausedNodeIds.push(nid)
+          if (!this._runningExplorers.has(nid)) {
+            await this.bridge.control('control_plane/mark_node_yielded', {
+              workspace_root: this.workspaceRoot,
+              node_id: nid,
+              yield_reason: 'GLOBAL_PAUSE_QUEUED_NODE',
+            }).catch(() => {})
+          }
+        }
+      } catch {}
+    }
     this._wakeLoop()
-    return { paused: true, state: this._poolState }
+    return { paused: true, state: this._poolState, pausedNodeIds }
   }
 
   async resumeBackground() {
-    if (this._poolState !== 'paused') return { resumed: false, state: this._poolState }
+    // 若处于 idle / stopped（如重启后从历史工作区恢复），先对所有暂停接管态节点做 SHA 对账，再拉起后台编排器进入全面托管
+    if (this._poolState === 'idle' || this._poolState === 'stopped') {
+      const resumedNodeIds = await this._resumeAllHumanPausedNodes('GLOBAL_COLD_RESUME_FULL_AUTOPILOT')
+      const st = await this.startBackground()
+      if (st?.started) {
+        return { resumed: true, restarted: true, state: this._poolState, resumedNodeIds, ...st }
+      }
+      return {
+        resumed: false,
+        state: this._poolState,
+        resumedNodeIds,
+        error: st?.error || `当前处于 ${this._poolState} 状态，无法启动全面托管`,
+      }
+    }
+    if (this._poolState !== 'paused') {
+      return { resumed: false, state: this._poolState, resumedNodeIds: [], error: `当前处于 ${this._poolState} 状态，无需恢复` }
+    }
+
+    // 统一状态机：全局恢复全面托管前，对所有暂停接管态节点统一执行 resume_node（自动完成 Worktree SHA 对账）
+    const resumedNodeIds = await this._resumeAllHumanPausedNodes('GLOBAL_RESUME_FULL_AUTOPILOT')
+
     // 裁决 4：彻底废除扫盘自动静默升版暗门，仅只读检测是否有未审批磁盘草稿
     let draftNotice = null
     try {
@@ -384,10 +470,11 @@ export class GreatwallOrchestrator {
     } catch {}
     this._itemBreaker.resetAll()
     this._govCooldownUntil.clear()
+    this._explorerCooldownUntil.clear()
     this._poolState = 'running'
     this.telemetry.setOrchestratorState('running')
     this._wakeLoop()
-    return { resumed: true, state: this._poolState, draftNotice }
+    return { resumed: true, state: this._poolState, resumedNodeIds, draftNotice }
   }
 
   async abortNode(nodeId, reason = 'ABORTED_BY_CONTROLLER') {
@@ -455,6 +542,15 @@ export class GreatwallOrchestrator {
       const liveEntry = this.liveSessions.get(running.sessionId)
       try { liveEntry?.handle?.agent?.cancel?.({ kind: 'hook', reason: 'HUMAN_STOP' }) } catch {}
     }
+    // 人类收工后必须确保事件池处于 running 态以驱动 Stage 3 冻结包导出与盲审终签（新探索派发已由 DB human_stop_active 硬拦截）
+    if (res?.ok) {
+      if (this._poolState === 'paused') {
+        this._poolState = 'running'
+        this.telemetry.setOrchestratorState('running')
+      } else if ((this._poolState === 'idle' || this._poolState === 'stopped') && !this._backgroundTask) {
+        await this.startBackground().catch(() => {})
+      }
+    }
     this._wakeLoop()
     return { humanStopRecorded: Boolean(res?.ok), callerSource, record: res?.data || null, status: await this.getControlStatus() }
   }
@@ -494,6 +590,7 @@ export class GreatwallOrchestrator {
 
     return {
       poolState: this._poolState,
+      state: this._poolState,
       kernelAlive,
       lastError: statusError,
       initialized: snapData ? Boolean(snapData.initialized ?? true) : false,
@@ -506,7 +603,7 @@ export class GreatwallOrchestrator {
       effectiveContextWindow: this.host.effectiveContextWindow,
       latestSpecRevision: Number(snapData?.latest_spec_revision || 0),
       runningExplorersCount: this._runningExplorers.size,
-      runningExplorers: [...this._runningExplorers.values()].map((e) => ({ nodeId: e.node.node_id, questionId: e.node.question_id, sessionId: e.sessionId })),
+      runningExplorers: [...this._runningExplorers.values()].map((e) => ({ nodeId: e.node.node_id, questionId: e.node.question_id, sessionId: e.sessionId, startedAt: e.startedAt || null })),
       runningGovernanceTasks: [...this._runningGov.keys()],
       circuitBrokenItems: this._itemBreaker.getBrokenItems(),
       activeSessions: [...this.liveSessions.entries()].map(([sid, s]) => ({ sessionId: sid, role: s.role, questionId: s.questionId, nodeId: s.nodeId, label: s.uiLabel, startedAt: s.startedAt })),
@@ -577,22 +674,31 @@ export class GreatwallOrchestrator {
   }
 
   _launchExplorerWorker(node, snap, sig) {
+    const nid = String(node?.node_id || '')
+    if (!nid) return
+    if ((this._explorerCooldownUntil?.get(nid) || 0) > Date.now()) return
     const slotTier = this.slotAllocator.acquire(node)
     if (!slotTier) return
-    const expSessionId = `gw-exp-${node.node_id}`
+    const expSessionId = `gw-exp-${nid}`
+    let failed = false
     const p = driveExplorerCompanionPair(this.createDispatchRuntimePort(), node, snap, expSessionId, { signal: sig })
       .catch((err) => {
         if (err?.code !== 'GREATWALL_RUN_ABORTED') {
-          this.telemetry.recordEvent('explorer_worker_error', { nodeId: node.node_id, error: String(err?.message || err) })
+          failed = true
+          this._explorerCooldownUntil?.set(nid, Date.now() + 3000)
+          this.telemetry.recordEvent('explorer_worker_error', { nodeId: nid, error: String(err?.message || err) })
         }
       })
       .finally(() => {
-        this._runningExplorers.delete(node.node_id)
-        this.slotAllocator.release(node.node_id)
+        this._runningExplorers.delete(nid)
+        this.slotAllocator.release(nid)
         this._syncSlotsToTelemetry()
-        this._wakeLoop()
+        if (!failed) {
+          this._explorerCooldownUntil?.delete(nid)
+          this._wakeLoop()
+        }
       })
-    this._runningExplorers.set(node.node_id, { promise: p, node, sessionId: expSessionId, slotTier, startedAt: Date.now() })
+    this._runningExplorers.set(nid, { promise: p, node, sessionId: expSessionId, slotTier, startedAt: Date.now() })
     this._syncSlotsToTelemetry()
   }
 

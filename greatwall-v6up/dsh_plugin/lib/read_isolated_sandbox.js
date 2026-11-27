@@ -82,7 +82,6 @@ export const SHELL_TOOL_NAMES = new Set(['pwsh', 'bash', 'shell', 'run_command']
 
 const SHELL_WRITE_RE = /(?:>|>>|\bOut-File\b|\bSet-Content\b|\bAdd-Content\b|\bNew-Item\b|\bRemove-Item\b|\bMove-Item\b|\bCopy-Item\b|\btee\b|\brm\s|\bmv\s|\bcp\s|\btouch\s|\bmkdir\s)/i
 const ZERO_NATIVE_ROLES = new Set([
-  'gw_chief',
   'logistics_coordinator',
   'supervisory_committee',
   'library_chronicler',
@@ -90,6 +89,7 @@ const ZERO_NATIVE_ROLES = new Set([
 ])
 const NO_SHELL_ROLES = new Set([
   ...ZERO_NATIVE_ROLES,
+  'gw_chief',
   'lineage_companion',
   'external_surveyor',
 ])
@@ -304,8 +304,8 @@ export function createSandboxCallEvaluator(opts) {
     }
 
     if (isWriteTool) {
-      if (role === 'lineage_companion' || role === 'library_verifier') {
-        return `SANDBOX_VIOLATION: ${role} 严禁修改磁盘文件 (${name})`
+      if (role === 'gw_chief' || role === 'lineage_companion' || role === 'library_verifier') {
+        return `SANDBOX_VIOLATION: ${role} 为只读角色，严禁修改磁盘文件 (${name})`
       }
       for (const pVal of extractPathValues(args)) {
         if (PROCESS_MD_FORBIDDEN_RE.test(pVal)) {
@@ -321,14 +321,16 @@ export function createSandboxCallEvaluator(opts) {
       const isVerifierOwnSandbox = role === 'library_verifier' && Boolean(sandboxCanon) && isInsideRoot(canon, sandboxCanon)
       if (PROTECTED_TOKEN_RE.test(pVal)) {
         const isCalForWorks = role === 'works_engineer' && /_hidden_calibrations/i.test(pVal) && !/greatwall\.db/i.test(pVal)
+        const isFinalDeliveryForChief = role === 'gw_chief' && /final_delivery/i.test(pVal) && !/(?:greatwall\.db|_hidden|blind_sandboxes|frozen_deliveries)/i.test(pVal)
         const isDbOrHidden = /(?:greatwall\.db(?:-wal|-shm)?|_hidden_calibrations|frozen_deliveries|GREATWALL_DATA_DIR|GREATWALL_DB_PATH|GREATWALL_PLUGIN_DATA_DIR)/i.test(pVal)
-        if (!isCalForWorks && !(isVerifierOwnSandbox && !isDbOrHidden)) {
+        if (!isCalForWorks && !isFinalDeliveryForChief && !(isVerifierOwnSandbox && !isDbOrHidden)) {
           return `SANDBOX_VIOLATION: 角色 ${role} 严禁访问受保护资产 (${pVal})`
         }
       }
       if (role !== 'works_engineer') {
         for (const prot of protectedCanons) {
           if (isVerifierOwnSandbox) continue
+          if (role === 'gw_chief' && prot === finalDeliveryCanon) continue
           if (isInsideRoot(canon, prot)) {
             return `SANDBOX_VIOLATION: 禁止访问受保护外部数据区或隐藏资产 (${pVal})`
           }
@@ -341,7 +343,12 @@ export function createSandboxCallEvaluator(opts) {
       const worktreeInputsCanon = sandboxCanon ? path.join(sandboxCanon, 'inputs') : ''
       const worktreeDonorsCanon = sandboxCanon ? path.join(sandboxCanon, '.greatwall_donors') : ''
 
-      if (role === 'explorer' || role === 'lineage_companion') {
+      if (role === 'gw_chief') {
+        // 裁决一：允许 gw_chief 只读工作区公开文件、分支 worktrees/ 与 final_delivery/，严禁越出工作区或读隐藏集/DB
+        if (!isInsideRoot(canon, wsCanon) && !isSpillOnlyRead) {
+          return `SANDBOX_VIOLATION: gw_chief 仅限只读访问当前科研工作区 (${opts.workspaceRoot}) 内文件，禁止越界 ${pVal}`
+        }
+      } else if (role === 'explorer' || role === 'lineage_companion') {
         if (isWriteTool && worktreeInputsCanon && isInsideRoot(canon, worktreeInputsCanon)) {
           return `SANDBOX_VIOLATION: ${role} 严禁修改只读公开输入挂载目录 (${pVal})`
         }

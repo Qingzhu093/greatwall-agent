@@ -209,6 +209,7 @@ export class AgentSessionHost {
         protectedDirs: this.protectedDirs,
         sharedInputPaths: this.sharedInputPaths,
         effectiveContextWindow: this.effectiveContextWindow,
+        liveSessions: this.liveSessions,
         setSessionReadonly: (sid, flag) => this.setSessionReadonly(sid, flag),
         isSessionReadonly: (sid) => this.isSessionReadonly(sid),
       },
@@ -369,9 +370,9 @@ export class AgentSessionHost {
     if (role === 'library_verifier' && !effSandbox) {
       throw new Error('BLIND_SANDBOX_REQUIRED: library_verifier 必须挂载独立空白盲审沙箱 sandboxAbsPath！')
     }
-    const metaCwd = role === 'library_verifier'
-      ? effSandbox
-      : ((role === 'explorer' || role === 'lineage_companion') ? effWorktree : this.workspaceRoot)
+    // 裁决二 & 三：探索者与伴随的 header.cwd 归入主工作区根目录（确保显示在主工作区左侧栏且可直接点开历史伴随对话），
+    // 创建后立刻通过 DSH 原生 workingDirectory.set(agent, effWorktree) 切入隔离 Worktree，并继续叠加沙箱 Guard 物理锁死！
+    const metaCwd = role === 'library_verifier' ? effSandbox : this.workspaceRoot
 
     const sessionTitle = uiLabel || formatNodeSessionTitle(role, { questionId, branchId, nodeId })
     const turnSignals = []
@@ -446,9 +447,19 @@ export class AgentSessionHost {
     let resumedFromDisk = false
     if (preferResume && typeof this.ctx.agents.resume === 'function') {
       try {
-        handle = await this.ctx.agents.resume(commonOpts)
+        // DSH RC5 `ctx.agents.resume` 权威字段名为 `resumeSessionId`（同时保留 sessionId 兼容测试 mock）
+        const resumeOpts = {
+          resumeSessionId: effSid,
+          sessionId: effSid,
+          agentOptions: mergedAgentOptions,
+          signal: signal || undefined,
+          setup: setupFn,
+        }
+        handle = await this.ctx.agents.resume(resumeOpts)
         resumedFromDisk = true
-      } catch {
+      } catch (resumeErr) {
+        const msg = String(resumeErr?.message || resumeErr)
+        this.telemetry?.recordEvent?.('session_resume_fallback', { sessionId: effSid, role, error: msg })
         handle = null
       }
     }
@@ -458,6 +469,17 @@ export class AgentSessionHost {
 
     liveHandleRef = handle
     this._inheritParentPermissionState(handle?.agent?.session)
+    // 裁决二：若为 explorer / lineage_companion 且隔离 Worktree 存在，立即通过 RC5 workingDirectory.set 切入隔离目录
+    if ((role === 'explorer' || role === 'lineage_companion') && effWorktree && effWorktree !== this.workspaceRoot) {
+      try {
+        const wdSvc = typeof this.ctx?.get === 'function' ? this.ctx.get('workingDirectory') : this.ctx?.workingDirectory
+        if (wdSvc && typeof wdSvc.set === 'function' && handle?.agent) {
+          await wdSvc.set(handle.agent, effWorktree, signal || undefined)
+        }
+      } catch (err) {
+        this.telemetry?.recordEvent?.('working_directory_switch_warn', { sessionId: effSid, worktree: effWorktree, error: String(err?.message || err) })
+      }
+    }
     const crossCwd = this._isCrossCwd(metaCwd)
     this.telemetry.recordSessionStart({
       sessionId: effSid,

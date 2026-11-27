@@ -37,14 +37,31 @@ async function postGreatwallControl(action, payload = {}) {
   return res.json();
 }
 
-function openNativeSession(getUiWorkspace, sessionId) {
-  if (!sessionId) return false;
+function openNativeSession(getUiWorkspace, sessionId, onFeedback = null) {
+  if (!sessionId) {
+    if (typeof onFeedback === "function") onFeedback("未找到目标会话 ID，无法打开对话。");
+    return false;
+  }
   try {
     const uiWs = typeof getUiWorkspace === "function" ? getUiWorkspace() : null;
     if (uiWs && typeof uiWs.openSession === "function") {
-      uiWs.openSession(sessionId);
+      const ret = uiWs.openSession(sessionId);
+      if (ret && typeof ret.catch === "function") {
+        ret.catch((err) => {
+          if (typeof onFeedback === "function") {
+            onFeedback(`打开会话 ${sessionId} 失败：${String(err?.message || err)}（请检查左侧归档区或刷新面板）`);
+          }
+        });
+      }
       return true;
     }
-  } catch {}
+    if (typeof onFeedback === "function") {
+      onFeedback(`当前宿主未暴露 uiWorkspace.openSession，无法直接跳转会话 ${sessionId}。`);
+    }
+  } catch (err) {
+    if (typeof onFeedback === "function") {
+      onFeedback(`打开会话 ${sessionId} 异常：${String(err?.message || err)}`);
+    }
+  }
   return false;
 }

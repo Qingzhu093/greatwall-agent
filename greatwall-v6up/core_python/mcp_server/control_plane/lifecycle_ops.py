@@ -463,3 +463,46 @@ def submit_works_ticket(
         "created_at": now,
     }
 
+
+def pass_stage1_parse0_gate(conn: sqlite3.Connection) -> dict[str, Any]:
+    """裁决五：确定性 Stage 1 -> Stage 2 放行门禁（取代原 supervisory_committee 空壳角色）。
+
+    校验 Parse 0 契约已签、初始仪器已核查 (`stage1_works_checked=1`) 且首批分支已开枝，
+    满足条件后在单写者事务内毫秒级推进至 `STAGE2_EVOLVE` 并落盘 `compliance_alerts` 审计留痕。
+    """
+    p0 = conn.execute(
+        "SELECT stage, human_signed_at, goal_and_completion_md, stage1_works_checked FROM parse0_contract WHERE contract_id = 'active'"
+    ).fetchone()
+    if p0 is None:
+        return {"passed": False, "stage": "STAGE1_PARSE0", "reason": "parse0_not_initialized"}
+    if str(p0["stage"] or "") != "STAGE1_PARSE0":
+        return {"passed": True, "stage": str(p0["stage"]), "already_advanced": True}
+    if not str(p0["human_signed_at"] or "").strip() or not str(p0["goal_and_completion_md"] or "").strip():
+        return {"passed": False, "stage": "STAGE1_PARSE0", "reason": "parse0_unsigned_or_empty_goal"}
+    if int(p0["stage1_works_checked"] or 0) != 1:
+        return {"passed": False, "stage": "STAGE1_PARSE0", "reason": "stage1_works_not_checked"}
+    branch_cnt = conn.execute("SELECT COUNT(*) AS cnt FROM lineage_nodes").fetchone()
+    if int(branch_cnt["cnt"] or 0) <= 0:
+        return {"passed": False, "stage": "STAGE1_PARSE0", "reason": "no_initial_branch_spawned"}
+
+    now = utc_now_iso()
+    aid = f"ca_{uuid.uuid4().hex[:10]}"
+    with rw_immediate_tx(conn):
+        conn.execute(
+            "UPDATE parse0_contract SET stage = 'STAGE2_EVOLVE', updated_at = ? WHERE contract_id = 'active' AND stage = 'STAGE1_PARSE0'",
+            (now,),
+        )
+        conn.execute(
+            """
+            INSERT INTO compliance_alerts(alert_id, stage, status, blocking_questions_json, notes, created_at)
+            VALUES (?, 'PARSE0_GATE', 'PASSED', '[]', ?, ?)
+            """,
+            (aid, "确定性门禁放行：Parse 0 已签、初始仪器已核查、首批正交分支已就位，推进至 STAGE2_EVOLVE。", now),
+        )
+    return {
+        "passed": True,
+        "stage": "STAGE2_EVOLVE",
+        "alert_id": aid,
+        "deterministic": True,
+    }
+

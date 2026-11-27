@@ -33,7 +33,18 @@ const CSS_TEXT = [
   ".gw-pre{margin:0;padding:7px 8px;border-radius:7px;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l4);font-family:var(--dsw-font-mono,ui-monospace,monospace);font-size:11px;white-space:pre-wrap;word-break:break-word;max-height:240px;overflow-y:auto}",
   ".gw-select{box-sizing:border-box;width:100%;border:1px solid var(--dsw-alias-border-l3);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border-radius:7px;padding:4px 7px;font-size:11px}",
   ".gw-bar{position:relative;height:6px;border-radius:999px;background:var(--dsw-alias-fill-l2,rgba(128,128,128,.2));overflow:hidden}",
-  ".gw-bar-fill{height:100%;border-radius:999px;background:#2563eb;transition:width .2s ease}"
+  ".gw-bar-fill{height:100%;border-radius:999px;background:#2563eb;transition:width .2s ease}",
+  ".gw-tree-q{border:1px solid var(--dsw-alias-border-l4);border-radius:8px;padding:7px 8px;background:var(--dsw-alias-bg-layer-1);display:flex;flex-direction:column;gap:6px}",
+  ".gw-tree-fam{border-left:2px solid var(--dsw-alias-border-l3);padding-left:8px;margin-left:3px;display:flex;flex-direction:column;gap:5px}",
+  ".gw-tree-node{border:1px solid var(--dsw-alias-border-l4);border-radius:7px;padding:6px 8px;background:var(--dsw-alias-bg-layer-2);display:flex;flex-direction:column;gap:4px}",
+  ".gw-pulse{display:inline-block;width:7px;height:7px;border-radius:50%;background:#16a34a;margin-right:4px}",
+  ".gw-summary{font-size:12px;color:var(--dsw-alias-label-primary);white-space:pre-wrap;word-break:break-word}",
+  ".gw-link-btn{cursor:pointer;border:none;background:transparent;color:#2563eb;padding:0;font-size:11px;text-align:left}",
+  ".gw-banner{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:5px 10px;font-size:11px;border-bottom:1px solid var(--dsw-alias-border-l4)}",
+  ".gw-banner-ok{color:#15803d;background:rgba(22,163,74,.08)}",
+  ".gw-banner-err{color:#dc2626;background:rgba(220,38,38,.08)}",
+  ".gw-banner-info{color:#2563eb;background:rgba(37,99,235,.06)}",
+  ".gw-confirm-bar{display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap;padding:6px 10px;font-size:11px;color:#b91c1c;background:rgba(220,38,38,.08);border-bottom:1px solid rgba(220,38,38,.3)}"
 ].join("");
 
 function mountConsoleStyles() {
@@ -54,9 +65,67 @@ function mountConsoleStyles() {
 function stateBadgeClass(st) {
   const s = String(st || "").toUpperCase();
   if (s.includes("RUN") || s === "DISPATCHING" || s === "STOPPED_SOLVED" || s === "CLOSED_VERIFIED" || s === "APPROVED_EXECUTED") return "gw-badge gw-b-run";
-  if (s.includes("PAUSE") || s.includes("HUMAN") || s.includes("PENDING") || s.includes("BLOCKED")) return "gw-badge gw-b-warn";
+  if (s.includes("PAUSE") || s.includes("HUMAN") || s.includes("PENDING") || s.includes("BLOCKED") || s === "EARLY_HANDOFF_READY") return "gw-badge gw-b-warn";
   if (s.includes("ERR") || s.includes("FAIL") || s.includes("REFUTED") || s === "UNHEALTHY") return "gw-badge gw-b-err";
   return "gw-badge gw-b-info";
+}
+
+function readablePoolState(st) {
+  const s = String(st || "").toLowerCase();
+  if (s === "running") return "全面托管中";
+  if (s === "paused") return "等待人类接管";
+  if (s === "starting") return "启动中";
+  if (s === "idle") return "空闲待命";
+  if (s === "stopped") return "已停止";
+  if (s === "archived") return "历史归档";
+  if (s === "error") return "异常停摆";
+  return s || "未知";
+}
+
+function readableStage(st) {
+  const s = String(st || "").toUpperCase();
+  if (s === "STAGE1_PARSE0") return "Stage 1 · 立项准备";
+  if (s === "STAGE2_EVOLVE") return "Stage 2 · 攻坚演化";
+  if (s === "STAGE3_CONSOLIDATE" || s === "STAGE3_DELIVER") return "Stage 3 · 终稿核验";
+  if (s === "CLOSED_VERIFIED") return "已验收结题";
+  return s || "";
+}
+
+function readableControlState(st) {
+  const s = String(st || "").toUpperCase();
+  if (s === "AUTO_RUNNING") return "自动托管";
+  if (s === "PAUSE_DRAINING") return "让权停机中";
+  if (s === "HUMAN_ACTIVE") return "等待人类接管";
+  if (s === "EARLY_HANDOFF_READY") return "已授权提前交班";
+  return s || "";
+}
+
+function readableDispatchState(st) {
+  const s = String(st || "").toUpperCase();
+  if (s === "DISPATCHING") return "攻关中";
+  if (s === "PAUSED_HUMAN" || s === "PAUSED") return "人工暂停";
+  if (s === "PAUSED_SATURATED") return "语义饱和待拍板";
+  if (s === "PAUSED_BLOCKED") return "阻塞/预算挂起";
+  if (s === "WAITING_HUMAN") return "待人类拍板";
+  if (s === "STOPPED_SOLVED") return "已通关";
+  if (s === "CLOSED") return "已结题";
+  return s || "未知";
+}
+
+function readableActionLabel(act) {
+  const map = {
+    pause: "全局暂停（全部等待人类接管）",
+    resume: "恢复全面托管",
+    human_stop: "人类收工",
+    pause_node: "暂停接管该分支",
+    resume_node: "交还托管(SHA对账)",
+    authorize_early_handoff: "授权提前交班",
+    set_subproblem_state: "切换子题启停",
+    set_autonomy_mode: "切换自主档位",
+    approve_proposal: "审批提案",
+    open_chief: "唤起科研总控"
+  };
+  return map[act] || act;
 }
 
 function GreatwallGlyph({ size = 16, className }) {

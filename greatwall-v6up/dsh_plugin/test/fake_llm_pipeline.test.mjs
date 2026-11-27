@@ -29,9 +29,20 @@ const CORE_PYTHON_ROOT = path.resolve(__dirname, '..', '..', 'core_python')
 function createScriptedDshContext({ modelWindow = 272_000, onAgentTurn }) {
   const sessions = new Map()
   const pressureBySession = new Map()
+  const workingDirBySession = new Map()
 
   const ctx = {
     sessions,
+    workingDirectory: {
+      async set(agentOrSession, dir) {
+        const id = agentOrSession?.session?.id || agentOrSession?.id
+        if (id && dir) workingDirBySession.set(id, dir)
+      },
+      get(agentOrSession) {
+        const id = agentOrSession?.session?.id || agentOrSession?.id
+        return (id && workingDirBySession.get(id)) || agentOrSession?.session?.header?.cwd || ''
+      },
+    },
     llm: {
       async resolveModelInfo() {
         return { contextWindow: modelWindow, reasoning: { efforts: [{ id: 'low' }, { id: 'medium' }, { id: 'high' }] } }
@@ -162,7 +173,7 @@ function createScriptedDshContext({ modelWindow = 272_000, onAgentTurn }) {
             currentIdlePromise = (async () => {
               const api = {
                 sessionId: sid,
-                cwd: createOpts.meta?.cwd || '',
+                cwd: workingDirBySession.get(sid) || createOpts.meta?.cwd || '',
                 agentOptions: createOpts.agentOptions || {},
                 promptText,
                 callTool: runTool,

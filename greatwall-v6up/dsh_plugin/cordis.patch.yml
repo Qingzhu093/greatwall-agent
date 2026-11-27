@@ -1,6 +1,6 @@
 # dsh-greatwall-v6up v0.3 Cordis Bundle 声明（DSH 0.2.2-rc.5 唯一权威 Preset 来源）
 # - 注册 8 套角色专用 Preset 覆盖全院 10 大角色，物理落实零代码写/零终端/零外网隔离
-# - 仅 greatwall-chief 挂载原生 @deepseek-ai/dsh-compaction-basic（严禁给 explorer 开启 pruner）
+# - greatwall-chief 直接复用 Profile 根上挂载的 @deepseek-ai/dsh-compaction-basic 自动压缩（Preset 隔离域禁挂全局 Service；严禁给 explorer 开启 pruner）
 # - 仅 greatwall-external-surveyor 挂载 @deepseek-ai/dsh-tool-web（唯一联网，物理禁读院内成果）
 - insert:
     - id: greatwall-v6up
@@ -11,21 +11,27 @@
       config:
         id: greatwall-chief
         name: '长城 · 科研总控 (gw-chief)'
-        description: '人类在环科研总控 Superagent（物理零写码/零终端/零外网，启用原生自动压缩与弹性现况锚点卡）'
+        description: '人类在环科研总控与参谋 Superagent（只读工作区与分支代码 + 实时 Watchdog 视野，物理零写码/零终端/零外网/禁读隐藏集）'
         order: 49
         plugins:
           - id: persona
             name: '@deepseek-ai/dsh-persona'
             config:
-              prefix: 'You are GreatWall Chief (gw-chief), the human-in-the-loop scientific orchestrator operating exclusively via narrow read-only recall tools and human-confirmed control proposals.'
+              prefix: 'You are GreatWall Chief (gw-chief), the human-in-the-loop scientific advisor and orchestrator with read-only visibility into workspace files, branch code, live Watchdog trajectories, and narrow recall/proposal tools.'
               complete: false
               includeRuntimeContext: false
           - id: tool-executor-native
             name: '@deepseek-ai/dsh-tool-executor-native'
-          - id: token-meter
-            name: '@deepseek-ai/dsh-token-meter'
-          - id: compaction-basic
-            name: '@deepseek-ai/dsh-compaction-basic'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              write: false
+              edit: false
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
 
     - id: preset-greatwall-explorer
       name: '@deepseek-ai/dsh-agent-preset'

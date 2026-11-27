@@ -33,7 +33,7 @@ export function computeChiefAnchorBudgetChars(subproblemCount = 1, hardCapChars 
 /**
  * 构造实时「全院现况锚点卡」（纯确定性快照投影，防长会话压缩后记忆断链）。
  */
-export function buildChiefAnchorCard(snap, { hardCapChars = 1200, recentEvents = [] } = {}) {
+export function buildChiefAnchorCard(snap, { hardCapChars = 1200, recentEvents = [], liveRuntime = null } = {}) {
   if (!snap || !snap.initialized) {
     return '[全院现况锚点卡] 课题尚未初始化 Parse 0 契约。'
   }
@@ -49,6 +49,17 @@ export function buildChiefAnchorCard(snap, { hardCapChars = 1200, recentEvents =
   const lines = [
     `[全院现况锚点卡] stage=${snap.stage || 'UNKNOWN'} | mode=${snap.autonomy_mode || 'WAVE_CONFIRM'} | spec=v${Number(snap.latest_spec_revision || 0)} | closure=${snap.closure_state?.status || 'OPEN'}`,
   ]
+  const runningExps = Array.isArray(liveRuntime?.runningExplorers) ? liveRuntime.runningExplorers : []
+  const runningGovs = Array.isArray(liveRuntime?.runningGovernanceTasks) ? liveRuntime.runningGovernanceTasks : []
+  if (runningExps.length > 0) {
+    const expTxt = runningExps
+      .slice(0, 8)
+      .map((e) => `${e.nodeId}(${e.questionId},已跑${e.elapsedSec}s,sid=${e.sessionId})`)
+      .join(', ')
+    lines.push(`实时活跃探索者(${runningExps.length}，正在执行中非卡死): ${expTxt}`)
+  } else if (liveRuntime) {
+    lines.push(`实时活跃探索者(0)${runningGovs.length > 0 ? ` | 治理任务(${runningGovs.length}): ${runningGovs.slice(0, 4).join(',')}` : ''}`)
+  }
   for (const s of subs) {
     const baseTxt = s.baseline_entry_id ? `基线=${s.baseline_entry_id}` : '基线=无'
     const solved = s.solved_entry_id ? `解=${s.solved_entry_id}` : '未通关'
@@ -208,10 +219,26 @@ export async function ensureChiefSession(
       return true
     })
 
+    const orch = controller?.orchestrator
+    const nowMs = Date.now()
+    const liveRuntime = orch
+      ? {
+          poolState: orch._poolState || 'idle',
+          runningExplorers: [...(orch._runningExplorers?.values?.() || [])].map((e) => ({
+            nodeId: e.node?.node_id || '',
+            questionId: e.node?.question_id || '',
+            sessionId: e.sessionId || '',
+            elapsedSec: Math.max(0, Math.round((nowMs - Number(e.startedAt || nowMs)) / 1000)),
+          })),
+          runningGovernanceTasks: [...(orch._runningGov?.keys?.() || [])],
+        }
+      : null
+
     if (snapData) {
       latestAnchorText = buildChiefAnchorCard(snapData, {
         hardCapChars,
         recentEvents: filteredEvents,
+        liveRuntime,
       })
     }
     return latestAnchorText

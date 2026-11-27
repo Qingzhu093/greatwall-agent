@@ -223,7 +223,20 @@ export class GreatwallControlService {
       return { ok: false, action: act, callerSource: caller, error: `调用方 ${caller} 无权执行动作 ${act}` }
     }
 
-    const createIfMissing = caller === 'agent_tool' || act === 'init' || act === 'approve_proposal' || act === 'open_chief'
+    const AUTO_CREATE_UI_ACTIONS = new Set([
+      'init',
+      'start',
+      'resume',
+      'human_stop',
+      'approve_proposal',
+      'pause_node',
+      'resume_node',
+      'authorize_early_handoff',
+      'set_subproblem_state',
+      'set_autonomy_mode',
+      'open_chief',
+    ])
+    const createIfMissing = caller === 'agent_tool' || AUTO_CREATE_UI_ACTIONS.has(act)
     const ctrl = controller || (workspaceRoot ? this.ensureController(workspaceRoot, { callerAgent, createIfMissing }) : null)
     if (!ctrl) return { ok: false, action: act, callerSource: caller, error: '未找到目标工作区对应的活跃长城控制器。' }
 
@@ -261,12 +274,38 @@ export class GreatwallControlService {
           agentOptions: explicitAgentOpts,
           callerAgent,
         })
+        // 裁决一：start 成功后自动异步拉起 gw-chief 出现在主工作区左侧栏，不再逼用户去右侧 UI 手动点按钮
+        if (startRes?.started && !startRes?.alreadyRunning && typeof this.ctx?.agents?.create === 'function') {
+          void ensureChiefSession(ctrl, {
+            prompt: '',
+            hardCapChars: this.config.chiefAnchorHardCapChars ?? 1200,
+            chiefInbox: this.chiefInbox,
+          }).catch(() => {})
+        }
         return { ok: Boolean(startRes?.started), action: act, callerSource: caller, ...startRes }
       })
     }
 
-    if (act === 'pause') return { ok: true, action: act, callerSource: caller, ...ctrl.orchestrator.pauseBackground() }
-    if (act === 'resume') return { ok: true, action: act, callerSource: caller, ...(await ctrl.orchestrator.resumeBackground()) }
+    if (act === 'pause') {
+      const pRes = await ctrl.orchestrator.pauseBackground()
+      return {
+        ok: Boolean(pRes?.paused),
+        action: act,
+        callerSource: caller,
+        error: pRes?.paused ? null : (pRes?.error || `当前状态为 ${pRes?.state || 'unknown'}，无需暂停`),
+        ...pRes,
+      }
+    }
+    if (act === 'resume') {
+      const rRes = await ctrl.orchestrator.resumeBackground()
+      return {
+        ok: Boolean(rRes?.resumed),
+        action: act,
+        callerSource: caller,
+        error: rRes?.resumed ? null : (rRes?.error || `当前状态为 ${rRes?.state || 'unknown'}，无法恢复托管`),
+        ...rRes,
+      }
+    }
     if (act === 'stop') {
       const stopRes = await ctrl.orchestrator.stopBackground(`${defaultReasonPrefix}_STOP`)
       await ctrl.bridge?.closeIdleChild?.()
@@ -316,13 +355,26 @@ export class GreatwallControlService {
       return { ok: Boolean(res?.ok), action: act, callerSource: caller, data: res?.data || null, error: res?.ok ? null : res?.error }
     }
     if (act === 'pause_node') {
+      const nid = String(payload.node_id ?? payload.nodeId ?? '')
       const res = await ctrl.bridge.control('control_plane/pause_node', {
         workspace_root: ws,
-        node_id: String(payload.node_id ?? payload.nodeId ?? ''),
+        node_id: nid,
         actor_source: 'human_ui',
         reason: String(payload.reason || 'HUMAN_UI_PAUSE'),
       })
-      if (res?.ok) ctrl.orchestrator._wakeLoop?.()
+      if (res?.ok) {
+        // 若事件池当前未运行或该节点不在运行槽位中，同步落盘 mark_node_yielded 防止永久卡死在 PAUSE_DRAINING
+        const isRunning = ctrl.orchestrator.getPoolState?.() === 'running'
+        const hasLiveWorker = Boolean(ctrl.orchestrator._runningExplorers?.has?.(nid))
+        if (!isRunning || !hasLiveWorker) {
+          await ctrl.bridge.control('control_plane/mark_node_yielded', {
+            workspace_root: ws,
+            node_id: nid,
+            yield_reason: 'DIRECT_YIELD_NOT_RUNNING',
+          }).catch(() => {})
+        }
+        ctrl.orchestrator._wakeLoop?.()
+      }
       return { ok: Boolean(res?.ok), action: act, callerSource: caller, data: res?.data || null, error: res?.ok ? null : res?.error }
     }
     if (act === 'resume_node') {
@@ -347,14 +399,17 @@ export class GreatwallControlService {
       return { ok: Boolean(res?.ok), action: act, callerSource: caller, data: res?.data || null, error: res?.ok ? null : res?.error }
     }
     if (act === 'set_subproblem_state') {
+      const desired = String(payload.desired_state ?? payload.desiredState ?? 'PAUSED').toUpperCase()
       const res = await ctrl.bridge.control('control_plane/set_subproblem_state', {
         workspace_root: ws,
         question_id: String(payload.question_id ?? payload.questionId ?? ''),
-        desired_state: String(payload.desired_state ?? payload.desiredState ?? 'PAUSED'),
+        desired_state: desired,
         actor_source: 'human_ui',
         reason: String(payload.reason || 'HUMAN_UI_SUBPROBLEM_TOGGLE'),
       })
-      if (res?.ok) await ctrl.orchestrator.wakeOrRestartIfIdle?.()
+      // 仅在恢复该题(ACTIVE)时唤醒或重启事件池，暂停单题绝不反向拉起已停机的事件池
+      if (res?.ok && desired === 'ACTIVE') await ctrl.orchestrator.wakeOrRestartIfIdle?.()
+      else if (res?.ok) ctrl.orchestrator._wakeLoop?.()
       return { ok: Boolean(res?.ok), action: act, callerSource: caller, data: res?.data || null, error: res?.ok ? null : res?.error }
     }
     if (act === 'set_autonomy_mode') {
@@ -367,6 +422,7 @@ export class GreatwallControlService {
       return { ok: Boolean(res?.ok), action: act, callerSource: caller, data: res?.data || null, error: res?.ok ? null : res?.error }
     }
     if (act === 'open_chief') {
+      await ctrl.orchestrator._resolveAndLockModelBinding?.().catch(() => {})
       const chiefRes = await ensureChiefSession(ctrl, {
         prompt: String(payload.prompt || ''),
         hardCapChars: this.config.chiefAnchorHardCapChars || 1200,

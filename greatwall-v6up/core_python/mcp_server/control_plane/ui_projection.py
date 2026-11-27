@@ -103,7 +103,9 @@ def get_ui_full_inspector_payload(
             """
             SELECT entry_id, question_id, ledger_type, l3_entry_kind, goal_coverage,
                    l2_category, title, substr(abstract_md, 1, 400) AS abstract_preview,
-                   exact_verified_scope_md, exact_refuted_scope_md, verified_review_id, created_at
+                   substr(abstract_md, 1, 400) AS abstract_md,
+                   exact_verified_scope_md, exact_refuted_scope_md, verified_review_id,
+                   verified_spec_revision, publish_tier, is_active, created_at
             FROM internal_research_ledger
             WHERE is_active = 1
             ORDER BY created_at DESC LIMIT 40

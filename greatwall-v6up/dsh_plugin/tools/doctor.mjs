@@ -256,8 +256,8 @@ function checkPresetsIntegrity() {
     if (pid === 'greatwall-explorer' && pluginNames.has('@deepseek-ai/dsh-compaction-tool-result-pruner')) {
       issues.push('红线违规：greatwall-explorer 严禁挂载 dsh-compaction-tool-result-pruner')
     }
-    if (pid === 'greatwall-chief' && !pluginNames.has('@deepseek-ai/dsh-compaction-basic')) {
-      issues.push('greatwall-chief 必须挂载 @deepseek-ai/dsh-compaction-basic')
+    if (pluginNames.has('@deepseek-ai/dsh-compaction-basic') || pluginNames.has('@deepseek-ai/dsh-token-meter')) {
+      issues.push(`${pid} 隔离域严禁挂载全局服务 dsh-compaction-basic / dsh-token-meter（会触发 leakedServices 导致加载失败）`)
     }
   }
   const ok = presetIds.length === 8 && declared.length === 8 && issues.length === 0

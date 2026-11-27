@@ -180,6 +180,8 @@ export async function resolveAuthoritativeModelBinding({
   callerAgent = null,
   ctx = null,
   configDefaultOptions = {},
+  persistedBinding = null,
+  fallbackSessionIds = [],
   runtimeDefaultWindow = 500_000,
 } = {}) {
   let provider = ''
@@ -238,6 +240,41 @@ export async function resolveAuthoritativeModelBinding({
       provider = cfgP
       model = cfgM
       source = 'plugin_config'
+    }
+  }
+
+  // 重启冷恢复：优先复用本工作区上次已锁定的权威模型绑定
+  if ((!provider || !model) && persistedBinding?.provider && persistedBinding?.model) {
+    provider = String(persistedBinding.provider).trim()
+    model = String(persistedBinding.model).trim()
+    if (Number(persistedBinding.effectiveContextWindow || 0) > 0 && !sessionContextWindow) {
+      sessionContextWindow = Math.round(Number(persistedBinding.effectiveContextWindow))
+    }
+    source = 'persisted_telemetry'
+  }
+
+  // 历史会话事件回读：若上次未落盘 lastModelBinding，从本工作区已有会话事件流读取真实 model/selection
+  if ((!provider || !model) && Array.isArray(fallbackSessionIds) && fallbackSessionIds.length > 0) {
+    const sq = typeof ctx?.get === 'function' ? ctx.get('sessionQuery') : ctx?.sessionQuery
+    const sessionsMap = typeof ctx?.get === 'function' ? ctx.get('sessions') : ctx?.sessions
+    for (const sid of fallbackSessionIds.slice(0, 6)) {
+      if (!sid) continue
+      let evs = null
+      try {
+        const live = sessionsMap?.get?.(sid)
+        if (typeof live?.snapshotEvents === 'function') evs = live.snapshotEvents()
+      } catch {}
+      if ((!Array.isArray(evs) || evs.length === 0) && typeof sq?.listEvents === 'function') {
+        try { evs = await sq.listEvents(sid) } catch {}
+      }
+      const fromHist = extractModelBindingFromEvents(evs)
+      if (fromHist.provider && fromHist.model) {
+        provider = fromHist.provider
+        model = fromHist.model
+        if (fromHist.contextWindow > 0 && !sessionContextWindow) sessionContextWindow = fromHist.contextWindow
+        source = `history_session:${sid}`
+        break
+      }
     }
   }
 

@@ -131,7 +131,7 @@ test('1. 8套Preset、10角色路由与平台感知原生工具白名单', () =>
   // 平台感知 Shell 工具与平权矩阵
   assert.equal(resolvePlatformShellTool('win32'), 'pwsh')
   assert.equal(resolvePlatformShellTool('linux'), 'bash')
-  assert.deepEqual(resolvePlatformAllowedTools('gw_chief', 'win32'), [])
+  assert.deepEqual(resolvePlatformAllowedTools('gw_chief', 'win32'), ['read', 'glob', 'grep'])
   assert.deepEqual(resolvePlatformAllowedTools('logistics_coordinator', 'win32'), [])
   assert.deepEqual(resolvePlatformAllowedTools('supervisory_committee', 'linux'), [])
   assert.deepEqual(resolvePlatformAllowedTools('library_chronicler', 'linux'), [])
@@ -139,18 +139,19 @@ test('1. 8套Preset、10角色路由与平台感知原生工具白名单', () =>
   assert.deepEqual(resolvePlatformAllowedTools('library_verifier', 'win32'), ['read', 'glob', 'grep', 'pwsh'])
   assert.deepEqual(resolvePlatformAllowedTools('library_verifier', 'linux'), ['read', 'glob', 'grep', 'bash'])
 
-  // 声明式 Preset 插件校验：8 套均挂载 RC5 tool-executor-native；chief 启用 compaction-basic，explorer 禁 pruner
+  // 声明式 Preset 插件校验：8 套均挂载 RC5 tool-executor-native；Preset 隔离域禁挂全局 compaction-basic/token-meter，explorer 禁 pruner
   const winDefs = Object.fromEntries(winDefsList.map((d) => [d.id, d]))
   for (const def of winDefsList) {
     assert.ok(
       def.plugins.some((p) => p.name === '@deepseek-ai/dsh-tool-executor-native'),
       `Preset ${def.id} 必须挂载 @deepseek-ai/dsh-tool-executor-native`,
     )
+    assert.ok(
+      !def.plugins.some((p) => p.name === '@deepseek-ai/dsh-compaction-basic' || p.name === '@deepseek-ai/dsh-token-meter'),
+      `Preset ${def.id} 隔离域严禁直接挂载全局服务 compaction-basic / token-meter`,
+    )
   }
-  assert.ok(
-    winDefs['greatwall-chief'].plugins.some((p) => p.name === '@deepseek-ai/dsh-compaction-basic'),
-    'greatwall-chief 必须启用原生 @deepseek-ai/dsh-compaction-basic',
-  )
+  assert.deepEqual(winDefs['greatwall-chief'].plugins.map((p) => p.id), ['persona', 'tool-executor-native', 'tool-fs', 'tool-fs-search'])
   assert.ok(
     !winDefs['greatwall-explorer'].plugins.some((p) => p.name === '@deepseek-ai/dsh-compaction-tool-result-pruner'),
     'greatwall-explorer 严禁开启 dsh-compaction-tool-result-pruner',

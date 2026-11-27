@@ -47,7 +47,18 @@ window.__ModuleLoader__.load({
 		  ".gw-pre{margin:0;padding:7px 8px;border-radius:7px;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l4);font-family:var(--dsw-font-mono,ui-monospace,monospace);font-size:11px;white-space:pre-wrap;word-break:break-word;max-height:240px;overflow-y:auto}",
 		  ".gw-select{box-sizing:border-box;width:100%;border:1px solid var(--dsw-alias-border-l3);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border-radius:7px;padding:4px 7px;font-size:11px}",
 		  ".gw-bar{position:relative;height:6px;border-radius:999px;background:var(--dsw-alias-fill-l2,rgba(128,128,128,.2));overflow:hidden}",
-		  ".gw-bar-fill{height:100%;border-radius:999px;background:#2563eb;transition:width .2s ease}"
+		  ".gw-bar-fill{height:100%;border-radius:999px;background:#2563eb;transition:width .2s ease}",
+		  ".gw-tree-q{border:1px solid var(--dsw-alias-border-l4);border-radius:8px;padding:7px 8px;background:var(--dsw-alias-bg-layer-1);display:flex;flex-direction:column;gap:6px}",
+		  ".gw-tree-fam{border-left:2px solid var(--dsw-alias-border-l3);padding-left:8px;margin-left:3px;display:flex;flex-direction:column;gap:5px}",
+		  ".gw-tree-node{border:1px solid var(--dsw-alias-border-l4);border-radius:7px;padding:6px 8px;background:var(--dsw-alias-bg-layer-2);display:flex;flex-direction:column;gap:4px}",
+		  ".gw-pulse{display:inline-block;width:7px;height:7px;border-radius:50%;background:#16a34a;margin-right:4px}",
+		  ".gw-summary{font-size:12px;color:var(--dsw-alias-label-primary);white-space:pre-wrap;word-break:break-word}",
+		  ".gw-link-btn{cursor:pointer;border:none;background:transparent;color:#2563eb;padding:0;font-size:11px;text-align:left}",
+		  ".gw-banner{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:5px 10px;font-size:11px;border-bottom:1px solid var(--dsw-alias-border-l4)}",
+		  ".gw-banner-ok{color:#15803d;background:rgba(22,163,74,.08)}",
+		  ".gw-banner-err{color:#dc2626;background:rgba(220,38,38,.08)}",
+		  ".gw-banner-info{color:#2563eb;background:rgba(37,99,235,.06)}",
+		  ".gw-confirm-bar{display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap;padding:6px 10px;font-size:11px;color:#b91c1c;background:rgba(220,38,38,.08);border-bottom:1px solid rgba(220,38,38,.3)}"
 		].join("");
 
 		function mountConsoleStyles() {
@@ -68,9 +79,67 @@ window.__ModuleLoader__.load({
 		function stateBadgeClass(st) {
 		  const s = String(st || "").toUpperCase();
 		  if (s.includes("RUN") || s === "DISPATCHING" || s === "STOPPED_SOLVED" || s === "CLOSED_VERIFIED" || s === "APPROVED_EXECUTED") return "gw-badge gw-b-run";
-		  if (s.includes("PAUSE") || s.includes("HUMAN") || s.includes("PENDING") || s.includes("BLOCKED")) return "gw-badge gw-b-warn";
+		  if (s.includes("PAUSE") || s.includes("HUMAN") || s.includes("PENDING") || s.includes("BLOCKED") || s === "EARLY_HANDOFF_READY") return "gw-badge gw-b-warn";
 		  if (s.includes("ERR") || s.includes("FAIL") || s.includes("REFUTED") || s === "UNHEALTHY") return "gw-badge gw-b-err";
 		  return "gw-badge gw-b-info";
+		}
+
+		function readablePoolState(st) {
+		  const s = String(st || "").toLowerCase();
+		  if (s === "running") return "全面托管中";
+		  if (s === "paused") return "等待人类接管";
+		  if (s === "starting") return "启动中";
+		  if (s === "idle") return "空闲待命";
+		  if (s === "stopped") return "已停止";
+		  if (s === "archived") return "历史归档";
+		  if (s === "error") return "异常停摆";
+		  return s || "未知";
+		}
+
+		function readableStage(st) {
+		  const s = String(st || "").toUpperCase();
+		  if (s === "STAGE1_PARSE0") return "Stage 1 · 立项准备";
+		  if (s === "STAGE2_EVOLVE") return "Stage 2 · 攻坚演化";
+		  if (s === "STAGE3_CONSOLIDATE" || s === "STAGE3_DELIVER") return "Stage 3 · 终稿核验";
+		  if (s === "CLOSED_VERIFIED") return "已验收结题";
+		  return s || "";
+		}
+
+		function readableControlState(st) {
+		  const s = String(st || "").toUpperCase();
+		  if (s === "AUTO_RUNNING") return "自动托管";
+		  if (s === "PAUSE_DRAINING") return "让权停机中";
+		  if (s === "HUMAN_ACTIVE") return "等待人类接管";
+		  if (s === "EARLY_HANDOFF_READY") return "已授权提前交班";
+		  return s || "";
+		}
+
+		function readableDispatchState(st) {
+		  const s = String(st || "").toUpperCase();
+		  if (s === "DISPATCHING") return "攻关中";
+		  if (s === "PAUSED_HUMAN" || s === "PAUSED") return "人工暂停";
+		  if (s === "PAUSED_SATURATED") return "语义饱和待拍板";
+		  if (s === "PAUSED_BLOCKED") return "阻塞/预算挂起";
+		  if (s === "WAITING_HUMAN") return "待人类拍板";
+		  if (s === "STOPPED_SOLVED") return "已通关";
+		  if (s === "CLOSED") return "已结题";
+		  return s || "未知";
+		}
+
+		function readableActionLabel(act) {
+		  const map = {
+		    pause: "全局暂停（全部等待人类接管）",
+		    resume: "恢复全面托管",
+		    human_stop: "人类收工",
+		    pause_node: "暂停接管该分支",
+		    resume_node: "交还托管(SHA对账)",
+		    authorize_early_handoff: "授权提前交班",
+		    set_subproblem_state: "切换子题启停",
+		    set_autonomy_mode: "切换自主档位",
+		    approve_proposal: "审批提案",
+		    open_chief: "唤起科研总控"
+		  };
+		  return map[act] || act;
 		}
 
 		function GreatwallGlyph({ size = 16, className }) {
@@ -128,15 +197,32 @@ window.__ModuleLoader__.load({
 		  return res.json();
 		}
 
-		function openNativeSession(getUiWorkspace, sessionId) {
-		  if (!sessionId) return false;
+		function openNativeSession(getUiWorkspace, sessionId, onFeedback = null) {
+		  if (!sessionId) {
+		    if (typeof onFeedback === "function") onFeedback("未找到目标会话 ID，无法打开对话。");
+		    return false;
+		  }
 		  try {
 		    const uiWs = typeof getUiWorkspace === "function" ? getUiWorkspace() : null;
 		    if (uiWs && typeof uiWs.openSession === "function") {
-		      uiWs.openSession(sessionId);
+		      const ret = uiWs.openSession(sessionId);
+		      if (ret && typeof ret.catch === "function") {
+		        ret.catch((err) => {
+		          if (typeof onFeedback === "function") {
+		            onFeedback(`打开会话 ${sessionId} 失败：${String(err?.message || err)}（请检查左侧归档区或刷新面板）`);
+		          }
+		        });
+		      }
 		      return true;
 		    }
-		  } catch {}
+		    if (typeof onFeedback === "function") {
+		      onFeedback(`当前宿主未暴露 uiWorkspace.openSession，无法直接跳转会话 ${sessionId}。`);
+		    }
+		  } catch (err) {
+		    if (typeof onFeedback === "function") {
+		      onFeedback(`打开会话 ${sessionId} 异常：${String(err?.message || err)}`);
+		    }
+		  }
 		  return false;
 		}
 
@@ -145,11 +231,25 @@ window.__ModuleLoader__.load({
 		function ThreeQuestionsView({ data, busy, onControl, getUiWorkspace }) {
 		  const status = data?.status || {};
 		  const insp = data?.inspector || {};
+		  const poolState = String(status.poolState || "idle").toLowerCase();
+		  const isPoolRunning = poolState === "running";
+		  const isClosed = String(status.stage || "").toUpperCase() === "CLOSED_VERIFIED" || String(status.closureStatus || "").toUpperCase() === "CLOSED_VERIFIED";
+		  const humanStopActive = Boolean(status.humanStopActive);
 		  const rawSubs = insp.subproblem_runtime_state || status.subproblemStates || insp.subproblem_states || [];
 		  const subproblems = Array.isArray(rawSubs) ? rawSubs : Object.values(rawSubs || {});
 		  const proposals = insp.pending_proposals || [];
-		  const l3List = (insp.internal_ledger || []).filter((x) => x.ledger_type === "L3_VERIFIED" && Number(x.is_active) === 1);
+		  const l3List = (insp.internal_ledger || []).filter((x) => x.ledger_type === "L3_VERIFIED" && Number(x.is_active ?? 1) === 1);
 		  const autonomyMode = status.autonomyMode || insp.snapshot?.autonomy_mode || "WAVE_CONFIRM";
+
+		  const emptyProposalHint = isClosed
+		    ? "课题已验收结题，全部成果已冻结交付。"
+		    : (humanStopActive
+		        ? "已触发人类收工，正在推进 Stage 3 终稿打包与核验。"
+		        : (isPoolRunning
+		            ? "当前无待拍板提案，系统正按授权全面托管推进中。"
+		            : (poolState === "paused"
+		                ? "当前无待拍板提案；系统处于「等待人类接管」态，点击顶部「全面托管」恢复推进。"
+		                : `当前无待拍板提案；编排器当前未运行（${typeof readablePoolState === "function" ? readablePoolState(poolState) : poolState}），点击顶部「恢复托管」即可继续推进。`)));
 
 		  return jsxs("div", {
 		    style: { display: "flex", flexDirection: "column", gap: "9px" },
@@ -190,8 +290,16 @@ window.__ModuleLoader__.load({
 		                    jsxs("div", {
 		                      className: "gw-row",
 		                      children: [
-		                        jsxs("strong", { children: [`${s.question_id} · v${s.active_spec_revision || 0}`] }),
-		                        jsx("span", { className: stateBadgeClass(s.dispatch_state), children: s.dispatch_state })
+		                        jsxs("strong", { children: [`${s.question_id} · 口径 v${s.active_spec_revision || 0}`] }),
+		                        jsx("span", {
+		                          className: !isPoolRunning && s.dispatch_state === "DISPATCHING"
+		                            ? (poolState === "paused" ? "gw-badge gw-b-warn" : "gw-badge gw-b-info")
+		                            : stateBadgeClass(s.dispatch_state),
+		                          title: `${s.dispatch_state} (pool=${poolState})`,
+		                          children: !isPoolRunning && s.dispatch_state === "DISPATCHING"
+		                            ? (poolState === "paused" ? "总池已暂停" : "待恢复(未运行)")
+		                            : (typeof readableDispatchState === "function" ? readableDispatchState(s.dispatch_state) : s.dispatch_state)
+		                        })
 		                      ]
 		                    }),
 		                    jsxs("div", {
@@ -230,7 +338,7 @@ window.__ModuleLoader__.load({
 		            ]
 		          }),
 		          proposals.length === 0
-		            ? jsx("div", { className: "gw-muted", children: "当前无待拍板提案，系统正按授权自主推进。" })
+		            ? jsx("div", { className: "gw-muted", children: emptyProposalHint })
 		            : proposals.map((p) =>
 		                jsxs("div", {
 		                  className: "gw-item",
@@ -307,6 +415,9 @@ window.__ModuleLoader__.load({
 		// --- module: client_src/components/LivingSurveyView.js ---
 		/** GreatWall v0.3 子题活体全局总览（<=1500字）、OPEN 悬赏缺口与大外环圆桌视图。 */
 		function LivingSurveyView({ data }) {
+		  const [expandedWaves, setExpandedWaves] = (typeof React !== "undefined" && typeof React.useState === "function")
+		    ? React.useState({})
+		    : [{}, () => {}];
 		  const insp = data?.inspector || {};
 		  const rawSurveys = insp.living_surveys_list || insp.living_surveys || [];
 		  const surveys = Array.isArray(rawSurveys) ? rawSurveys : Object.values(rawSurveys || {});
@@ -387,7 +498,25 @@ window.__ModuleLoader__.load({
 		                        jsx("span", { className: stateBadgeClass(w.status), children: w.status })
 		                      ]
 		                    }),
-		                    w.minutes_md ? jsx("div", { className: "gw-muted", children: String(w.minutes_md).slice(0, 220) }) : null
+		                    w.minutes_md
+		                      ? jsxs("div", {
+		                          children: [
+		                            jsx("div", {
+		                              className: "gw-summary",
+		                              children: expandedWaves[w.conference_id] || String(w.minutes_md).length <= 180
+		                                ? String(w.minutes_md)
+		                                : `${String(w.minutes_md).slice(0, 180)}…`
+		                            }),
+		                            String(w.minutes_md).length > 180
+		                              ? jsx("button", {
+		                                  className: "gw-link-btn",
+		                                  onClick: () => setExpandedWaves((prev) => ({ ...prev, [w.conference_id]: !prev[w.conference_id] })),
+		                                  children: expandedWaves[w.conference_id] ? "收起纪要" : "展开完整纪要"
+		                                })
+		                              : null
+		                          ]
+		                        })
+		                      : null
 		                  ]
 		                }, w.conference_id)
 		              )
@@ -398,92 +527,310 @@ window.__ModuleLoader__.load({
 		}
 
 		// --- module: client_src/components/BranchDetailDrawer.js ---
-		/** GreatWall v0.3 分支详情与 45% 人工接管抽屉（暂停让权 / 交还托管 / 提前交班 / 一键直达会话）。 */
+		/** GreatWall v0.3 轻量谱系树状图（子题 -> 学派 -> 分支代次）与 45% 人工接管面板（裁决四）。 */
+		function formatElapsedLabel(startedAt) {
+		  if (!startedAt) return "";
+		  const ms = Date.now() - Date.parse(startedAt);
+		  if (!Number.isFinite(ms) || ms < 0) return "";
+		  const sec = Math.floor(ms / 1000);
+		  if (sec < 60) return `已跑 ${sec}s`;
+		  const min = Math.floor(sec / 60);
+		  return `已跑 ${min}m${sec % 60}s`;
+		}
+
+		function readableBranchKind(kind) {
+		  const k = String(kind || "PURE").toUpperCase();
+		  if (k === "HUMAN_SEEDED") return "人类种子";
+		  if (k === "SYNTHESIS") return "双供体合体";
+		  if (k === "PROTECTED") return "保护支线";
+		  return "纯血主线";
+		}
+
+		function readableNodeStatus(st) {
+		  const s = String(st || "").toUpperCase();
+		  if (s === "EXPLORING") return "攻关中";
+		  if (s === "ACTIVE_REVISING") return "盲审返工中";
+		  if (s === "AWAITING_TRIAGE") return "待分诊";
+		  if (s === "PENDING_REVIEW") return "盲审验真中";
+		  if (s === "BLOCKED_L4B") return "缺引理挂起";
+		  if (s === "SEALED") return "已封存";
+		  if (s === "CLOSED") return "已关闭";
+		  return s || "未知";
+		}
+
 		function BranchDetailDrawer({ data, busy, onControl, getUiWorkspace }) {
+		  const [expandedNodes, setExpandedNodes] = React.useState({});
+		  const [showHistorical, setShowHistorical] = React.useState(false);
+		  const [feedback, setFeedback] = React.useState("");
+		  const [confirmEarlyNodeId, setConfirmEarlyNodeId] = React.useState("");
+
+		  const poolState = String(data?.status?.poolState || "idle").toLowerCase();
+		  const isPoolRunning = poolState === "running";
 		  const insp = data?.inspector || {};
+		  const knownSessions = data?.telemetryState?.sessions || null;
 		  const nodes = insp.lineage_nodes || [];
-		  const activeNodes = nodes.filter((n) => ["EXPLORING", "ACTIVE_REVISING", "AWAITING_TRIAGE", "PENDING_REVIEW", "BLOCKED_L4B"].includes(n.node_status));
+		  const families = insp.method_families || [];
+		  const activeSessions = data?.status?.activeSessions || [];
+		  const runningExplorers = data?.status?.runningExplorers || [];
+		  const liveByNode = {};
+		  for (const r of runningExplorers) {
+		    if (r?.nodeId) liveByNode[r.nodeId] = { nodeId: r.nodeId, sessionId: r.sessionId, startedAt: r.startedAt || null };
+		  }
+		  for (const s of activeSessions) {
+		    if (s?.nodeId && (s.role === "explorer" || s.role === "lineage_companion")) {
+		      liveByNode[s.nodeId] = { ...(liveByNode[s.nodeId] || {}), ...s };
+		    }
+		  }
+
+		  const familyNameMap = {};
+		  for (const f of families) {
+		    if (f?.family_id) {
+		      familyNameMap[f.family_id] = String(f.mechanism_signature || f.family_id).slice(0, 42);
+		    }
+		  }
+
+		  const ACTIVE_SET = new Set(["EXPLORING", "ACTIVE_REVISING", "AWAITING_TRIAGE", "PENDING_REVIEW", "BLOCKED_L4B"]);
+		  const visibleNodes = showHistorical ? nodes : nodes.filter((n) => ACTIVE_SET.has(n.node_status));
+
+		  // 按 子题 -> 学派 -> 代次 组织谱系树
+		  const byQuestion = {};
+		  for (const n of visibleNodes) {
+		    const qid = String(n.question_id || "Q1");
+		    const fid = String(n.family_id || "未归类学派");
+		    if (!byQuestion[qid]) byQuestion[qid] = {};
+		    if (!byQuestion[qid][fid]) byQuestion[qid][fid] = [];
+		    byQuestion[qid][fid].push(n);
+		  }
+		  const qKeys = Object.keys(byQuestion).sort();
+
+		  const toggleExpand = (nid) => {
+		    setExpandedNodes((prev) => ({ ...prev, [nid]: !prev[nid] }));
+		  };
 
 		  return jsxs("div", {
 		    style: { display: "flex", flexDirection: "column", gap: "9px" },
 		    children: [
+		      feedback ? jsx("div", { className: "gw-item", style: { borderColor: "rgba(217,119,6,.45)" }, children: feedback }) : null,
 		      jsxs("div", {
 		        className: "gw-card",
 		        children: [
-		          jsx("div", { className: "gw-card-hd", children: `活跃与待处置分支 (${activeNodes.length} / 总计 ${nodes.length} 代)` }),
-		          activeNodes.length === 0
+		          jsxs("div", {
+		            className: "gw-card-hd",
+		            children: [
+		              jsx("span", { children: `谱系树状图 (${visibleNodes.length} / 总计 ${nodes.length} 代)` }),
+		              jsx("button", {
+		                className: "gw-btn",
+		                onClick: () => setShowHistorical((v) => !v),
+		                children: showHistorical ? "仅看活跃分支" : "展开历史封存代"
+		              })
+		            ]
+		          }),
+		          qKeys.length === 0
 		            ? jsx("div", { className: "gw-muted", children: "当前无在研或待处置分支节点。" })
-		            : activeNodes.map((n) => {
-		                const win = Math.max(1, Number(n.effective_context_window || 500000));
-		                const pct = Math.min(100, Math.round((Number(n.pressure_tokens || 0) / win) * 100));
-		                const ctrlSt = String(n.control_state || "AUTO_RUNNING");
-		                const canIntervene = n.node_status === "EXPLORING" || n.node_status === "ACTIVE_REVISING";
-		                const expSid = `gw-exp-${n.node_id}`;
-		                const compSid = n.companion_session_id || `gw-comp-${n.node_id}`;
-
+		            : qKeys.map((qid) => {
+		                const famMap = byQuestion[qid];
+		                const famKeys = Object.keys(famMap).sort();
 		                return jsxs("div", {
-		                  className: "gw-item",
+		                  className: "gw-tree-q",
 		                  children: [
 		                    jsxs("div", {
 		                      className: "gw-row",
 		                      children: [
-		                        jsx("strong", { className: "gw-mono", children: `${n.question_id} · ${n.node_id} (G${n.generation || 1})` }),
-		                        jsxs("div", {
-		                          className: "gw-actions",
-		                          children: [
-		                            jsx("span", { className: stateBadgeClass(n.node_status), children: n.node_status }),
-		                            ctrlSt !== "AUTO_RUNNING" ? jsx("span", { className: "gw-badge gw-b-warn", children: ctrlSt }) : null
-		                          ]
-		                        })
+		                        jsx("strong", { children: `子题 ${qid}` }),
+		                        jsx("span", { className: "gw-muted", children: `${famKeys.length} 个方法学派` })
 		                      ]
 		                    }),
-		                    jsx("div", { className: "gw-muted", children: `${n.family_id || "未归类"} · ${n.branch_kind || "PURE"} · 保护期 ${n.protection_generations_left ?? 0} 代 · 水位 ${pct}%` }),
-		                    jsx("div", {
-		                      className: "gw-bar",
-		                      children: jsx("div", { className: "gw-bar-fill", style: { width: `${pct}%` } })
-		                    }),
-		                    n.mechanism_summary ? jsx("div", { children: n.mechanism_summary }) : null,
-		                    jsxs("div", {
-		                      className: "gw-actions",
-		                      children: [
-		                        jsx("button", {
-		                          className: "gw-btn",
-		                          onClick: () => openNativeSession(getUiWorkspace, expSid),
-		                          children: "打开探索对话"
-		                        }),
-		                        jsx("button", {
-		                          className: "gw-btn",
-		                          onClick: () => openNativeSession(getUiWorkspace, compSid),
-		                          children: "打开伴随对话"
-		                        }),
-		                        canIntervene && ctrlSt === "AUTO_RUNNING"
-		                          ? jsx("button", {
-		                              className: "gw-btn gw-btn-pri",
-		                              disabled: busy,
-		                              onClick: () => onControl("pause_node", { node_id: n.node_id, reason: "HUMAN_TAKEOVER_45PCT" }),
-		                              children: "暂停接管"
-		                            })
-		                          : null,
-		                        canIntervene && (ctrlSt === "PAUSE_DRAINING" || ctrlSt === "HUMAN_ACTIVE")
-		                          ? jsx("button", {
-		                              className: "gw-btn gw-btn-ok",
-		                              disabled: busy,
-		                              onClick: () => onControl("resume_node", { node_id: n.node_id }),
-		                              children: "交还托管(SHA对账)"
-		                            })
-		                          : null,
-		                        canIntervene
-		                          ? jsx("button", {
-		                              className: "gw-btn",
-		                              disabled: busy,
-		                              onClick: () => onControl("authorize_early_handoff", { node_id: n.node_id }),
-		                              children: "授权提前交班"
-		                            })
-		                          : null
-		                      ]
+		                    famKeys.map((fid) => {
+		                      const fNodes = [...famMap[fid]].sort((a, b) => Number(a.generation || 1) - Number(b.generation || 1));
+		                      const famLabel = familyNameMap[fid] || fid;
+		                      return jsxs("div", {
+		                        className: "gw-tree-fam",
+		                        children: [
+		                          jsxs("div", {
+		                            className: "gw-row",
+		                            children: [
+		                              jsx("span", { style: { fontWeight: 600 }, children: `├─ ${famLabel}` }),
+		                              jsx("span", { className: "gw-muted gw-mono", children: fid })
+		                            ]
+		                          }),
+		                          fNodes.map((n) => {
+		                            const win = Math.max(1, Number(n.effective_context_window || 500000));
+		                            const pct = Math.min(100, Math.round((Number(n.pressure_tokens || 0) / win) * 100));
+		                            const ctrlSt = String(n.control_state || "AUTO_RUNNING");
+		                            const canIntervene = n.node_status === "EXPLORING" || n.node_status === "ACTIVE_REVISING";
+		                            const expSid = `gw-exp-${n.node_id}`;
+		                            const compSid = n.companion_session_id || `gw-comp-${n.node_id}`;
+		                            const liveInfo = liveByNode[n.node_id] || null;
+		                            const isTrulyRunning = Boolean(liveInfo && ctrlSt === "AUTO_RUNNING" && poolState === "running");
+		                            const elapsed = isTrulyRunning ? formatElapsedLabel(liveInfo.startedAt) : "";
+		                            const summary = String(n.mechanism_summary || "").trim();
+		                            const isExpanded = Boolean(expandedNodes[n.node_id]);
+		                            const needsToggle = summary.length > 90;
+		                            const displaySummary = needsToggle && !isExpanded ? `${summary.slice(0, 90)}…` : summary;
+		                            const isPausedForHuman = ctrlSt === "PAUSE_DRAINING" || ctrlSt === "HUMAN_ACTIVE";
+
+		                            const expExists = !knownSessions || Boolean(knownSessions[expSid]) || Boolean(liveInfo);
+		                            const compExists = !knownSessions || Boolean(knownSessions[compSid]);
+		                            const badgeStatusKey = isTrulyRunning
+		                              ? "RUNNING"
+		                              : (!isPoolRunning && canIntervene && ctrlSt === "AUTO_RUNNING"
+		                                  ? (poolState === "paused" ? "PAUSED" : "INFO")
+		                                  : n.node_status);
+		                            const badgeLabel = isTrulyRunning
+		                              ? "运行中"
+		                              : (canIntervene && ctrlSt === "AUTO_RUNNING"
+		                                  ? (isPoolRunning
+		                                      ? "排队等槽位"
+		                                      : (poolState === "paused" ? "总池已暂停" : "已停机待续"))
+		                                  : readableNodeStatus(n.node_status));
+
+		                            let obsCount = 0;
+		                            try {
+		                              const arr = Array.isArray(n.bound_obs_ids) ? n.bound_obs_ids : JSON.parse(n.bound_obs_ids_json || "[]");
+		                              obsCount = Array.isArray(arr) ? arr.length : 0;
+		                            } catch {}
+
+		                            return jsxs("div", {
+		                              className: "gw-tree-node",
+		                              children: [
+		                                jsxs("div", {
+		                                  className: "gw-row",
+		                                  children: [
+		                                    jsxs("span", {
+		                                      style: { fontWeight: 600 },
+		                                      title: `节点 ID: ${n.node_id}`,
+		                                      children: [
+		                                        isTrulyRunning ? jsx("span", { className: "gw-pulse", title: "实时运行中" }) : null,
+		                                        `第 ${n.generation || 1} 代 · ${readableBranchKind(n.branch_kind)}`,
+		                                        elapsed ? ` · ${elapsed}` : ""
+		                                      ]
+		                                    }),
+		                                    jsxs("div", {
+		                                      className: "gw-actions",
+		                                      children: [
+		                                        jsx("span", {
+		                                          className: stateBadgeClass(badgeStatusKey),
+		                                          children: badgeLabel
+		                                        }),
+		                                        ctrlSt !== "AUTO_RUNNING"
+		                                          ? jsx("span", { className: stateBadgeClass(ctrlSt), title: ctrlSt, children: readableControlState(ctrlSt) })
+		                                          : null
+		                                      ]
+		                                    })
+		                                  ]
+		                                }),
+		                                jsx("div", {
+		                                  className: "gw-muted",
+		                                  title: `内部节点 ID: ${n.node_id}`,
+		                                  children: `水位 ${pct}% · 收据 ${obsCount} 份 · 保护期 ${n.protection_generations_left ?? 0} 代`
+		                                }),
+		                                jsx("div", {
+		                                  className: "gw-bar",
+		                                  children: jsx("div", { className: "gw-bar-fill", style: { width: `${pct}%` } })
+		                                }),
+		                                summary
+		                                  ? jsxs("div", {
+		                                      children: [
+		                                        jsx("div", { className: "gw-summary", children: displaySummary }),
+		                                        needsToggle
+		                                          ? jsx("button", {
+		                                              className: "gw-link-btn",
+		                                              onClick: () => toggleExpand(n.node_id),
+		                                              children: isExpanded ? "收起完整思路" : "展开完整思路"
+		                                            })
+		                                          : null
+		                                      ]
+		                                    })
+		                                  : null,
+		                                jsxs("div", {
+		                                  className: "gw-actions",
+		                                  children: [
+		                                    jsx("button", {
+		                                      className: "gw-btn",
+		                                      disabled: !expExists,
+		                                      title: expExists ? `打开 ${expSid}` : "该探索会话尚未创建",
+		                                      onClick: () => {
+		                                        setFeedback("");
+		                                        openNativeSession(getUiWorkspace, expSid, setFeedback);
+		                                      },
+		                                      children: "打开探索对话"
+		                                    }),
+		                                    jsx("button", {
+		                                      className: "gw-btn",
+		                                      disabled: !compExists,
+		                                      title: compExists ? `打开 ${compSid}` : "该伴随会话尚未创建",
+		                                      onClick: () => {
+		                                        setFeedback("");
+		                                        openNativeSession(getUiWorkspace, compSid, setFeedback);
+		                                      },
+		                                      children: "打开伴随对话"
+		                                    }),
+		                                    isPoolRunning && canIntervene && ctrlSt === "AUTO_RUNNING"
+		                                      ? jsx("button", {
+		                                          className: "gw-btn gw-btn-pri",
+		                                          disabled: busy,
+		                                          onClick: () => onControl("pause_node", { node_id: n.node_id, reason: "HUMAN_TAKEOVER_45PCT" }),
+		                                          children: "暂停接管"
+		                                        })
+		                                      : null,
+		                                    canIntervene && isPausedForHuman
+		                                      ? jsx("button", {
+		                                          className: "gw-btn gw-btn-ok",
+		                                          disabled: busy,
+		                                          onClick: () => {
+		                                            setConfirmEarlyNodeId("");
+		                                            void onControl("resume_node", { node_id: n.node_id });
+		                                          },
+		                                          children: "交还托管(SHA对账)"
+		                                        })
+		                                      : null,
+		                                    canIntervene && isPausedForHuman
+		                                      ? jsx("button", {
+		                                          className: "gw-btn",
+		                                          disabled: busy,
+		                                          onClick: () => setConfirmEarlyNodeId((cur) => (cur === n.node_id ? "" : n.node_id)),
+		                                          children: "授权提前交班"
+		                                        })
+		                                      : null
+		                                  ]
+		                                }),
+		                                confirmEarlyNodeId === n.node_id && canIntervene && isPausedForHuman
+		                                  ? jsxs("div", {
+		                                      className: "gw-confirm-bar",
+		                                      style: { borderRadius: "6px", border: "1px solid rgba(220,38,38,.3)" },
+		                                      children: [
+		                                        jsx("span", { children: "确认提前结束本代探索并交由伴随封存遗嘱？" }),
+		                                        jsxs("div", {
+		                                          className: "gw-actions",
+		                                          children: [
+		                                            jsx("button", {
+		                                              className: "gw-btn gw-btn-danger",
+		                                              disabled: busy,
+		                                              onClick: () => {
+		                                                setConfirmEarlyNodeId("");
+		                                                void onControl("authorize_early_handoff", { node_id: n.node_id });
+		                                              },
+		                                              children: "确认提前交班"
+		                                            }),
+		                                            jsx("button", {
+		                                              className: "gw-btn",
+		                                              disabled: busy,
+		                                              onClick: () => setConfirmEarlyNodeId(""),
+		                                              children: "取消"
+		                                            })
+		                                          ]
+		                                        })
+		                                      ]
+		                                    })
+		                                  : null
+		                              ]
+		                            }, n.node_id);
+		                          })
+		                        ]
+		                      }, fid);
 		                    })
 		                  ]
-		                }, n.node_id);
+		                }, qid);
 		              })
 		        ]
 		      })
@@ -505,12 +852,41 @@ window.__ModuleLoader__.load({
 		  const [selectedWs, setSelectedWs] = React.useState(() => readPersistedWs());
 		  const [data, setData] = React.useState(null);
 		  const [busy, setBusy] = React.useState(false);
-		  const [banner, setBanner] = React.useState("");
+		  const [banner, setBanner] = React.useState(null);
+		  const [confirmHumanStop, setConfirmHumanStop] = React.useState(false);
+		  const reqSeqRef = React.useRef(0);
+		  const bannerTimerRef = React.useRef(null);
+
+		  const showBanner = React.useCallback((kind, text, autoHideMs = 6000) => {
+		    if (bannerTimerRef.current) {
+		      clearTimeout(bannerTimerRef.current);
+		      bannerTimerRef.current = null;
+		    }
+		    if (!text) {
+		      setBanner(null);
+		      return;
+		    }
+		    setBanner({ kind, text });
+		    if (kind !== "err" && autoHideMs > 0) {
+		      bannerTimerRef.current = setTimeout(() => {
+		        setBanner(null);
+		        bannerTimerRef.current = null;
+		      }, autoHideMs);
+		    }
+		  }, []);
+
+		  React.useEffect(() => () => {
+		    if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
+		  }, []);
 
 		  const refresh = React.useCallback(async (wsOverride) => {
+		    const seq = ++reqSeqRef.current;
 		    try {
 		      const ws = wsOverride !== undefined ? wsOverride : selectedWs;
-		      const res = await fetchGreatwallStatus({ workspaceRoot: ws });
+		      const uiWs = typeof getUiWorkspace === "function" ? getUiWorkspace() : null;
+		      const activeSid = String(uiWs?.activeSessionId || uiWs?.currentSessionId || "");
+		      const res = await fetchGreatwallStatus({ workspaceRoot: ws, sessionId: activeSid });
+		      if (seq !== reqSeqRef.current) return;
 		      if (res && res.ok) {
 		        setData(res);
 		        if (!ws && res.workspaceRoot) {
@@ -519,9 +895,10 @@ window.__ModuleLoader__.load({
 		        }
 		      }
 		    } catch (err) {
-		      setBanner(`刷新失败: ${String(err?.message || err)}`);
+		      if (seq !== reqSeqRef.current) return;
+		      showBanner("err", `刷新失败: ${String(err?.message || err)}`);
 		    }
-		  }, [selectedWs]);
+		  }, [selectedWs, getUiWorkspace, showBanner]);
 
 		  React.useEffect(() => {
 		    void refresh();
@@ -531,27 +908,37 @@ window.__ModuleLoader__.load({
 
 		  const handleControl = async (action, payload = {}) => {
 		    setBusy(true);
-		    setBanner("");
+		    showBanner("info", "", 0);
 		    try {
 		      const ws = data?.workspaceRoot || selectedWs;
 		      const res = await postGreatwallControl(action, { workspaceRoot: ws, ...payload });
+		      const label = readableActionLabel(action);
 		      if (res?.ok === false) {
-		        setBanner(`操作失败 (${action}): ${res.error || "未知错误"}`);
+		        showBanner("err", `${label}失败: ${res.error || "未知错误"}`);
 		      } else if (action === "open_chief" && res?.sessionId) {
-		        openNativeSession(getUiWorkspace, res.sessionId);
-		        setBanner(`已唤醒科研总控会话 ${res.sessionId}`);
+		        const opened = openNativeSession(getUiWorkspace, res.sessionId, (msg) => showBanner("err", msg));
+		        if (opened) showBanner("ok", `已唤醒科研总控会话`);
+		      } else if (action === "pause") {
+		        const cnt = Array.isArray(res?.pausedNodeIds) ? res.pausedNodeIds.length : 0;
+		        showBanner("ok", cnt > 0 ? `已全局暂停，${cnt} 条在跑分支已切入等待人类接管` : "已全局暂停，系统进入等待人类接管态");
+		      } else if (action === "resume") {
+		        const cnt = Array.isArray(res?.resumedNodeIds) ? res.resumedNodeIds.length : 0;
+		        showBanner("ok", cnt > 0 ? `已对 ${cnt} 条接管分支完成 SHA 对账并恢复全面托管` : "已恢复全面托管运行");
 		      } else {
-		        setBanner(`已执行 ${action}`);
+		        showBanner("ok", `已完成：${label}`);
 		      }
 		      await refresh(ws);
 		    } catch (err) {
-		      setBanner(`请求异常: ${String(err?.message || err)}`);
+		      showBanner("err", `请求异常: ${String(err?.message || err)}`);
 		    } finally {
 		      setBusy(false);
 		    }
 		  };
 
 		  const poolState = data?.status?.poolState || "idle";
+		  const stage = data?.status?.stage || "";
+		  const isClosed = stage === "CLOSED_VERIFIED" || data?.status?.closureStatus === "CLOSED_VERIFIED";
+		  const humanStopActive = Boolean(data?.status?.humanStopActive);
 		  const knownWorkspaces = data?.knownWorkspaces || [];
 
 		  return jsxs("div", {
@@ -564,22 +951,62 @@ window.__ModuleLoader__.load({
 		            className: "gw-title-wrap",
 		            children: [
 		              jsx("strong", { children: "GreatWall v0.3" }),
-		              jsx("span", { className: stateBadgeClass(poolState), children: poolState }),
-		              data?.status?.stage ? jsx("span", { className: "gw-badge gw-b-info", children: data.status.stage }) : null
+		              jsx("span", { className: stateBadgeClass(poolState), title: poolState, children: readablePoolState(poolState) }),
+		              stage ? jsx("span", { className: "gw-badge gw-b-info", title: stage, children: readableStage(stage) }) : null
 		            ]
 		          }),
 		          jsxs("div", {
 		            className: "gw-actions",
 		            children: [
-		              poolState === "running"
-		                ? jsx("button", { className: "gw-btn", disabled: busy, onClick: () => handleControl("pause"), children: "暂停" })
-		                : jsx("button", { className: "gw-btn gw-btn-pri", disabled: busy, onClick: () => handleControl("resume"), children: "继续" }),
-		              jsx("button", { className: "gw-btn gw-btn-danger", disabled: busy, onClick: () => handleControl("human_stop", { note: "UI_HUMAN_STOP" }), children: "人类收工" }),
+		              !isClosed
+		                ? (poolState === "running"
+		                    ? jsx("button", { className: "gw-btn", disabled: busy, onClick: () => handleControl("pause"), children: "暂停接管" })
+		                    : jsx("button", {
+		                        className: "gw-btn gw-btn-pri",
+		                        disabled: busy || poolState === "starting",
+		                        onClick: () => handleControl("resume"),
+		                        children: poolState === "paused" ? "全面托管" : "恢复托管"
+		                      }))
+		                : null,
+		              jsx("button", {
+		                className: "gw-btn gw-btn-danger",
+		                disabled: busy || isClosed || humanStopActive,
+		                onClick: () => setConfirmHumanStop((v) => !v),
+		                children: humanStopActive ? "已收工" : "人类收工"
+		              }),
 		              jsx("button", { className: "gw-btn", disabled: busy, onClick: () => void refresh(), children: "刷新" })
 		            ]
 		          })
 		        ]
 		      }),
+		      confirmHumanStop && !isClosed && !humanStopActive
+		        ? jsxs("div", {
+		            className: "gw-confirm-bar",
+		            children: [
+		              jsx("span", { children: "确认全局收工并强制进入 Stage 3 部分结题？（不可撤销）" }),
+		              jsxs("div", {
+		                className: "gw-actions",
+		                children: [
+		                  jsx("button", {
+		                    className: "gw-btn gw-btn-danger",
+		                    disabled: busy,
+		                    onClick: () => {
+		                      setConfirmHumanStop(false);
+		                      void handleControl("human_stop", { note: "UI_HUMAN_STOP" });
+		                    },
+		                    children: "确认收工"
+		                  }),
+		                  jsx("button", {
+		                    className: "gw-btn",
+		                    disabled: busy,
+		                    onClick: () => setConfirmHumanStop(false),
+		                    children: "取消"
+		                  })
+		                ]
+		              })
+		            ]
+		          })
+		        : null,
 		      knownWorkspaces.length > 1
 		        ? jsx("div", {
 		            style: { padding: "6px 10px", borderBottom: "1px solid var(--dsw-alias-border-l4)" },
@@ -588,6 +1015,7 @@ window.__ModuleLoader__.load({
 		              value: data?.workspaceRoot || selectedWs,
 		              onChange: (e) => {
 		                const next = e.target.value;
+		                setConfirmHumanStop(false);
 		                setSelectedWs(next);
 		                persistSelectedWs(next);
 		                void refresh(next);
@@ -596,7 +1024,15 @@ window.__ModuleLoader__.load({
 		            })
 		          })
 		        : null,
-		      banner ? jsx("div", { style: { padding: "4px 10px", fontSize: "11px", color: "#2563eb", borderBottom: "1px solid var(--dsw-alias-border-l4)" }, children: banner }) : null,
+		      banner
+		        ? jsxs("div", {
+		            className: `gw-banner gw-banner-${banner.kind || "info"}`,
+		            children: [
+		              jsx("span", { children: banner.text }),
+		              jsx("button", { className: "gw-link-btn", onClick: () => setBanner(null), children: "关闭" })
+		            ]
+		          })
+		        : null,
 		      jsxs("div", {
 		        className: "gw-tabs",
 		        children: [

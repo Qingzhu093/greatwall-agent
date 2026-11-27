@@ -11,12 +11,41 @@ function GreatwallConsoleBody({ getUiWorkspace }) {
   const [selectedWs, setSelectedWs] = React.useState(() => readPersistedWs());
   const [data, setData] = React.useState(null);
   const [busy, setBusy] = React.useState(false);
-  const [banner, setBanner] = React.useState("");
+  const [banner, setBanner] = React.useState(null);
+  const [confirmHumanStop, setConfirmHumanStop] = React.useState(false);
+  const reqSeqRef = React.useRef(0);
+  const bannerTimerRef = React.useRef(null);
+
+  const showBanner = React.useCallback((kind, text, autoHideMs = 6000) => {
+    if (bannerTimerRef.current) {
+      clearTimeout(bannerTimerRef.current);
+      bannerTimerRef.current = null;
+    }
+    if (!text) {
+      setBanner(null);
+      return;
+    }
+    setBanner({ kind, text });
+    if (kind !== "err" && autoHideMs > 0) {
+      bannerTimerRef.current = setTimeout(() => {
+        setBanner(null);
+        bannerTimerRef.current = null;
+      }, autoHideMs);
+    }
+  }, []);
+
+  React.useEffect(() => () => {
+    if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
+  }, []);
 
   const refresh = React.useCallback(async (wsOverride) => {
+    const seq = ++reqSeqRef.current;
     try {
       const ws = wsOverride !== undefined ? wsOverride : selectedWs;
-      const res = await fetchGreatwallStatus({ workspaceRoot: ws });
+      const uiWs = typeof getUiWorkspace === "function" ? getUiWorkspace() : null;
+      const activeSid = String(uiWs?.activeSessionId || uiWs?.currentSessionId || "");
+      const res = await fetchGreatwallStatus({ workspaceRoot: ws, sessionId: activeSid });
+      if (seq !== reqSeqRef.current) return;
       if (res && res.ok) {
         setData(res);
         if (!ws && res.workspaceRoot) {
@@ -25,9 +54,10 @@ function GreatwallConsoleBody({ getUiWorkspace }) {
         }
       }
     } catch (err) {
-      setBanner(`刷新失败: ${String(err?.message || err)}`);
+      if (seq !== reqSeqRef.current) return;
+      showBanner("err", `刷新失败: ${String(err?.message || err)}`);
     }
-  }, [selectedWs]);
+  }, [selectedWs, getUiWorkspace, showBanner]);
 
   React.useEffect(() => {
     void refresh();
@@ -37,27 +67,37 @@ function GreatwallConsoleBody({ getUiWorkspace }) {
 
   const handleControl = async (action, payload = {}) => {
     setBusy(true);
-    setBanner("");
+    showBanner("info", "", 0);
     try {
       const ws = data?.workspaceRoot || selectedWs;
       const res = await postGreatwallControl(action, { workspaceRoot: ws, ...payload });
+      const label = readableActionLabel(action);
       if (res?.ok === false) {
-        setBanner(`操作失败 (${action}): ${res.error || "未知错误"}`);
+        showBanner("err", `${label}失败: ${res.error || "未知错误"}`);
       } else if (action === "open_chief" && res?.sessionId) {
-        openNativeSession(getUiWorkspace, res.sessionId);
-        setBanner(`已唤醒科研总控会话 ${res.sessionId}`);
+        const opened = openNativeSession(getUiWorkspace, res.sessionId, (msg) => showBanner("err", msg));
+        if (opened) showBanner("ok", `已唤醒科研总控会话`);
+      } else if (action === "pause") {
+        const cnt = Array.isArray(res?.pausedNodeIds) ? res.pausedNodeIds.length : 0;
+        showBanner("ok", cnt > 0 ? `已全局暂停，${cnt} 条在跑分支已切入等待人类接管` : "已全局暂停，系统进入等待人类接管态");
+      } else if (action === "resume") {
+        const cnt = Array.isArray(res?.resumedNodeIds) ? res.resumedNodeIds.length : 0;
+        showBanner("ok", cnt > 0 ? `已对 ${cnt} 条接管分支完成 SHA 对账并恢复全面托管` : "已恢复全面托管运行");
       } else {
-        setBanner(`已执行 ${action}`);
+        showBanner("ok", `已完成：${label}`);
       }
       await refresh(ws);
     } catch (err) {
-      setBanner(`请求异常: ${String(err?.message || err)}`);
+      showBanner("err", `请求异常: ${String(err?.message || err)}`);
     } finally {
       setBusy(false);
     }
   };
 
   const poolState = data?.status?.poolState || "idle";
+  const stage = data?.status?.stage || "";
+  const isClosed = stage === "CLOSED_VERIFIED" || data?.status?.closureStatus === "CLOSED_VERIFIED";
+  const humanStopActive = Boolean(data?.status?.humanStopActive);
   const knownWorkspaces = data?.knownWorkspaces || [];
 
   return jsxs("div", {
@@ -70,22 +110,62 @@ function GreatwallConsoleBody({ getUiWorkspace }) {
             className: "gw-title-wrap",
             children: [
               jsx("strong", { children: "GreatWall v0.3" }),
-              jsx("span", { className: stateBadgeClass(poolState), children: poolState }),
-              data?.status?.stage ? jsx("span", { className: "gw-badge gw-b-info", children: data.status.stage }) : null
+              jsx("span", { className: stateBadgeClass(poolState), title: poolState, children: readablePoolState(poolState) }),
+              stage ? jsx("span", { className: "gw-badge gw-b-info", title: stage, children: readableStage(stage) }) : null
             ]
           }),
           jsxs("div", {
             className: "gw-actions",
             children: [
-              poolState === "running"
-                ? jsx("button", { className: "gw-btn", disabled: busy, onClick: () => handleControl("pause"), children: "暂停" })
-                : jsx("button", { className: "gw-btn gw-btn-pri", disabled: busy, onClick: () => handleControl("resume"), children: "继续" }),
-              jsx("button", { className: "gw-btn gw-btn-danger", disabled: busy, onClick: () => handleControl("human_stop", { note: "UI_HUMAN_STOP" }), children: "人类收工" }),
+              !isClosed
+                ? (poolState === "running"
+                    ? jsx("button", { className: "gw-btn", disabled: busy, onClick: () => handleControl("pause"), children: "暂停接管" })
+                    : jsx("button", {
+                        className: "gw-btn gw-btn-pri",
+                        disabled: busy || poolState === "starting",
+                        onClick: () => handleControl("resume"),
+                        children: poolState === "paused" ? "全面托管" : "恢复托管"
+                      }))
+                : null,
+              jsx("button", {
+                className: "gw-btn gw-btn-danger",
+                disabled: busy || isClosed || humanStopActive,
+                onClick: () => setConfirmHumanStop((v) => !v),
+                children: humanStopActive ? "已收工" : "人类收工"
+              }),
               jsx("button", { className: "gw-btn", disabled: busy, onClick: () => void refresh(), children: "刷新" })
             ]
           })
         ]
       }),
+      confirmHumanStop && !isClosed && !humanStopActive
+        ? jsxs("div", {
+            className: "gw-confirm-bar",
+            children: [
+              jsx("span", { children: "确认全局收工并强制进入 Stage 3 部分结题？（不可撤销）" }),
+              jsxs("div", {
+                className: "gw-actions",
+                children: [
+                  jsx("button", {
+                    className: "gw-btn gw-btn-danger",
+                    disabled: busy,
+                    onClick: () => {
+                      setConfirmHumanStop(false);
+                      void handleControl("human_stop", { note: "UI_HUMAN_STOP" });
+                    },
+                    children: "确认收工"
+                  }),
+                  jsx("button", {
+                    className: "gw-btn",
+                    disabled: busy,
+                    onClick: () => setConfirmHumanStop(false),
+                    children: "取消"
+                  })
+                ]
+              })
+            ]
+          })
+        : null,
       knownWorkspaces.length > 1
         ? jsx("div", {
             style: { padding: "6px 10px", borderBottom: "1px solid var(--dsw-alias-border-l4)" },
@@ -94,6 +174,7 @@ function GreatwallConsoleBody({ getUiWorkspace }) {
               value: data?.workspaceRoot || selectedWs,
               onChange: (e) => {
                 const next = e.target.value;
+                setConfirmHumanStop(false);
                 setSelectedWs(next);
                 persistSelectedWs(next);
                 void refresh(next);
@@ -102,7 +183,15 @@ function GreatwallConsoleBody({ getUiWorkspace }) {
             })
           })
         : null,
-      banner ? jsx("div", { style: { padding: "4px 10px", fontSize: "11px", color: "#2563eb", borderBottom: "1px solid var(--dsw-alias-border-l4)" }, children: banner }) : null,
+      banner
+        ? jsxs("div", {
+            className: `gw-banner gw-banner-${banner.kind || "info"}`,
+            children: [
+              jsx("span", { children: banner.text }),
+              jsx("button", { className: "gw-link-btn", onClick: () => setBanner(null), children: "关闭" })
+            ]
+          })
+        : null,
       jsxs("div", {
         className: "gw-tabs",
         children: [
