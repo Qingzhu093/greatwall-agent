@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS observations (
     spec_sha256 TEXT NOT NULL,
     instrument_sha256 TEXT NOT NULL,
     cache_key TEXT NOT NULL DEFAULT '',
+    frozen_code_snapshot_path TEXT NOT NULL DEFAULT '',
     stage_a_artifact_path TEXT,
     revalidated_from_obs_id TEXT REFERENCES observations(obs_id),
     obs_status TEXT NOT NULL CHECK(obs_status IN (
@@ -143,7 +144,7 @@ CREATE TABLE IF NOT EXISTS lineage_nodes (
     generation INTEGER NOT NULL DEFAULT 1,
     branch_kind TEXT NOT NULL DEFAULT 'PURE'
         CHECK(branch_kind IN ('PURE','PROTECTED','SYNTHESIS','HUMAN_SEEDED')),
-    protection_generations_left INTEGER NOT NULL DEFAULT 2,
+    protection_generations_left INTEGER NOT NULL DEFAULT 1,
     branch_budget_nodes_left INTEGER,
     companion_session_id TEXT NOT NULL DEFAULT '',
     briefing_sealed_at TEXT,
@@ -177,9 +178,14 @@ CREATE TABLE IF NOT EXISTS lineage_nodes (
     candidate_rel_path TEXT,
     bound_obs_ids_json TEXT NOT NULL DEFAULT '[]',
     pressure_tokens INTEGER NOT NULL DEFAULT 0,
-    effective_context_window INTEGER NOT NULL DEFAULT 500000,
+    effective_context_window INTEGER NOT NULL DEFAULT 360000,
     spec_revision INTEGER NOT NULL DEFAULT 0,
     first_reflection_unlocked INTEGER NOT NULL DEFAULT 0,
+    holiday_prompt_id INTEGER,
+    holiday_bet_json TEXT NOT NULL DEFAULT '{}',
+    holiday_completed INTEGER NOT NULL DEFAULT 0,
+    pending_review_feedback_json TEXT NOT NULL DEFAULT '[]',
+    peer_takeaways_json TEXT NOT NULL DEFAULT '[]',
     inplace_repair_count INTEGER NOT NULL DEFAULT 0,
     reopen_condition TEXT,
     last_revision_requests_json TEXT NOT NULL DEFAULT '[]',
@@ -212,7 +218,7 @@ CREATE TABLE IF NOT EXISTS lineage_dead_ends (
 CREATE INDEX IF NOT EXISTS idx_dead_ends_branch ON lineage_dead_ends(branch_id, created_at);
 
 -- ============================================================================
--- 8. 视图 ①：谱系状态看板 (lineage_briefings，<= 2200 字硬限)
+-- 8. 视图 ①：谱系状态看板 (lineage_briefings，<= 5000 字硬限)
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS lineage_briefings (
     briefing_id TEXT PRIMARY KEY,
@@ -223,7 +229,7 @@ CREATE TABLE IF NOT EXISTS lineage_briefings (
     sec3_bottleneck TEXT NOT NULL,
     sec4_dead_ends TEXT NOT NULL,
     sec5_immediate_will TEXT NOT NULL,
-    total_chars INTEGER NOT NULL CHECK(total_chars <= 2200),
+    total_chars INTEGER NOT NULL CHECK(total_chars <= 5000),
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_briefings_node ON lineage_briefings(node_id, created_at);
@@ -286,13 +292,20 @@ CREATE TABLE IF NOT EXISTS review_queue (
     question_id TEXT NOT NULL,
     source_node_id TEXT NOT NULL,
     source_type TEXT NOT NULL CHECK(source_type IN (
-        'LEVEL1_MANUSCRIPT','LEVEL4A_BARRIER','AUDITOR_SALVAGED_LEMMA','LOCAL_LEMMA_SUBMISSION'
+        'LEVEL1_MANUSCRIPT','LEVEL4A_BARRIER','AUDITOR_SALVAGED_LEMMA','LOCAL_LEMMA_SUBMISSION',
+        'SNAPSHOT_MANUSCRIPT','COMPOSITE_FULL_GOAL'
     )),
     proposer_session_id TEXT NOT NULL,
     review_status TEXT NOT NULL DEFAULT 'STAGE1_BLIND' CHECK(review_status IN (
-        'STAGE1_BLIND','STAGE2_UNBLIND','CLOSED_ACCEPTED','CLOSED_REVISE','CLOSED_REFUTED'
+        'STAGE1_BLIND','STAGE2_UNBLIND','CLOSED_ACCEPTED','CLOSED_REVISE','CLOSED_REFUTED','CLOSED_DUPLICATE'
     )),
     manuscript_title TEXT NOT NULL DEFAULT '',
+    non_blocking INTEGER NOT NULL DEFAULT 1,
+    declared_citations_json TEXT NOT NULL DEFAULT '[]',
+    composite_entry_ids_json TEXT NOT NULL DEFAULT '[]',
+    rigor_score INTEGER,
+    novelty_score INTEGER,
+    significance_score INTEGER,
     spec_revision INTEGER NOT NULL DEFAULT 0,
     column_a_snapshot_md TEXT NOT NULL DEFAULT '',
     column_b_snapshot_md TEXT NOT NULL DEFAULT '',
@@ -303,7 +316,7 @@ CREATE TABLE IF NOT EXISTS review_queue (
     stage1_ledger_json TEXT,
     stage1_locked_at TEXT,
     final_locked_at TEXT,
-    final_verdict TEXT CHECK(final_verdict IN ('ACCEPT','ACCEPT_NARROWED','REVISE','REFUTED') OR final_verdict IS NULL),
+    final_verdict TEXT CHECK(final_verdict IN ('ACCEPT','ACCEPT_NARROWED','REVISE','REFUTED','REJECT_DUPLICATE') OR final_verdict IS NULL),
     revision_requests_json TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -321,6 +334,16 @@ CREATE TABLE IF NOT EXISTS internal_research_ledger (
     goal_coverage TEXT CHECK(goal_coverage IN ('FULL_GOAL','PARTIAL_OR_LEMMA','EQUIVALENT_REDUCTION') OR goal_coverage IS NULL),
     publish_tier TEXT NOT NULL DEFAULT 'BASELINE_UPDATE',
     verified_spec_revision INTEGER NOT NULL DEFAULT 0,
+    author_node_id TEXT,
+    author_branch_id TEXT,
+    author_family_id TEXT,
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    cited_entries_json TEXT NOT NULL DEFAULT '[]',
+    rigor_score INTEGER,
+    novelty_score INTEGER,
+    significance_score INTEGER,
+    overall_score REAL,
+    reviewer_comment_md TEXT NOT NULL DEFAULT '',
     l2_category TEXT CHECK(l2_category IN ('REFUTED','UNRESOLVED_OBJECTION') OR l2_category IS NULL),
     title TEXT NOT NULL,
     abstract_md TEXT NOT NULL,
@@ -423,7 +446,9 @@ CREATE TABLE IF NOT EXISTS works_engineering_queue (
     ticket_type TEXT NOT NULL CHECK(ticket_type IN ('INSTRUMENT_ERROR','PAIN_POINT','DUPLICATE_TOOL','EXPLOIT','DISCRIMINATOR')),
     instrument_id TEXT,
     payload_json TEXT NOT NULL DEFAULT '{}',
-    status TEXT NOT NULL DEFAULT 'OPEN' CHECK(status IN ('OPEN','RESOLVED')),
+    status TEXT NOT NULL DEFAULT 'OPEN' CHECK(status IN ('OPEN','RESOLVED','WONTFIX','DUPLICATE')),
+    resolution_note TEXT NOT NULL DEFAULT '',
+    resolved_by_version INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -484,17 +509,25 @@ CREATE TABLE IF NOT EXISTS project_closure_state (
 -- ============================================================================
 -- 既有三条硬触发器
 -- ============================================================================
-CREATE TRIGGER IF NOT EXISTS trg_reviews_lock_stage1
-BEFORE UPDATE OF stage1_ledger_json, stage1_locked_at ON review_queue
+"""
+
+STAGE1_TRIGGER_SQL = """
+DROP TRIGGER IF EXISTS trg_reviews_lock_stage1;
+CREATE TRIGGER trg_reviews_lock_stage1
+BEFORE UPDATE OF stage1_ledger_json, stage1_locked_at, rigor_score ON review_queue
 WHEN OLD.stage1_locked_at IS NOT NULL
   AND (
       COALESCE(NEW.stage1_ledger_json, '') != COALESCE(OLD.stage1_ledger_json, '')
       OR COALESCE(NEW.stage1_locked_at, '') != COALESCE(OLD.stage1_locked_at, '')
+      OR COALESCE(NEW.rigor_score, -1) != COALESCE(OLD.rigor_score, -1)
   )
 BEGIN
     SELECT RAISE(ABORT, 'STAGE1_LEDGER_IMMUTABLE');
 END;
 
+"""
+
+BASE_SCHEMA_SQL += """
 CREATE TRIGGER IF NOT EXISTS trg_l3_require_verified_review
 BEFORE INSERT ON internal_research_ledger
 WHEN NEW.ledger_type = 'L3_VERIFIED'

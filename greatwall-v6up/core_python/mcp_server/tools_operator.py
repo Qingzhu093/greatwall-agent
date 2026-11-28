@@ -106,10 +106,21 @@ def tool_chief_read(conn: sqlite3.Connection, caller_role: str, session_id: str,
             result["data"]["resource"] = resource
             return result
     text = None
-    if len(parts) == 3 and parts[0] == "node" and parts[2] == "transcript":
+    if len(parts) == 1 and parts[0] == "contract":
+        row = conn.execute("SELECT goal_and_completion_md, delivery_spec_md, latest_ruling_summary_md FROM parse0_contract WHERE contract_id='active'").fetchone()
+        if row:
+            text = "\n\n".join(
+                part for part in [
+                    str(row["goal_and_completion_md"] or "").strip(),
+                    str(row["delivery_spec_md"] or "").strip(),
+                    (f"## 最新裁定摘要\n{row['latest_ruling_summary_md']}" if str(row["latest_ruling_summary_md"] or "").strip() else ""),
+                ]
+                if part
+            )
+    elif len(parts) == 3 and parts[0] == "node" and parts[2] == "transcript":
         node = _active_node(conn, parts[1])
         return {"ok": True, "data": {"resource": resource, "session_id": f"gw-exp-{node['node_id']}"}}
-    if len(parts) == 3 and (parts[0], parts[2]) in _TEXT_QUERIES:
+    elif len(parts) == 3 and (parts[0], parts[2]) in _TEXT_QUERIES:
         row = conn.execute(_TEXT_QUERIES[parts[0], parts[2]], (parts[1],)).fetchone()
         text = str(row["content"] or "") if row else None
     elif len(parts) == 3 and parts[0] == "review" and parts[2] == "ledger":
@@ -120,6 +131,10 @@ def tool_chief_read(conn: sqlite3.Connection, caller_role: str, session_id: str,
         row = conn.execute("SELECT * FROM internal_research_ledger WHERE entry_id=?", (parts[1],)).fetchone()
         if row:
             text = json.dumps({k: row[k] for k in row.keys() if k.endswith(("_md","_json"))}, ensure_ascii=False, indent=2)
+        else:
+            ext = conn.execute("SELECT * FROM external_literature_cards WHERE ref_id=?", (parts[1],)).fetchone()
+            if ext:
+                text = json.dumps(dict(ext), ensure_ascii=False, indent=2)
     elif len(parts) == 2 and parts[0] == "receipt":
         row = conn.execute("SELECT * FROM operation_receipts WHERE op_id=?", (parts[1],)).fetchone()
         if row:

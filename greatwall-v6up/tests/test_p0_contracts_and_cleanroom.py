@@ -23,7 +23,7 @@ class TestP0ContractsAndCleanroom(unittest.TestCase):
         cfg_path = ROOT_DIR / "core_python" / "config.json"
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
         clk = cfg["session_context_clock"]
-        self.assertEqual(clk["context_window_cap_tokens"], 500000)
+        self.assertEqual(clk["context_window_cap_tokens"], 360000)
         self.assertEqual(clk["min_evals_before_reflection"], 0)
         self.assertEqual(clk["context_reflect_hint_pct"], 0.37)
         self.assertEqual(clk["context_handoff_pct"], 0.70)
@@ -111,7 +111,7 @@ class TestP0ContractsAndCleanroom(unittest.TestCase):
 
     def test_44_tools_schema_consistency_and_enums(self) -> None:
         defs = mcp.TOOL_DEFINITIONS
-        self.assertEqual(len(defs), 47)
+        self.assertEqual(len(defs), 53)
         def_names = {d["name"] for d in defs}
         self.assertEqual(def_names, set(mcp._TOOL_REGISTRY.keys()))
         self.assertEqual(def_names, set(helpers.ALL_TOOL_NAMES))
@@ -141,7 +141,7 @@ class TestP0ContractsAndCleanroom(unittest.TestCase):
 
     def test_dsh_package_json_v3_files_whitelist(self) -> None:
         pkg = json.loads((ROOT_DIR / "dsh_plugin" / "package.json").read_text(encoding="utf-8"))
-        self.assertTrue(str(pkg["version"]).startswith("0.3.0"), f"unexpected version: {pkg['version']}")
+        self.assertTrue(str(pkg["version"]) == "0.3.2", f"unexpected version: {pkg['version']}")
         files = pkg.get("files", [])
         self.assertIn("lib", files)
         self.assertIn("cordis.patch.yml", files)

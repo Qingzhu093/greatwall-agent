@@ -1,7 +1,7 @@
 {
   "meta": {
-    "title": "长城科研共同体 (GreatWall V6-Up)",
-    "description": "面向长周期自主科学发现的 DSH 0.2.2-rc.5 外部编排插件：双向沙箱隔离、SQLite 单写者科研内核与多角色协同求解。"
+    "title": "长城科研共同体 (GreatWall V6-Up v0.3.2)",
+    "description": "面向长周期自主科学发现的 DSH 0.2.2-rc.5 外部编排插件：双向沙箱隔离、SQLite 单写者 53 窄工具内核、三维反路灯盲审、脉冲同行拼图工作坊与 52% 停码夜科学绿洲。"
   },
   "config": {
     "corePythonRoot": "Python 内核根目录（可选）",
@@ -9,6 +9,9 @@
     "dataDir": "数据持久化目录（可选）",
     "requestTimeoutMs": "常规 RPC 超时（毫秒）",
     "longToolTimeoutMs": "长耗时评测与导出超时（毫秒）",
+    "chiefAnchorHardCapChars": "总控置顶锚点卡字数上限（默认 2400）",
+    "maxEffectiveContextWindow": "单班岗有效上下文窗口上限（tokens，默认 360000）",
+    "contextHolidayPct": "夜科学停码绿洲触发水位（0.42–0.62，默认 0.52）",
     "defaultAgentOptions": "子会话默认模型配置（可选）"
   }
 }

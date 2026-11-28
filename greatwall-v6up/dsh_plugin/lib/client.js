@@ -331,7 +331,10 @@ window.__ModuleLoader__.load({
 		                          : null
 		                      ]
 		                    }),
-		                    s.block_reason_code ? jsx("div", { className: "gw-muted", children: `阻塞原因: ${s.block_reason_code}` }) : null
+		                    s.block_reason_code ? jsx("div", { className: "gw-muted", children: `阻塞原因: ${s.block_reason_code}` }) : null,
+		                    s.streetlight_warning === "STREETLIGHT_WARNING"
+		                      ? jsx("div", { className: "gw-muted", children: "连续两篇边缘注记，等待圆桌核对承重进展" })
+		                      : null
 		                  ]
 		                }, s.question_id)
 		              )
@@ -351,18 +354,48 @@ window.__ModuleLoader__.load({
 		          }),
 		          proposals.length === 0
 		            ? jsx("div", { className: "gw-muted", children: emptyProposalHint })
-		            : proposals.map((p) =>
-		                jsxs("div", {
+		            : proposals.map((p) => {
+		                const actionLabelMap = {
+		                  APPROVE_WAVE_VERDICT: "圆桌波次裁决",
+		                  AMEND_RULING_DRAFT: "改题升版裁定",
+		                  AUTHORIZE_PARTIAL_DELIVERY: "授权部分结题",
+		                  ADVANCE_EPOCH: "推进新纪元归档",
+		                };
+		                const titleZh = actionLabelMap[p.action_type] || p.action_type;
+		                let waveActions = [];
+		                try {
+		                  const parsed = typeof p.payload_json === "string" ? JSON.parse(p.payload_json || "{}") : (p.payload || {});
+		                  if (Array.isArray(parsed?.actions)) waveActions = parsed.actions;
+		                } catch {}
+		                return jsxs("div", {
 		                  className: "gw-item",
 		                  children: [
 		                    jsxs("div", {
 		                      className: "gw-row",
 		                      children: [
-		                        jsx("strong", { className: "gw-mono", children: `${p.action_type} · ${p.target_id}` }),
+		                        jsx("strong", { children: `${titleZh} · ${p.target_id}` }),
 		                        jsx("span", { className: "gw-badge gw-b-warn", children: p.proposal_id })
 		                      ]
 		                    }),
-		                    jsx("div", { children: p.rationale_md || "(无说明)" }),
+		                    waveActions.length > 0
+		                      ? jsx("ul", {
+		                          style: { margin: "4px 0 6px 16px", padding: 0 },
+		                          children: waveActions.map((act, idx) => {
+		                            const targetTag = act.node_id
+		                              ? ` · ${act.node_id}`
+		                              : (act.branch_id
+		                                  ? ` · ${act.branch_id}`
+		                                  : (act.primary_donor_node_id && act.secondary_donor_node_id
+		                                      ? ` · ${act.primary_donor_node_id}+${act.secondary_donor_node_id}`
+		                                      : (act.source_node_id ? ` · ${act.source_node_id}` : "")));
+		                            const detailTxt = act.synthesis_goal_md || act.description || act.gap_directive_md || act.mandate || act.note || act.reason || act.rationale || act.mechanism_signature || "";
+		                            return jsx("li", {
+		                              children: `${act.action}${targetTag}${detailTxt ? `：${String(detailTxt).slice(0, 120)}` : ""}`
+		                            }, `${p.proposal_id}-act-${idx}`);
+		                          })
+		                        })
+		                      : null,
+		                    jsx("div", { className: "gw-muted", children: String(p.rationale_md || "(无说明)").slice(0, 260) }),
 		                    jsxs("div", {
 		                      className: "gw-actions",
 		                      children: [
@@ -381,8 +414,8 @@ window.__ModuleLoader__.load({
 		                      ]
 		                    })
 		                  ]
-		                }, p.proposal_id)
-		              )
+		                }, p.proposal_id);
+		              })
 		        ]
 		      }),
 
@@ -425,7 +458,7 @@ window.__ModuleLoader__.load({
 		}
 
 		// --- module: client_src/components/LivingSurveyView.js ---
-		/** GreatWall v0.3 子题活体全局总览（<=1500字）、OPEN 悬赏缺口与大外环圆桌视图。 */
+		/** 子题活体总览、承重缺口与波次圆桌视图。 */
 		function LivingSurveyView({ data }) {
 		  const [expandedWaves, setExpandedWaves] = (typeof React !== "undefined" && typeof React.useState === "function")
 		    ? React.useState({})
@@ -435,6 +468,7 @@ window.__ModuleLoader__.load({
 		  const surveys = Array.isArray(rawSurveys) ? rawSurveys : Object.values(rawSurveys || {});
 		  const gaps = (insp.open_lemma_gaps || []).filter((g) => g.status === "OPEN");
 		  const waves = insp.wave_conferences || [];
+		  const extCards = insp.external_literature_cards || [];
 
 		  return jsxs("div", {
 		    style: { display: "flex", flexDirection: "column", gap: "9px" },
@@ -442,7 +476,31 @@ window.__ModuleLoader__.load({
 		      jsxs("div", {
 		        className: "gw-card",
 		        children: [
-		          jsx("div", { className: "gw-card-hd", children: `子题全局总览（<=1500 字导览索引，共 ${surveys.length} 份）` }),
+		          jsx("div", { className: "gw-card-hd", children: `左翼外藏文献卡 R###（共 ${extCards.length} 张）` }),
+		          extCards.length === 0
+		            ? jsx("div", { className: "gw-muted", children: "尚无外藏文献卡，Stage 1 对外采编完成后将自动呈现。" })
+		            : extCards.map((c) =>
+		                jsxs("div", {
+		                  className: "gw-item",
+		                  children: [
+		                    jsxs("div", {
+		                      className: "gw-row",
+		                      children: [
+		                        jsx("strong", { className: "gw-mono", children: `${c.ref_id} (${c.question_id})` }),
+		                        c.read_depth ? jsx("span", { className: "gw-badge gw-b-info", children: c.read_depth }) : null
+		                      ]
+		                    }),
+		                    jsx("div", { children: c.title }),
+		                    c.abstract_md ? jsx("div", { className: "gw-muted", children: String(c.abstract_md).slice(0, 220) }) : null
+		                  ]
+		                }, c.ref_id)
+		              )
+		        ]
+		      }),
+		      jsxs("div", {
+		        className: "gw-card",
+		        children: [
+		          jsx("div", { className: "gw-card-hd", children: `右翼内藏 · 子题全局总览（<=4000 字阶段总览，共 ${surveys.length} 份）` }),
 		          surveys.length === 0
 		            ? jsx("div", { className: "gw-muted", children: "尚无已发布的《子题全局总览》，首个波次圆桌完成后将自动呈现。" })
 		            : surveys.map((sv) =>
@@ -452,7 +510,7 @@ window.__ModuleLoader__.load({
 		                    jsxs("div", {
 		                      className: "gw-row",
 		                      children: [
-		                        jsx("strong", { children: `${sv.question_id} · r${sv.revision} (${sv.total_chars}/1500 字)` }),
+		                        jsx("strong", { children: `${sv.question_id} · r${sv.revision} (${sv.total_chars}/4000 字)` }),
 		                        jsx("span", { className: "gw-badge gw-b-info", children: sv.trigger_reason || "WAVE" })
 		                      ]
 		                    }),
@@ -464,7 +522,13 @@ window.__ModuleLoader__.load({
 		                        `[3. 排雷雷达]\n${sv.sec3_avoidance_radar_md || ""}`,
 		                        `[4. 明确缺口]\n${sv.sec4_explicit_gaps_md || ""}`
 		                      ].join("\n\n")
-		                    })
+		                    }),
+		                    sv.marginal_notes_md ? jsxs("details", {
+		                      children: [
+		                        jsx("summary", { children: "边缘研究注记" }),
+		                        jsx("pre", { className: "gw-pre", children: sv.marginal_notes_md })
+		                      ]
+		                    }) : null
 		                  ]
 		                }, sv.survey_id)
 		              )

@@ -144,9 +144,9 @@ test('node takeover waits for RC5 jobs to exit before recording yield', async ()
 })
 
 test('v0.3-5: ChiefRuntime 弹性锚点卡字数公式、高信噪比收件箱与原生 Action Card 注册/降级', async () => {
-  assert.equal(computeChiefAnchorBudgetChars(1), 500)
-  assert.equal(computeChiefAnchorBudgetChars(4), 720)
-  assert.equal(computeChiefAnchorBudgetChars(20), 1500)
+  assert.equal(computeChiefAnchorBudgetChars(1), 1200)
+  assert.equal(computeChiefAnchorBudgetChars(4), 1400)
+  assert.equal(computeChiefAnchorBudgetChars(20), 2400)
   assert.equal(computeChiefAnchorBudgetChars(20, 900), 900)
 
   const anchor = buildChiefAnchorCard({
@@ -253,11 +253,11 @@ test('v0.3-6: WaveConferenceRunner 四拍圆桌（封存伴随零写权唤醒 Ro
 
   const compCalls = trace.filter((x) => x.role === 'lineage_companion')
   assert.equal(compCalls.length, 4, '2 名参会助手 × 2 轮交锋 = 4 次唤醒')
-  for (const c of compCalls) {
+  for (const [idx, c] of compCalls.entries()) {
     assert.deepEqual(c.allowedMcpOverride.sort(), [...SEALED_COMPANION_CONFERENCE_TOOLS].sort(), '封存伴随参会必须物理撤除写工具')
     assert.ok(!c.allowedMcpOverride.includes('submit_node_handoff'))
     assert.ok(!c.allowedMcpOverride.includes('save_lineage_briefing'))
-    assert.equal(c.archiveOnComplete, true, '会后必须归档伴随会话')
+    assert.equal(c.archiveOnComplete, idx >= 2, 'Round 1 保持解档供 Round 2 续谈，Round 2 会后必须归档伴随会话')
   }
   assert.ok(trace.some((x) => x.role === 'conference_chair' && x.sessionId === 'gw-chair-wc_q1_1'))
 

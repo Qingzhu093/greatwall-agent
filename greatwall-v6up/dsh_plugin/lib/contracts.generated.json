@@ -1,0 +1,173 @@
+{
+  "schema_version": "0.3.2",
+  "tool_count": 53,
+  "canonical_roles": [
+    "gw_chief",
+    "supervisory_committee",
+    "works_engineer",
+    "explorer",
+    "lineage_companion",
+    "logistics_coordinator",
+    "external_surveyor",
+    "library_chronicler",
+    "library_verifier",
+    "conference_chair"
+  ],
+  "role_mcp_tools": {
+    "gw_chief": [
+      "chief_get_overview_snapshot",
+      "chief_trace_entity",
+      "chief_read",
+      "chief_operate",
+      "chief_send_branch_note",
+      "chief_seed_branch",
+      "chief_preview_impact",
+      "chief_propose_control_action",
+      "request_internal_survey",
+      "get_internal_survey_report"
+    ],
+    "supervisory_committee": [
+      "get_supervisory_audit_snapshot",
+      "check_stage2_closure_gate",
+      "record_compliance_check",
+      "register_saved_graph_query"
+    ],
+    "works_engineer": [
+      "get_works_engineering_queue",
+      "register_question_instrument",
+      "upgrade_instrument_with_calibration",
+      "recompute_stage_b_only",
+      "update_skill_ledger",
+      "resolve_works_ticket"
+    ],
+    "explorer": [
+      "run_isolated_eval",
+      "get_living_survey",
+      "query_library_catalog",
+      "get_library_entry",
+      "request_literature_survey",
+      "read_lineage_graph",
+      "handback_to_chief",
+      "submit_works_ticket",
+      "request_internal_survey",
+      "get_internal_survey_report",
+      "submit_holiday_bet"
+    ],
+    "lineage_companion": [
+      "get_living_survey",
+      "query_library_catalog",
+      "get_library_entry",
+      "get_companion_context",
+      "save_lineage_briefing",
+      "record_reflection_and_unlock_pull",
+      "submit_node_handoff",
+      "submit_conference_statement",
+      "submit_works_ticket",
+      "request_internal_survey",
+      "get_internal_survey_report"
+    ],
+    "logistics_coordinator": [
+      "get_logistics_dashboard",
+      "register_method_family",
+      "triage_node",
+      "fork_branch",
+      "submit_works_ticket"
+    ],
+    "external_surveyor": [
+      "get_survey_requests",
+      "publish_external_literature_card",
+      "submit_works_ticket"
+    ],
+    "library_chronicler": [
+      "get_chronicler_snapshot",
+      "publish_living_survey",
+      "export_stage3_final_delivery",
+      "submit_works_ticket",
+      "get_internal_survey_task",
+      "publish_internal_survey_report"
+    ],
+    "library_verifier": [
+      "get_blind_manuscript",
+      "submit_stage1_blind_ledger",
+      "get_unblinded_manuscript_and_peers",
+      "submit_stage2_unblind_verdict",
+      "propose_salvaged_lemma",
+      "submit_works_ticket"
+    ],
+    "conference_chair": [
+      "get_conference_dossier",
+      "record_conference_minutes",
+      "submit_conference_verdict",
+      "submit_works_ticket"
+    ]
+  },
+  "readonly_blocked_mcp_tools": [
+    "chief_operate",
+    "chief_propose_control_action",
+    "chief_seed_branch",
+    "chief_send_branch_note",
+    "export_stage3_final_delivery",
+    "fork_branch",
+    "handback_to_chief",
+    "propose_salvaged_lemma",
+    "publish_external_literature_card",
+    "publish_internal_survey_report",
+    "publish_living_survey",
+    "recompute_stage_b_only",
+    "record_compliance_check",
+    "record_conference_minutes",
+    "record_reflection_and_unlock_pull",
+    "register_method_family",
+    "register_question_instrument",
+    "register_saved_graph_query",
+    "request_internal_survey",
+    "request_literature_survey",
+    "resolve_works_ticket",
+    "run_isolated_eval",
+    "save_lineage_briefing",
+    "submit_conference_statement",
+    "submit_conference_verdict",
+    "submit_holiday_bet",
+    "submit_node_handoff",
+    "submit_stage1_blind_ledger",
+    "submit_stage2_unblind_verdict",
+    "submit_works_ticket",
+    "triage_node",
+    "update_skill_ledger",
+    "upgrade_instrument_with_calibration"
+  ],
+  "long_running_mcp_tools": [
+    "export_stage3_final_delivery",
+    "recompute_stage_b_only",
+    "register_question_instrument",
+    "run_isolated_eval",
+    "upgrade_instrument_with_calibration"
+  ],
+  "turn_concluding_tools": [
+    "export_stage3_final_delivery",
+    "publish_internal_survey_report",
+    "publish_living_survey",
+    "record_compliance_check",
+    "record_conference_minutes",
+    "record_reflection_and_unlock_pull",
+    "save_lineage_briefing",
+    "submit_conference_statement",
+    "submit_conference_verdict",
+    "submit_node_handoff",
+    "submit_stage1_blind_ledger",
+    "submit_stage2_unblind_verdict"
+  ],
+  "error_codes": [
+    "ERR_AUTH",
+    "ERR_CONFLICT",
+    "ERR_EXECUTION",
+    "ERR_INVALID_INPUT",
+    "ERR_INVARIANT",
+    "ERR_LOCKED",
+    "ERR_NOT_FOUND",
+    "ERR_STALE_EPOCH",
+    "ERR_STORAGE",
+    "HUMAN_STOP_NOT_RECORDED",
+    "MISSING_MODEL_BINDING"
+  ]
+}

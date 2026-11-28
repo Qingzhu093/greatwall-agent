@@ -1,7 +1,7 @@
 {
   "meta": {
-    "title": "GreatWall Research Collective (V6-Up)",
-    "description": "DSH 0.2.2-rc.5 external orchestrator plugin for long-horizon autonomous scientific discovery with dual-sandbox isolation and a SQLite single-writer kernel."
+    "title": "GreatWall Research Collective (V6-Up v0.3.2)",
+    "description": "DSH 0.2.2-rc.5 external orchestrator plugin for long-horizon autonomous scientific discovery with dual-sandbox isolation, 53 narrow SQLite tools, 3D peer review, pulse peer-jigsaw workshops, and 52% context holiday."
   },
   "config": {
     "corePythonRoot": "Core Python Root (optional)",
@@ -9,6 +9,9 @@
     "dataDir": "Persistent Data Directory (optional)",
     "requestTimeoutMs": "Default RPC Timeout (ms)",
     "longToolTimeoutMs": "Long Evaluation & Export Timeout (ms)",
+    "chiefAnchorHardCapChars": "Chief Pinned Anchor Hard Cap (chars, default 2400)",
+    "maxEffectiveContextWindow": "Max Effective Context Window per Shift (tokens, default 360000)",
+    "contextHolidayPct": "Night-Science Holiday Watermark (0.42–0.62, default 0.52)",
     "defaultAgentOptions": "Default Sub-Agent Model Options (optional)"
   }
 }

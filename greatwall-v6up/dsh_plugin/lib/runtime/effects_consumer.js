@@ -10,7 +10,9 @@
  * @module dsh-greatwall-v6up/runtime/effects_consumer
  */
 
-const SLOW_KINDS = ['DRAIN_AND_STOP_NODE', 'REFRESH_LIVING_SURVEY', 'RUN_WAVE_CONFERENCE']
+const CONTROL_SLOW_KINDS = ['DRAIN_AND_STOP_NODE']
+const WORK_SLOW_KINDS = ['REFRESH_LIVING_SURVEY', 'RUN_WAVE_CONFERENCE', 'RUN_INTERNAL_SURVEY']
+const SLOW_KINDS = [...CONTROL_SLOW_KINDS, ...WORK_SLOW_KINDS]
 const FAST_KINDS = [
   'NOTIFY_CHIEF', 'CANCEL_NODE_SESSION', 'NOTIFY_POLICY_CHANGED',
   'WAKE_BLOCKED_BRANCH', 'SPAWN_PAIR', 'DELIVER_BRANCH_NOTE', 'DELIVER_HANDBACK_RECEIPT',
@@ -37,14 +39,15 @@ export class RuntimeEffectsConsumer {
     this._inflight = new Map()
   }
 
-  /** 拉取并处理一批到期或崩溃过期的 Outbox 副作用。 */
-  async drainOnce({ limit = 12, signal = null } = {}) {
+  /** 拉取并处理一批到期或崩溃过期的 Outbox 副作用。暂停态下仅消费快控制与撤回类副作用，不新拉重型 LLM 任务。 */
+  async drainOnce({ limit = 12, signal = null, paused = false } = {}) {
     if (this._draining || signal?.aborted) return { claimedCount: 0 }
     this._draining = true
     try {
+      const slowKinds = paused ? CONTROL_SLOW_KINDS : SLOW_KINDS
       const [fast, slow] = await Promise.all([
         this._claimLane(FAST_KINDS, limit, signal),
-        this._claimLane(SLOW_KINDS, 6, signal),
+        this._claimLane(slowKinds, 6, signal),
       ])
       return { claimedCount: fast + slow }
     } finally {
@@ -146,4 +149,18 @@ export class RuntimeEffectsConsumer {
       renewTimer = null
     }
   }
+}
+
+export async function runInternalSurvey(spawnAndRunAgent, effect, { survey_req_id: surveyId }, { signal }) {
+  if (effect.survey_status === 'FULFILLED') return
+  const result = await spawnAndRunAgent({
+    role: 'library_chronicler', questionId: effect.target_id,
+    uiLabel: `[院内专题综述] ${effect.target_id} ${surveyId}`,
+    shortTransaction: true, archiveOnComplete: true, signal,
+    prompt: `请调用 get_internal_survey_task(survey_req_id="${surveyId}")，按需用 get_chronicler_snapshot 精读。只综合证据、逐段标明编号、保留适用条件、不替探索者下达路线指令，调用 publish_internal_survey_report 发布 200–4000 字报告。`,
+  })
+  if (!result.turnSignals.some(({ toolName, receipt }) => toolName === 'publish_internal_survey_report' && receipt.ok)) {
+    throw new Error(`专题综述 ${surveyId} 会话结束时未提交报告`)
+  }
+  return { externalHandleId: result.sessionId }
 }

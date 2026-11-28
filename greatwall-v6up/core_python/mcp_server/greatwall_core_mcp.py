@@ -59,6 +59,11 @@ from .tools_explorer import (  # noqa: E402
     tool_request_literature_survey,
     tool_run_isolated_eval,
 )
+from .tools_explorer_eval import tool_submit_holiday_bet
+from .tools_internal_survey import (
+    tool_get_internal_survey_report, tool_get_internal_survey_task,
+    tool_publish_internal_survey_report, tool_request_internal_survey,
+)
 from .tools_library_roles import (  # noqa: E402
     tool_export_stage3_final_delivery,
     tool_get_chronicler_snapshot,
@@ -97,11 +102,12 @@ from .tools_works import (  # noqa: E402
     tool_recompute_stage_b_only,
     tool_register_question_instrument,
     tool_resolve_works_ticket,
+    tool_submit_works_ticket,
     tool_update_skill_ledger,
     tool_upgrade_instrument_with_calibration,
 )
 
-SERVER_INFO = {"name": "greatwall-v6up-core", "version": "0.3.0-alpha.1"}
+SERVER_INFO = {"name": "greatwall-v6up-core", "version": "0.3.2"}
 PROTOCOL_VERSION = "2024-11-05"
 
 # 纯只读且无任何写库副作用的窄工具集合（排除写 FACT_LOG 的 get_library_entry 与挂载沙箱的 get_blind_manuscript / get_unblinded_manuscript_and_peers）
@@ -118,6 +124,8 @@ _PURE_READONLY_TOOLS: frozenset[str] = frozenset(
         "get_logistics_dashboard",
         "get_survey_requests",
         "get_chronicler_snapshot",
+        "get_internal_survey_report",
+        "get_internal_survey_task",
         "get_conference_dossier",
         "get_works_engineering_queue",
         "get_supervisory_audit_snapshot",
@@ -146,12 +154,14 @@ _TOOL_HANDLERS: dict[str, Any] = {
     "chief_propose_control_action": tool_chief_propose_control_action,
     # explorer & 共享 Pull (7)
     "run_isolated_eval": tool_run_isolated_eval,
+    "submit_holiday_bet": tool_submit_holiday_bet,
     "get_living_survey": tool_get_living_survey,
     "query_library_catalog": tool_query_library_catalog,
     "get_library_entry": tool_get_library_entry,
     "request_literature_survey": tool_request_literature_survey,
     "read_lineage_graph": tool_read_lineage_graph,
     "handback_to_chief": tool_handback_to_chief,
+    "submit_works_ticket": tool_submit_works_ticket,
     # lineage_companion (5)
     "get_companion_context": tool_get_companion_context,
     "save_lineage_briefing": tool_save_lineage_briefing,
@@ -168,6 +178,10 @@ _TOOL_HANDLERS: dict[str, Any] = {
     "publish_external_literature_card": tool_publish_external_literature_card,
     # library_chronicler (3)
     "get_chronicler_snapshot": tool_get_chronicler_snapshot,
+    "request_internal_survey": tool_request_internal_survey,
+    "get_internal_survey_report": tool_get_internal_survey_report,
+    "get_internal_survey_task": tool_get_internal_survey_task,
+    "publish_internal_survey_report": tool_publish_internal_survey_report,
     "publish_living_survey": tool_publish_living_survey,
     "export_stage3_final_delivery": tool_export_stage3_final_delivery,
     # conference_chair (3)
@@ -268,7 +282,7 @@ def dispatch_tool_call(
     if not isinstance(meta, dict):
         meta = {}
 
-    for spoof_k in ("workspace_root", "caller_role", "role", "session_id", "human_rpc_id", "human_message", "session_epoch_id"):
+    for spoof_k in ("workspace_root", "caller_role", "role", "session_id", "human_rpc_id", "human_message", "session_epoch_id", "bound_node_id"):
         raw_args.pop(spoof_k, None)
 
     if host_meta is not None:
@@ -289,6 +303,8 @@ def dispatch_tool_call(
             base_kwargs["human_rpc_id"] = str((host_meta or {}).get("human_rpc_id") or "")
         if name == "handback_to_chief":
             base_kwargs["human_message"] = str((host_meta or {}).get("human_message") or "")
+        if name == "get_internal_survey_report":
+            base_kwargs["bound_node_id"] = (host_meta or {}).get("bound_node_id")
         if accepts_cancel:
             base_kwargs["cancel_event"] = cancel_event
 

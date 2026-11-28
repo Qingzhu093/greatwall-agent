@@ -20,13 +20,14 @@ export const HIGH_SIGNAL_CHIEF_EVENTS = Object.freeze(new Set([
   'ALL_BRANCHES_BLOCKED',
   'EXPLORER_HANDBACK',
   'HUMAN_WORKTREE_RECONCILED',
+  'INTERNAL_SURVEY_ARRIVED',
 ]))
 
 /**
- * 根据子题数分配现况卡字数。
+ * 根据子题数分配现况卡字数（充分利用硬上限，避免 4 题时仅 720 字导致尾部高优告警被截断）。
  */
-export function computeChiefAnchorBudgetChars(subproblemCount = 1, hardCapChars = 1500) {
-  return Math.min(hardCapChars, Math.max(500, 240 + 120 * subproblemCount))
+export function computeChiefAnchorBudgetChars(subproblemCount = 1, hardCapChars = 2400) {
+  return Math.min(hardCapChars, Math.max(1200, 600 + 200 * subproblemCount))
 }
 
 /**
@@ -45,10 +46,16 @@ export function buildChiefAnchorCard(snap, { hardCapChars, recentEvents = [], li
     ? snap.active_wave_conferences
     : (Array.isArray(snap.active_conferences) ? snap.active_conferences : [])
 
+  const poolTag = liveRuntime?.poolState ? ` | pool=${liveRuntime.poolState}` : ''
   const lines = [
-    `[全院现况锚点卡] stage=${snap.stage || 'UNKNOWN'} | mode=${snap.autonomy_mode || 'WAVE_CONFIRM'} | spec=v${Number(snap.latest_spec_revision || 0)} | closure=${snap.closure_state?.status || 'OPEN'}`,
+    `[全院现况锚点卡] stage=${snap.stage || 'UNKNOWN'}${poolTag} | mode=${snap.autonomy_mode || 'WAVE_CONFIRM'} | spec=v${Number(snap.latest_spec_revision || 0)} | 外藏=${Number(snap.external_literature_count || 0)}卡 | closure=${snap.closure_state?.status || 'OPEN'}`,
   ]
-  const reconciliation = recentEvents.findLast((event) => event.eventType === 'HUMAN_WORKTREE_RECONCILED')?.payload
+  const nowMs = Date.now()
+  const reconciliation = recentEvents.findLast((event) => {
+    if (event.eventType !== 'HUMAN_WORKTREE_RECONCILED') return false
+    const ts = Date.parse(event.receivedAt || '')
+    return Number.isNaN(ts) || (nowMs - ts) <= 90_000
+  })?.payload
   if (reconciliation) {
     const note = reconciliation.note ? ` · ${reconciliation.note.slice(0, 100)}` : ''
     lines.push(`人工交还 ${reconciliation.node_id} · 工件${reconciliation.artifact_dirty ? '有改动' : '未改动'}${note}`)
@@ -56,20 +63,24 @@ export function buildChiefAnchorCard(snap, { hardCapChars, recentEvents = [], li
   const ledger = snap.operator_slot_ledger
   if (ledger) {
     lines.push(`席位 执行=${ledger.working.length} 收尾占用=${ledger.draining.length} 停驻/人工=${ledger.hibernated_or_human.length}`)
+  }
+  // 高优决策信号前置（待拍板提案 / 活跃圆桌 / 转办 / 最新高信噪比通报），确保绝不被尾部截断
+  if (pendingProps.length > 0) {
+    const pText = pendingProps.slice(0, 6).map((p) => `${p.proposal_id}:${p.action_type}(${p.target_id})`).join(', ')
+    lines.push(`待拍板提案(${pendingProps.length}): ${pText}`)
+  }
+  if (activeWaves.length > 0) {
+    const wText = activeWaves.slice(0, 4).map((w) => `${w.conference_id}:${w.question_id}[${w.status}]`).join(', ')
+    lines.push(`活跃圆桌: ${wText}`)
+  }
+  if (ledger) {
     for (const handback of (snap.handbacks || []).slice(0, 2)) {
       lines.push(`转办 ${handback.handback_id} ${handback.question_id} ${handback.origin_human_mandate ? '有人类授权' : '待人类确认'}`)
     }
-    for (const arrangement of (snap.active_arrangements || []).slice(-3)) {
-      const summary = arrangement.summary_md || Object.entries(arrangement.patch || {}).map(([key, value]) => `${key}=${value}`).join(' ')
-      const until = arrangement.expires_at || (arrangement.ends_on_kind === 'AFTER_INFLIGHT_BATCH' ? '在途批次结束' : '手动撤销')
-      lines.push(`安排 v${arrangement.arrangement_version} ${arrangement.target_id} 至${until} · ${summary.slice(0,80)}`)
-    }
-    for (const op of (snap.operation_receipts || []).slice(0, 2)) {
-      lines.push(`回执 ${op.op_id} ${op.status}`)
-    }
   }
-  if (snap.pinned_notes?.length) {
-    lines.push(...snap.pinned_notes.map((note) => `置顶 ${note.question_id}: ${note.content_md}`))
+  if (Array.isArray(recentEvents) && recentEvents.length > 0) {
+    const eText = recentEvents.slice(-4).map((e) => `${e.eventType}(${e.payload?.question_id || e.payload?.proposal_id || e.payload?.node_id || e.payload?.survey_req_id || ''})`).join('; ')
+    lines.push(`最新高信噪比通报(${recentEvents.length}): ${eText}`)
   }
   const runningExps = Array.isArray(liveRuntime?.runningExplorers) ? liveRuntime.runningExplorers : []
   const runningGovs = Array.isArray(liveRuntime?.runningGovernanceTasks) ? liveRuntime.runningGovernanceTasks : []
@@ -90,17 +101,18 @@ export function buildChiefAnchorCard(snap, { hardCapChars, recentEvents = [], li
       `- ${s.question_id}: ${s.dispatch_state}${s.dispatch_policy ? '/' + s.dispatch_policy : ''}(v${Number(s.active_spec_revision || 0)}) ${baseTxt} ${solved} W${Number(s.completed_waves || 0)}${blk}`,
     )
   }
-  if (pendingProps.length > 0) {
-    const pText = pendingProps.slice(0, 6).map((p) => `${p.proposal_id}:${p.action_type}(${p.target_id})`).join(', ')
-    lines.push(`待拍板提案(${pendingProps.length}): ${pText}`)
+  if (ledger) {
+    for (const arrangement of (snap.active_arrangements || []).slice(-3)) {
+      const summary = arrangement.summary_md || Object.entries(arrangement.patch || {}).map(([key, value]) => `${key}=${value}`).join(' ')
+      const until = arrangement.expires_at || (arrangement.ends_on_kind === 'AFTER_INFLIGHT_BATCH' ? '在途批次结束' : '手动撤销')
+      lines.push(`安排 v${arrangement.arrangement_version} ${arrangement.target_id} 至${until} · ${summary.slice(0, 80)}`)
+    }
+    for (const op of (snap.operation_receipts || []).slice(0, 2)) {
+      lines.push(`回执 ${op.op_id} ${op.status}`)
+    }
   }
-  if (activeWaves.length > 0) {
-    const wText = activeWaves.slice(0, 4).map((w) => `${w.conference_id}:${w.question_id}[${w.status}]`).join(', ')
-    lines.push(`活跃圆桌: ${wText}`)
-  }
-  if (Array.isArray(recentEvents) && recentEvents.length > 0) {
-    const eText = recentEvents.slice(-4).map((e) => `${e.eventType}(${e.payload?.question_id || e.payload?.proposal_id || e.payload?.node_id || ''})`).join('; ')
-    lines.push(`最新高信噪比通报(${recentEvents.length}): ${eText}`)
+  if (snap.pinned_notes?.length) {
+    lines.push(...snap.pinned_notes.map((note) => `置顶 ${note.question_id}: ${note.content_md}`))
   }
   const full = lines.join('\n')
   return full.length <= maxChars ? full : `${full.slice(0, Math.max(0, maxChars - 1))}…`

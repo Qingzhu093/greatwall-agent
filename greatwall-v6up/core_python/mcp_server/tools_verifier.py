@@ -11,6 +11,7 @@ v0.3 核心升级：
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from pathlib import Path
@@ -46,8 +47,15 @@ from .mcp_core_helpers import (
 from .tools_verifier_helpers import (
     apply_revise_or_exhaust as _apply_revise_or_exhaust,
     archive_to_l2_and_seal as _archive_to_l2_and_seal,
+    build_peer_calibration_pack,
+    composite_entries,
     enqueue_exploit_ticket_if_present,
     fulfill_open_gaps_and_wake_branches,
+    record_publication_citations,
+    require_unclosed_stage2,
+    review_author,
+    validate_library_citations,
+    validate_review_score,
     is_local_lemma_review,
     require_non_self_review as _require_non_self_review,
 )
@@ -75,7 +83,7 @@ def tool_get_blind_manuscript(
     if obs_ids:
         ph = ",".join("?" for _ in obs_ids)
         for o in conn.execute(
-            f"SELECT obs_id, instrument_id, instrument_version, tier, obs_status, tracks_json, details_text FROM observations WHERE obs_id IN ({ph})",
+            f"SELECT obs_id, instrument_id, instrument_version, tier, obs_status, tracks_json, details_text, frozen_code_snapshot_path FROM observations WHERE obs_id IN ({ph})",
             tuple(obs_ids),
         ).fetchall():
             obs_list.append(
@@ -87,6 +95,7 @@ def tool_get_blind_manuscript(
                     "obs_status": str(o["obs_status"]),
                     "tracks": json.loads(o["tracks_json"] or "{}"),
                     "details": str(o["details_text"] or ""),
+                    "code_snapshot_rel_path": f"obs_snapshots/{o['obs_id']}" if o["frozen_code_snapshot_path"] else None,
                 }
             )
 
@@ -122,6 +131,7 @@ def tool_submit_stage1_blind_ledger(
     question_id: str,
     ledger_items: list[dict[str, Any]],
     stage1_verdict: str,
+    rigor_score: int,
     revision_or_refutation_reason: str | None = None,
     exact_refuted_scope_md: str | None = None,
     exploit_ticket_payload: dict[str, Any] | None = None,
@@ -148,17 +158,22 @@ def tool_submit_stage1_blind_ledger(
         raise FailClosedError(ERR_INVALID_INPUT, f"stage1_verdict 仅允许 {sorted(ALLOWED_STAGE1_VERDICTS)}，实收 {stage1_verdict!r}")
 
     now = utc_now_iso()
-    ledger_json = json.dumps(ledger_items, ensure_ascii=False)
+    validate_review_score("rigor_score", rigor_score)
+    if sv in ("PASS", "PARTIAL_PASS") and rigor_score < 7:
+        raise FailClosedError(ERR_INVALID_INPUT, f"{sv} 要求 rigor_score >= 7")
+    if sv == "PASS" and any(item.get("is_verified") is False for item in ledger_items):
+        raise FailClosedError(ERR_INVALID_INPUT, "主声称有未验证证据，局部严密时须用 PARTIAL_PASS，否则退修")
+    ledger_json = json.dumps({"stage1_verdict": sv, "ledger_items": ledger_items}, ensure_ascii=False)
 
     if sv in ("PASS", "PARTIAL_PASS"):
         with rw_immediate_tx(conn):
             conn.execute(
                 """
                 UPDATE review_queue
-                SET stage1_ledger_json = ?, stage1_locked_at = ?, review_status = 'STAGE2_UNBLIND', updated_at = ?
+                SET stage1_ledger_json = ?, stage1_locked_at = ?, rigor_score = ?, review_status = 'STAGE2_UNBLIND', updated_at = ?
                 WHERE review_id = ?
                 """,
-                (ledger_json, now, now, review_id),
+                (ledger_json, now, rigor_score, now, review_id),
             )
             exploit_tid = enqueue_exploit_ticket_if_present(
                 conn, question_id=question_id, review_id=review_id, exploit_ticket_payload=exploit_ticket_payload, now=now
@@ -173,7 +188,7 @@ def tool_submit_stage1_blind_ledger(
             tool_name="submit_stage1_blind_ledger",
             question_id=question_id,
             next_step_guidance=msg,
-            data={"review_id": review_id, "stage1_verdict": sv, "review_status": "STAGE2_UNBLIND", "exploit_ticket_id": exploit_tid},
+            data={"review_id": review_id, "stage1_verdict": sv, "rigor_score": rigor_score, "review_status": "STAGE2_UNBLIND", "exploit_ticket_id": exploit_tid},
         )
 
     if sv == "REVISE":
@@ -182,8 +197,8 @@ def tool_submit_stage1_blind_ledger(
             raise FailClosedError(ERR_INVALID_INPUT, "Stage 1 判 REVISE 必须提供具体可操作的 revision_or_refutation_reason")
         with rw_immediate_tx(conn):
             conn.execute(
-                "UPDATE review_queue SET stage1_ledger_json = ?, stage1_locked_at = ?, updated_at = ? WHERE review_id = ?",
-                (ledger_json, now, now, review_id),
+                "UPDATE review_queue SET stage1_ledger_json = ?, stage1_locked_at = ?, rigor_score = ?, updated_at = ? WHERE review_id = ?",
+                (ledger_json, now, rigor_score, now, review_id),
             )
             r_info = _apply_revise_or_exhaust(conn, rev=rev, revision_items=[reason], reason_text=reason, now=now)
             exploit_tid = enqueue_exploit_ticket_if_present(
@@ -214,11 +229,11 @@ def tool_submit_stage1_blind_ledger(
         conn.execute(
             """
             UPDATE review_queue
-            SET stage1_ledger_json = ?, stage1_locked_at = ?, final_locked_at = ?,
+            SET stage1_ledger_json = ?, stage1_locked_at = ?, rigor_score = ?, final_locked_at = ?,
                 review_status = 'CLOSED_REFUTED', final_verdict = 'REFUTED', updated_at = ?
             WHERE review_id = ?
             """,
-            (ledger_json, now, now, now, review_id),
+            (ledger_json, now, rigor_score, now, now, review_id),
         )
         l2_id = _archive_to_l2_and_seal(
             conn,
@@ -229,6 +244,7 @@ def tool_submit_stage1_blind_ledger(
             refuted_scope=scope_ref,
             now=now,
             seal_source_node=not is_local_lemma_review(rev),
+            rigor_score=rigor_score,
         )
         exploit_tid = enqueue_exploit_ticket_if_present(
             conn, question_id=question_id, review_id=review_id, exploit_ticket_payload=exploit_ticket_payload, now=now
@@ -321,7 +337,7 @@ def tool_get_unblinded_manuscript_and_peers(
     open_gaps = [
         dict(r)
         for r in conn.execute(
-            "SELECT gap_id, blocked_node_id, formal_statement_md, verification_spec_md FROM open_lemma_gaps WHERE question_id = ? AND status = 'OPEN' ORDER BY created_at ASC",
+            "SELECT gap_id, blocked_node_id, formal_statement_md, verification_spec_md FROM open_lemma_gaps WHERE question_id = ? AND status = 'OPEN' AND gap_tier = 'LOAD_BEARING' ORDER BY created_at ASC",
             (qid,),
         ).fetchall()
     ]
@@ -353,6 +369,10 @@ def tool_get_unblinded_manuscript_and_peers(
     rev_spec = int(rev["spec_revision"] or 0)
     spec_outdated = rev_spec < active_spec_rev
 
+    ledger = json.loads(rev["stage1_ledger_json"] or "[]")
+    ledger_items = ledger["ledger_items"] if isinstance(ledger, dict) else ledger
+    composite = composite_entries(conn, rev) if rev["source_type"] == "COMPOSITE_FULL_GOAL" else []
+
     return build_tool_receipt(
         conn=conn,
         tool_name="get_unblinded_manuscript_and_peers",
@@ -371,7 +391,11 @@ def tool_get_unblinded_manuscript_and_peers(
             "spec_revision_outdated": spec_outdated,
             "latest_ruling_summary_md": latest_ruling_summary,
             "column_b_snapshot_md": str(rev["column_b_snapshot_md"]),
-            "stage1_ledger": json.loads(rev["stage1_ledger_json"] or "[]"),
+            "stage1_ledger": ledger_items,
+            "rigor_score": rev["rigor_score"],
+            "declared_citations": json.loads(rev["declared_citations_json"]),
+            "peer_calibration_pack": build_peer_calibration_pack(conn, qid),
+            "composite_entries_full": composite,
             "peer_l3_entries": peer_l3,
             "open_lemma_gaps": open_gaps,
             "peer_in_review": peer_in_review,
@@ -401,6 +425,11 @@ def tool_submit_stage2_unblind_verdict(
     fulfilled_gap_ids: list[str] | None = None,
     exploit_ticket_payload: dict[str, Any] | None = None,
     edge_type_overrides: dict[str, str] | None = None,
+    novelty_score: int | None = None,
+    significance_score: int | None = None,
+    reviewer_comment_md: str = "",
+    tags: list[str] | None = None,
+    confirmed_citations: list[str] | None = None,
 ) -> dict[str, Any]:
     """Stage 2 终判与 Stage 3 不可变冻结目录一步原子终签。"""
     enforce_role_tool_permission(conn, caller_role, "submit_stage2_unblind_verdict", session_id=session_id)
@@ -511,11 +540,43 @@ def tool_submit_stage2_unblind_verdict(
     bound_obs = json.loads(rev["bound_obs_ids_json"] or "[]")
     local_lemma = is_local_lemma_review(rev)
 
+    rigor = rev["rigor_score"]
+    for field, score in (("novelty_score", novelty_score), ("significance_score", significance_score)):
+        if score is not None or (rigor is not None and fv in ("ACCEPT", "ACCEPT_NARROWED", "REJECT_DUPLICATE")):
+            validate_review_score(field, score)
+    composite = rev["source_type"] == "COMPOSITE_FULL_GOAL"
+    reduction_percentages = re.findall(r"(?<![\d.+−-])(\d+(?:\.\d+)?)\s*[%％]", cross_draft_comparison_notes)
+    substantial_reduction = is_equivalent_reduction and any(20 <= float(p) <= 100 for p in reduction_percentages)
+    if novelty_score is not None and novelty_score <= 3 and not substantial_reduction:
+        fv = "REJECT_DUPLICATE"
+    if fv == "REJECT_DUPLICATE":
+        with rw_immediate_tx(conn):
+            require_unclosed_stage2(conn, review_id)
+            conn.execute(
+                """
+                UPDATE review_queue SET review_status = 'CLOSED_DUPLICATE', final_verdict = 'REJECT_DUPLICATE',
+                    final_locked_at = ?, novelty_score = ?, significance_score = ?, updated_at = ?
+                WHERE review_id = ?
+                """,
+                (now, novelty_score, significance_score, now, review_id),
+            )
+            if not local_lemma:
+                conn.execute("UPDATE lineage_nodes SET node_status = 'SEALED', updated_at = ? WHERE node_id = ?",
+                             (now, rev["source_node_id"]))
+        return build_tool_receipt(
+            conn=conn, tool_name="submit_stage2_unblind_verdict", question_id=qid,
+            next_step_guidance="查重退稿，审稿单已结案。",
+            data={"review_id": review_id, "review_status": "CLOSED_DUPLICATE", "final_verdict": fv},
+        )
+
     if fv == "REVISE":
         req_items = [str(x).strip() for x in (revision_requests or []) if str(x).strip()]
         if not req_items:
             raise FailClosedError(ERR_INVALID_INPUT, "Stage 2 判 REVISE 必须提供非空 revision_requests")
         with rw_immediate_tx(conn):
+            require_unclosed_stage2(conn, review_id)
+            conn.execute("UPDATE review_queue SET novelty_score = ?, significance_score = ? WHERE review_id = ?",
+                         (novelty_score, significance_score, review_id))
             r_info = _apply_revise_or_exhaust(conn, rev=rev, revision_items=req_items, reason_text="; ".join(req_items), now=now)
             exploit_tid = enqueue_exploit_ticket_if_present(
                 conn, question_id=qid, review_id=review_id, exploit_ticket_payload=exploit_ticket_payload, now=now
@@ -537,9 +598,11 @@ def tool_submit_stage2_unblind_verdict(
         if not ref_scope:
             raise FailClosedError(ERR_INVALID_INPUT, "Stage 2 判 REFUTED 必须填写 exact_refuted_scope_md")
         with rw_immediate_tx(conn):
+            require_unclosed_stage2(conn, review_id)
             conn.execute(
-                "UPDATE review_queue SET review_status = 'CLOSED_REFUTED', final_verdict = 'REFUTED', final_locked_at = ?, updated_at = ? WHERE review_id = ?",
-                (now, now, review_id),
+                """UPDATE review_queue SET review_status = 'CLOSED_REFUTED', final_verdict = 'REFUTED',
+                       final_locked_at = ?, novelty_score = ?, significance_score = ?, updated_at = ? WHERE review_id = ?""",
+                (now, novelty_score, significance_score, now, review_id),
             )
             l2_id = _archive_to_l2_and_seal(
                 conn,
@@ -550,6 +613,7 @@ def tool_submit_stage2_unblind_verdict(
                 refuted_scope=ref_scope,
                 now=now,
                 seal_source_node=not local_lemma,
+                novelty_score=novelty_score, significance_score=significance_score, reviewer_comment_md=reviewer_comment_md,
             )
             exploit_tid = enqueue_exploit_ticket_if_present(
                 conn, question_id=qid, review_id=review_id, exploit_ticket_payload=exploit_ticket_payload, now=now
@@ -572,6 +636,17 @@ def tool_submit_stage2_unblind_verdict(
         raise FailClosedError(ERR_INVALID_INPUT, f"ACCEPT* 必须提供合法 goal_coverage {sorted(ALLOWED_GOAL_COVERAGES)}")
     if ptier_u not in ALLOWED_PUBLISH_TIERS:
         raise FailClosedError(ERR_INVALID_INPUT, f"非法 publish_tier={publish_tier!r}，仅允许 {sorted(ALLOWED_PUBLISH_TIERS)}")
+    ledger = json.loads(rev["stage1_ledger_json"])
+    if isinstance(ledger, dict) and ledger["stage1_verdict"] == "PARTIAL_PASS" and fv != "ACCEPT_NARROWED":
+        raise FailClosedError(ERR_INVALID_INPUT, "PARTIAL_PASS 须使用 ACCEPT_NARROWED 录用局部结论")
+    if significance_score is not None and significance_score <= 4:
+        ptier_u = "MARGINAL_NOTE"
+    if ptier_u == "BASELINE_UPDATE" and significance_score is not None and significance_score < 7:
+        raise FailClosedError(ERR_INVALID_INPUT, "BASELINE_UPDATE 要求 significance_score >= 7")
+    if composite and (fv != "ACCEPT" or cov_u != "FULL_GOAL" or ptier_u == "MARGINAL_NOTE"):
+        raise FailClosedError(ERR_INVALID_INPUT, "组合完备稿录用须通过完整目标核验（ACCEPT、FULL_GOAL）")
+    overall = round(0.40 * rigor + 0.25 * novelty_score + 0.35 * significance_score, 1) if rigor is not None else None
+
     if (fv == "ACCEPT_NARROWED" or bool(is_equivalent_reduction)) and cov_u == "FULL_GOAL":
         raise FailClosedError(
             ERR_INVALID_INPUT,
@@ -593,6 +668,9 @@ def tool_submit_stage2_unblind_verdict(
     exploit_tid: str | None = None
 
     with rw_immediate_tx(conn):
+        require_unclosed_stage2(conn, review_id)
+        children = composite_entries(conn, rev) if composite else []
+        citations = validate_library_citations(conn, [*(confirmed_citations or []), *(r["entry_id"] for r in children)])
         # 裁决 4：在单写者写锁内部实时校验子题级 active_spec_revision（防并发改题与防跨题连坐！）
         active_spec_rev = get_subproblem_active_spec_revision(conn, qid)
         if rev_spec < active_spec_rev and cov_u == "FULL_GOAL":
@@ -614,8 +692,9 @@ def tool_submit_stage2_unblind_verdict(
                     )
 
         conn.execute(
-            "UPDATE review_queue SET review_status = 'CLOSED_ACCEPTED', final_verdict = ?, final_locked_at = ?, updated_at = ? WHERE review_id = ?",
-            (fv, now, now, review_id),
+            """UPDATE review_queue SET review_status = 'CLOSED_ACCEPTED', final_verdict = ?, final_locked_at = ?,
+                   novelty_score = ?, significance_score = ?, updated_at = ? WHERE review_id = ?""",
+            (fv, now, novelty_score, significance_score, now, review_id),
         )
 
         entry_id = next_prefixed_id(conn, "internal_research_ledger", "entry_id", "L3-")
@@ -625,8 +704,10 @@ def tool_submit_stage2_unblind_verdict(
                 entry_id, question_id, ledger_type, l3_entry_kind, goal_coverage, l2_category,
                 title, abstract_md, exact_verified_scope_md, exact_refuted_scope_md,
                 body_proof_or_code_md, bound_obs_ids_json, verified_review_id,
-                verified_spec_revision, publish_tier, is_active, created_at
-            ) VALUES (?, ?, 'L3_VERIFIED', ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                verified_spec_revision, publish_tier, is_active, created_at,
+                author_node_id, author_branch_id, author_family_id, tags_json, cited_entries_json,
+                rigor_score, novelty_score, significance_score, overall_score, reviewer_comment_md
+            ) VALUES (?, ?, 'L3_VERIFIED', ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 entry_id,
@@ -643,8 +724,13 @@ def tool_submit_stage2_unblind_verdict(
                 rev_spec,
                 ptier_u,
                 now,
+                *review_author(conn, rev),
+                json.dumps(tags or [], ensure_ascii=False), json.dumps(citations, ensure_ascii=False),
+                rigor, novelty_score, significance_score, overall, reviewer_comment_md,
             ),
         )
+
+        record_publication_citations(conn, entry_id, citations, session_id, composite=composite)
 
         # 裁决 3：ACCEPT_NARROWED 同事务追加 1 条 L2_FAILURE_RECORD 忠实记录主命题失灵边界
         if fv == "ACCEPT_NARROWED" and clean_refuted:
@@ -657,11 +743,19 @@ def tool_submit_stage2_unblind_verdict(
                 refuted_scope=clean_refuted,
                 now=now,
                 seal_source_node=False,
+                novelty_score=novelty_score, significance_score=significance_score, reviewer_comment_md=reviewer_comment_md,
             )
 
         if isinstance(edge_type_overrides, dict):
             for ref_dst, new_etype in edge_type_overrides.items():
                 nt = str(new_etype).strip().upper()
+                if ref_dst in citations:
+                    if not composite:
+                        conn.execute(
+                            "UPDATE epistemic_edges SET edge_type = ? WHERE source_id = ? AND target_id = ? AND edge_track = 'CLAIM_DECLARED'",
+                            (nt, entry_id, ref_dst),
+                        )
+                    continue
                 conn.execute(
                     """
                     INSERT INTO epistemic_edges(edge_id, source_id, target_id, edge_track, edge_type, session_id, metadata_json, created_at)
@@ -690,15 +784,16 @@ def tool_submit_stage2_unblind_verdict(
                 """,
                 (entry_id, now, qid),
             )
-        else:
+        elif ptier_u != "MARGINAL_NOTE":
             conn.execute(
                 "UPDATE subproblem_runtime_state SET completed_nodes_since_last_l3 = 0, updated_at = ? WHERE question_id = ?",
                 (now, qid),
             )
 
-        woken_gaps = fulfill_open_gaps_and_wake_branches(
-            conn, question_id=qid, fulfilled_gap_ids=fulfilled_gap_ids, fulfilled_by_l3_id=entry_id, now=now
-        )
+        if ptier_u != "MARGINAL_NOTE":
+            woken_gaps = fulfill_open_gaps_and_wake_branches(
+                conn, question_id=qid, fulfilled_gap_ids=fulfilled_gap_ids, fulfilled_by_l3_id=entry_id, now=now,
+            )
         exploit_tid = enqueue_exploit_ticket_if_present(
             conn, question_id=qid, review_id=review_id, exploit_ticket_payload=exploit_ticket_payload, now=now
         )
@@ -724,6 +819,7 @@ def tool_submit_stage2_unblind_verdict(
             "l3_entry_kind": kind_u,
             "goal_coverage": cov_u,
             "publish_tier": ptier_u,
+            "overall_score": overall,
             "verified_spec_revision": rev_spec,
             "fulfilled_gaps": woken_gaps,
             "exploit_ticket_id": exploit_tid,

@@ -15,6 +15,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .control_plane.operator_policy import active_arrangements, effective_policy
 from .control_plane_service import (
     check_branch_requires_satisfied,
     compute_family_concentration_alerts,
@@ -120,13 +121,31 @@ def tool_get_logistics_dashboard(
             params_q,
         ).fetchall()
     ]
-    subproblem_states = [
-        dict(r)
-        for r in conn.execute(
-            f"SELECT question_id, desired_state, dispatch_state, active_spec_revision, completed_nodes_since_last_conference FROM subproblem_runtime_state {where_q} ORDER BY question_id",
-            params_q,
-        ).fetchall()
-    ]
+    arrs = active_arrangements(conn)
+    active_branch_ids_by_q: dict[str, set[str]] = {}
+    for ab in active_branches:
+        active_branch_ids_by_q.setdefault(str(ab["question_id"]), set()).add(str(ab["branch_id"]))
+
+    subproblem_states = []
+    subproblem_quota_map: dict[str, dict[str, Any]] = {}
+    for r in conn.execute(
+        f"SELECT question_id, desired_state, dispatch_state, active_spec_revision, completed_nodes_since_last_conference, max_active_branches FROM subproblem_runtime_state {where_q} ORDER BY question_id",
+        params_q,
+    ).fetchall():
+        row_d = dict(r)
+        qid_r = str(row_d["question_id"])
+        q_pol = effective_policy(arrs, question_id=qid_r)
+        q_max = int(q_pol.get("max_active_branches", row_d.get("max_active_branches") or 3))
+        q_dp = str(q_pol.get("dispatch_policy", "NORMAL"))
+        act_cnt = len(active_branch_ids_by_q.get(qid_r, set()))
+        avail = max(0, q_max - act_cnt)
+        row_d["max_active_branches"] = q_max
+        row_d["active_branch_count"] = act_cnt
+        row_d["available_branch_slots"] = avail
+        row_d["dispatch_policy"] = q_dp
+        row_d["can_open_new_branch"] = q_dp == "NORMAL" and avail > 0
+        subproblem_states.append(row_d)
+        subproblem_quota_map[qid_r] = row_d
 
     for tn in triage_nodes:
         obs_rows = conn.execute(
@@ -152,14 +171,27 @@ def tool_get_logistics_dashboard(
 
     guidance_parts: list[str] = []
     if conc_alerts:
-        guidance_parts.append(f"发现 {len(conc_alerts)} 条无豁免学派聚拢告警 (>50%)，请执行 fork_branch(fork_mode='orthogonal') 正交分流！")
+        forkable_conc = [a for a in conc_alerts if a.get("can_fork_now", True)]
+        full_conc = [a for a in conc_alerts if not a.get("can_fork_now", True)]
+        if forkable_conc:
+            guidance_parts.append(
+                f"发现 {len(forkable_conc)} 条有可用名额的无豁免学派聚拢告警 (>50%)，请对有空位的子题执行 fork_branch(fork_mode='orthogonal') 正交分流！"
+            )
+        if full_conc:
+            full_desc = [
+                f"{a['question_id']}({a.get('total_active_branches')}/{a.get('max_active_branches')})"
+                for a in full_conc
+            ]
+            guidance_parts.append(
+                f"子题 {', '.join(full_desc)} 存在路线集中告警，但当前分支名额已满或禁新派（available_branch_slots=0），请勿调用 fork_branch 开枝，待现有分支完成或圆桌腾出名额后再分流。"
+            )
     if orphaned_revs:
         guidance_parts.append(
             f"发现 {len(orphaned_revs)} 条孤儿盲审返工单（{[r['review_id'] for r in orphaned_revs]}），请调用 fork_branch(parent_node_id=source_node_id, fork_mode='lateral') 续接！"
         )
     if understaffed_qs:
         guidance_parts.append(
-            f"子题 {[u['question_id'] for u in understaffed_qs]} 存在正交学派断代缺编，请按空闲槽位补齐多路 Worktree！"
+            f"子题 {[u['question_id'] for u in understaffed_qs]} 存在正交学派断代缺编且有可用名额，请按空闲槽位补齐多路 Worktree！"
         )
     if not guidance_parts:
         guidance_parts.append(
@@ -410,7 +442,7 @@ def tool_fork_branch(
     mounted_inputs.extend(sync_public_instruments_and_skills_to_worktree(conn, workspace_root, wt_dir))
 
     cfg = load_runtime_config()
-    default_prot = int(cfg.get("default_protection_generations", 2))
+    default_prot = int(cfg.get("branch_growth_protection_generations", cfg.get("default_protection_generations", 1)))
     now = utc_now_iso()
 
     with rw_immediate_tx(conn):

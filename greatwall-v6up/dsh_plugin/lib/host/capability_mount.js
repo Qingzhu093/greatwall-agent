@@ -58,7 +58,8 @@ export function mountCapabilitiesOnAgentSession(
     ? path.resolve(cwd)
     : hostDeps.workspaceRoot
   const effSandbox = role === 'library_verifier' && sandboxAbsPath ? path.resolve(sandboxAbsPath) : ''
-  hostDeps.setSessionReadonly(agent.id, Boolean(readonly))
+  const sessionKey = agent.session?.id || agent.id
+  hostDeps.setSessionReadonly(sessionKey, Boolean(readonly), 'ARCHIVED')
 
   cleanupFns.push(
     installRoleSandboxGuard(agentCtx, {
@@ -70,7 +71,8 @@ export function mountCapabilitiesOnAgentSession(
       sandboxAbsPath: effSandbox,
       protectedDirs: hostDeps.protectedDirs,
       sharedInputPaths: hostDeps.sharedInputPaths,
-      readonly: () => Boolean(readonly) || hostDeps.isSessionReadonly(agent.id),
+      readonly: () => Boolean(readonly) || hostDeps.isSessionReadonly(sessionKey),
+      readonlyPhase: () => hostDeps.getSessionReadonlyPhase?.(sessionKey),
       bridge: hostDeps.bridge,
     }),
   )
@@ -83,6 +85,7 @@ export function mountCapabilitiesOnAgentSession(
       installLiveClockObservers({
         rootCtx: hostDeps.rootCtx, agentCtx, agent, bridge: hostDeps.bridge, workspaceRoot: hostDeps.workspaceRoot,
         nodeId, role, contextWindowTokens: hostDeps.effectiveContextWindow, onNativeThresholdHit,
+        contextHolidayPct: hostDeps.contextHolidayPct,
       }),
     )
   }
@@ -161,6 +164,9 @@ export function mountCapabilitiesOnAgentSession(
         workspaceRoot: hostDeps.workspaceRoot,
         nodeId,
         contextWindowTokens: hostDeps.effectiveContextWindow,
+        onHolidayCompleted: () => {
+          if (hostDeps.getSessionReadonlyPhase?.(sessionKey) === 'HOLIDAY_52') hostDeps.setSessionReadonly(sessionKey, false)
+        },
         onTurnSignal: (sig) => turnSignals.push(sig),
         sessionEpochId,
         onOperatorReceipt: hostDeps.onOperatorReceipt,

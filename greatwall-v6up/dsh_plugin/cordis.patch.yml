@@ -1,4 +1,4 @@
-# dsh-greatwall-v6up v0.3 Cordis Bundle 声明（DSH 0.2.2-rc.5 唯一权威 Preset 来源）
+# dsh-greatwall-v6up v0.3.2 Cordis Bundle 声明（DSH 0.2.2-rc.5 唯一权威 Preset 来源）
 # - 注册 8 套角色专用 Preset 覆盖全院 10 大角色，物理落实零代码写/零终端/零外网隔离
 # - greatwall-chief 复用根压缩服务，Web Profile 未启用根服务时使用总控专属压缩组
 # - 仅 greatwall-external-surveyor 挂载 @deepseek-ai/dsh-tool-web（唯一联网，物理禁读院内成果）
@@ -49,7 +49,7 @@
       config:
         id: greatwall-explorer
         name: '长城 · 探索者 (Explorer)'
-        description: '隔离分支探索与科研求解预设（无 ptc / 无压缩 / 无 pruner / 无网络）'
+        description: '隔离分支探索与科研求解预设（360k 四段时钟 / 52% 夜科学绿洲 / 无 ptc / 无压缩 / 无 pruner / 无网络）'
         order: 50
         plugins:
           - id: persona
@@ -80,7 +80,7 @@
       config:
         id: greatwall-verifier
         name: '长城 · 隔离沙箱盲审官 (Verifier)'
-        description: '独立空白盲审沙箱跑证与 Stage 3 冻结包终签预设（只读 fs + 平台 Shell，物理禁写/禁 DB/禁外网）'
+        description: '独立空白盲审沙箱跑证、两阶段三维打分（Rigor/Novelty/Significance）与 Stage 3 冻结包终签预设（物理禁写/禁 DB/禁外网）'
         order: 51
         plugins:
           - id: persona
@@ -113,7 +113,7 @@
       config:
         id: greatwall-companion
         name: '长城 · 伴随助手 (Companion)'
-        description: '单节点确定性会话 ID 伴随预设（PRE_SPAWN / 37% 诊断 / 70% 封存交班 / 封存后圆桌只读发言）'
+        description: '单节点确定性会话 ID 伴随预设（PRE_SPAWN 写看板 / 37% 11类元反思 / 70% 非阻塞投稿交班 / 封存后圆桌点对点只读发言）'
         order: 52
         plugins:
           - id: persona
@@ -193,13 +193,13 @@
       config:
         id: greatwall-chronicler
         name: '长城 · 对内综述与终稿官 (Chronicler)'
-        description: '零外网零终端零写盘：专司 <=1500 字子题全局总览与 Stage 3 冻结五件套组装'
+        description: '零外网零终端零写盘：维护核心四栏 <=4000 字、边缘附栏 <=1500 字的子题总览，撰写院内专题综述与终稿'
         order: 55
         plugins:
           - id: persona
             name: '@deepseek-ai/dsh-persona'
             config:
-              prefix: 'You are a GreatWall v0.3 Library Chronicler with zero network and zero write access, maintaining <=1500-char living surveys and Stage 3 final reports.'
+              prefix: 'You are a GreatWall v0.3.2 Library Chronicler with zero network and zero filesystem write access. Maintain living surveys with a 4000-character core and a separate 1500-character marginal section, internal surveys, and Stage 3 final reports.'
               complete: false
               includeRuntimeContext: false
           - id: tool-executor-native

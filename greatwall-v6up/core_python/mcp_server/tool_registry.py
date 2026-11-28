@@ -16,7 +16,7 @@ from .db_schema import (
 )
 from .mcp_schema_docs import enrich_tool_definitions
 
-CONTRACTS_SCHEMA_VERSION = "0.3.0"
+CONTRACTS_SCHEMA_VERSION = "0.3.2"
 
 CANONICAL_ROLES: tuple[str, ...] = (
     "gw_chief",
@@ -125,7 +125,7 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
         name="chief_operate", roles="gw_chief", access="write", needs_workspace_root=True,
         description="人类当面授权或一次性转办授权下，组合执行运行安排和分支动作。返回可持续查询的回执。",
         input_schema=_schema({
-            "operation": {"type": "string", "enum": ["apply_arrangement", "revoke_arrangement", "node_intervene", "family_manage", "approve_wave_verdict", "submit_ticket", "recover_queue", "pin_note"]},
+            "operation": {"type": "string", "enum": ["apply_arrangement", "revoke_arrangement", "node_intervene", "family_manage", "approve_wave_verdict", "open_wave_conference", "submit_ticket", "cancel_ticket", "request_survey", "recover_queue", "pin_note"]},
             "arrangement": {**_ARRANGEMENT_SCHEMA, "type": ["object", "null"]},
             "arrangements": {"type": ["array", "null"], "items": _ARRANGEMENT_SCHEMA},
             "node_action": {"type": ["object", "null"], "properties": {
@@ -137,7 +137,8 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
             "details": {"type": ["object", "null"], "properties": {
                 "arrangement_id": {"type": "string"}, "family_id": {"type": "string"}, "mode": {"type": "string"},
                 "proposal_id": {"type": "string"}, "question_id": {"type": "string"}, "ticket_type": {"type": "string"},
-                "instrument_id": {"type": "string"}, "description": {"type": "string"}, "note_id": {"type": "string"},
+                "ticket_id": {"type": "string"}, "instrument_id": {"type": "string"}, "description": {"type": "string"},
+                "topic_query": {"type": "string"}, "reason": {"type": "string"}, "note_id": {"type": "string"},
                 "content_md": {"type": "string"}, "summary_md": {"type": "string"},
             }},
         }, ["operation"]),
@@ -212,7 +213,7 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
         name="get_living_survey",
         roles=("explorer", "lineage_companion"),
         access="read",
-        description="[explorer(37%+)/lineage_companion(0%+)] 拉取指定子题最新《子题全局总览（<=1500字导览索引）》与高优悬赏缺口摘要。",
+        description="[explorer(37%+)/lineage_companion(0%+)] 拉取指定子题最新《子题全局总览（<=4000字阶段总览索引）》与高优悬赏缺口摘要。",
         input_schema=_schema(
             {
                 "node_id": {"type": "string"},
@@ -302,7 +303,7 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
         roles="lineage_companion",
         access="write",
         concludes_turn=True,
-        description="[lineage_companion] 定额滚动重压缩写入谱系前情提要（总长 <= 2200 字）。",
+        description="[lineage_companion] 定额滚动重压缩写入谱系前情提要（总长 <= 5000 字）。",
         input_schema=_schema(
             {
                 "branch_id": {"type": "string"},
@@ -321,16 +322,16 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
         roles="lineage_companion",
         access="write",
         concludes_turn=True,
-        description="[lineage_companion] 记录 <=2 轮(<=300字/轮) 37% 外部专家问诊并当场解锁 first_reflection_unlocked=1（无 eval_count 门槛）。",
+        description="[lineage_companion] 记录 <=2 轮(<=500字/轮) 37% 外部专家问诊并当场解锁 first_reflection_unlocked=1（无 eval_count 门槛）。",
         input_schema=_schema(
             {
                 "node_id": {"type": "string"},
                 "selected_categories": {"type": "array", "items": {"type": "string"}},
-                "holiday_prompt_id": {"type": "integer"},
+                "holiday_prompt_id": {"type": ["integer", "null"], "default": None},
                 "turns": {"type": "array", "items": {"type": "object"}},
                 "verdict_3state": {"type": "string"},
             },
-            ["node_id", "selected_categories", "holiday_prompt_id", "turns", "verdict_3state"],
+            ["node_id", "selected_categories", "turns", "verdict_3state"],
         ),
     ),
     _spec(
@@ -356,6 +357,27 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
                 "is_empty_crash": {"type": "boolean", "default": False},
                 "tool_pain_point": {"type": ["string", "null"], "default": None},
                 "recommended_triage": {"type": ["object", "null"], "default": None},
+                "holiday_bet_outcome": {
+                    **_schema({"outcome": {"type": "string"}, "note_md": {"type": "string"}}, ["outcome", "note_md"]),
+                    "type": ["object", "null"], "default": None,
+                },
+                "manuscript_submissions": {
+                    "type": ["array", "null"], "default": None,
+                    "items": _schema(
+                        {
+                            "title": {"type": "string"},
+                            "abstract_md": {"type": "string"},
+                            "claim_and_proof_md": {"type": "string"},
+                            "exact_scope_md": {"type": "string"},
+                            "bound_obs_ids": {"type": "array", "items": {"type": "string"}},
+                            "declared_citations": {"type": "array", "items": {"type": "string"}},
+                            "tags": {"type": "array", "items": {"type": "string"}},
+                            "non_blocking": {"type": "boolean", "default": True},
+                        },
+                        ["title", "abstract_md", "claim_and_proof_md", "exact_scope_md",
+                         "bound_obs_ids", "declared_citations", "tags"],
+                    ),
+                },
                 "local_lemma_submissions": {"type": ["array", "null"], "items": {"type": "object"}, "default": None},
             },
             ["node_id", "branch_id", "question_id", "mechanism_summary", "evidence_grade", "column_a_facts_md", "column_b_hypothesis_md", "will_md", "obs_ids", "dead_ends", "is_empty_crash"],
@@ -366,13 +388,15 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
         roles="lineage_companion",
         access="write",
         concludes_turn=True,
-        description="[lineage_companion(封存参会态)] 在宏观大外环圆桌第 1/2 轮提交点对点红蓝交锋发言（已封存节点零档案写权）。",
+        description="[lineage_companion(封存参会态)] 在宏观研讨会上半场第 1 至多轮（上限 4 轮）提交点对点同行协作发言（已封存节点零档案写权）。",
         input_schema=_schema(
             {
                 "conference_id": {"type": "string"},
                 "node_id": {"type": "string"},
                 "round_no": {"type": "integer"},
                 "statement_md": {"type": "string"},
+                "speech_act": {"type": "string", "default": "PROPOSE_AND_SELF_AUDIT"},
+                "unverified_ideas": {"type": "array", "items": {"type": "string"}, "default": []},
                 "target_node_ids": {"type": "array", "items": {"type": "string"}, "default": []},
             },
             ["conference_id", "node_id", "round_no", "statement_md"],
@@ -428,7 +452,7 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
         roles="logistics_coordinator",
         access="write",
         needs_workspace_root=True,
-        description="[logistics_coordinator] 开启新探索分支（默认 2 班岗成长保护期、确定性 requires、WHERE branch_id != :self 查重）。",
+        description="[logistics_coordinator] 开启新探索分支（默认 1 代成长保护期、确定性 requires、WHERE branch_id != :self 查重）。",
         input_schema=_schema(
             {
                 "question_id": {"type": "string"},
@@ -476,7 +500,7 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
         ),
     ),
     # ========================================================================
-    # 6. library_chronicler (3 个，零外网零代码，专司 1500 字总览与 Stage 3 终稿)
+    # 6. library_chronicler (3 个，零外网零代码，专司 4000 字阶段总览与 Stage 3 终稿)
     # ========================================================================
     _spec(
         name="get_chronicler_snapshot",
@@ -496,7 +520,7 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
         roles="library_chronicler",
         access="write",
         concludes_turn=True,
-        description="[library_chronicler] 发布每道子题唯一的《子题全局总览与明确缺口导览》（硬限 <= 1500 字），若绑定圆桌会议则同事务切至 ADJUDICATING。",
+        description="[library_chronicler] 发布每道子题唯一的《子题全局总览与明确缺口导览》（硬限 <= 4000 字），若绑定圆桌会议则同事务切至 ADJUDICATING。",
         input_schema=_schema(
             {
                 "question_id": {"type": "string"},
@@ -504,6 +528,7 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
                 "sec2_l3_lemma_tree_md": {"type": "string"},
                 "sec3_avoidance_radar_md": {"type": "string"},
                 "sec4_explicit_gaps_md": {"type": "string"},
+                "marginal_notes_md": {"type": "string", "default": ""},
                 "conference_id": {"type": ["string", "null"], "default": None},
                 "trigger_reason": {"type": "string", "default": "WAVE_CONFERENCE"},
             },
@@ -565,7 +590,7 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
         access="write",
         needs_workspace_root=True,
         concludes_turn=True,
-        description="[conference_chair] 第 4 拍读取刚刷新的《子题全局总览》后签发 6 类宏观调整单（WAVE_CONFIRM 挂人类审批，AUTOPILOT 低风险直落）。",
+        description="[conference_chair] 第 4 拍读取刚刷新的《子题全局总览》后签发 7 类宏观调整单（WAVE_CONFIRM 挂人类审批，AUTOPILOT 低风险直落）。",
         input_schema=_schema(
             {
                 "conference_id": {"type": "string"},
@@ -598,11 +623,12 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
                 "question_id": {"type": "string"},
                 "ledger_items": {"type": "array", "items": {"type": "object"}},
                 "stage1_verdict": {"type": "string"},
+                "rigor_score": {"type": "integer"},
                 "revision_or_refutation_reason": {"type": ["string", "null"], "default": None},
                 "exact_refuted_scope_md": {"type": ["string", "null"], "default": None},
                 "exploit_ticket_payload": {"type": ["object", "null"], "default": None},
             },
-            ["review_id", "question_id", "ledger_items", "stage1_verdict"],
+            ["review_id", "question_id", "ledger_items", "stage1_verdict", "rigor_score"],
         ),
     ),
     _spec(
@@ -637,6 +663,11 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
                 "fulfilled_gap_ids": {"type": ["array", "null"], "items": {"type": "string"}, "default": None},
                 "exploit_ticket_payload": {"type": ["object", "null"], "default": None},
                 "edge_type_overrides": {"type": ["object", "null"], "default": None},
+                "novelty_score": {"type": ["integer", "null"], "default": None},
+                "significance_score": {"type": ["integer", "null"], "default": None},
+                "reviewer_comment_md": {"type": "string", "default": ""},
+                "tags": {"type": "array", "items": {"type": "string"}, "default": []},
+                "confirmed_citations": {"type": "array", "items": {"type": "string"}, "default": []},
             },
             ["review_id", "final_verdict"],
         ),
@@ -657,6 +688,29 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
                 "bound_obs_ids": {"type": "array", "items": {"type": "string"}, "default": []},
             },
             ["source_node_id", "question_id", "title", "abstract_md", "column_a_self_contained_proof_md", "column_b_scope_notes_md", "bound_obs_ids"],
+        ),
+    ),
+    _spec(
+        name="submit_works_ticket",
+        roles=(
+            "explorer",
+            "lineage_companion",
+            "logistics_coordinator",
+            "library_verifier",
+            "conference_chair",
+            "library_chronicler",
+            "external_surveyor",
+        ),
+        access="write",
+        description="[全院共享] 向科研仪器科（工造司）报修仪器缺陷或提出公共工具需求（内置同键 OPEN 幂等合并、单会话限 2 单与全院队列防洪阀）。",
+        input_schema=_schema(
+            {
+                "question_id": {"type": "string", "default": "ALL"},
+                "ticket_type": {"type": "string", "enum": ["INSTRUMENT_ERROR", "PAIN_POINT", "DUPLICATE_TOOL", "EXPLOIT", "DISCRIMINATOR"]},
+                "description": {"type": "string"},
+                "instrument_id": {"type": ["string", "null"], "default": None},
+            },
+            ["question_id", "ticket_type", "description"],
         ),
     ),
     # ========================================================================
@@ -705,6 +759,8 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
                 "calibration_suite_rel_path": {"type": "string"},
                 "artifact_schema": {"type": ["string", "null"], "default": None},
                 "default_spec": {"type": ["object", "null"], "default": None},
+                "resolved_ticket_ids": {"type": "array", "items": {"type": "string"}, "default": []},
+                "upgrade_summary_md": {"type": "string", "default": ""},
             },
             ["question_id", "instrument_id", "new_instrument_rel_path", "calibration_suite_rel_path"],
         ),
@@ -792,6 +848,72 @@ _RAW_TOOL_SPECS: tuple[dict[str, Any], ...] = (
         input_schema=_schema(
             {"query_name": {"type": "string"}, "description": {"type": "string"}, "sql_select": {"type": "string"}},
             ["query_name", "description", "sql_select"],
+        ),
+    ),
+    _spec(
+        name="request_internal_survey",
+        roles=("explorer", "lineage_companion", "gw_chief"),
+        access="write",
+        description="异步请求零外网院内专题综述，探索者须完成 37% 元反思，每节点最多两次。",
+        input_schema=_schema(
+            {
+                "question_id": {"type": "string"},
+                "query_md": {"type": "string"},
+                "focus_scope": {"type": "string", "default": "QUESTION_ONLY"},
+                "node_id": {"type": ["string", "null"], "default": None},
+            },
+            ["question_id", "query_md"],
+        ),
+    ),
+    _spec(
+        name="get_internal_survey_report",
+        roles=("explorer", "lineage_companion", "gw_chief"),
+        access="read",
+        description="读取院内专题报告及引用，或列出已结案目录，探索者须完成 37% 元反思。",
+        input_schema=_schema(
+            {
+                "survey_req_id": {"type": "string", "default": ""},
+                "question_id": {"type": "string", "default": "ALL"},
+            },
+            [],
+        ),
+    ),
+    _spec(
+        name="get_internal_survey_task",
+        roles="library_chronicler",
+        access="read",
+        description="读取专题原始查询、全馆目录、排雷雷达与有效观测摘要。",
+        input_schema=_schema({"survey_req_id": {"type": "string"}}, ["survey_req_id"]),
+    ),
+    _spec(
+        name="publish_internal_survey_report",
+        roles="library_chronicler",
+        access="write",
+        concludes_turn=True,
+        description="发布 800–4000 字带编号引用的专题综述并通知请求方。",
+        input_schema=_schema(
+            {
+                "survey_req_id": {"type": "string"},
+                "report_md": {"type": "string"},
+                "cited_entry_ids": {"type": "array", "items": {"type": "string"}},
+                "cited_obs_ids": {"type": "array", "items": {"type": "string"}, "default": []},
+            },
+            ["survey_req_id", "report_md", "cited_entry_ids"],
+        ),
+    ),
+    _spec(
+        name="submit_holiday_bet",
+        roles="explorer",
+        access="write",
+        description="52% 夜科学只读绿洲唯一写入入口，登记可证伪赌注并恢复写码和评测。",
+        input_schema=_schema(
+            {
+                "node_id": {"type": "string"},
+                "anomaly_or_analogy_md": {"type": "string"},
+                "testable_hypothesis_md": {"type": "string"},
+                "falsification_experiment_md": {"type": "string"},
+            },
+            ["node_id", "anomaly_or_analogy_md", "testable_hypothesis_md", "falsification_experiment_md"],
         ),
     ),
 )

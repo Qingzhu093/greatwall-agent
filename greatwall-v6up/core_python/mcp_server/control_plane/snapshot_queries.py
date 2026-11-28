@@ -35,7 +35,7 @@ def fetch_l3_counts_by_question(conn: sqlite3.Connection) -> tuple[dict[str, int
     any_counts: dict[str, int] = {}
     for r in conn.execute(
         """
-        SELECT question_id, goal_coverage, verified_spec_revision
+        SELECT question_id, goal_coverage, verified_spec_revision, publish_tier
         FROM internal_research_ledger
         WHERE ledger_type = 'L3_VERIFIED' AND is_active = 1
         """
@@ -43,7 +43,7 @@ def fetch_l3_counts_by_question(conn: sqlite3.Connection) -> tuple[dict[str, int
         q = str(r["question_id"])
         any_counts[q] = any_counts.get(q, 0) + 1
         req_rev = spec_by_q.get(q, fallback_rev)
-        if str(r["goal_coverage"] or "") == "FULL_GOAL" and int(r["verified_spec_revision"] or 0) >= req_rev:
+        if r["goal_coverage"] == "FULL_GOAL" and r["publish_tier"] != "MARGINAL_NOTE" and r["verified_spec_revision"] >= req_rev:
             full_counts[q] = full_counts.get(q, 0) + 1
     return full_counts, any_counts
 
@@ -52,6 +52,27 @@ def fetch_subproblem_states(conn: sqlite3.Connection) -> dict[str, dict[str, Any
     return {
         str(r["question_id"]): dict(r)
         for r in conn.execute("SELECT * FROM subproblem_runtime_state ORDER BY question_id ASC").fetchall()
+    }
+
+
+def fetch_streetlight_warning_questions(conn: sqlite3.Connection) -> set[str]:
+    return {
+        row["question_id"]
+        for row in conn.execute(
+            """
+            WITH ranked AS (
+                SELECT l.question_id, l.publish_tier, ROW_NUMBER() OVER (
+                    PARTITION BY l.question_id ORDER BY l.created_at DESC, l.entry_id DESC
+                ) AS position
+                FROM internal_research_ledger l
+                JOIN subproblem_runtime_state s USING (question_id)
+                WHERE l.ledger_type = 'L3_VERIFIED' AND l.is_active = 1
+                  AND l.verified_spec_revision >= s.active_spec_revision
+            )
+            SELECT question_id FROM ranked WHERE position <= 2
+            GROUP BY question_id HAVING SUM(publish_tier = 'MARGINAL_NOTE') = 2
+            """
+        )
     }
 
 
@@ -75,7 +96,7 @@ def fetch_v03_queues(conn: sqlite3.Connection) -> dict[str, Any]:
     open_lemma_gaps = [
         dict(r)
         for r in conn.execute(
-            "SELECT * FROM open_lemma_gaps WHERE status = 'OPEN' ORDER BY question_id, created_at ASC"
+            "SELECT * FROM open_lemma_gaps WHERE status = 'OPEN' AND gap_tier = 'LOAD_BEARING' ORDER BY question_id, created_at ASC"
         ).fetchall()
     ]
     living_surveys: dict[str, dict[str, Any]] = {}
@@ -111,6 +132,7 @@ def fetch_active_branch_family_rows(conn: sqlite3.Connection) -> list[dict[str, 
             SELECT question_id, branch_id, family_id
             FROM lineage_nodes
             WHERE node_status IN ('EXPLORING', 'ACTIVE_REVISING', 'AWAITING_TRIAGE', 'PENDING_REVIEW')
+              AND control_state NOT IN ('HIBERNATED','DRAIN_AFTER_TURN')
             GROUP BY question_id, branch_id
             """
         ).fetchall()
@@ -148,7 +170,7 @@ def fetch_topology_raw_data(conn: sqlite3.Connection, question_filter: str = "AL
                 FROM review_queue r
                 LEFT JOIN lineage_nodes n ON n.node_id = r.source_node_id
                 WHERE r.review_status = 'CLOSED_REVISE'
-                  AND r.source_type != 'LOCAL_LEMMA_SUBMISSION'
+                  AND r.non_blocking = 0
                 ORDER BY r.updated_at DESC
                 """
             ).fetchall()
@@ -188,7 +210,7 @@ def fetch_topology_raw_data(conn: sqlite3.Connection, question_filter: str = "AL
                 FROM review_queue r
                 LEFT JOIN lineage_nodes n ON n.node_id = r.source_node_id
                 WHERE r.review_status = 'CLOSED_REVISE'
-                  AND r.source_type != 'LOCAL_LEMMA_SUBMISSION'
+                  AND r.non_blocking = 0
                   AND r.question_id = ?
                 ORDER BY r.updated_at DESC
                 """,

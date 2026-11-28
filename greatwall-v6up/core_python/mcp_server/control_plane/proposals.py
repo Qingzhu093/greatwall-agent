@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -34,6 +35,7 @@ from .effects_outbox import enqueue_runtime_effect
 from .lifecycle_ops import record_human_stop, submit_works_ticket
 from .node_interventions import authorize_early_handoff
 from .subproblem_locks import find_latest_spec_full_goal_l3, set_subproblem_state
+from .wave_verdict_actions import PreparedBranch, prepare_wave_growth
 from .workspace_sync import (
     sync_approved_public_inputs,
     sync_public_instruments_and_skills_to_worktree,
@@ -377,6 +379,17 @@ def _execute_seed_human_branch(
     return {"question_id": qid, "branch_id": new_bid, "node_id": new_nid, "family_id": fid, "branch_kind": "HUMAN_SEEDED", "worktree_abs_path": str(wt_dir)}
 
 
+def pending_wave_proposal_target(conn: sqlite3.Connection, proposal_id: str) -> str | None:
+    row = conn.execute(
+        """
+        SELECT target_id FROM control_proposals
+        WHERE proposal_id = ? AND action_type = 'APPROVE_WAVE_VERDICT' AND status = 'PENDING_HUMAN'
+        """,
+        (proposal_id,),
+    ).fetchone()
+    return row["target_id"] if row else None
+
+
 def approve_control_proposal(
     conn: sqlite3.Connection,
     *,
@@ -384,6 +397,7 @@ def approve_control_proposal(
     proposal_id: str,
     decision: str = "APPROVE",
     approved_by_source: str = "human_ui",
+    prepared_growth: dict[int, PreparedBranch] | None = None,
 ) -> dict[str, Any]:
     """人类落签批准或驳回 control_proposals（乐观锁防双端重复点击）。"""
     if approved_by_source not in ("human_ui", "action_card_human", "gw_chief_human", "branch_handback"):
@@ -393,7 +407,9 @@ def approve_control_proposal(
         raise FailClosedError(ERR_INVALID_INPUT, f"decision 仅允许 APPROVE / REJECT，实收 {decision!r}")
 
     now = utc_now_iso()
-    with rw_immediate_tx(conn):
+    target = pending_wave_proposal_target(conn, proposal_id) if dec == "APPROVE" else None
+    staging = prepare_wave_growth(conn, workspace_root, target) if prepared_growth is None else nullcontext(prepared_growth)
+    with staging as prepared, rw_immediate_tx(conn):
         row = conn.execute("SELECT * FROM control_proposals WHERE proposal_id = ?", (str(proposal_id),)).fetchone()
         if row is None:
             raise FailClosedError(ERR_NOT_FOUND, f"提案 {proposal_id!r} 不存在")
@@ -482,7 +498,8 @@ def approve_control_proposal(
             exec_result = execute_approved_wave_verdict(
                 conn,
                 workspace_root=workspace_root,
-                conference_id=str(payload.get("conference_id") or tid),
+                conference_id=tid,
+                prepared_growth=prepared,
             )
         elif act == "SEED_HUMAN_BRANCH":
             exec_result = _execute_seed_human_branch(

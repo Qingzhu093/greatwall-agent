@@ -10,14 +10,8 @@ import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import path from 'node:path'
 
-/** 需要长超时的重计算/跨进程校准与恢复工具清单。 */
-export const LONG_RUNNING_MCP_TOOLS = Object.freeze(new Set([
-  'run_isolated_eval',
-  'register_question_instrument',
-  'upgrade_instrument_with_calibration',
-  'recompute_stage_b_only',
-  'export_stage3_final_delivery',
-]))
+import { LONG_RUNNING_MCP_TOOLS } from './prompts.js'
+export { LONG_RUNNING_MCP_TOOLS } from './prompts.js'
 
 export const LONG_RUNNING_CONTROL_METHODS = Object.freeze(new Set([
   'control_plane/recover_heavy_jobs',
@@ -48,6 +42,7 @@ export class GreatwallMcpBridge {
     this.pythonBin = opts.pythonBin || process.env.GREATWALL_PYTHON || 'python'
     this.dataDir = opts.dataDir || ''
     this.requestTimeoutMs = Number(opts.requestTimeoutMs ?? 60_000)
+    this.maxEffectiveContextWindow = opts.maxEffectiveContextWindow
     this.longToolTimeoutMs = Number(opts.longToolTimeoutMs ?? 300_000)
 
     /** @type {import('node:child_process').ChildProcessWithoutNullStreams | null} */
@@ -139,6 +134,7 @@ export class GreatwallMcpBridge {
       PYTHONIOENCODING: 'utf-8',
       PYTHONUTF8: '1',
     }
+    if (this.maxEffectiveContextWindow) env.GREATWALL_CONTEXT_WINDOW_CAP = String(this.maxEffectiveContextWindow)
     if (this.workspaceRoot) env.GREATWALL_WORKSPACE_ROOT = this.workspaceRoot
     if (this.dataDir) {
       env.PLUGIN_DATA = this.dataDir
@@ -320,6 +316,7 @@ export class GreatwallMcpBridge {
       caller_role: trustedCtx.role,
       session_id: trustedCtx.sessionId,
       session_epoch_id: trustedCtx.sessionEpochId,
+      bound_node_id: trustedCtx.nodeId,
       human_rpc_id: trustedCtx.humanMandate?.rpcId || '',
       human_message: trustedCtx.humanMandate?.text || '',
     }

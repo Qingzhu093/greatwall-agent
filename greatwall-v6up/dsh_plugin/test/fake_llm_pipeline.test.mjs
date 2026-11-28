@@ -415,8 +415,7 @@ test('L2 剧本 1：零费用假模型全链路沙盘（272k 自适应窗口 + �
         if (api.promptText.includes('探索者 Round 1')) {
           const unl = await api.callTool('record_reflection_and_unlock_pull', {
             node_id: createdNodeId,
-            selected_categories: ['Category 7 Attractor Tasks'],
-            holiday_prompt_id: 3,
+            selected_categories: ['C08_ATTRACTOR_TRAP'],
             turns: [{ question: '钝角情形是否已覆盖？', answer: '已用直径圆直接覆盖钝角情形，仅锐角需 Jung 上界。' }],
             verdict_3state: 'SUFFICIENT_EVIDENCE',
           })
@@ -438,6 +437,7 @@ test('L2 剧本 1：零费用假模型全链路沙盘（272k 自适应窗口 + �
             dead_ends: [],
             candidate_rel_path: 'proof_check.py',
             is_empty_crash: false,
+            holiday_bet_outcome: { outcome: 'UNTESTED', note_md: '本班完成了证明，另一个经验假设留待测试。' },
           })
           assert.equal(ho.ok, true, JSON.stringify(ho))
           return '70% 交接单已落库。'
@@ -446,6 +446,27 @@ test('L2 剧本 1：零费用假模型全链路沙盘（272k 自适应窗口 + �
 
       // 6) 探索者：验证公开 inputs/ 可读 + _hidden 越界被拦 + 272k 窗口 37% -> 70% + 70% 只读禁写
       if (sid.startsWith('gw-exp-') || sid.startsWith('gw_exp_')) {
+        if (api.promptText.includes('52% 暂停编程反思')) {
+          for (const [name, args] of [
+            ['write', { file_path: path.join(api.cwd, 'holiday_probe.py'), content: 'x=1' }],
+            [process.platform === 'win32' ? 'pwsh' : 'bash', { command: 'echo example' }],
+            ['run_isolated_eval', {}],
+          ]) {
+            const blocked = await api.callTool(name, args)
+            assert.match(blocked.error, /52% 夜科学/)
+          }
+          const bet = await api.callTool('submit_holiday_bet', {
+            node_id: createdNodeId,
+            anomaly_or_analogy_md: '锐角退化边界的形状变化近似两个极值条件交换主导地位的现象，值得作配对比较。',
+            testable_hypothesis_md: '在固定最长边的三角形族上，角度越过直角阈值时最优支撑点数发生改变。',
+            falsification_experiment_md: '对直角阈值两侧生成等尺度配对样本，若得到同样的支撑点数即可否定假设。',
+          })
+          assert.equal(bet.ok, true, JSON.stringify(bet))
+          const resumedWrite = await api.callTool('write', { file_path: path.join(api.cwd, 'holiday_probe.py'), content: 'x=1' })
+          assert.equal(resumedWrite.ok, true, JSON.stringify(resumedWrite))
+          auditTrail.holidayUnlockedInTurn = true
+          return '已记录可证伪赌注并恢复工具。'
+        }
         if (api.promptText.includes('70% 清醒收官')) {
           // 实测 70% 只读态尝试写文件被真实沙箱 Guard 拦截！
           const badW = await api.callTool('write', { file_path: path.join(api.cwd, 'forbidden_edit.py'), content: 'x=1' })
@@ -479,8 +500,13 @@ test('L2 剧本 1：零费用假模型全链路沙盘（272k 自适应窗口 + �
           await api.triggerPreStep()
           return '已推进至 37.5% (102k/272k)，等待反思。'
         }
-        // 过 37% 后验证可拉取馆藏，并推至 191,000 / 272,000 = 70.2% 触发 HANDOFF_70
+        // 先跨过停码水位，恢复后再进入清醒交班。
         await api.callTool('query_library_catalog', { node_id: createdNodeId, question_id: 'Q1', scope: 'ALL', keyword: 'Jung' })
+        if (expStep === 2) {
+          api.setPressureTokens(142_000)
+          await api.triggerPreStep()
+          return '已跨过 52% 水位。'
+        }
         api.setPressureTokens(191_000)
         await api.triggerPreStep()
         return '已推进至 70.2% (191k/272k)，准备清醒收官。'
@@ -496,6 +522,7 @@ test('L2 剧本 1：零费用假模型全链路沙盘（272k 自适应窗口 + �
           const sv = await api.callTool('submit_stage2_unblind_verdict', {
             review_id: auditRevId,
             final_verdict: 'ACCEPT',
+          novelty_score: 8, significance_score: 8,
             title: 'Stage 3 终核通过',
             abstract_md: '已对照 verified_l3_scopes.json 核验五件套报告与复现脚本一致，无任何边界夸大。',
           })
@@ -521,6 +548,7 @@ test('L2 剧本 1：零费用假模型全链路沙盘（272k 自适应窗口 + �
           question_id: 'Q1',
           ledger_items: [{ claim: 'Jung 上界成立', evidence_location_and_quote: 'proof_check.py 实跑通过', is_verified: true }],
           stage1_verdict: 'PASS',
+          rigor_score: 8,
         })
         assert.equal(s1.ok, true, JSON.stringify(s1))
         const ub = await api.callTool('get_unblinded_manuscript_and_peers', { review_id: revId })
@@ -528,6 +556,7 @@ test('L2 剧本 1：零费用假模型全链路沙盘（272k 自适应窗口 + �
         const s2 = await api.callTool('submit_stage2_unblind_verdict', {
           review_id: revId,
           final_verdict: 'ACCEPT',
+          novelty_score: 8, significance_score: 8,
           l3_entry_kind: 'POS_THEOREM',
           goal_coverage: 'FULL_GOAL',
           is_equivalent_reduction: false,
@@ -581,6 +610,7 @@ test('L2 剧本 1：零费用假模型全链路沙盘（272k 自适应窗口 + �
     assert.equal(auditTrail.explorerHiddenReadBlocked, true, '探索者越界读 _hidden_calibrations 必须被双向沙箱阻断')
     assert.equal(auditTrail.verifierDbReadBlocked, true, '盲审官越界读 greatwall.db 必须被双向沙箱阻断')
     assert.equal(auditTrail.explorerReadonlyWriteBlocked, true, '70% 收官只读态探索者写文件必须被 Guard 阻断')
+    assert.equal(auditTrail.holidayUnlockedInTurn, true, '52% 赌注落库后同一回合必须立即恢复写入')
     assert.deepEqual([...auditTrail.boundModelsSeen], ['deepseek-account/deepseek-flash'], '全链路全部子会话必须严格锁死绑定模型')
     assert.ok(fs.existsSync(path.join(ws, 'final_delivery', '01_formal_report.md')), '必须生成 Stage 3 交付报告')
     await orch.disposeAll()

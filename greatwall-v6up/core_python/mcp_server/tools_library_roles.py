@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from typing import Any
@@ -240,7 +241,7 @@ def tool_get_chronicler_snapshot(
     gaps = [
         dict(r)
         for r in conn.execute(
-            f"SELECT * FROM open_lemma_gaps WHERE status = 'OPEN'{where_q} ORDER BY question_id, created_at ASC",
+            f"SELECT * FROM open_lemma_gaps WHERE status = 'OPEN' AND gap_tier = 'LOAD_BEARING'{where_q} ORDER BY question_id, created_at ASC",
             q_args,
         ).fetchall()
     ]
@@ -260,14 +261,15 @@ def tool_get_chronicler_snapshot(
         conn=conn,
         tool_name="get_chronicler_snapshot",
         question_id=qf,
-        next_step_guidance="请严守四条纪律：① <=1500 字导览索引；② 保留反例证据；③ Explicit Gaps 只写客观问题缺口、严禁泄露他派私有思路；④ 不直接核销悬赏。",
+        next_step_guidance="请严守四条纪律：① <=4000 字高密度阶段总览索引；② 保留反例证据；③ Explicit Gaps 只写客观问题缺口、严禁泄露他派私有思路；④ 不直接核销悬赏。",
         data={
             "goal_and_completion_md": str(p0["goal_and_completion_md"]) if p0 else "",
             "required_questions": json.loads(p0["subquestions_json"]) if p0 else [],
             "hard_ledger": hard_ledger,
             "conference": conf,
             "previous_living_survey": dict(prev_survey) if prev_survey else None,
-            "l3_verified": l3,
+            "l3_verified": [r for r in l3 if r["publish_tier"] != "MARGINAL_NOTE"],
+            "marginal_papers": [r for r in l3 if r["publish_tier"] == "MARGINAL_NOTE"],
             "l2_failures": l2,
             "external_literature": ext,
             "open_lemma_gaps": gaps,
@@ -286,8 +288,9 @@ def tool_publish_living_survey(
     sec4_explicit_gaps_md: str,
     conference_id: str | None = None,
     trigger_reason: str = "WAVE_CONFERENCE",
+    marginal_notes_md: str = "",
 ) -> dict[str, Any]:
-    """发布子题唯一《子题全局总览与明确缺口导览》（硬限 <= 1500 字），并联动圆桌推进至 ADJUDICATING。"""
+    """发布子题唯一《子题全局总览与明确缺口导览》（硬限 <= 4000 字），并联动圆桌推进至 ADJUDICATING。"""
     enforce_role_tool_permission(conn, caller_role, "publish_living_survey", session_id=session_id)
     qid = str(question_id or "").strip()
     qrow = conn.execute("SELECT question_id FROM subproblem_runtime_state WHERE question_id = ?", (qid,)).fetchone()
@@ -303,11 +306,31 @@ def tool_publish_living_survey(
     if any(len(s) < 2 for s in secs):
         raise FailClosedError(ERR_INVALID_INPUT, "总览四栏均不能为空")
     total_chars = sum(len(s) for s in secs)
-    if total_chars > 1500:
+    from .mcp_core_helpers import load_runtime_config
+    max_survey_chars = int(load_runtime_config().get("max_living_survey_chars", 4000))
+    if total_chars > max_survey_chars:
         raise FailClosedError(
             ERR_INVALID_INPUT,
-            f"《子题全局总览》总字数超限：{total_chars} > 1500 字！请精简为高密度导览索引（全量悬赏已存在 open_lemma_gaps，只需列 Top 索引编号）。",
+            f"《子题全局总览》总字数超限：{total_chars} > {max_survey_chars} 字！请精简为高密度阶段总览索引（全量悬赏已存在 open_lemma_gaps，只需列 Top 索引编号）。",
         )
+
+    marginal = marginal_notes_md.strip()
+    stamp = "[系统禁令：以下条目属非承重边缘注记，严禁后勤据此新开分支，严禁探索者将其列为主攻目标]"
+    stamped = f"{stamp}\n\n{marginal}" if marginal else ""
+    if len(stamped) > 1500:
+        raise FailClosedError(ERR_INVALID_INPUT, f"总览边缘附栏含系统印章当前 {len(stamped)} 字，上限 1500 字，请精简后重交")
+    if marginal and marginal in secs[3]:
+        raise FailClosedError(ERR_INVALID_INPUT, "边缘注记须单独填写，第四栏仅供承重缺口")
+    for entry_id in set(re.findall(r"L3-\d+", "\n".join(secs))):
+        row = conn.execute(
+            "SELECT publish_tier FROM internal_research_ledger WHERE entry_id = ?", (entry_id,),
+        ).fetchone()
+        if row is not None and row["publish_tier"] == "MARGINAL_NOTE":
+            raise FailClosedError(ERR_INVALID_INPUT, f"总览核心四栏不得引用边缘注记 {entry_id}")
+    for gap_id in set(re.findall(r"gap_[a-zA-Z0-9_]+", secs[3])):
+        row = conn.execute("SELECT gap_tier FROM open_lemma_gaps WHERE gap_id = ?", (gap_id,)).fetchone()
+        if row is None or row["gap_tier"] != "LOAD_BEARING":
+            raise FailClosedError(ERR_INVALID_INPUT, f"总览第四栏只能收录实存承重缺口：{gap_id}")
 
     now = utc_now_iso()
     with rw_immediate_tx(conn):
@@ -323,10 +346,10 @@ def tool_publish_living_survey(
                 survey_id, question_id, revision,
                 sec1_baseline_and_instruments_md, sec2_l3_lemma_tree_md,
                 sec3_avoidance_radar_md, sec4_explicit_gaps_md,
-                total_chars, trigger_reason, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                marginal_notes_md, total_chars, trigger_reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (survey_id, qid, new_rev, secs[0], secs[1], secs[2], secs[3], total_chars, str(trigger_reason or "WAVE_CONFERENCE"), now),
+            (survey_id, qid, new_rev, secs[0], secs[1], secs[2], secs[3], stamped, total_chars, str(trigger_reason or "WAVE_CONFERENCE"), now),
         )
         if conference_id:
             conn.execute(
@@ -342,7 +365,7 @@ def tool_publish_living_survey(
         conn=conn,
         tool_name="publish_living_survey",
         question_id=qid,
-        next_step_guidance=f"总览 {survey_id}（v{new_rev}，{total_chars}/1500 字）已发布；若绑定波次圆桌已切至 ADJUDICATING 唤醒裁判拍板。",
+        next_step_guidance=f"总览 {survey_id}（v{new_rev}，{total_chars}/{max_survey_chars} 字）已发布；若绑定波次圆桌已切至 ADJUDICATING 唤醒裁判拍板。",
         data={"survey_id": survey_id, "question_id": qid, "revision": new_rev, "total_chars": total_chars},
     )
 
@@ -395,6 +418,8 @@ def tool_submit_conference_statement(
     round_no: int,
     statement_md: str,
     target_node_ids: list[str] | None = None,
+    speech_act: str = "PROPOSE_AND_SELF_AUDIT",
+    unverified_ideas: list[str] | None = None,
 ) -> dict[str, Any]:
     enforce_role_tool_permission(conn, caller_role, "submit_conference_statement", session_id=session_id, node_id=node_id)
     res = append_conference_statement(
@@ -404,6 +429,8 @@ def tool_submit_conference_statement(
         round_no=round_no,
         statement_md=statement_md,
         target_node_ids=target_node_ids,
+        speech_act=speech_act,
+        unverified_ideas=unverified_ideas,
     )
     return build_tool_receipt(
         conn=conn,
@@ -448,7 +475,9 @@ def tool_get_conference_dossier(
                 "status": str(conf["status"]),
                 "participants": json.loads(conf["participant_nodes_json"] or "[]"),
                 "critiques_ledger": json.loads(conf["critiques_ledger_json"] or "[]"),
-                "minutes_md": str(conf["minutes_md"] or ""),
+                "minutes_md": conf["minutes_md"],
+                "agenda": json.loads(conf["agenda_json"]),
+                "peer_takeaways": json.loads(conf["peer_takeaways_json"]),
                 "linked_survey_id": conf["linked_survey_id"],
             },
             "hard_ledger": hard_ledger,
@@ -465,19 +494,42 @@ def tool_record_conference_minutes(
     minutes_md: str,
 ) -> dict[str, Any]:
     enforce_role_tool_permission(conn, caller_role, "record_conference_minutes", session_id=session_id)
-    conf = conn.execute("SELECT * FROM wave_conferences WHERE conference_id = ?", (str(conference_id),)).fetchone()
-    if conf is None:
-        raise FailClosedError(ERR_NOT_FOUND, f"圆桌会议 {conference_id!r} 不存在")
-    if str(conf["status"]) not in ("ROUND_1_CRITIQUE", "ROUND_2_REBUTTAL"):
-        raise FailClosedError(ERR_LOCKED, f"会议 {conference_id!r} 状态为 {conf['status']}，不可落盘第 2 拍纪要")
-    clean_min = str(minutes_md or "").strip()
-    if len(clean_min) < 30:
-        raise FailClosedError(ERR_INVALID_INPUT, "圆桌纪要 minutes_md 至少 30 字")
+    clean_min = minutes_md.strip()
+    if not 30 <= len(clean_min) <= 6000:
+        raise FailClosedError(ERR_INVALID_INPUT, f"圆桌纪要当前 {len(clean_min)} 字，须为 30–6000 字，请调整后重交")
     with rw_immediate_tx(conn):
+        conf = conn.execute("SELECT * FROM wave_conferences WHERE conference_id = ?", (conference_id,)).fetchone()
+        if conf is None:
+            raise FailClosedError(ERR_NOT_FOUND, f"圆桌会议 {conference_id!r} 不存在")
+        if conf["status"] not in ("ROUND_1_CRITIQUE", "ROUND_2_REBUTTAL"):
+            raise FailClosedError(ERR_LOCKED, f"会议 {conference_id!r} 状态为 {conf['status']}，不可落盘第 2 拍纪要")
+        branch_by_node = {p["node_id"]: p["branch_id"] for p in json.loads(conf["participant_nodes_json"])}
+        takeaways: dict[str, list[dict[str, Any]]] = {branch: [] for branch in branch_by_node.values()}
+        for statement in json.loads(conf["critiques_ledger_json"]):
+            if int(statement["round"]) < 2:
+                continue
+            branches = {branch_by_node[node] for node in statement["target_node_ids"]}
+            if statement.get("speech_act") == "CONFIRM_TAKEAWAY":
+                branches.add(branch_by_node[statement["node_id"]])
+            for branch in branches:
+                takeaways[branch].append(statement)
         conn.execute(
-            "UPDATE wave_conferences SET minutes_md = ?, status = 'SURVEY_REFRESHING' WHERE conference_id = ?",
-            (clean_min[:4000], str(conference_id)),
+            """
+            UPDATE wave_conferences SET minutes_md = ?, peer_takeaways_json = ?, status = 'SURVEY_REFRESHING'
+            WHERE conference_id = ?
+            """,
+            (clean_min, json.dumps(takeaways, ensure_ascii=False), conference_id),
         )
+        for branch, entries in takeaways.items():
+            conn.execute(
+                """
+                UPDATE lineage_nodes SET peer_takeaways_json = ? WHERE node_id = (
+                    SELECT node_id FROM lineage_nodes WHERE question_id = ? AND branch_id = ?
+                    ORDER BY generation DESC LIMIT 1
+                )
+                """,
+                (json.dumps(entries, ensure_ascii=False), conf["question_id"], branch),
+            )
     return build_tool_receipt(
         conn=conn,
         tool_name="record_conference_minutes",

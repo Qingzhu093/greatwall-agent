@@ -18,6 +18,7 @@ from ..evaluators.isolated_runner import (
     sha256_file,
 )
 from .control_plane_service import execute_heavy_async_job, safe_resolve_in_worktree
+from .control_plane.observation_artifacts import publish_observation_in_tx
 from .db_schema import (
     ALLOWED_INSTRUMENT_TIERS,
     ERR_INVALID_INPUT,
@@ -51,6 +52,39 @@ def _resolve_instrument_file(workspace_root: str, rel_path: str) -> Path:
     raise FailClosedError(ERR_NOT_FOUND, f"找不到仪器脚本 {rel_path!r}")
 
 
+def tool_submit_holiday_bet(
+    conn: sqlite3.Connection, caller_role: str, session_id: str, node_id: str,
+    anomaly_or_analogy_md: str, testable_hypothesis_md: str, falsification_experiment_md: str,
+) -> dict[str, Any]:
+    enforce_role_tool_permission(conn, caller_role, "submit_holiday_bet", session_id=session_id, node_id=node_id)
+    bet = {
+        "anomaly_or_analogy_md": anomaly_or_analogy_md.strip(),
+        "testable_hypothesis_md": testable_hypothesis_md.strip(),
+        "falsification_experiment_md": falsification_experiment_md.strip(),
+    }
+    for field, limit in (("anomaly_or_analogy_md", 600), ("testable_hypothesis_md", 500), ("falsification_experiment_md", 500)):
+        if not 30 <= len(bet[field]) <= limit:
+            raise FailClosedError(ERR_INVALID_INPUT, f"{field} 当前 {len(bet[field])} 字，须为 30–{limit} 字")
+    with rw_immediate_tx(conn):
+        node = conn.execute(
+            "SELECT question_id, holiday_prompt_id, holiday_completed, node_status FROM lineage_nodes WHERE node_id = ?",
+            (node_id,),
+        ).fetchone()
+        if node is None:
+            raise FailClosedError(ERR_NOT_FOUND, f"节点 {node_id!r} 不存在")
+        if node["holiday_prompt_id"] is None or node["holiday_completed"] or node["node_status"] not in ("EXPLORING", "ACTIVE_REVISING"):
+            raise FailClosedError(ERR_LOCKED, "只在当前班岗已开启且尚未结束的夜科学回合登记赌注")
+        conn.execute(
+            "UPDATE lineage_nodes SET holiday_bet_json = ?, holiday_completed = 1, updated_at = ? WHERE node_id = ?",
+            (json.dumps(bet, ensure_ascii=False), utc_now_iso(), node_id),
+        )
+    return build_tool_receipt(
+        conn=conn, tool_name="submit_holiday_bet", question_id=node["question_id"], node_id=node_id,
+        next_step_guidance="反思假设已落库，即将恢复写码与评测。请优先将洞见融入原主线收官或运行轻量探针；若本代剩余窗口不足以完整实测，可在 70% 交接时如实标记 UNTESTED 留给下一代深挖。",
+        data={"node_id": node_id, "holiday_completed": True},
+    )
+
+
 def _materialize_cached_obs_for_node(
     conn: sqlite3.Connection,
     *,
@@ -80,9 +114,9 @@ def _materialize_cached_obs_for_node(
             INSERT INTO observations(
                 obs_id, question_id, branch_id, node_id, instrument_id, instrument_version, tier,
                 candidate_entry_sha256, tools_dir_sha256, spec_sha256, instrument_sha256, cache_key,
-                stage_a_artifact_path, revalidated_from_obs_id, obs_status, tracks_json,
+                frozen_code_snapshot_path, stage_a_artifact_path, revalidated_from_obs_id, obs_status, tracks_json,
                 details_text, linguistic_prediction, spec_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 new_obs_id,
@@ -96,6 +130,7 @@ def _materialize_cached_obs_for_node(
                 str(cached["tools_dir_sha256"]),
                 str(cached["spec_sha256"]),
                 str(cached["instrument_sha256"]),
+                cached["frozen_code_snapshot_path"],
                 cached["stage_a_artifact_path"],
                 src_obs_id,
                 str(cached["obs_status"]),
@@ -530,6 +565,7 @@ def tool_run_isolated_eval(
 
     staging_root = paths["eval_artifacts_dir"] / "_staging" / f"off_{uuid.uuid4().hex[:12]}"
     staging_stage_a = staging_root / "stage_a_output.json"
+    staging_code = staging_root / "code_snapshot"
     try:
         res = run_isolated_instrument(
             instrument_path=inst_abs,
@@ -541,6 +577,7 @@ def tool_run_isolated_eval(
             worktree_root=worktree_abs,
             persist_stage_a_path=str(staging_stage_a),
             cancel_event=cancel_event,
+            code_snapshot_path=staging_code,
         )
         if cancel_event is not None and cancel_event.is_set():
             raise FailClosedError(ERR_LOCKED, "正式评测请求已取消，已丢弃暂存产物未落库")
@@ -552,7 +589,7 @@ def tool_run_isolated_eval(
         final_stage_a_path: str | None = None
         stale_reval_target_ver: int | None = None
 
-        with rw_immediate_tx(conn):
+        with publish_observation_in_tx(conn, staging_root) as publish:
             if cancel_event is not None and cancel_event.is_set():
                 raise FailClosedError(ERR_LOCKED, "正式评测请求已取消，已丢弃暂存产物未落库")
             active_inst_row = conn.execute(
@@ -569,85 +606,77 @@ def tool_run_isolated_eval(
                 stored_cache_key = ""
 
             obs_id = next_prefixed_id(conn, "observations", "obs_id", "Obs-")
-            final_stage_a = paths["eval_artifacts_dir"] / obs_id / "stage_a_output.json"
-            if staging_stage_a.is_file():
-                final_stage_a.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(staging_stage_a), str(final_stage_a))
-                final_stage_a_path = str(final_stage_a)
-            try:
+            final_snapshot_path, final_stage_a_path = publish(obs_id)
+            conn.execute(
+                """
+                INSERT INTO observations(
+                    obs_id, question_id, branch_id, node_id, instrument_id, instrument_version, tier,
+                    candidate_entry_sha256, tools_dir_sha256, spec_sha256, instrument_sha256, cache_key,
+                    frozen_code_snapshot_path, stage_a_artifact_path, obs_status, tracks_json, details_text, linguistic_prediction,
+                    spec_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'official', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    obs_id,
+                    question_id,
+                    str(node["branch_id"]),
+                    node_id,
+                    instrument_id,
+                    int(inst["version"]),
+                    cand_sha,
+                    tools_sha,
+                    spec_sha,
+                    inst_sha,
+                    stored_cache_key,
+                    final_snapshot_path,
+                    final_stage_a_path,
+                    obs_status,
+                    json.dumps(res.get("tracks") or {}, ensure_ascii=False),
+                    str(res.get("details") or ""),
+                    pred,
+                    json.dumps(stored_spec, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            if obs_status in ("VALID_PASS", "MEASURED_REJECTION", "VALID_UNDECIDED"):
                 conn.execute(
                     """
-                    INSERT INTO observations(
-                        obs_id, question_id, branch_id, node_id, instrument_id, instrument_version, tier,
-                        candidate_entry_sha256, tools_dir_sha256, spec_sha256, instrument_sha256, cache_key,
-                        stage_a_artifact_path, obs_status, tracks_json, details_text, linguistic_prediction,
-                        spec_json, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'official', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    UPDATE lineage_nodes
+                    SET artifact_dirty_since_last_obs = 0,
+                        last_reconciled_candidate_sha256 = ?,
+                        last_reconciled_tools_sha256 = ?,
+                        candidate_rel_path = CASE WHEN COALESCE(candidate_rel_path, '') = '' AND ? != '' THEN ? ELSE candidate_rel_path END,
+                        updated_at = ?
+                    WHERE node_id = ? AND node_status IN ('EXPLORING', 'ACTIVE_REVISING')
                     """,
-                    (
-                        obs_id,
-                        question_id,
-                        str(node["branch_id"]),
-                        node_id,
-                        instrument_id,
-                        int(inst["version"]),
-                        cand_sha,
-                        tools_sha,
-                        spec_sha,
-                        inst_sha,
-                        stored_cache_key,
-                        final_stage_a_path,
-                        obs_status,
-                        json.dumps(res.get("tracks") or {}, ensure_ascii=False),
-                        str(res.get("details") or ""),
-                        pred,
-                        json.dumps(stored_spec, ensure_ascii=False),
-                        now,
-                        now,
-                    ),
+                    (cand_sha, tools_sha, raw_rel, raw_rel, now, node_id),
                 )
-                if obs_status in ("VALID_PASS", "MEASURED_REJECTION", "VALID_UNDECIDED"):
-                    conn.execute(
-                        """
-                        UPDATE lineage_nodes
-                        SET artifact_dirty_since_last_obs = 0,
-                            last_reconciled_candidate_sha256 = ?,
-                            last_reconciled_tools_sha256 = ?,
-                            candidate_rel_path = CASE WHEN COALESCE(candidate_rel_path, '') = '' AND ? != '' THEN ? ELSE candidate_rel_path END,
-                            updated_at = ?
-                        WHERE node_id = ? AND node_status IN ('EXPLORING', 'ACTIVE_REVISING')
-                        """,
-                        (cand_sha, tools_sha, raw_rel, raw_rel, now, node_id),
-                    )
-                if stale_reval_target_ver is not None:
-                    conn.execute(
-                        """
-                        INSERT INTO pending_revalidation_queue(
-                            queue_id, obs_id, question_id, target_instrument_id, target_version, status, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?)
-                        """,
-                        (f"reval_{uuid.uuid4().hex[:10]}", obs_id, question_id, instrument_id, stale_reval_target_ver, now, now),
-                    )
-                record_declared_refs(
-                    conn,
-                    source_id=obs_id,
-                    declared_refs=declared_refs,
-                    session_id=session_id,
-                    default_edge_type=str(cfg.get("default_declared_ref_edge_type", "MOTIVATING_REF")),
+            if stale_reval_target_ver is not None:
+                conn.execute(
+                    """
+                    INSERT INTO pending_revalidation_queue(
+                        queue_id, obs_id, question_id, target_instrument_id, target_version, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?)
+                    """,
+                    (f"reval_{uuid.uuid4().hex[:10]}", obs_id, question_id, instrument_id, stale_reval_target_ver, now, now),
                 )
-                if res["status"] == "INSTRUMENT_ERROR":
-                    circuit_broken = _handle_instrument_error_ticket(
-                        conn, question_id, instrument_id, int(inst["version"]), str(res["details"]), now, cfg
-                    )
-                elif res["status"] in ("OK", "CANDIDATE_ERROR"):
-                    conn.execute(
-                        "UPDATE instruments SET consecutive_error_count = 0, updated_at = ? WHERE instrument_id = ? AND version = ?",
-                        (now, instrument_id, int(inst["version"])),
-                    )
-            except Exception:
-                if final_stage_a_path:
-                    shutil.rmtree(Path(final_stage_a_path).parent, ignore_errors=True)
-                raise
+            record_declared_refs(
+                conn,
+                source_id=obs_id,
+                declared_refs=declared_refs,
+                session_id=session_id,
+                default_edge_type=str(cfg.get("default_declared_ref_edge_type", "MOTIVATING_REF")),
+            )
+            if res["status"] == "INSTRUMENT_ERROR":
+                circuit_broken = _handle_instrument_error_ticket(
+                    conn, question_id, instrument_id, int(inst["version"]), str(res["details"]), now, cfg
+                )
+            elif res["status"] in ("OK", "CANDIDATE_ERROR"):
+                conn.execute(
+                    "UPDATE instruments SET consecutive_error_count = 0, updated_at = ? WHERE instrument_id = ? AND version = ?",
+                    (now, instrument_id, int(inst["version"])),
+                )
     finally:
         shutil.rmtree(staging_root, ignore_errors=True)
 

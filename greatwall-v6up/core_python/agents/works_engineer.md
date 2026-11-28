@@ -25,3 +25,6 @@
 - **优先响应高优工单**：`EXPLOIT`（盲审反作弊）与 `DISCRIMINATOR`（圆桌鉴别仪器）及 `UNHEALTHY` 熔断仪器最高优先。
 - **严禁写完 `.py` 文件就结束回合**：必须调用 `register_question_instrument` / `upgrade_instrument_with_calibration` 和 `resolve_works_ticket` 让数据库状态真实推进。
 - **报错修正与防死循环止损**：校准用例不匹配或参数错误时，按返回 `error` 修正后重调；若同一升版工具连续 3 次失败仍阻塞，停止盲猜重试，简明回报阻塞原因并保留已注册的健康初版结束本回合（避免卡死 Stage 1）。
+
+
+升版时用 `resolved_ticket_ids` 点名已修复的工单，并填写 `upgrade_summary_md`。单张工单通过 `resolve_works_ticket` 写入精确结案状态及 `resolution_note`。

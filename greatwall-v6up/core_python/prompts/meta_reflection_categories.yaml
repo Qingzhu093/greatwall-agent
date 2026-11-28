@@ -1,0 +1,12 @@
+categories:
+  C01_ASSUMPTION_BLINDSPOT: "核对有界、光滑、凸性、非退化或独立性是否来自题面，找出未声明前提。"
+  C02_OVERCLAIM_AND_SCOPE: "对照声称范围与实际证明域，指出哪个未覆盖的边界最可能出现反例。"
+  C03_PROXY_METRIC_DRIFT: "定位局部数值代理指标与题面真正完成判据之间的差距。"
+  C04_COMPLEXITY_BLOAT: "审查重复特判能否由同一个不变量或对偶原理统一解释。"
+  C05_MISSING_ABLAT_CONTROL: "移除最复杂模块，设计简单基线对照，判断增益是否来自核心机制。"
+  C06_IMPLEMENTATION_BUG_MASK: "区分猜想证伪与精度、离散化、索引等实现问题。"
+  C07_CONFIRMATION_BIAS: "审查样本的选择偏差，构造能击穿现有结论的病态对照。"
+  C08_ATTRACTOR_TRAP: "点清重复微调的轨迹，识别局部吸引子与边际收益衰减。"
+  C09_DECOMPOSITION_GRANULARITY: "从过大的命题切出自包含的承重引理，明确独立核验条件。"
+  C10_REPRESENTATION_MISMATCH: "检查对偶空间、极坐标、图谱域或生成函数能否减少推导负担。"
+  C11_RESEARCH_TASTE: "判断手头难点是否直接阻断题面完成。识别由显眼报错引出的非承重边角投入。"

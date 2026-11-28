@@ -90,7 +90,10 @@ function ThreeQuestionsView({ data, busy, onControl, getUiWorkspace }) {
                           : null
                       ]
                     }),
-                    s.block_reason_code ? jsx("div", { className: "gw-muted", children: `阻塞原因: ${s.block_reason_code}` }) : null
+                    s.block_reason_code ? jsx("div", { className: "gw-muted", children: `阻塞原因: ${s.block_reason_code}` }) : null,
+                    s.streetlight_warning === "STREETLIGHT_WARNING"
+                      ? jsx("div", { className: "gw-muted", children: "连续两篇边缘注记，等待圆桌核对承重进展" })
+                      : null
                   ]
                 }, s.question_id)
               )
@@ -110,18 +113,48 @@ function ThreeQuestionsView({ data, busy, onControl, getUiWorkspace }) {
           }),
           proposals.length === 0
             ? jsx("div", { className: "gw-muted", children: emptyProposalHint })
-            : proposals.map((p) =>
-                jsxs("div", {
+            : proposals.map((p) => {
+                const actionLabelMap = {
+                  APPROVE_WAVE_VERDICT: "圆桌波次裁决",
+                  AMEND_RULING_DRAFT: "改题升版裁定",
+                  AUTHORIZE_PARTIAL_DELIVERY: "授权部分结题",
+                  ADVANCE_EPOCH: "推进新纪元归档",
+                };
+                const titleZh = actionLabelMap[p.action_type] || p.action_type;
+                let waveActions = [];
+                try {
+                  const parsed = typeof p.payload_json === "string" ? JSON.parse(p.payload_json || "{}") : (p.payload || {});
+                  if (Array.isArray(parsed?.actions)) waveActions = parsed.actions;
+                } catch {}
+                return jsxs("div", {
                   className: "gw-item",
                   children: [
                     jsxs("div", {
                       className: "gw-row",
                       children: [
-                        jsx("strong", { className: "gw-mono", children: `${p.action_type} · ${p.target_id}` }),
+                        jsx("strong", { children: `${titleZh} · ${p.target_id}` }),
                         jsx("span", { className: "gw-badge gw-b-warn", children: p.proposal_id })
                       ]
                     }),
-                    jsx("div", { children: p.rationale_md || "(无说明)" }),
+                    waveActions.length > 0
+                      ? jsx("ul", {
+                          style: { margin: "4px 0 6px 16px", padding: 0 },
+                          children: waveActions.map((act, idx) => {
+                            const targetTag = act.node_id
+                              ? ` · ${act.node_id}`
+                              : (act.branch_id
+                                  ? ` · ${act.branch_id}`
+                                  : (act.primary_donor_node_id && act.secondary_donor_node_id
+                                      ? ` · ${act.primary_donor_node_id}+${act.secondary_donor_node_id}`
+                                      : (act.source_node_id ? ` · ${act.source_node_id}` : "")));
+                            const detailTxt = act.synthesis_goal_md || act.description || act.gap_directive_md || act.mandate || act.note || act.reason || act.rationale || act.mechanism_signature || "";
+                            return jsx("li", {
+                              children: `${act.action}${targetTag}${detailTxt ? `：${String(detailTxt).slice(0, 120)}` : ""}`
+                            }, `${p.proposal_id}-act-${idx}`);
+                          })
+                        })
+                      : null,
+                    jsx("div", { className: "gw-muted", children: String(p.rationale_md || "(无说明)").slice(0, 260) }),
                     jsxs("div", {
                       className: "gw-actions",
                       children: [
@@ -140,8 +173,8 @@ function ThreeQuestionsView({ data, busy, onControl, getUiWorkspace }) {
                       ]
                     })
                   ]
-                }, p.proposal_id)
-              )
+                }, p.proposal_id);
+              })
         ]
       }),
 

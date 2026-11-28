@@ -1,5 +1,5 @@
 /**
- * DSH 原生 TokenMeter 500k 物理时钟与 `concludeTurn()` 回合间隙控制流（v3.0）。
+ * DSH 原生 TokenMeter 360k 物理时钟与 `concludeTurn()` 回合间隙控制流（v3.0）。
  *
  * 核心升级（对齐 09 §5.2 & agent_kb/05）：
  * 1. 彻底废除 `evalCount >= 1` 反思锁：`pct >= 0.37 && !unlocked` 立即触发 `REFLECT_37`，
@@ -15,15 +15,16 @@ import { watchHumanMandate } from './sessions/human_mandate.js'
 import { readChiefTranscript } from './sessions/chief_transcript.js'
 
 const DIRECT_CHIEF_TOOLS = new Set(['chief_operate', 'chief_send_branch_note', 'chief_seed_branch'])
+const pendingPressureSyncs = new WeakMap()
 
 /**
  * 采样指定 Agent Session 当前上下文 Token 压力水位。
  * @param {object} ctx DSH Cordis Context
  * @param {object} agent DSH Live Agent（含 `agent.session`）
- * @param {number} [defaultWindow=500000]
+ * @param {number} [defaultWindow=360000]
  * @returns {{ pressureTokens: number, contextWindow: number, source: string }}
  */
-export function sampleAgentContextPressure(ctx, agent, defaultWindow = 500_000) {
+export function sampleAgentContextPressure(ctx, agent, defaultWindow = 360_000) {
   let pressureTokens = 0
   let contextWindow = defaultWindow
   let source = 'none'
@@ -44,7 +45,7 @@ export function sampleAgentContextPressure(ctx, agent, defaultWindow = 500_000) 
       }
       if (typeof cp.contextWindow === 'number' && Number.isFinite(cp.contextWindow) && cp.contextWindow > 0) {
         const measured = Math.round(cp.contextWindow)
-        // 取真实模型窗口与显式安全上限的较小值，绝不用 500k 覆盖 272k 模型真实窗口
+        // 取真实模型窗口与显式安全上限的较小值，绝不用 360k 覆盖 272k 模型真实窗口
         contextWindow = defaultWindow > 0 ? Math.min(defaultWindow, measured) : measured
       }
     }
@@ -71,12 +72,12 @@ export function sampleAgentContextPressure(ctx, agent, defaultWindow = 500_000) 
  */
 export function evaluateContextClockTrigger({
   pressureTokens,
-  contextWindow = 500_000,
+  contextWindow = 360_000,
   firstReflectionUnlocked = false,
   reflectPct = 0.37,
   handoffPct = 0.70,
 }) {
-  const denom = Math.max(1, Number(contextWindow) || 500_000)
+  const denom = Math.max(1, Number(contextWindow) || 360_000)
   const pct = Math.max(0, Number(pressureTokens) || 0) / denom
   if (pct >= handoffPct) {
     return { pressurePct: pct, trigger: 'HANDOFF_70' }
@@ -96,14 +97,18 @@ export async function syncLivePressureToDb(
   bridge,
   workspaceRoot,
   nodeId,
-  defaultWindow = 500_000,
+  defaultWindow = 360_000,
   { signal = null } = {},
 ) {
   if (!nodeId || !bridge) return null
   if (signal?.aborted) return null
   const sample = sampleAgentContextPressure(ctx, agent, defaultWindow)
-  try {
-    return await bridge.control(
+  const session = agent.session ?? agent
+  // 工具回调和探针回合都能写水位，按采样顺序提交，避免旧水位覆盖已触发的门槛。
+  const prior = pendingPressureSyncs.get(session)
+  const pending = (prior ?? Promise.resolve()).catch(() => {}).then(() => {
+    if (signal?.aborted) return null
+    return bridge.control(
       'control_plane/sync_pressure',
       {
         workspace_root: workspaceRoot,
@@ -113,11 +118,17 @@ export async function syncLivePressureToDb(
       },
       { signal },
     )
+  })
+  pendingPressureSyncs.set(session, pending)
+  try {
+    return await pending
   } catch (err) {
     if (signal?.aborted || err?.name === 'AbortError' || err?.code === 'ABORT_ERR') {
       throw err
     }
     return null
+  } finally {
+    if (pendingPressureSyncs.get(session) === pending) pendingPressureSyncs.delete(session)
   }
 }
 
@@ -133,7 +144,8 @@ export function installLiveClockObservers({
   workspaceRoot,
   nodeId = '',
   role,
-  contextWindowTokens = 500_000,
+  contextWindowTokens = 360_000,
+  contextHolidayPct = 0.52,
   onNativeThresholdHit,
 }) {
   if (role !== 'explorer' || !nodeId || !bridge) {
@@ -141,13 +153,14 @@ export function installLiveClockObservers({
   }
   const disposers = []
   let lastTriggerEmitted = ''
+  let holidayTriggered = false
   let lastSyncAtMs = 0
   const THROTTLE_MS = 15_000
 
   const checkAndSync = async (sourceHook, { force = false } = {}) => {
     const nowMs = Date.now()
     const sample = sampleAgentContextPressure(rootCtx, agent, contextWindowTokens)
-    const estPct = sample.pressureTokens / Math.max(1, sample.contextWindow || contextWindowTokens || 500_000)
+    const estPct = sample.pressureTokens / Math.max(1, sample.contextWindow || contextWindowTokens || 360_000)
     // 裁决五：每步工具调用间隙按 >=15s 节流写库（跨 37%/70% 阈值或 force 时立即写），避免争抢单写者锁同时消除长回合盲区
     if (!force && nowMs - lastSyncAtMs < THROTTLE_MS && estPct < 0.37) {
       return
@@ -164,14 +177,21 @@ export function installLiveClockObservers({
       return
     }
     const unlocked = Boolean(rowData.first_reflection_unlocked)
-    const effWindow = Number(rowData.effective_context_window || rowData.context_window_tokens || sample.contextWindow || contextWindowTokens || 500_000)
+    const effWindow = Number(rowData.effective_context_window || rowData.context_window_tokens || sample.contextWindow || contextWindowTokens || 360_000)
 
     const { pressurePct, trigger } = evaluateContextClockTrigger({
-      pressureTokens: sample.pressureTokens,
+      pressureTokens: rowData.pressure_tokens ?? sample.pressureTokens,
       contextWindow: effWindow,
       firstReflectionUnlocked: unlocked,
     })
 
+    if (unlocked && rowData.holiday_completed === false && pressurePct >= contextHolidayPct) {
+      if (!holidayTriggered) {
+        holidayTriggered = true
+        onNativeThresholdHit?.({ trigger: 'HOLIDAY_52', pressurePct, sourceHook })
+      }
+      return rowData
+    }
     if (trigger === 'HANDOFF_70' && lastTriggerEmitted !== 'HANDOFF_70') {
       lastTriggerEmitted = 'HANDOFF_70'
       onNativeThresholdHit?.({ trigger: 'HANDOFF_70', pressurePct, sourceHook })
@@ -195,7 +215,8 @@ export function installLiveClockObservers({
   try {
     const dStep = agentCtx.on('agent/pre-step', async (_payload, next) => {
       const node = await checkAndSync('agent/pre-step', { force: true })
-      if (node?.control_state === 'DRAIN_AFTER_TURN') return { kind: 'reject' }
+      if (node?.control_state === 'DRAIN_AFTER_TURN'
+          && !node.pending_handoff_reason?.startsWith('HIBERNATED_BY_WAVE_CONFERENCE')) return { kind: 'reject' }
       return next()
     })
     if (typeof dStep === 'function') disposers.push(dStep)
@@ -242,10 +263,11 @@ export function registerScopedMcpTools({
   role,
   workspaceRoot,
   nodeId = '',
-  contextWindowTokens = 500_000,
+  contextWindowTokens = 360_000,
   onTurnSignal,
   sessionEpochId = 1,
   onOperatorReceipt = null,
+  onHolidayCompleted = null,
   onHumanMessage,
 }) {
   const disposers = []
@@ -296,10 +318,13 @@ export function registerScopedMcpTools({
 
         // 基础设施/RPC/取消/超时故障由 bridge.callTool 直接 throw，交由 DSH 管线如实记录工具失败；
         // 科研/制度返回（{ ok: false, error_code, ... }）保留为结构化 JSON 收据供模型消费自纠。
-        let res = await bridge.callTool(toolName, args, {
+        const bindsNode = toolName === 'request_internal_survey' || toolName === 'submit_holiday_bet'
+        const toolArgs = bindsNode && nodeId ? { ...args, node_id: nodeId } : args
+        let res = await bridge.callTool(toolName, toolArgs, {
           workspaceRoot,
           role,
           sessionId: agent.id,
+          nodeId,
           sessionEpochId,
           humanMandate: gate?.current(),
           signal: execSignal,
@@ -315,6 +340,11 @@ export function registerScopedMcpTools({
 
         if (res.ok && (DIRECT_CHIEF_TOOLS.has(toolName) || toolName === 'handback_to_chief')) {
           onOperatorReceipt?.(toolName)
+        }
+        if (toolName === 'submit_holiday_bet' && res.ok && res.data.holiday_completed) {
+          onHolidayCompleted?.()
+          exec.concludeTurn()
+          onTurnSignal?.({ role, nodeId, sessionId: agent.id, toolName, trigger: 'HOLIDAY_COMPLETE', receipt: res })
         }
 
         if (role === 'explorer' && toolName === 'run_isolated_eval' && res?.ok) {

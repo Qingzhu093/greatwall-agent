@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from .db.enums import ALLOWED_CONFERENCE_SPEECH_ACTS, ALLOWED_CONVERGENCE_MODES, ALLOWED_HOLIDAY_OUTCOMES, ALLOWED_INTERNAL_SURVEY_SCOPES
 from .db_schema import (
     ALLOWED_CLAIMED_EDGE_TYPES,
     ALLOWED_COMPANION_MODES,
@@ -58,7 +59,7 @@ _COMMON_DESCRIPTIONS: dict[str, str] = {
     "fulfilled_gap_ids": "本次 L3 成果核销的悬赏缺口 gap_id 列表。",
     "narrowed_l2_title": "ACCEPT_NARROWED 降级收编时同步归档的 L2 失败记录标题。",
     "revision_requests": "盲审退修具体可操作修改要求列表。",
-    "cross_draft_comparison_notes": "与同题既有 L3/L2 馆藏的横向对照与去重说明。",
+    "cross_draft_comparison_notes": "与同题既有 L3/L2 馆藏的横向对照。申请低新颖分精简豁免时，写明原规模、新规模及降幅百分数（如证明从 50 步减为 40 步，精简 20%）。",
     "exploit_ticket_payload": "发现仪器漏洞/反作弊漏洞时同事务签发给工造司的 EXPLOIT 工单负载。",
     "minutes_md": "圆桌会议结构化纪要正文（Markdown）。",
     "next_round_focus_md": "下一轮圆桌聚焦议题或交锋靶点。",
@@ -82,7 +83,7 @@ _TOOL_PROP_PATCHES: dict[str, dict[str, dict[str, Any]]] = {
     },
     "chief_read": {
         "resource": {
-            "description": "统一资源 URI：survey/<Q> | node/<id>/manuscript | node/<id>/briefing | node/<id>/transcript | review/<id>/ledger | conference/<id>/minutes | entry/<id> | receipt/<op_id> | archive/<epoch_id>/<上述任一路径>。",
+            "description": "统一资源 URI：contract（Parse 0 完整契约与完成判据）| survey/<Q> | node/<id>/manuscript | node/<id>/briefing | node/<id>/transcript | review/<id>/ledger | conference/<id>/minutes | entry/<id>（支持内藏 L3/L2 与外藏 R###）| receipt/<op_id> | archive/<epoch_id>/<上述任一路径>。",
         },
         "offset": {"minimum": 0, "description": "UTF-16 字符起始偏移（沿上一次返回的 next_offset 续读）。"},
         "limit": {"minimum": 1, "maximum": 16000, "description": "单页最大读取字符数（默认 4000）。"},
@@ -95,17 +96,29 @@ _TOOL_PROP_PATCHES: dict[str, dict[str, dict[str, Any]]] = {
                 "node_intervene",
                 "family_manage",
                 "approve_wave_verdict",
+                "open_wave_conference",
                 "submit_ticket",
+                "cancel_ticket",
+                "request_survey",
                 "recover_queue",
                 "pin_note",
             ],
-            "description": "8 类日常运维直执原语枚举。",
+            "description": "11 类日常运维直执原语枚举（含人工随时召集圆桌 open_wave_conference、直派外藏查新 request_survey 与撤回未结工单 cancel_ticket）。",
         },
         "arrangement": {"description": "单条运行安排补丁（含 scope_type、target_id、dispatch_policy、priority_weight、max_active_branches、max_concurrent_workers、inflight_drain_mode、ends_on_kind/expires_at 等）。"},
         "arrangements": {"description": "多条运行安排列表（同一人类意图涉及多个子题时一次原子提交）。"},
         "node_action": {"description": "点名分支动作（node_ids + mode: retire|hibernate|pause_takeover|resume|early_handoff|reactivate + 可选 archive_family/reason）。"},
         "handback_id": {"description": "可选：人类在探索者窗口发起并转办至总控的一次性授权凭证 ID。"},
-        "details": {"description": "扩展操作参数（如 revoke_arrangement 的 arrangement_id、family_manage 的 family_id/mode、submit_ticket 的 ticket_type/description、pin_note 的 content_md 等）。"},
+        "details": {"description": "扩展操作参数（revoke_arrangement 传 arrangement_id；family_manage 传 family_id/mode；submit_ticket 传 question_id/ticket_type/description/instrument_id；cancel_ticket 传 ticket_id/reason；request_survey 传 question_id/topic_query/reason；pin_note 传 question_id/note_id/content_md）。"},
+    },
+    "submit_works_ticket": {
+        "question_id": {"description": "关联子题号（如 Q1 / ALL）。"},
+        "ticket_type": {
+            "enum": ["INSTRUMENT_ERROR", "PAIN_POINT", "DUPLICATE_TOOL", "EXPLOIT", "DISCRIMINATOR"],
+            "description": "工单类型枚举：仪器报错 / 痛点 / 重复造轮子 / 漏洞 / 鉴别器。",
+        },
+        "description": {"minLength": 5, "description": "简明扼要的问题或共享工具需求描述（>=5 字）。"},
+        "instrument_id": {"description": "可选：关联的仪器或目标共享工具 ID（如 sim_env / geo_kernel）。"},
     },
     "chief_send_branch_note": {
         "node_id": {"description": "接收导师点拨的目标探索节点 ID。"},
@@ -161,7 +174,7 @@ _TOOL_PROP_PATCHES: dict[str, dict[str, dict[str, Any]]] = {
         "mode": {"enum": sorted(ALLOWED_COMPANION_MODES), "description": "伴随阶段模式。"},
     },
     "record_reflection_and_unlock_pull": {
-        "holiday_prompt_id": {"minimum": 1, "maximum": 28, "description": "夜科学启发题编号（1–28）。"},
+        "holiday_prompt_id": {"minimum": 1, "maximum": 28, "description": "旧调用的兼容参数，默认 null。夜科学由宿主在 52% 另行选题。"},
         "turns": {
             "minItems": 1,
             "maxItems": 2,
@@ -194,13 +207,52 @@ _TOOL_PROP_PATCHES: dict[str, dict[str, dict[str, Any]]] = {
         "recommended_triage": {
             "description": "可选：伴随助手结构化去向建议（合法常规情形由确定性控制面直接落单，无需额外拉起后勤分诊员）。",
         },
+        "holiday_bet_outcome": {
+            "description": '核销本班收到的赌注。示例：{"outcome":"FALSIFIED","note_md":"在 Obs-007 条件下观测到反例"}。',
+            "properties": {"outcome": {"type": "string", "enum": sorted(ALLOWED_HOLIDAY_OUTCOMES)},
+                           "note_md": {"type": "string", "description": "实验依据或未测试原因。"}},
+        },
+        "manuscript_submissions": {
+            "description": (
+                '阶段投稿默认为非阻塞。示例：[{"title":"有限域引理","abstract_md":"适用有限凸域",'
+                '"claim_and_proof_md":"逐步证明正文","exact_scope_md":"有限凸域",'
+                '"bound_obs_ids":["Obs-001"],"declared_citations":["L3-001"],"tags":["凸性"],"non_blocking":true}]'
+            ),
+        },
         "local_lemma_submissions": {
-            "description": "可选：活节点 70% 交班顺手独立拆交的局部引理列表（挂冻结快照建一次性盲审单，绝不锁死也不打断继续推进的原分支）。",
+            "description": (
+                "可选：活节点 70% 交班顺手独立拆交的局部引理列表（挂冻结快照建一次性盲审单，绝不锁死也不打断继续推进的原分支）。"
+                "每项必填字段：title（引理标题）与 column_a_self_contained_proof_md（>=20字自包含证明正文）；"
+                "可选：column_b_scope_notes_md、bound_obs_ids、artifact_rel_path。"
+                "示例：[{\"title\":\"Lemma 1: 能量单调性\",\"column_a_self_contained_proof_md\":\"完整自包含证明（>=20字）...\",\"column_b_scope_notes_md\":\"适用边界\",\"bound_obs_ids\":[\"Obs001\"]}]。"
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "必填：局部引理标题。"},
+                    "column_a_self_contained_proof_md": {
+                        "type": "string",
+                        "minLength": 20,
+                        "description": "必填（>=20字）：自包含证明正文（严禁改名为 proof_md）。",
+                    },
+                    "column_b_scope_notes_md": {"type": "string", "description": "可选：适用范围与边界备注。"},
+                    "bound_obs_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选：绑定的实测 [Obs###] 编号列表。",
+                    },
+                    "artifact_rel_path": {"type": ["string", "null"], "description": "可选：对应代码/产物相对路径。"},
+                },
+                "required": ["title", "column_a_self_contained_proof_md"],
+            },
         },
     },
     "submit_conference_statement": {
-        "round_no": {"minimum": 1, "maximum": 2, "description": "圆桌轮次：1（互挑刺）或 2（回应辩护）。"},
-        "statement_md": {"minLength": 20, "description": "点对点红蓝交锋发言正文（>=20 字）。"},
+        "round_no": {"minimum": 1, "maximum": 4, "description": "第 1 轮自审与提案，第 2 轮及后续追问轮点对点回复（按本场 discussion_rounds 上限）。"},
+        "statement_md": {"minLength": 20, "maxLength": 1200, "description": "提交本轮证据、接口与协作动作。"},
+        "speech_act": {"enum": sorted(ALLOWED_CONFERENCE_SPEECH_ACTS), "description": "第 1 轮固定 PROPOSE_AND_SELF_AUDIT，第 2 轮及后续轮选择一种同行协作动作。"},
+        "unverified_ideas": {"description": "未验证的设想或可供嫁接模块，内核加 [UNVERIFIED] 标记。"},
+        "target_node_ids": {"description": "第 2 轮及后续轮参会人至少两名时，点名至少一位其他参会者。"},
     },
     "triage_node": {
         "triage_level": {"enum": sorted(ALLOWED_TRIAGE_LEVELS)},
@@ -216,27 +268,84 @@ _TOOL_PROP_PATCHES: dict[str, dict[str, dict[str, Any]]] = {
         "abstract_md": {"minLength": 60, "maxLength": 1200, "description": "文献高密度核心摘要（60–1200 字）。"},
     },
     "publish_living_survey": {
-        "sec1_baseline_and_instruments_md": {"description": "栏1：当前最优已证实解与实验室可用仪器（四栏合计硬限 <= 1500 字）。"},
+        "sec1_baseline_and_instruments_md": {"description": "栏1：当前最优已证实解与实验室可用仪器（四栏合计硬限 <= 4000 字）。"},
         "sec2_l3_lemma_tree_md": {"description": "栏2：已证实可复用的模块化引理索引。"},
         "sec3_avoidance_radar_md": {"description": "栏3：实锤死路禁区与反例摘要。"},
         "sec4_explicit_gaps_md": {"description": "栏4：Top 客观明确缺口导览与高优悬赏编号（严禁泄露他派未验真私有思路）。"},
+        "marginal_notes_md": {"maxLength": 1500, "description": "边缘注记专栏，独立于核心四栏；含固定系统印章的合计上限 1500 字。"},
     },
     "export_stage3_final_delivery": {
         "delivery_mode": {"enum": sorted(ALLOWED_DELIVERY_MODES)},
     },
+    "record_conference_minutes": {
+        "minutes_md": {"maxLength": 6000, "description": "完整会议纪要，包含证据共识、接口缝隙与承重缺口。"},
+    },
     "submit_conference_verdict": {
         "actions": {
+            "description": (
+                '示例：[{"action_type":"HIBERNATE","target_node_id":"node_q1_a","reason_md":"边际投入已枯竭","salvage_audit":true},'
+                '{"action_type":"SPAWN_SYNTHESIS","primary_node_id":"node_q1_b","secondary_node_id":"node_q1_c",'
+                '"target_family_id":"fam_q1_b","synthesis_goal_md":"拼接有限域与无界域的前提接口"},'
+                '{"action_type":"DISCRIMINATOR","instrument_id":"inst_q1","probe_requirement_md":"区分两个构造的边界输入"},'
+                '{"action_type":"CONVERGE_SUBPROBLEM","convergence_mode":"CONVERGE_FULL_COMPOSITE",'
+                '"composite_entry_ids":["L3-001","L3-002"],"rationale_md":"核验两篇覆盖合并后的完成判据"}]'
+            ),
             "items": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": sorted(ALLOWED_WAVE_VERDICT_ACTIONS)},
+                    "action_type": {"type": "string", "enum": sorted(ALLOWED_WAVE_VERDICT_ACTIONS)},
+                    "family_id": {"type": "string", "description": "开枝学派 ID。"},
+                    "mechanism_signature": {"type": "string", "description": "开枝的方法机制。"},
+                    "orthogonal_contrast": {"type": "string", "description": "开枝与现有方法的正交差异。"},
+                    "gap_directive_md": {"type": "string", "description": "开枝对应的承重缺口与验证目标。"},
+                    "requires": {"type": "array", "items": {"type": "string"}, "description": "可选：分支级精确前置依赖（L3-### 或 OBS:<instrument_id>:PASS）。"},
+                    "source_node_id": {"type": "string", "description": "PROTECT 的来源节点。"},
+                    "primary_node_id": {"type": "string", "description": "融合主供体。"},
+                    "secondary_node_id": {"type": "string", "description": "融合副供体。"},
+                    "target_family_id": {"type": "string", "description": "融合分支的已登记学派。"},
+                    "synthesis_goal_md": {"type": "string", "description": "融合的具体目标与接口。"},
+                    "budget_nodes": {"type": "integer", "minimum": 1, "description": "本波额度内的合体班岗预算。"},
+                    "target_node_id": {"type": "string", "description": "休眠目标分支的代表节点。"},
+                    "reason_md": {"type": "string", "description": "休眠的实证理由。"},
+                    "salvage_audit": {"type": "boolean", "default": False, "description": "将可用局部成果送盲审打捞。"},
+                    "instrument_id": {"type": "string", "description": "鉴别探针对应仪器。"},
+                    "probe_requirement_md": {"type": "string", "description": "鉴别探针的证据需求。"},
+                    "convergence_mode": {"type": "string", "enum": sorted(ALLOWED_CONVERGENCE_MODES)},
+                    "composite_entry_ids": {"type": "array", "items": {"type": "string"}, "default": []},
+                    "rationale_md": {"type": "string", "description": "收敛、保护或请示的依据。"},
                 },
-                "required": ["action"],
+                "required": ["action_type"],
             },
-            "description": "6 类宏观树结构调整动作列表。",
         },
     },
+    "submit_holiday_bet": {
+        "anomaly_or_analogy_md": {"minLength": 30, "maxLength": 600, "description": "说明反常或跨领域类比。"},
+        "testable_hypothesis_md": {"minLength": 30, "maxLength": 500, "description": "写出实测可证伪的假设。"},
+        "falsification_experiment_md": {
+            "minLength": 30, "maxLength": 500,
+            "description": (
+                '描述能推翻假设的判据。示例：{"node_id":"node_q1_a",'
+                '"anomaly_or_analogy_md":"边界扰动导致状态突然转换，类似跨越相变阈值时的两类稳态结构。",'
+                '"testable_hypothesis_md":"保持输入规模和求解费率固定时，转换只由指定边界距离触发。",'
+                '"falsification_experiment_md":"用配对输入逐步扫描阈值两侧，如果远离阈值仍反复出现转换即推翻假设。"}'
+            ),
+        },
+    },
+    "request_internal_survey": {
+        "query_md": {"minLength": 10, "maxLength": 1500, "description": "院内专题检索问题。"},
+        "focus_scope": {"enum": sorted(ALLOWED_INTERNAL_SURVEY_SCOPES), "description": "限当前子题或跨子题。"},
+    },
+    "publish_internal_survey_report": {
+        "report_md": {"minLength": 800, "maxLength": 4000, "description": "逐段引用实存编号的客观院内综述。"},
+        "cited_entry_ids": {"description": "正文引用的 L3、L2 或 R 编号。"},
+        "cited_obs_ids": {"description": "正文引用的有效正式观测编号。"},
+    },
+    "upgrade_instrument_with_calibration": {
+        "resolved_ticket_ids": {"description": "本次升版明确修复的 OPEN 工单编号。"},
+        "upgrade_summary_md": {"description": "点名自动结案时必填的修复与校准说明。"},
+    },
     "submit_stage1_blind_ledger": {
+        "rigor_score": {"minimum": 1, "maximum": 10, "description": "阶段一锁定的严密性分；PASS 或 PARTIAL_PASS 须 >=7。"},
         "ledger_items": {
             "minItems": 1,
             "items": {
@@ -256,6 +365,13 @@ _TOOL_PROP_PATCHES: dict[str, dict[str, dict[str, Any]]] = {
         },
     },
     "submit_stage2_unblind_verdict": {
+        "novelty_score": {"description": "新颖性 1–10；低于 4 且无实质精简，查重退稿。"},
+        "significance_score": {"description": "重要性 1–10；低于 5 强制收为 MARGINAL_NOTE。"},
+        "reviewer_comment_md": {"description": "公开审稿附页，按承重缺口与改良项说明。"},
+        "confirmed_citations": {"description": "确认实存的馆藏或外藏引用编号。"},
+        "is_equivalent_reduction": {
+            "description": "等价归约时勾选。低新颖分稿须在 cross_draft_comparison_notes 说明具体至少 20% 的实质精简。",
+        },
         "final_verdict": {"enum": sorted(ALLOWED_FINAL_VERDICTS)},
         "l3_entry_kind": {"enum": [*sorted(ALLOWED_L3_ENTRY_KINDS), None]},
         "goal_coverage": {"enum": [*sorted(ALLOWED_GOAL_COVERAGES), None]},

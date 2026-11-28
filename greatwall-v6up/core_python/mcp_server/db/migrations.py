@@ -8,8 +8,9 @@ from datetime import datetime, timezone
 
 from ..db_runtime import rw_immediate_tx
 from .enums import ERR_STORAGE, FailClosedError
-from .schema_base import BASE_SCHEMA_SQL
+from .schema_base import BASE_SCHEMA_SQL, STAGE1_TRIGGER_SQL
 from .schema_v031 import V031_SCHEMA_SQL
+from .schema_v032 import MINI_PAPERS_VIEW_SQL, V032_SCHEMA_SQL
 from .schema_v03 import SEALED_HANDOFF_TRIGGER_SQL, V03_SCHEMA_SQL
 
 
@@ -157,137 +158,6 @@ def _migrate_survey_requests_check_constraint(conn: sqlite3.Connection) -> None:
     _rebuild_table_without_fk(conn, _do)
 
 
-def _migrate_works_queue_discriminator_constraint(conn: sqlite3.Connection) -> None:
-    """v0.2 -> v0.3：幂等重建 works_engineering_queue 放开 DISCRIMINATOR 枚举。"""
-    row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'works_engineering_queue'"
-    ).fetchone()
-    ddl = str(row["sql"] or "") if row else ""
-    if not ddl or "'DISCRIMINATOR'" in ddl:
-        return
-
-    def _do(c: sqlite3.Connection) -> None:
-        c.execute(
-            """
-            CREATE TABLE works_engineering_queue_v3 (
-                ticket_id TEXT PRIMARY KEY,
-                question_id TEXT NOT NULL,
-                ticket_type TEXT NOT NULL CHECK(ticket_type IN ('INSTRUMENT_ERROR','PAIN_POINT','DUPLICATE_TOOL','EXPLOIT','DISCRIMINATOR')),
-                instrument_id TEXT,
-                payload_json TEXT NOT NULL DEFAULT '{}',
-                status TEXT NOT NULL DEFAULT 'OPEN' CHECK(status IN ('OPEN','RESOLVED')),
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        c.execute(
-            """
-            INSERT INTO works_engineering_queue_v3(
-                ticket_id, question_id, ticket_type, instrument_id, payload_json, status, created_at, updated_at
-            )
-            SELECT ticket_id, question_id, ticket_type, instrument_id, payload_json, status, created_at, updated_at
-            FROM works_engineering_queue
-            """
-        )
-        c.execute("DROP TABLE works_engineering_queue")
-        c.execute("ALTER TABLE works_engineering_queue_v3 RENAME TO works_engineering_queue")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_works_tickets_status ON works_engineering_queue(status, question_id)")
-
-    _rebuild_table_without_fk(conn, _do)
-
-
-def _migrate_review_queue_local_lemma_constraint(conn: sqlite3.Connection) -> None:
-    """v0.2 -> v0.3：幂等重建 review_queue 放开 LOCAL_LEMMA_SUBMISSION 枚举。"""
-    row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'review_queue'"
-    ).fetchone()
-    ddl = str(row["sql"] or "") if row else ""
-    if not ddl or "'LOCAL_LEMMA_SUBMISSION'" in ddl:
-        return
-
-    cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(review_queue)").fetchall()}
-    target_cols = [
-        ("review_id", "''"),
-        ("question_id", "''"),
-        ("source_node_id", "''"),
-        ("source_type", "'LEVEL1_MANUSCRIPT'"),
-        ("proposer_session_id", "''"),
-        ("review_status", "'STAGE1_BLIND'"),
-        ("manuscript_title", "''"),
-        ("spec_revision", "0"),
-        ("column_a_snapshot_md", "''"),
-        ("column_b_snapshot_md", "''"),
-        ("bound_obs_ids_json", "'[]'"),
-        ("artifact_rel_path", "NULL"),
-        ("artifact_snapshot_abs_path", "NULL"),
-        ("sanitized_code_diff_md", "''"),
-        ("stage1_ledger_json", "NULL"),
-        ("stage1_locked_at", "NULL"),
-        ("final_locked_at", "NULL"),
-        ("final_verdict", "NULL"),
-        ("revision_requests_json", "NULL"),
-        ("created_at", "''"),
-        ("updated_at", "''"),
-    ]
-    insert_cols = ", ".join(name for name, _ in target_cols)
-    select_exprs = ", ".join(name if name in cols else default_expr for name, default_expr in target_cols)
-
-    def _do(c: sqlite3.Connection) -> None:
-        c.execute("DROP TRIGGER IF EXISTS trg_reviews_lock_stage1")
-        c.execute("ALTER TABLE review_queue RENAME TO _review_queue_old")
-        c.execute(
-            """
-            CREATE TABLE review_queue (
-                review_id TEXT PRIMARY KEY,
-                question_id TEXT NOT NULL,
-                source_node_id TEXT NOT NULL,
-                source_type TEXT NOT NULL CHECK(source_type IN (
-                    'LEVEL1_MANUSCRIPT','LEVEL4A_BARRIER','AUDITOR_SALVAGED_LEMMA','LOCAL_LEMMA_SUBMISSION'
-                )),
-                proposer_session_id TEXT NOT NULL,
-                review_status TEXT NOT NULL DEFAULT 'STAGE1_BLIND' CHECK(review_status IN (
-                    'STAGE1_BLIND','STAGE2_UNBLIND','CLOSED_ACCEPTED','CLOSED_REVISE','CLOSED_REFUTED'
-                )),
-                manuscript_title TEXT NOT NULL DEFAULT '',
-                spec_revision INTEGER NOT NULL DEFAULT 0,
-                column_a_snapshot_md TEXT NOT NULL DEFAULT '',
-                column_b_snapshot_md TEXT NOT NULL DEFAULT '',
-                bound_obs_ids_json TEXT NOT NULL DEFAULT '[]',
-                artifact_rel_path TEXT,
-                artifact_snapshot_abs_path TEXT,
-                sanitized_code_diff_md TEXT NOT NULL DEFAULT '',
-                stage1_ledger_json TEXT,
-                stage1_locked_at TEXT,
-                final_locked_at TEXT,
-                final_verdict TEXT CHECK(final_verdict IN ('ACCEPT','ACCEPT_NARROWED','REVISE','REFUTED') OR final_verdict IS NULL),
-                revision_requests_json TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        c.execute(f"INSERT INTO review_queue({insert_cols}) SELECT {select_exprs} FROM _review_queue_old")
-        c.execute("DROP TABLE _review_queue_old")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_review_status ON review_queue(review_status, question_id)")
-        c.execute(
-            """
-            CREATE TRIGGER IF NOT EXISTS trg_reviews_lock_stage1
-            BEFORE UPDATE OF stage1_ledger_json, stage1_locked_at ON review_queue
-            WHEN OLD.stage1_locked_at IS NOT NULL
-              AND (
-                  COALESCE(NEW.stage1_ledger_json, '') != COALESCE(OLD.stage1_ledger_json, '')
-                  OR COALESCE(NEW.stage1_locked_at, '') != COALESCE(OLD.stage1_locked_at, '')
-              )
-            BEGIN
-                SELECT RAISE(ABORT, 'STAGE1_LEDGER_IMMUTABLE');
-            END;
-            """
-        )
-
-    _rebuild_table_without_fk(conn, _do)
-
-
 _INCREMENTAL_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # v0.2 既有安全增量列
     ("instruments", "frozen_snapshot_path", "TEXT"),
@@ -295,7 +165,7 @@ _INCREMENTAL_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("lineage_nodes", "explorer_will_md", "TEXT NOT NULL DEFAULT ''"),
     ("lineage_nodes", "pending_handoff_mode", "TEXT"),
     ("lineage_nodes", "pending_handoff_reason", "TEXT NOT NULL DEFAULT ''"),
-    ("lineage_nodes", "effective_context_window", "INTEGER NOT NULL DEFAULT 500000"),
+    ("lineage_nodes", "effective_context_window", "INTEGER NOT NULL DEFAULT 360000"),
     ("lineage_nodes", "spec_revision", "INTEGER NOT NULL DEFAULT 0"),
     ("review_queue", "spec_revision", "INTEGER NOT NULL DEFAULT 0"),
     ("parse0_contract", "shared_inputs_json", "TEXT NOT NULL DEFAULT '[]'"),
@@ -308,7 +178,7 @@ _INCREMENTAL_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # v0.3 新增增量列（100% 对齐 agent_kb_v0_3_04 §二点一）
     ("parse0_contract", "autonomy_mode", "TEXT NOT NULL DEFAULT 'WAVE_CONFIRM'"),
     ("lineage_nodes", "branch_kind", "TEXT NOT NULL DEFAULT 'PURE'"),
-    ("lineage_nodes", "protection_generations_left", "INTEGER NOT NULL DEFAULT 2"),
+    ("lineage_nodes", "protection_generations_left", "INTEGER NOT NULL DEFAULT 1"),
     ("lineage_nodes", "branch_budget_nodes_left", "INTEGER"),
     ("lineage_nodes", "companion_session_id", "TEXT NOT NULL DEFAULT ''"),
     ("lineage_nodes", "briefing_sealed_at", "TEXT"),
@@ -465,37 +335,143 @@ def _backfill_v03_data(conn: sqlite3.Connection) -> None:
         )
 
 
+def _rebuild_from_schema(conn: sqlite3.Connection, table: str, schema: str) -> None:
+    def rebuild(c: sqlite3.Connection) -> None:
+        objects = c.execute(
+            "SELECT sql FROM sqlite_master WHERE tbl_name = ? AND type IN ('index','trigger') AND sql IS NOT NULL",
+            (table,),
+        ).fetchall()
+        previous = f"_{table}_before_upgrade"
+        c.execute(f"ALTER TABLE {table} RENAME TO {previous}")
+        ddl = schema.split(f"CREATE TABLE IF NOT EXISTS {table} (", 1)[1].split(";", 1)[0]
+        c.execute(f"CREATE TABLE {table} ({ddl}")
+        new_cols = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
+        common = ", ".join(f'"{r["name"]}"' for r in c.execute(f"PRAGMA table_info({previous})") if r["name"] in new_cols)
+        c.execute(f"INSERT INTO {table} ({common}) SELECT {common} FROM {previous}")
+        c.execute(f"DROP TABLE {previous}")
+        for obj in objects:
+            c.execute(obj["sql"])
+
+    _rebuild_table_without_fk(conn, rebuild)
+
+
 def _migrate_operator_plane_constraints(conn: sqlite3.Connection) -> None:
     for table, marker, schema in (
-        ("lineage_nodes", "RETIRED", BASE_SCHEMA_SQL),
-        ("method_families", "ARCHIVED", BASE_SCHEMA_SQL),
-        ("runtime_effects", "DELIVER_BRANCH_NOTE", V03_SCHEMA_SQL),
-        ("node_interventions", "ADVISOR_NOTE_SENT", V03_SCHEMA_SQL),
-        ("control_proposals", "ADVANCE_EPOCH", V03_SCHEMA_SQL),
+        ("method_families", "'ARCHIVED'", BASE_SCHEMA_SQL),
+        ("node_interventions", "'ADVISOR_NOTE_SENT'", V03_SCHEMA_SQL),
+        ("control_proposals", "'ADVANCE_EPOCH'", V03_SCHEMA_SQL),
     ):
-        previous_sql = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,),
-        ).fetchone()["sql"]
-        if f"'{marker}'" in previous_sql:
+        previous_sql = conn.execute("SELECT sql FROM sqlite_master WHERE name = ?", (table,)).fetchone()["sql"]
+        if marker not in previous_sql:
+            _rebuild_from_schema(conn, table, schema)
+
+
+def _migrate_v032_constraints_and_backfill(conn: sqlite3.Connection) -> None:
+    for table, marker, schema in (
+        ("lineage_nodes", "effective_context_window INTEGER NOT NULL DEFAULT 360000", BASE_SCHEMA_SQL),
+        ("review_queue", "'COMPOSITE_FULL_GOAL'", BASE_SCHEMA_SQL),
+        ("runtime_effects", "'RUN_INTERNAL_SURVEY'", V03_SCHEMA_SQL),
+        ("works_engineering_queue", "'WONTFIX'", BASE_SCHEMA_SQL),
+        ("subproblem_living_surveys", "length(marginal_notes_md) <= 1500", V03_SCHEMA_SQL),
+        ("wave_conferences", "length(minutes_md) <= 6000", V03_SCHEMA_SQL),
+    ):
+        ddl = conn.execute("SELECT sql FROM sqlite_master WHERE name = ?", (table,)).fetchone()["sql"]
+        if marker in ddl and (table != "lineage_nodes" or "'RETIRED'" in ddl):
             continue
+        _rebuild_from_schema(conn, table, schema)
 
-        def rebuild(c: sqlite3.Connection) -> None:
-            objects = c.execute(
-                "SELECT sql FROM sqlite_master WHERE tbl_name = ? AND type IN ('index','trigger') AND sql IS NOT NULL",
-                (table,),
+    for table, columns in {
+        "observations": ("frozen_code_snapshot_path TEXT NOT NULL DEFAULT ''",),
+        "lineage_nodes": (
+            "holiday_prompt_id INTEGER", "holiday_bet_json TEXT NOT NULL DEFAULT '{}'",
+            "holiday_completed INTEGER NOT NULL DEFAULT 0", "pending_review_feedback_json TEXT NOT NULL DEFAULT '[]'",
+            "peer_takeaways_json TEXT NOT NULL DEFAULT '[]'",
+        ),
+        "internal_research_ledger": (
+            "author_node_id TEXT", "author_branch_id TEXT", "author_family_id TEXT",
+            "tags_json TEXT NOT NULL DEFAULT '[]'", "cited_entries_json TEXT NOT NULL DEFAULT '[]'",
+            "rigor_score INTEGER", "novelty_score INTEGER", "significance_score INTEGER",
+            "overall_score REAL", "reviewer_comment_md TEXT NOT NULL DEFAULT ''",
+        ),
+        "open_lemma_gaps": (
+            "gap_tier TEXT NOT NULL DEFAULT 'LOAD_BEARING' CHECK(gap_tier IN ('LOAD_BEARING', 'IMPROVEMENT'))",
+            "source_entry_id TEXT",
+        ),
+    }.items():
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for definition in columns:
+            if definition.split()[0] not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+    conn.executescript(STAGE1_TRIGGER_SQL)
+    conn.executescript(MINI_PAPERS_VIEW_SQL)
+    with rw_immediate_tx(conn):
+        conn.execute(
+            """
+            UPDATE internal_research_ledger AS l
+            SET (author_node_id, author_branch_id, author_family_id) = (
+                SELECT r.source_node_id, n.branch_id, n.family_id
+                FROM review_queue r LEFT JOIN lineage_nodes n ON n.node_id = r.source_node_id
+                WHERE r.review_id = l.verified_review_id
+            )
+            WHERE author_node_id IS NULL AND verified_review_id IS NOT NULL
+            """
+        )
+        conn.execute(
+            """
+            UPDATE works_engineering_queue
+            SET resolution_note = json_extract(payload_json, '$.resolution_note'),
+                status = CASE json_extract(payload_json, '$.resolution')
+                    WHEN 'WONTFIX' THEN 'WONTFIX' WHEN 'DUPLICATE' THEN 'DUPLICATE' ELSE 'RESOLVED' END
+            WHERE status = 'RESOLVED' AND resolution_note = '' AND json_valid(payload_json)
+              AND json_type(payload_json, '$.resolution_note') = 'text'
+              AND json_extract(payload_json, '$.resolution_note') != ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE review_queue SET non_blocking = 0
+            WHERE source_type IN ('LEVEL1_MANUSCRIPT','LEVEL4A_BARRIER') AND non_blocking != 0
+            """
+        )
+
+
+def _migrate_relaxed_char_limit_constraints(conn: sqlite3.Connection) -> None:
+    """幂等放宽旧库 lineage_briefings (2200/3600->5000) 与 subproblem_living_surveys (1500->4000) 字数 CHECK 约束。"""
+    for tbl, old_tok, new_tok in (
+        ("lineage_briefings", "total_chars <= 2200", "total_chars <= 5000"),
+        ("lineage_briefings", "total_chars <= 3600", "total_chars <= 5000"),
+        ("subproblem_living_surveys", "total_chars <= 1500", "total_chars <= 4000"),
+    ):
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (tbl,),
+        ).fetchone()
+        ddl = str(row["sql"] or "") if row else ""
+        if not ddl or old_tok not in ddl:
+            continue
+        new_ddl = ddl.replace(old_tok, new_tok)
+        cols = [str(r["name"]) for r in conn.execute(f"PRAGMA table_info({tbl})").fetchall()]
+        col_csv = ", ".join(cols)
+        idx_sqls = [
+            str(r["sql"])
+            for r in conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL",
+                (tbl,),
             ).fetchall()
-            previous = f"_{table}_before_operator_plane"
-            c.execute(f"ALTER TABLE {table} RENAME TO {previous}")
-            ddl = schema.split(f"CREATE TABLE IF NOT EXISTS {table} (", 1)[1].split(";", 1)[0]
-            c.execute(f"CREATE TABLE {table} ({ddl}")
-            new_cols = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
-            common = ", ".join(f'"{r["name"]}"' for r in c.execute(f"PRAGMA table_info({previous})") if r["name"] in new_cols)
-            c.execute(f"INSERT INTO {table} ({common}) SELECT {common} FROM {previous}")
-            c.execute(f"DROP TABLE {previous}")
-            for obj in objects:
-                c.execute(obj["sql"])
+        ]
 
-        _rebuild_table_without_fk(conn, rebuild)
+        def _do(c: sqlite3.Connection, _tbl=tbl, _new_ddl=new_ddl, _col_csv=col_csv, _idx_sqls=idx_sqls) -> None:
+            tmp_tbl = f"_{_tbl}_old_charlim"
+            c.execute(f"DROP TABLE IF EXISTS {tmp_tbl}")
+            c.execute(f"ALTER TABLE {_tbl} RENAME TO {tmp_tbl}")
+            c.execute(_new_ddl)
+            c.execute(f"INSERT INTO {_tbl}({_col_csv}) SELECT {_col_csv} FROM {tmp_tbl}")
+            c.execute(f"DROP TABLE {tmp_tbl}")
+            for sql in _idx_sqls:
+                c.execute(sql)
+
+        _rebuild_table_without_fk(conn, _do)
 
 
 def init_database_schema(conn: sqlite3.Connection) -> None:
@@ -505,8 +481,7 @@ def init_database_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(V03_SCHEMA_SQL)
     _migrate_closure_state_check_constraint(conn)
     _migrate_survey_requests_check_constraint(conn)
-    _migrate_works_queue_discriminator_constraint(conn)
-    _migrate_review_queue_local_lemma_constraint(conn)
+    _migrate_relaxed_char_limit_constraints(conn)
 
     for tbl, col, col_def in _INCREMENTAL_COLUMNS:
         existing = {str(r["name"]) for r in conn.execute(f"PRAGMA table_info({tbl})").fetchall()}
@@ -536,3 +511,5 @@ def init_database_schema(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO external_literature_fts(external_literature_fts) VALUES('rebuild')")
     _backfill_v03_data(conn)
     conn.commit()
+    conn.executescript(V032_SCHEMA_SQL)
+    _migrate_v032_constraints_and_backfill(conn)

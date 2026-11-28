@@ -173,7 +173,7 @@ class TestP2Full31ToolsAndGates(unittest.TestCase):
             "lineage_companion",
             "s_comp1",
             node_id=nid,
-            selected_categories=["Attractor Tasks", "Boundary Assumptions"],
+            selected_categories=["C08_ATTRACTOR_TRAP", "C01_ASSUMPTION_BLINDSPOT"],
             holiday_prompt_id=3,
             turns=[{"question": "是否可放宽正则性前提？", "answer": "可改用 Cauchy-Schwarz 不等式消除正则假设。"}],
             verdict_3state="SUFFICIENT_EVIDENCE",
@@ -273,6 +273,7 @@ class TestP2Full31ToolsAndGates(unittest.TestCase):
             question_id="Q1",
             ledger_items=[{"claim": "主定理成立", "evidence_location_and_quote": "thm.md L1-L3: Complete proof", "status": "VERIFIED"}],
             stage1_verdict="PASS",
+            rigor_score=8,
         )
         self.assertTrue(s1["ok"], s1)
 
@@ -285,6 +286,7 @@ class TestP2Full31ToolsAndGates(unittest.TestCase):
             question_id="Q1",
             ledger_items=[{"claim": "主定理成立", "evidence_location_and_quote": "thm.md L1", "status": "REFUTED"}],
             stage1_verdict="REFUTED",
+            rigor_score=5,
         )
         self.assertFalse(s1_again["ok"])
 
@@ -296,6 +298,7 @@ class TestP2Full31ToolsAndGates(unittest.TestCase):
             "s_ver1",
             review_id=review_id,
             final_verdict="ACCEPT",
+            novelty_score=8, significance_score=8,
             l3_entry_kind="POS_THEOREM",
             goal_coverage="FULL_GOAL",
             title="Q1 主定理完整证明",
@@ -337,11 +340,12 @@ class TestP2Full31ToolsAndGates(unittest.TestCase):
                 review_id=rid, question_id=qid,
                 ledger_items=[{"claim": "结论成立", "evidence_location_and_quote": "res.md L1-L2: Verified", "status": "VERIFIED"}],
                 stage1_verdict="PASS",
+                rigor_score=8,
             )
             self._call("get_unblinded_manuscript_and_peers", "library_verifier", f"sv_{qid}", review_id=rid)
             s2 = self._call(
                 "submit_stage2_unblind_verdict", "library_verifier", f"sv_{qid}",
-                review_id=rid, final_verdict="ACCEPT", l3_entry_kind="POS_THEOREM", goal_coverage="FULL_GOAL",
+                review_id=rid, final_verdict="ACCEPT", novelty_score=8, significance_score=8, l3_entry_kind="POS_THEOREM", goal_coverage="FULL_GOAL",
                 title=f"{qid} 结论", abstract_md=f"{qid} 严格成立并通过全部独立复核，结论边界清晰且已与馆藏条目逐项对齐无冲突，可供终稿直接引用。",
                 exact_verified_scope_md=f"{qid} 全域",
             )
@@ -388,6 +392,7 @@ class TestP2Full31ToolsAndGates(unittest.TestCase):
             "s_ver_stale",
             review_id=f"STAGE3_FINAL_AUDIT:{deliv_a}",
             final_verdict="ACCEPT",
+            novelty_score=8, significance_score=8,
             title="尝试用旧版 A 放行新版 B",
             abstract_md="版本 A 全部溯源与引用一致。",
         )
@@ -414,6 +419,7 @@ class TestP2Full31ToolsAndGates(unittest.TestCase):
             "s_ver_final2",
             review_id=f"STAGE3_FINAL_AUDIT:{deliv_b}",
             final_verdict="ACCEPT",
+            novelty_score=8, significance_score=8,
             title="版本 B 终稿审定",
             abstract_md="版本 B 全部引用与哈希匹配。",
         )
@@ -438,6 +444,7 @@ class TestP2Full31ToolsAndGates(unittest.TestCase):
             review_id=r1, question_id="Q1",
             ledger_items=[{"claim": "边界完备", "evidence_location_and_quote": "draft.md L1: 缺边界证明", "status": "UNVERIFIED"}],
             stage1_verdict="REVISE",
+            rigor_score=5,
             revision_or_refutation_reason="请补全边界情形推导",
         )
         self.assertTrue(rev1["ok"], rev1)
@@ -472,6 +479,7 @@ class TestP2Full31ToolsAndGates(unittest.TestCase):
             review_id=r2, question_id="Q1",
             ledger_items=[{"claim": "阶段一复核", "evidence_location_and_quote": "draft.md L1: s1 ok", "status": "VERIFIED"}],
             stage1_verdict="PASS",
+            rigor_score=8,
         )
         self._call("get_unblinded_manuscript_and_peers", "library_verifier", "sv2", review_id=r2)
         rev2 = self._call(
@@ -496,6 +504,7 @@ class TestP2Full31ToolsAndGates(unittest.TestCase):
             review_id=r3, question_id="Q1",
             ledger_items=[{"claim": "边界闭环", "evidence_location_and_quote": "draft.md L1: 三次仍未闭合", "status": "REFUTED"}],
             stage1_verdict="REVISE",
+            rigor_score=5,
             revision_or_refutation_reason="三次返工后仍未闭合核心质疑",
             exact_refuted_scope_md="边界情形未闭合",
         )
@@ -643,10 +652,10 @@ def evaluate(artifact, spec, tier="official"):
 
     def test_7_jsonrpc_and_fact_bridge_cli(self) -> None:
         init_resp = mcp.handle_jsonrpc_message({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
-        self.assertEqual(init_resp["result"]["serverInfo"]["version"], "0.3.0-alpha.1")
+        self.assertEqual(init_resp["result"]["serverInfo"]["version"], "0.3.2")
 
         list_resp = mcp.handle_jsonrpc_message({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
-        self.assertEqual(len(list_resp["result"]["tools"]), 47)
+        self.assertEqual(len(list_resp["result"]["tools"]), 53)
 
         snap_resp = mcp.handle_jsonrpc_message({
             "jsonrpc": "2.0",

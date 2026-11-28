@@ -15,7 +15,7 @@ from .lifecycle_ops import init_parse0_contract
 
 _CLEAR_TABLES = (
     "handback_records", "chief_pinned_notes", "operation_receipts", "run_arrangements",
-    "runtime_effects", "node_interventions", "open_lemma_gaps", "pending_revalidation_queue",
+    "runtime_effects", "internal_survey_requests", "node_interventions", "open_lemma_gaps", "pending_revalidation_queue",
     "subproblem_living_surveys", "wave_conferences", "async_eval_jobs", "observations",
     "probe_diagnostic_logs", "epistemic_edges", "internal_research_ledger", "review_queue",
     "lineage_dead_ends", "lineage_briefings", "lineage_nodes", "method_families",

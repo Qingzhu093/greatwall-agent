@@ -171,6 +171,7 @@ export class GreatwallControlService {
       pythonBin: opts.pythonBin || this.config.pythonBin || undefined,
       requestTimeoutMs: opts.requestTimeoutMs ?? this.config.requestTimeoutMs ?? 60_000,
       longToolTimeoutMs: opts.longToolTimeoutMs ?? this.config.longToolTimeoutMs ?? 300_000,
+      maxEffectiveContextWindow: this.config.maxEffectiveContextWindow,
     })
     const wsDataRoot = path.dirname(resolveTelemetryFilePath({ dataDir, workspaceRoot }))
     const protectedDirs = [...new Set([wsDataRoot, ...(opts.protectedDirs || [])])]
@@ -184,6 +185,8 @@ export class GreatwallControlService {
       dataDir,
       parentAgent: opts.parentAgent || null,
       defaultAgentOptions: opts.defaultAgentOptions || this.config.defaultAgentOptions || {},
+      maxEffectiveContextWindow: this.config.maxEffectiveContextWindow,
+      contextHolidayPct: this.config.contextHolidayPct,
       protectedDirs,
       onChiefNotify: async (ev) => {
         chiefInbox.ingest(ev)

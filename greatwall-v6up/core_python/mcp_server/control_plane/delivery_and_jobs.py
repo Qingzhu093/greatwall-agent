@@ -33,6 +33,7 @@ from ..mcp_core_helpers import (
     record_declared_refs,
 )
 from .blind_sandbox import _rmtree_force
+from .observation_artifacts import publish_observation_in_tx
 from .scheduler_rules import check_stage2_closure_gate_data
 
 # 进程级活跃 heavy 作业占用表（防止 recover_pending_heavy_jobs 撞上正在运行的普通领取者）
@@ -400,6 +401,7 @@ def execute_heavy_async_job(
     paths = resolve_storage_paths(workspace_root)
     staging_root = paths["eval_artifacts_dir"] / "_staging" / f"heavy_{job_id}_{uuid.uuid4().hex[:10]}"
     staging_stage_a = staging_root / "stage_a_output.json"
+    staging_code = staging_root / "code_snapshot"
 
     frozen_art = Path(str(job["artifact_snapshot_path"]))
     spec_snap = json.loads(job["spec_snapshot_json"] or "{}")
@@ -418,6 +420,7 @@ def execute_heavy_async_job(
                 worktree_root=frozen_root,
                 persist_stage_a_path=str(staging_stage_a),
                 cancel_event=cancel_event,
+                code_snapshot_path=staging_code,
             )
         except Exception:
             _rmtree_force(staging_root)
@@ -438,7 +441,7 @@ def execute_heavy_async_job(
 
         cancelled_before_commit = False
         try:
-            with rw_immediate_tx(conn):
+            with publish_observation_in_tx(conn, staging_root) as publish:
                 if cancel_event is not None and cancel_event.is_set():
                     # 先在事务内正常提交 RUNNING -> QUEUED，再在事务外抛取消异常，防止回滚把作业锁死在 RUNNING！
                     conn.execute(
@@ -473,21 +476,16 @@ def execute_heavy_async_job(
                     cache_key = "" if (obs_status in ("INSTRUMENT_ERROR", "INFRA_ERROR") or stale_due_to_upgrade) else str(job["cache_key"])
 
                     obs_id = next_prefixed_id(conn, "observations", "obs_id", "Obs-")
-                    final_stage_a = paths["eval_artifacts_dir"] / obs_id / "stage_a_output.json"
-                    persisted_path: str | None = None
-                    if staging_stage_a.is_file():
-                        final_stage_a.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.move(str(staging_stage_a), str(final_stage_a))
-                        persisted_path = str(final_stage_a)
+                    snapshot_path, persisted_path = publish(obs_id)
 
                     conn.execute(
                         """
                         INSERT INTO observations(
                             obs_id, question_id, branch_id, node_id, instrument_id, instrument_version, tier,
                             candidate_entry_sha256, tools_dir_sha256, spec_sha256, instrument_sha256, cache_key,
-                            stage_a_artifact_path, obs_status, tracks_json, details_text, linguistic_prediction,
+                            frozen_code_snapshot_path, stage_a_artifact_path, obs_status, tracks_json, details_text, linguistic_prediction,
                             spec_json, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, 'heavy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, 'heavy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             obs_id,
@@ -501,6 +499,7 @@ def execute_heavy_async_job(
                             spec_sha,
                             str(inst["instrument_sha256"]),
                             cache_key,
+                            snapshot_path,
                             persisted_path,
                             obs_status,
                             json.dumps(res.get("tracks") or {}, ensure_ascii=False),
@@ -536,10 +535,17 @@ def execute_heavy_async_job(
                     )
                     if upd.rowcount != 1:
                         raise FailClosedError(ERR_LOCKED, f"重型作业 {job_id!r} 结案冲突，已回滚观测提交")
-            if cancelled_before_commit:
-                raise RequestCancelledError(f"重型作业 {job_id!r} 已取消，已复位 QUEUED 且未写入观测记录")
+        except Exception:
+            with rw_immediate_tx(conn):
+                conn.execute(
+                    "UPDATE async_eval_jobs SET status = 'QUEUED', updated_at = ? WHERE job_id = ? AND status = 'RUNNING' AND obs_id IS NULL",
+                    (utc_now_iso(), job_id),
+                )
+            raise
         finally:
             _rmtree_force(staging_root)
+        if cancelled_before_commit:
+            raise RequestCancelledError(f"重型作业 {job_id!r} 已取消，已复位 QUEUED 且未写入观测记录")
     finally:
         if claimed_active:
             with _ACTIVE_HEAVY_LOCK:

@@ -1,13 +1,5 @@
 /**
  * GreatWall v0.3 异步事件池编排器主入口（精简高内聚，零上帝文件）。
- *
- * v0.3 架构集成：
- * - `WorkspaceInstanceLock`：单机单实例 `host.lock` 防双活抢单；
- * - `RuntimeEffectsConsumer`：每轮先消费 SQLite Outbox（60s 租约、崩溃认领、热注入 `NOTIFY_POLICY_CHANGED`、45% 让权与 `NOTIFY_CHIEF` 路由）；
- * - `WorkerSlotAllocator`：`maxWorkers` 普通槽 + `+1` 人类优先保留槽；
- * - `HumanTakeoverCoordinator`：45% 暂停让权 + `ctx.jobs` 清理 + `source.rpcId` 人类对话让权；
- * - `WaveConferenceRunner`：宏观大外环四拍脉冲确定性驱动；
- * - 废除 `resume` 扫盘自动升版暗门（改为只读草稿提示，裁决 4）。
  * @module dsh-greatwall-v6up/orchestrator
  */
 import crypto from 'node:crypto'
@@ -18,7 +10,7 @@ import { AgentSessionHost, resolveAuthoritativeModelBinding } from './agent_sess
 import { disposeNodeCompanion, driveExplorerCompanionPair } from './pair_lifecycle.js'
 import { WorkspaceInstanceLock } from './runtime/instance_lock.js'
 import { WorkerSlotAllocator } from './runtime/worker_slots.js'
-import { RuntimeEffectsConsumer } from './runtime/effects_consumer.js'
+import { RuntimeEffectsConsumer, runInternalSurvey } from './runtime/effects_consumer.js'
 import { HumanTakeoverCoordinator } from './sessions/human_takeover.js'
 import { GovernanceItemCircuitBreaker, selectDispatchableExplorers } from './orchestrator/circuit_breaker.js'
 import { assertValidBlindSandboxResult, buildDispatchRuntimePort } from './orchestrator/runtime_port.js'
@@ -31,16 +23,9 @@ export { GovernanceItemCircuitBreaker, selectDispatchableExplorers }
 
 export class GreatwallOrchestrator {
   constructor({
-    ctx,
-    bridge,
-    corePythonRoot,
-    workspaceRoot,
-    dataDir = '',
-    protectedDirs = [],
-    defaultAgentOptions = {},
-    parentAgent = null,
-    autoArchiveShortTx = true,
-    onChiefNotify = null,
+    ctx, bridge, corePythonRoot, workspaceRoot, dataDir = '', protectedDirs = [],
+    defaultAgentOptions = {}, parentAgent = null, autoArchiveShortTx = true,
+    onChiefNotify = null, maxEffectiveContextWindow, contextHolidayPct,
   }) {
     this.ctx = ctx
     this.bridge = bridge
@@ -56,41 +41,25 @@ export class GreatwallOrchestrator {
 
     const clkCfg = this.runtimeConfig?.session_context_clock || {}
     const orchCfg = this.runtimeConfig?.orchestration_and_eval || {}
-    this._windowCapTokens = Number(clkCfg.context_window_cap_tokens || clkCfg.context_window_tokens || 500_000)
+    this._windowCapTokens = maxEffectiveContextWindow ?? clkCfg.context_window_cap_tokens ?? 360_000
     this._requireExplicitModelBinding = orchCfg.require_explicit_model_binding !== false
     this._itemBreaker = new GovernanceItemCircuitBreaker(Number(orchCfg.governance_item_circuit_breaker_max_stalled_runs || 2))
 
     const wsDataRoot = path.dirname(resolveTelemetryFilePath({ dataDir, workspaceRoot: this.workspaceRoot }))
     this.instanceLock = new WorkspaceInstanceLock(path.join(wsDataRoot, 'host.lock'))
     this.slotAllocator = new WorkerSlotAllocator(Number(orchCfg.default_max_concurrent_workers || 4), 1)
-    this.humanTakeover = new HumanTakeoverCoordinator({
-      ctx,
-      bridge,
-      workspaceRoot: this.workspaceRoot,
-      telemetry: this.telemetry,
-    })
-
+    this.humanTakeover = new HumanTakeoverCoordinator({ ctx, bridge, workspaceRoot: this.workspaceRoot, telemetry: this.telemetry })
     this.host = new AgentSessionHost({
-      ctx,
-      bridge,
-      workspaceRoot: this.workspaceRoot,
-      rolePrompts: this.rolePrompts,
-      parentAgent: this.parentAgent,
-      protectedDirs,
-      defaultAgentOptions,
+      ctx, bridge, workspaceRoot: this.workspaceRoot, rolePrompts: this.rolePrompts,
+      parentAgent: this.parentAgent, protectedDirs, defaultAgentOptions,
       effectiveContextWindow: this._windowCapTokens,
-      autoArchiveShortTx,
-      humanTakeover: this.humanTakeover,
-      telemetry: this.telemetry,
+      contextHolidayPct: contextHolidayPct ?? clkCfg.context_holiday_pct ?? 0.52,
+      autoArchiveShortTx, humanTakeover: this.humanTakeover, telemetry: this.telemetry,
     })
-
     this.host.onOperatorReceipt = () => this.notifyOperator()
     this.effectsConsumer = new RuntimeEffectsConsumer({
-      bridge,
-      workspaceRoot: this.workspaceRoot,
-      ownerInstanceId: this.instanceLock.ownerId,
-      telemetry: this.telemetry,
-      handlers: this._buildEffectHandlers(),
+      bridge, workspaceRoot: this.workspaceRoot, ownerInstanceId: this.instanceLock.ownerId,
+      telemetry: this.telemetry, handlers: this._buildEffectHandlers(),
     })
 
     this._modelBinding = null
@@ -106,6 +75,8 @@ export class GreatwallOrchestrator {
     this._nodeCompanionSessions = new Map()
     this._seenAmbiguousAlertIds = new Set()
     this._stage3Done = false
+    this._projectPausedAll = false
+    this._govCancelNotifiedForPause = false
   }
 
   _buildEffectHandlers() {
@@ -157,6 +128,7 @@ export class GreatwallOrchestrator {
       },
       WAKE_BLOCKED_BRANCH: async () => { this._wakeLoop() },
       SPAWN_PAIR: async () => { this._wakeLoop() },
+      RUN_INTERNAL_SURVEY: (...args) => runInternalSurvey((opts) => this.spawnAndRunAgent(opts), ...args),
       RUN_WAVE_CONFERENCE: async () => { this._wakeLoop() },
       REFRESH_LIVING_SURVEY: async () => { this._wakeLoop() },
     }
@@ -172,6 +144,14 @@ export class GreatwallOrchestrator {
       workspace_root: this.workspaceRoot, node_id: nid, note: { id, text },
     })
     if (!queued?.ok) throw new Error(queued?.error || '便签入队失败')
+  }
+
+  _cancelActiveGovernanceSessions(reason) {
+    for (const entry of this.liveSessions.values()) {
+      if (entry.role !== 'gw_chief' && entry.role !== 'explorer') {
+        try { entry.handle?.agent?.cancel?.({ kind: 'hook', reason }) } catch {}
+      }
+    }
   }
 
   get liveSessions() { return this.host.liveSessions }
@@ -191,7 +171,8 @@ export class GreatwallOrchestrator {
   launchExplorer(node, snap, sig) { return this._launchExplorerWorker(node, snap, sig) }
   runBlindReview(rev, sig) { return this._runBlindReviewWithSandbox(rev, sig) }
   advanceWaveConference(conf, sig) { return new WaveConferenceRunner(this.createDispatchRuntimePort()).advanceConference(conf, sig) }
-  setSessionReadonly(sid, flag) { this.host?.setSessionReadonly?.(sid, flag) }
+  getContextHolidayPct() { return this.host.contextHolidayPct }
+  setSessionReadonly(sid, flag, phase) { this.host.setSessionReadonly(sid, flag, phase) }
   archiveSession(sid) { return this.host?.archiveSession?.(sid) }
   control(method, params = {}, opts = {}) { return this.bridge.control(method, params, opts) }
   recordEvent(eventName, detail = {}) { this.telemetry?.recordEvent?.(eventName, detail) }
@@ -454,6 +435,7 @@ export class GreatwallOrchestrator {
         }
       } catch {}
     }
+    this._cancelActiveGovernanceSessions('POOL_PAUSED')
     this._wakeLoop()
     return { paused: true, state: this._poolState, pausedNodeIds }
   }
@@ -798,8 +780,11 @@ export class GreatwallOrchestrator {
     }).catch(() => {})
 
     while (!sig.aborted && this._poolState !== 'stopped') {
-      // 每轮（含全局暂停态）先消费 Outbox 副作用队列，确保节点让权、新口径热通知与总控通知不被暂停卡死
-      await this.effectsConsumer.drainOnce({ signal: sig }).catch(() => {})
+      // 每轮（含全局暂停态）先消费 Outbox 副作用队列；暂停态下仅消费快控制与撤回，不新拉重型科研 LLM 任务
+      await this.effectsConsumer.drainOnce({
+        signal: sig,
+        paused: this._poolState === 'paused' || this._projectPausedAll,
+      }).catch(() => {})
 
       if (Date.now() >= nextOperatorTick) {
         nextOperatorTick = Date.now() + 500
@@ -835,6 +820,7 @@ export class GreatwallOrchestrator {
       if (this._runningGov.size !== runningGovCount || this._poolState === 'paused') continue
 
       const snap = snapRes.data
+      this._projectPausedAll = Boolean(snap.project_paused_all)
       if (snap.operator_plane && snap.slot_cap) this.slotAllocator.setMaxWorkers(snap.slot_cap)
       if (Array.isArray(snap.shared_inputs_rel_paths)) this.host.sharedInputPaths = snap.shared_inputs_rel_paths
       if (snap.stage === 'CLOSED_VERIFIED' || snap?.closure_state?.status === 'CLOSED_VERIFIED' || this._stage3Done) {
@@ -842,6 +828,17 @@ export class GreatwallOrchestrator {
         break
       }
       this._syncSlotsToTelemetry(snap.stage)
+
+      if (this._projectPausedAll) {
+        if (!this._govCancelNotifiedForPause) {
+          this._govCancelNotifiedForPause = true
+          this._cancelActiveGovernanceSessions('PAUSED_ALL')
+        }
+        idleStreak = 0
+        await this._waitWakeOrTimeout(400)
+        continue
+      }
+      this._govCancelNotifiedForPause = false
 
       for (const al of snap.ambiguous_spec_alerts || []) {
         if (al?.alert_id && !this._seenAmbiguousAlertIds.has(al.alert_id)) {
@@ -874,11 +871,13 @@ export class GreatwallOrchestrator {
         ? snap.active_wave_conferences
         : (Array.isArray(snap.active_conferences) ? snap.active_conferences : [])
       const hasPendingHumanWait =
+        Boolean(snap.project_paused_all) ||
         (snap.pending_proposals || []).length > 0 ||
         (snap.active_arrangements || []).some((a) => a.ends_on_kind !== 'MANUAL') ||
         (snap.pending_effects_count || 0) > 0 ||
         (snap.operation_receipts || []).some((op) => op.status === 'DRAINING') ||
         (snap.operator_slot_ledger?.draining?.length || 0) > 0 ||
+        (snap.operator_slot_ledger?.hibernated_or_human?.length || 0) > 0 ||
         (snap.human_paused_nodes || []).length > 0 ||
         activeConfs.some((c) => String(c?.status || '') === 'PENDING_HUMAN_APPROVAL')
 

@@ -161,7 +161,7 @@ function checkToolContractsSync(pySnapshot) {
   if (!pySnapshot) {
     return {
       id: 'tool_contracts_sync',
-      title: 'Python ↔ Node 47 窄工具与 10 角色跨层契约同步',
+      title: 'Python ↔ Node 窄工具与 10 角色跨层契约同步',
       status: 'error',
       required: true,
       detail: '因 Python 运行时检查失败，无法比对跨层契约',
@@ -169,6 +169,8 @@ function checkToolContractsSync(pySnapshot) {
   }
 
   const mismatches = []
+  if (pySnapshot.schema_version !== '0.3.2') mismatches.push({ field: 'schema_version' })
+  if (pySnapshot.tool_count !== 53 || ALL_MCP_TOOLS.size !== 53) mismatches.push({ field: 'tool_count' })
   const pyRoles = pySnapshot.role_mcp_tools || {}
   const pyAllTools = [...new Set(Object.values(pyRoles).flat())]
 
@@ -197,7 +199,7 @@ function checkToolContractsSync(pySnapshot) {
   if (mismatches.length > 0) {
     return {
       id: 'tool_contracts_sync',
-      title: 'Python ↔ Node 47 窄工具与 10 角色跨层契约同步',
+      title: 'Python ↔ Node 窄工具与 10 角色跨层契约同步',
       status: 'error',
       required: true,
       detail: `发现 ${mismatches.length} 处跨层契约漂移: ${mismatches.map((m) => m.field).join(', ')}`,
@@ -207,7 +209,7 @@ function checkToolContractsSync(pySnapshot) {
 
   return {
     id: 'tool_contracts_sync',
-    title: 'Python ↔ Node 47 窄工具与 10 角色跨层契约同步',
+    title: 'Python ↔ Node 窄工具与 10 角色跨层契约同步',
     status: 'ok',
     required: true,
     detail: `${ALL_MCP_TOOLS.size} 窄工具 / ${CANONICAL_ROLES.length} 角色路由 / ${READONLY_BLOCKED_MCP_TOOLS.size} 只读禁写 / ${LONG_RUNNING_MCP_TOOLS.size} 长耗时 / ${TURN_CONCLUDING_TOOLS.size} 回合收尾工具全部 100% 同步`,

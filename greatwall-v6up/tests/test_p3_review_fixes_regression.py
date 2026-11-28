@@ -146,11 +146,12 @@ class TestP3ReviewFixesRegression(unittest.TestCase):
             review_id=rid, question_id="Q1",
             ledger_items=[{"claim": "构造成立", "evidence_location_and_quote": "solve.py L1", "status": "VERIFIED"}],
             stage1_verdict="PASS",
+            rigor_score=8,
         )
         self._call("get_unblinded_manuscript_and_peers", "library_verifier", "sv1", review_id=rid)
         s2_res = self._call(
             "submit_stage2_unblind_verdict", "library_verifier", "sv1",
-            review_id=rid, final_verdict="ACCEPT", l3_entry_kind="POS_THEOREM", goal_coverage="FULL_GOAL",
+            review_id=rid, final_verdict="ACCEPT", novelty_score=8, significance_score=8, l3_entry_kind="POS_THEOREM", goal_coverage="FULL_GOAL",
             title="Q1 完整定理",
             abstract_md="完整证明 Q1 主命题并给出了可执行构造，经独立盲审沙箱复现核验确认逻辑无漏洞、所有依赖模块齐备且边界条件与题面定义严格吻合。",
             exact_verified_scope_md="Q1 全域",
@@ -669,11 +670,12 @@ def evaluate(artifact, spec, tier="official"):
             review_id=rid, question_id="Q1",
             ledger_items=[{"claim": "构造成立", "evidence_location_and_quote": "q1_solve.py L1", "status": "VERIFIED"}],
             stage1_verdict="PASS",
+            rigor_score=8,
         )
         self._call("get_unblinded_manuscript_and_peers", "library_verifier", "sv1", review_id=rid)
         s2 = self._call(
             "submit_stage2_unblind_verdict", "library_verifier", "sv1",
-            review_id=rid, final_verdict="ACCEPT", l3_entry_kind="POS_THEOREM", goal_coverage="FULL_GOAL",
+            review_id=rid, final_verdict="ACCEPT", novelty_score=8, significance_score=8, l3_entry_kind="POS_THEOREM", goal_coverage="FULL_GOAL",
             title="Q1 完整定理",
             abstract_md="完整证明 Q1 主命题并给出了可执行脚本 q1_solve.py，经独立盲审沙箱复现核验确认逻辑无漏洞且边界条件与题面定义严格吻合。",
             exact_verified_scope_md="Q1 全域",

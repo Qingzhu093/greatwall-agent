@@ -23,6 +23,40 @@ import time
 from pathlib import Path
 from typing import Any
 
+_OBS_CODE_SNAPSHOT_LIMIT = 10 * 1024 * 1024
+_OBS_CODE_SNAPSHOT_IGNORE = shutil.ignore_patterns(".git", "__pycache__", "*.pyc", ".pytest_cache")
+
+
+def _freeze_obs_code_snapshot(artifact: Path, worktree: Path, destination: Path) -> None:
+    """冻结待运行的入口与工具，观测持久化只需重命名暂存目录。"""
+    from ..mcp_server.db.enums import ERR_INVALID_INPUT, FailClosedError
+
+    total_bytes = 0
+
+    def copy_code(source: str | Path, target: str | Path) -> str:
+        nonlocal total_bytes
+        file = Path(source)
+        if file.is_symlink() or not file.is_file():
+            raise FailClosedError(ERR_INVALID_INPUT, f"观测快照只接受常规文件：{file.name}")
+        with file.open("rb") as src:
+            contents = src.read(_OBS_CODE_SNAPSHOT_LIMIT - total_bytes + 1)
+        total_bytes += len(contents)
+        if total_bytes > _OBS_CODE_SNAPSHOT_LIMIT:
+            raise FailClosedError(ERR_INVALID_INPUT, "观测入口与 tools/ 代码快照超过 10 MB，请精简后重试")
+        Path(target).write_bytes(contents)
+        return str(target)
+
+    def ignore_links(directory: str, names: list[str]) -> set[str]:
+        ignored = _OBS_CODE_SNAPSHOT_IGNORE(directory, names)
+        return ignored | {name for name in names if (Path(directory) / name).is_symlink()}
+
+    destination.mkdir(parents=True)
+    if artifact.is_file():
+        copy_code(artifact, destination / artifact.name)
+    tools = worktree / "tools"
+    if tools.is_dir() and not tools.is_symlink():
+        shutil.copytree(tools, destination / "tools", ignore=ignore_links, copy_function=copy_code)
+
 
 class RequestCancelledError(RuntimeError):
     """请求已被上游显式取消，子进程树已终止且严禁继续落库。"""
@@ -420,13 +454,16 @@ def _run_stage_a_python(
     timeout_sec: float,
     persist_stage_a_path: str | None = None,
     cancel_event: Any = None,
+    code_snapshot_path: Path | None = None,
 ) -> tuple[bool, dict[str, Any], str]:
     """在独立临时沙箱子进程运行 Python 候选 `run(public_input)` 并可选持久化产物。"""
     with tempfile.TemporaryDirectory(prefix="gw_stage_a_") as tmp:
         sandbox = Path(tmp)
         cand_dst = sandbox / cand_file.name
         shutil.copy2(cand_file, cand_dst)
-        _copy_branch_tools_into_sandbox(cand_file, sandbox, worktree_root=worktree_root)
+        _copy_branch_tools_into_sandbox(
+            cand_file, sandbox, worktree_root=str(code_snapshot_path) if code_snapshot_path else worktree_root,
+        )
         _copy_branch_inputs_into_sandbox(cand_file, sandbox, worktree_root=worktree_root)
 
         pub_in_file = sandbox / "_public_input.json"
@@ -572,6 +609,7 @@ def run_isolated_instrument(
     worktree_root: str = "",
     persist_stage_a_path: str | None = None,
     cancel_event: Any = None,
+    code_snapshot_path: Path | None = None,
 ) -> dict[str, Any]:
     """统一跨进程隔离仪器执行入口（支持三档同码、四态隔离与外部持久化）。"""
     tier_l = str(tier or "official").strip().lower()
@@ -604,6 +642,11 @@ def run_isolated_instrument(
             "obs_status": "CANDIDATE_ERROR",
         }
 
+    if code_snapshot_path is not None:
+        _freeze_obs_code_snapshot(art_file, Path(worktree_root), code_snapshot_path)
+        if art_file.is_file():
+            art_file = code_snapshot_path / art_file.name
+
     eff_spec = dict(spec) if isinstance(spec, dict) else {}
     timeout_sec = max(1.0, min(600.0, float(eff_spec.get("timeout_sec", 60.0))))
 
@@ -631,6 +674,7 @@ def run_isolated_instrument(
             timeout_sec=timeout_sec,
             persist_stage_a_path=persist_stage_a_path,
             cancel_event=cancel_event,
+            code_snapshot_path=code_snapshot_path,
         )
         if not ok_a:
             is_infra = bool(stage_a_data.get("_infra_error"))
@@ -699,6 +743,7 @@ def run_stage_b_revaluation(
     spec: dict[str, Any],
     tier: str = "official",
     cancel_event: Any = None,
+    code_snapshot_path: str = "",
 ) -> dict[str, Any]:
     """读取持久化 `stage_a_output.json` 交新版仪器免重跑 Stage B 重算。"""
     if cancel_event is not None and cancel_event.is_set():
@@ -724,6 +769,11 @@ def run_stage_b_revaluation(
             "obs_status": "INFRA_ERROR",
             "incompatible": False,
         }
+
+    if code_snapshot_path and isinstance(artifact_payload, dict) and "artifact_name" in artifact_payload:
+        frozen_entry = str(Path(code_snapshot_path) / artifact_payload["artifact_name"])
+        for key in ("artifact_path", "path", "module_path"):
+            artifact_payload[key] = frozen_entry
 
     eff_spec = dict(spec) if isinstance(spec, dict) else {}
     timeout_sec = max(1.0, min(600.0, float(eff_spec.get("timeout_sec", 60.0))))

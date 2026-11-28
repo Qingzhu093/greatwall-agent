@@ -13,7 +13,8 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { ALL_MCP_TOOLS } from './prompts.js'
+import { ALL_MCP_TOOLS, READONLY_BLOCKED_MCP_TOOLS } from './prompts.js'
+export { READONLY_BLOCKED_MCP_TOOLS } from './prompts.js'
 
 export const PUBLIC_INPUT_DEFAULT_DIRS = Object.freeze([
   'source_materials',
@@ -35,45 +36,15 @@ export const FORBIDDEN_PUBLIC_DIR_NAMES = new Set([
 ])
 
 export const READONLY_FS_TOOL_NAMES = new Set(['read', 'glob', 'grep', 'read_image', 'read_file'])
+const DEFAULT_SANDBOX_PATH_TOOLS = new Map([['read', 'file_path'], ['glob', 'path'], ['grep', 'path']])
+const ARXIV_ARTICLE_URL = /^https?:\/\/(?:www\.)?arxiv\.org\/(?:abs|pdf)\/((?:\d{4}\.\d{4,5}|[a-z][a-z.-]*\/\d{7})(?:v\d+)?)(?:\.pdf)?(?:[?#].*)?$/i
+export const HOLIDAY_UNLOCK_TOOL = 'submit_holiday_bet'
 
 export const PROCESS_MD_FORBIDDEN_RE = /(?:^|[\\/])(?:HANDOFF[^\\/]*|REVIEW[^\\/]*|SUPERVISORY[^\\/]*|LINEAGE_BRIEFING[^\\/]*|.*_(?:AUDIT|CLOSURE|HANDOFF|BRIEFING|VERDICT|REPORT))\.md$/i
 
 export const PROTECTED_TOKEN_RE = /(?:greatwall\.db(?:-wal|-shm)?|greatwall-v6up[\\/]workspaces|_hidden_calibrations|_hidden[a-z0-9_]*|eval_artifacts|blind_sandboxes|frozen_deliveries|final_delivery|GREATWALL_DATA_DIR|GREATWALL_DB_PATH|GREATWALL_PLUGIN_DATA_DIR|PLUGIN_DATA)/i
 
 export const VERIFIER_NETWORK_CMD_RE = /\b(?:curl|wget|Invoke-WebRequest|Invoke-RestMethod|iwr|irm|Start-BitsTransfer|nslookup|dig|nc|ncat|telnet|ssh|scp|ftp|urllib|requests|httpx|aiohttp|http\.client|socket\.create_connection)\b/i
-
-/** 全部写类 MCP 窄工具集合（与 Python tool_registry.py READONLY_BLOCKED_MCP_TOOLS 100% 同步）。 */
-export const READONLY_BLOCKED_MCP_TOOLS = new Set([
-  'chief_propose_control_action',
-  'chief_operate',
-  'chief_send_branch_note',
-  'chief_seed_branch',
-  'run_isolated_eval',
-  'request_literature_survey',
-  'handback_to_chief',
-  'save_lineage_briefing',
-  'record_reflection_and_unlock_pull',
-  'submit_node_handoff',
-  'submit_conference_statement',
-  'register_method_family',
-  'triage_node',
-  'fork_branch',
-  'publish_external_literature_card',
-  'publish_living_survey',
-  'export_stage3_final_delivery',
-  'record_conference_minutes',
-  'submit_conference_verdict',
-  'submit_stage1_blind_ledger',
-  'submit_stage2_unblind_verdict',
-  'propose_salvaged_lemma',
-  'register_question_instrument',
-  'upgrade_instrument_with_calibration',
-  'recompute_stage_b_only',
-  'update_skill_ledger',
-  'resolve_works_ticket',
-  'record_compliance_check',
-  'register_saved_graph_query',
-])
 
 export const WRITE_TOOL_NAMES = new Set([
   'write', 'edit', 'write_file', 'edit_file', 'create_file',
@@ -277,13 +248,17 @@ export function createSandboxCallEvaluator(opts) {
 
   return function evaluateToolCall(exec) {
     const name = String(exec?.name || '')
-    const args = exec?.arguments || {}
+    let args = exec?.arguments || {}
     const isReadonlyNow = Boolean(getReadonly())
 
     const isWriteTool = WRITE_TOOL_NAMES.has(name) || name.includes('write') || name.includes('edit')
     const isShellTool = SHELL_TOOL_NAMES.has(name) || typeof args?.command === 'string' || typeof args?.CommandLine === 'string'
 
     if (isReadonlyNow && (isWriteTool || isShellTool || READONLY_BLOCKED_MCP_TOOLS.has(name))) {
+      if (opts.readonlyPhase?.() === 'HOLIDAY_52') {
+        if (role === 'explorer' && name === HOLIDAY_UNLOCK_TOOL) return undefined
+        return `SANDBOX_VIOLATION: 52% 夜科学停码期禁止写入、终端和评测；提交 ${HOLIDAY_UNLOCK_TOOL} 或完成两回合后恢复。`
+      }
       return `SANDBOX_VIOLATION: 该会话已处于只读态（70% 遗嘱或已封存/归档），严禁调用写入、终端或状态变更工具 (${name})`
     }
 
@@ -298,12 +273,28 @@ export function createSandboxCallEvaluator(opts) {
 
     // external_surveyor 仅允许联网搜索工具，物理禁止任何本地文件或 Shell 访问（防院内成果泄露）
     if (role === 'external_surveyor') {
+      if (name === 'web_fetch' && typeof args.url === 'string') {
+        const article = ARXIV_ARTICLE_URL.exec(args.url)
+        if (article) exec.arguments = Object.freeze({ ...args, url: `https://arxiv.org/html/${article[1]}` })
+      }
+      // 原生 RC5 web_fetch 使用宿主已安装的代理策略，子会话共用宿主进程。
       if (name === 'web_search' || name === 'web_fetch') return undefined
       return `SANDBOX_VIOLATION: external_surveyor 仅允许 web_search / web_fetch，严禁接触本地磁盘或终端 (${name})`
     }
 
     if (role === 'library_verifier' && !sandboxCanon) {
       return `SANDBOX_VIOLATION: library_verifier 缺少有效独立盲审沙箱路径，禁止调用原生工具 ${name}`
+    }
+
+    const pathKey = DEFAULT_SANDBOX_PATH_TOOLS.get(name)
+    const boundRoot = role === 'library_verifier' ? opts.sandboxAbsPath || opts.worktreeAbsPath
+      : opts.worktreeAbsPath
+    if (pathKey && boundRoot && (args[pathKey] == null || args[pathKey] === '.')) {
+      const requested = name === 'read' && args[pathKey] == null ? args.path : args[pathKey]
+      const { path: _path, ...rest } = args
+      args = { ...rest, [pathKey]: requested && requested !== '.' ? requested : boundRoot }
+      // RC5 深冻结参数值，工具执行阶段从 exec 读取参数对象。
+      exec.arguments = Object.freeze(args)
     }
 
     if (isWriteTool) {
@@ -320,6 +311,9 @@ export function createSandboxCallEvaluator(opts) {
     const baseForRel = effectiveSandboxDir || opts.workspaceRoot
     const pathVals = extractPathValues(args)
     for (const pVal of pathVals) {
+      if (pVal.split(/[\\/]+/).some((segment) => segment === '..')) {
+        return `SANDBOX_VIOLATION: 文件路径不得包含上级目录段 (${pVal})`
+      }
       const canon = resolveCanonicalTarget(pVal, baseForRel)
       const isVerifierOwnSandbox = role === 'library_verifier' && Boolean(sandboxCanon) && isInsideRoot(canon, sandboxCanon)
       if (PROTECTED_TOKEN_RE.test(pVal)) {

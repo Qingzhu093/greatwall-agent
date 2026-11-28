@@ -150,12 +150,14 @@ class TestP4Round5RemediationContracts(unittest.TestCase):
             sid="works_1",
         )
         self.assertTrue(res_tkt["ok"], res_tkt)
-        self.assertEqual(res_tkt["data"]["status"], "RESOLVED")
+        self.assertEqual(res_tkt["data"]["status"], "WONTFIX")
         self.assertEqual(res_tkt["data"]["resolution"], "WONTFIX")
 
         wq2 = self._call("get_works_engineering_queue", {"question_id": "ALL"}, role="works_engineer", sid="works_1")
         open_tkts2 = [t for t in wq2["data"]["engineering_tickets"] if t["status"] == "OPEN"]
         self.assertEqual(len(open_tkts2), 0)
+        saved = next(t for t in wq2["data"]["engineering_tickets"] if t["ticket_id"] == tid)
+        self.assertEqual(saved["resolution_note"], "隐藏校验集属隔离红线设计，不得向探索者开放。")
 
     def test_2_handoff_anti_silent_swallow_and_abort_node(self) -> None:
         self.assertTrue(
@@ -338,6 +340,7 @@ class TestP4Round5RemediationContracts(unittest.TestCase):
                 "question_id": "Q1",
                 "ledger_items": [{"claim": "v0下成立", "evidence_location_and_quote": "manuscript_column_a.md", "is_verified": True}],
                 "stage1_verdict": "PASS",
+                "rigor_score": 8,
             },
             role="library_verifier",
             sid="ver_1",
@@ -355,6 +358,7 @@ class TestP4Round5RemediationContracts(unittest.TestCase):
             {
                 "review_id": rev_id,
                 "final_verdict": "ACCEPT",
+                "novelty_score": 8, "significance_score": 8,
                 "l3_entry_kind": "POS_THEOREM",
                 "goal_coverage": "FULL_GOAL",
                 "is_equivalent_reduction": False,
@@ -374,6 +378,7 @@ class TestP4Round5RemediationContracts(unittest.TestCase):
             {
                 "review_id": rev_id,
                 "final_verdict": "ACCEPT",
+                "novelty_score": 8, "significance_score": 8,
                 "l3_entry_kind": "POS_THEOREM",
                 "goal_coverage": "PARTIAL_OR_LEMMA",
                 "is_equivalent_reduction": False,
@@ -480,9 +485,9 @@ class TestP4Round5RemediationContracts(unittest.TestCase):
         sp2 = self._ctrl("control_plane/sync_pressure", {"node_id": nid, "pressure_tokens": 191000, "effective_context_window": 272000})
         self.assertEqual(sp2["data"]["trigger"], "HANDOFF_70")
 
-        # 若模型声称 1,000,000 窗口，应钳位至上限 500,000
+        # 若模型声称 1,000,000 窗口，应钳位至上限 360,000
         sp3 = self._ctrl("control_plane/sync_pressure", {"node_id": nid, "pressure_tokens": 190000, "effective_context_window": 1000000})
-        self.assertEqual(sp3["data"]["effective_context_window"], 500000)
+        self.assertEqual(sp3["data"]["effective_context_window"], 360000)
 
     def test_5_active_instruments_pushed_in_snapshot_and_pre_spawn(self) -> None:
         self._ctrl(
@@ -741,6 +746,7 @@ class TestP4Round5RemediationContracts(unittest.TestCase):
                 "question_id": "Q1",
                 "ledger_items": [{"claim": "反例需补全对称与物理界", "evidence_location_and_quote": "manuscript_column_a.md", "is_verified": False}],
                 "stage1_verdict": "REVISE",
+                "rigor_score": 5,
                 "revision_or_refutation_reason": "请补全 R1..R3 三项边界",
             },
             role="library_verifier",

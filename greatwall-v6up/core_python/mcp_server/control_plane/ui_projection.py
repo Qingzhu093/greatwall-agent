@@ -59,7 +59,7 @@ def get_ui_full_inspector_payload(
             nd["bound_obs_ids"] = json.loads(nd.get("bound_obs_ids_json") or "[]")
         except Exception:
             nd["bound_obs_ids"] = []
-        win = max(1, int(nd.get("effective_context_window") or 500000))
+        win = max(1, int(nd.get("effective_context_window") or 360000))
         tok = int(nd.get("pressure_tokens") or 0)
         nd["pressure_pct"] = round((tok / float(win)) * 100.0, 1)
 
@@ -109,6 +109,17 @@ def get_ui_full_inspector_payload(
             FROM internal_research_ledger
             WHERE is_active = 1
             ORDER BY created_at DESC LIMIT 40
+            """
+        ).fetchall()
+    ]
+    external_cards = [
+        dict(r)
+        for r in conn.execute(
+            """
+            SELECT ref_id, question_id, title, read_depth, support_scope,
+                   source_citation, substr(abstract_md, 1, 500) AS abstract_md, created_at
+            FROM external_literature_cards
+            ORDER BY ref_id ASC LIMIT 60
             """
         ).fetchall()
     ]
@@ -237,7 +248,7 @@ def get_ui_full_inspector_payload(
                 "spec_revision": int(nd_full.get("spec_revision") or 0),
                 "node_status": str(nd_full["node_status"]),
                 "pressure_tokens": int(nd_full.get("pressure_tokens") or 0),
-                "effective_context_window": int(nd_full.get("effective_context_window") or 500000),
+                "effective_context_window": int(nd_full.get("effective_context_window") or 360000),
                 "first_reflection_unlocked": int(nd_full.get("first_reflection_unlocked") or 0),
                 "mechanism_summary": str(nd_full.get("mechanism_summary") or ""),
                 "evidence_grade": str(nd_full.get("evidence_grade") or "NONE"),
@@ -289,6 +300,7 @@ def get_ui_full_inspector_payload(
         "observations": obs_list,
         "probes": probes_list,
         "reviews": reviews_list,
+        "external_literature_cards": external_cards,
         "internal_ledger": l3_l2_entries,
         "works_tickets": works_tickets,
         "compliance_logs": compliance_logs,

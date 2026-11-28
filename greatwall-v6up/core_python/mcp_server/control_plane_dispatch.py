@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ..evaluators.isolated_runner import RequestCancelledError
+from .control_plane.context_holiday import advance_context_holiday, begin_context_holiday
 from .control_plane_service import (
     abort_lineage_node,
     approve_control_proposal,
@@ -363,8 +364,16 @@ def dispatch_control_call(
                 ),
             }
 
+        if method == "control_plane/begin_context_holiday":
+            return {"ok": True, "data": begin_context_holiday(conn, p["node_id"], p["threshold"])}
+        if method == "control_plane/advance_context_holiday":
+            return {"ok": True, "data": advance_context_holiday(conn, p["node_id"], p["completed_turn"])}
+
         if method == "control_plane/open_wave_conference":
-            return {"ok": True, "data": check_and_open_wave_conference(conn, question_id=str(p["question_id"]), force=bool(p.get("force", False)))}
+            return {"ok": True, "data": check_and_open_wave_conference(
+                conn, question_id=str(p["question_id"]), force=bool(p.get("force", False)),
+                human_agenda_md=p.get("human_agenda_md", ""),
+            )}
 
         if method == "control_plane/fail_wave_conference":
             return {

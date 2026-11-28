@@ -294,3 +294,168 @@ def test_mcp_schema_docs_preserves_v031_chief_enums_and_uninitialized_snapshot()
     assert set(uninit["operator_slot_ledger"].keys()) == {"working", "draining", "hibernated_or_human"}
 
 
+def test_works_ticket_flood_guards_cancel_and_chief_request_survey():
+    import json
+    import tempfile
+    from core_python.mcp_server.control_plane.lifecycle_ops import submit_works_ticket
+    from core_python.mcp_server.db_schema import FailClosedError
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with closing(open_rw_connection(Path(tmp) / "gw.sqlite")) as conn:
+            _init(conn)
+            # 1) 同键 OPEN 工单幂等合并，不刷出多行
+            t1 = submit_works_ticket(conn, question_id="Q1", ticket_type="PAIN_POINT", instrument_id="geo_kernel",
+                                     description="首次反馈缺少凸包精度护栏", source="role:explorer", reporter_session_id="exp-1")
+            t2 = submit_works_ticket(conn, question_id="Q1", ticket_type="PAIN_POINT", instrument_id="geo_kernel",
+                                     description="第二分支重复反馈", source="role:explorer", reporter_session_id="exp-2")
+            assert t1["ticket_id"] == t2["ticket_id"] and t2["deduplicated"] is True and t2["report_count"] == 2
+
+            # 2) 单非特权会话最多同时 2 张在途 OPEN 工单；结案后自动释放额度
+            submit_works_ticket(conn, question_id="Q2", ticket_type="PAIN_POINT", instrument_id="tool_b",
+                                description="第二张不同工单", source="role:explorer", reporter_session_id="exp-1")
+            try:
+                submit_works_ticket(conn, question_id="Q2", ticket_type="DUPLICATE_TOOL", instrument_id="tool_c",
+                                    description="第三张在途单应提示耐心等待", source="role:explorer", reporter_session_id="exp-1")
+                raise AssertionError("应触发在途 2 张背压提示")
+            except FailClosedError as exc:
+                assert "正在由工造司处理中" in str(exc)
+
+            # 3) chief_operate 撤单 cancel_ticket 释放名额，随后 exp-1 可正常再开新单；并验证直派外藏 request_survey
+            cancelled = _command(conn, operation="cancel_ticket", details={"ticket_id": t1["ticket_id"], "reason": "误派撤回"})
+            assert cancelled["status"] == "SETTLED"
+            assert conn.execute("SELECT status FROM works_engineering_queue WHERE ticket_id=?", (t1["ticket_id"],)).fetchone()[0] == "RESOLVED"
+            t3 = submit_works_ticket(conn, question_id="Q2", ticket_type="DUPLICATE_TOOL", instrument_id="tool_c",
+                                     description="旧单结案释放名额后可正常提交", source="role:explorer", reporter_session_id="exp-1")
+            assert t3["status"] == "OPEN" and t3["deduplicated"] is False
+
+            srv = _command(conn, operation="request_survey", details={"question_id": "Q3", "topic_query": "CPP 覆盖路径规划综述全文", "reason": "补充 Q3 外藏全文"})
+            assert srv["status"] == "SETTLED" and srv["req_id"].startswith("srv_")
+            row = conn.execute("SELECT node_id, status FROM survey_requests WHERE req_id=?", (srv["req_id"],)).fetchone()
+            assert row["node_id"] == "gw_chief" and row["status"] == "PENDING"
+
+            # 4) chief_operate 人工主动召开圆桌 open_wave_conference + 防并发重开保护
+            wc = _command(conn, operation="open_wave_conference", details={"question_id": "Q1", "reason": "人类要求提前收束并刷新综述"})
+            assert wc["status"] == "SETTLED" and wc["conference_id"].startswith("wc_q1_w")
+            try:
+                _command(conn, operation="open_wave_conference", details={"question_id": "Q1"})
+                raise AssertionError("同子题已有进行中圆桌时应拒绝重复召开")
+            except FailClosedError as exc:
+                assert "已有进行中的圆桌" in str(exc)
+
+
+def test_round3_five_fixes_regression():
+    """回归覆盖第三轮实测 5 项流程修复：交班引理Schema/报错、圆桌动作传参、后勤满额不催开枝、总控early_handoff授权、工单合并保留全文。"""
+    import json
+    import tempfile
+    from core_python.mcp_server.control_plane.lifecycle_ops import submit_works_ticket
+    from core_python.mcp_server.control_plane.wave_engine import execute_approved_wave_verdict
+    from core_python.mcp_server.db_schema import FailClosedError
+    from core_python.mcp_server.mcp_schema_docs import enrich_tool_definitions
+    from core_python.mcp_server.tool_registry import TOOL_DEFINITIONS
+    from core_python.mcp_server.tools_logistics import tool_get_logistics_dashboard
+
+    tools_map = {t["name"]: t for t in enrich_tool_definitions(TOOL_DEFINITIONS)}
+    # 1) Schema 同时保留旧投稿入口和新版圆桌的专属字段
+    lemma_schema = tools_map["submit_node_handoff"]["inputSchema"]["properties"]["local_lemma_submissions"]
+    assert "column_a_self_contained_proof_md" in lemma_schema["items"]["properties"]
+    assert set(lemma_schema["items"]["required"]) == {"title", "column_a_self_contained_proof_md"}
+    verdict_act_props = tools_map["submit_conference_verdict"]["inputSchema"]["properties"]["actions"]["items"]["properties"]
+    for key in ("action_type", "synthesis_goal_md", "probe_requirement_md", "primary_node_id", "secondary_node_id"):
+        assert key in verdict_act_props
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = Path(tmp) / "ws"
+        ws.mkdir(parents=True, exist_ok=True)
+        with closing(open_rw_connection(Path(tmp) / "gw.sqlite")) as conn:
+            _init(conn)
+            # 创建 Q1 下 3 条同 fam1 活跃分支（达到默认 max_active_branches=3 上限）
+            for idx in range(1, 4):
+                wt = ws / "worktrees" / f"b{idx}"
+                wt.mkdir(parents=True, exist_ok=True)
+                (wt / "candidate.py").write_text(f"x = {idx}\n", encoding="utf-8")
+                conn.execute(
+                    """INSERT INTO lineage_nodes(
+                        node_id, question_id, branch_id, family_id, generation,
+                        node_status, worktree_abs_path, created_at, updated_at
+                    ) VALUES (?,?,?,?,1,'EXPLORING',?,?,?)""",
+                    (f"n_q1_{idx}", "Q1", f"b{idx}", "fam1", str(wt), "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+                )
+            conn.commit()
+
+            # 3) 后勤仪表盘：Q1 已满 3/3，聚拢告警标 can_fork_now=False，且引导不再催开枝
+            dash = tool_get_logistics_dashboard(conn, caller_role="logistics_coordinator", session_id="log-1", question_id="Q1")
+            dash_data = dash["data"]
+            q1_state = [s for s in dash_data["subproblem_states"] if s["question_id"] == "Q1"][0]
+            assert q1_state["max_active_branches"] == 3
+            assert q1_state["active_branch_count"] == 3
+            assert q1_state["available_branch_slots"] == 0
+            assert q1_state["can_open_new_branch"] is False
+            assert dash_data["family_concentration_alerts"][0]["can_fork_now"] is False
+            assert "名额已满" in dash["next_step_guidance"]
+
+            # 4) 总控下令提前交班：actor_source="gw_chief_human" -> chief_direct 授权直通，不再被 authorize_early_handoff 误拒
+            eh = operator_command(
+                conn,
+                operation="node_intervene",
+                actor_source="gw_chief_human",
+                node_action={"node_ids": ["n_q1_1"], "mode": "early_handoff", "reason": "人类通过总控下令提前交班"},
+            )
+            assert eh["status"] == "SETTLED" and not eh.get("failed_targets")
+            assert conn.execute("SELECT control_state FROM lineage_nodes WHERE node_id='n_q1_1'").fetchone()[0] == "EARLY_HANDOFF_READY"
+
+            # 5) 工单合并：1137 字报修正文完整保留，绝不截断为 400 字
+            long_desc = "故障复现步骤：" + ("A" * 1130)
+            assert len(long_desc) == 1137
+            t1 = submit_works_ticket(conn, question_id="Q1", ticket_type="INSTRUMENT_ERROR", instrument_id="inst_geo",
+                                     description="初次简短报错", source="role:explorer", reporter_session_id="exp-1")
+            t2 = submit_works_ticket(conn, question_id="Q1", ticket_type="INSTRUMENT_ERROR", instrument_id="inst_geo",
+                                     description=long_desc, source="role:explorer", reporter_session_id="exp-2")
+            assert t1["ticket_id"] == t2["ticket_id"] and t2["deduplicated"] is True
+            raw_payload = json.loads(
+                conn.execute("SELECT payload_json FROM works_engineering_queue WHERE ticket_id=?", (t1["ticket_id"],)).fetchone()[0]
+            )
+            assert len(raw_payload["additional_reports"][0]["description"]) == 1137
+            assert raw_payload["additional_reports"][0]["description"] == long_desc
+
+            # 2) 验证两个动作按各自的专属字段透传，并使用两条不同学派的供体。
+            conn.execute("UPDATE lineage_nodes SET node_status='SEALED' WHERE node_id='n_q1_3'")
+            conn.execute("UPDATE lineage_nodes SET family_id='fam2' WHERE node_id='n_q1_2'")
+            conn.execute(
+                """
+                INSERT INTO method_families(family_id, question_id, mechanism_signature, orthogonal_contrast, created_at)
+                VALUES ('fam_synthesis', 'Q1', '连续优化融合边界剪枝', '互补供体', '2026-01-01T00:00:00Z')
+                """
+            )
+            verdict_obj = {
+                "actions": [
+                    {
+                        "action_type": "SPAWN_SYNTHESIS",
+                        "primary_node_id": "n_q1_1",
+                        "secondary_node_id": "n_q1_2",
+                        "target_family_id": "fam_synthesis",
+                        "synthesis_goal_md": "将 n_q1_1 的连续优化与 n_q1_2 的边界剪枝融合并验证误差 < 1e-6",
+                    },
+                    {
+                        "action_type": "DISCRIMINATOR",
+                        "instrument_id": "inst_geo",
+                        "probe_requirement_md": "编写双曲线边界对拍探针，区分两派在高曲率拐点处的误差来源",
+                    },
+                ],
+                "rationale_md": "测试圆桌动作具体任务透传",
+            }
+            conn.execute(
+                """INSERT INTO wave_conferences(
+                    conference_id, question_id, wave_no, status, participant_nodes_json, verdict_json, created_at
+                ) VALUES ('wc_q1_w9_test', 'Q1', 9, 'ADJUDICATING', '["n_q1_1","n_q1_2"]', ?, '2026-01-01T00:00:00Z')""",
+                (json.dumps(verdict_obj, ensure_ascii=False),),
+            )
+            conn.commit()
+            res = execute_approved_wave_verdict(conn, workspace_root=str(ws), conference_id="wc_q1_w9_test")
+            syn_act = [x for x in res["executed"] if x["action"] == "SPAWN_SYNTHESIS"][0]
+            disc_act = [x for x in res["executed"] if x["action"] == "DISCRIMINATOR"][0]
+            syn_will = conn.execute("SELECT will_md FROM lineage_nodes WHERE node_id=?", (syn_act["node_id"],)).fetchone()[0]
+            assert "误差 < 1e-6" in syn_will and "旁路双供体融合验证" not in syn_will
+            disc_payload = json.loads(
+                conn.execute("SELECT payload_json FROM works_engineering_queue WHERE ticket_id=?", (disc_act["ticket_id"],)).fetchone()[0]
+            )
+            assert "高曲率拐点" in disc_payload["description"]

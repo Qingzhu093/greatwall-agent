@@ -175,9 +175,11 @@ export async function dispatchStage2Step(port, snap, sig, maxConcurrentWorkers =
   for (const [k, fp] of triageFpMap.entries()) {
     if (!port.isBreakerOpen(k, fp)) activeTriageItems.push({ key: k, beforeFp: fp })
   }
-  const concAlerts = (snap.family_concentration_alerts || []).filter(
-    (a) => !port.isBreakerOpen(`conc:${a.question_id}:${a.family_id}`, `cnt=${a.branch_count_in_family}/${a.total_active_branches}`),
-  )
+  const concAlerts = (snap.family_concentration_alerts || []).filter((a) => {
+    if (a.can_fork_now === false) return false
+    if (typeof a.available_branch_slots === 'number' && a.available_branch_slots <= 0) return false
+    return !port.isBreakerOpen(`conc:${a.question_id}:${a.family_id}`, `cnt=${a.branch_count_in_family}/${a.total_active_branches}`)
+  })
   const needQs = (snap.questions_needing_branch || []).filter((q) => !port.isBreakerOpen(`need_branch:${q}`, `need:${q}`))
   const orphanedRevs = (snap.orphaned_blind_review_revisions || []).filter(
     (r) => !port.isBreakerOpen(`orphan_rev:${r.review_id}`, `orphan:${r.review_id}:${r.source_node_id}`),

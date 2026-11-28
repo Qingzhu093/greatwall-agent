@@ -48,7 +48,8 @@ export class AgentSessionHost {
     protectedDirs = [],
     sharedInputPaths = [],
     defaultAgentOptions = {},
-    effectiveContextWindow = 500_000,
+    effectiveContextWindow = 360_000,
+    contextHolidayPct = 0.52,
     autoArchiveShortTx = true,
     humanTakeover = null,
     telemetry,
@@ -61,7 +62,8 @@ export class AgentSessionHost {
     this.protectedDirs = protectedDirs
     this.sharedInputPaths = Array.isArray(sharedInputPaths) ? sharedInputPaths : []
     this.defaultAgentOptions = defaultAgentOptions
-    this.effectiveContextWindow = Math.max(1, Number(effectiveContextWindow || 500_000))
+    this.effectiveContextWindow = Math.max(1, Number(effectiveContextWindow || 360_000))
+    this.contextHolidayPct = contextHolidayPct
     this.autoArchiveShortTx = Boolean(autoArchiveShortTx)
     this.humanTakeover = humanTakeover
     this.telemetry = telemetry
@@ -73,14 +75,17 @@ export class AgentSessionHost {
     this._resumeListenerDisposer = this._installResumeAutoRemountListener()
   }
 
-  setSessionReadonly(sessionId, isReadonly) {
+  setSessionReadonly(sessionId, isReadonly, phase = 'HANDOFF_70') {
     if (!sessionId) return
-    this._sessionReadonlyFlags.set(sessionId, Boolean(isReadonly))
+    if (isReadonly) this._sessionReadonlyFlags.set(sessionId, phase)
+    else this._sessionReadonlyFlags.delete(sessionId)
   }
 
   isSessionReadonly(sessionId) {
     return Boolean(this._sessionReadonlyFlags.get(sessionId))
   }
+
+  getSessionReadonlyPhase(sessionId) { return this._sessionReadonlyFlags.get(sessionId) }
 
   /** 向在线探索会话温和热注入新口径裁决通知（绝不强杀在途旧口径分支）。 */
   injectPolicyChange(sessionId, noticeText) {
@@ -219,6 +224,24 @@ export class AgentSessionHost {
     }
   }
 
+  async unarchiveSession(sessionId) {
+    if (!sessionId) return { unarchived: false, skipped: true }
+    const reg = typeof this.ctx?.get === 'function' ? this.ctx.get('workspaceRegistry') : this.ctx?.workspaceRegistry
+    if (reg && typeof reg.unarchiveSession === 'function') {
+      try {
+        await reg.unarchiveSession(sessionId)
+      } catch (err) {
+        this.telemetry?.recordEvent?.('session_unarchive_warn', { sessionId, error: String(err?.message || err) })
+      }
+    }
+    const rec = this.telemetry?.state?.sessions?.[sessionId]
+    if (rec) {
+      rec.archived = false
+      rec.readonly = false
+    }
+    return { unarchived: true }
+  }
+
   async archiveSession(sessionId) {
     if (!this.autoArchiveShortTx || !sessionId) return { archived: false, skipped: true }
     const reg = typeof this.ctx?.get === 'function' ? this.ctx.get('workspaceRegistry') : this.ctx?.workspaceRegistry
@@ -257,11 +280,13 @@ export class AgentSessionHost {
         protectedDirs: this.protectedDirs,
         sharedInputPaths: this.sharedInputPaths,
         effectiveContextWindow: this.effectiveContextWindow,
+        contextHolidayPct: this.contextHolidayPct,
         liveSessions: this.liveSessions,
         onOperatorReceipt: this.onOperatorReceipt,
         humanTakeover: this.humanTakeover,
-        setSessionReadonly: (sid, flag) => this.setSessionReadonly(sid, flag),
+        setSessionReadonly: (sid, flag, phase) => this.setSessionReadonly(sid, flag, phase),
         isSessionReadonly: (sid) => this.isSessionReadonly(sid),
+        getSessionReadonlyPhase: (sid) => this.getSessionReadonlyPhase(sid),
       },
       agentCtx,
       agent,
@@ -480,7 +505,8 @@ export class AgentSessionHost {
         turnSignals,
         onNativeThresholdHit: (ev) => {
           nativeThresholds.push(ev)
-          if (ev?.trigger === 'REFLECT_37' || ev?.trigger === 'HANDOFF_70' || ev?.trigger === 'NODE_TERMINATED') {
+          if (ev.trigger === 'HOLIDAY_52') this.setSessionReadonly(effSid, true, 'HOLIDAY_52')
+          if (['REFLECT_37', 'HOLIDAY_52', 'HANDOFF_70', 'NODE_TERMINATED'].includes(ev.trigger)) {
             thresholdCancelled = true
             try { liveHandleRef?.agent?.cancel?.({ kind: 'hook', reason: ev.trigger }) } catch {}
           }
@@ -502,6 +528,9 @@ export class AgentSessionHost {
     let handle = null
     let resumedFromDisk = false
     if (preferResume && typeof this.ctx.agents.resume === 'function') {
+      // 提前登记 setup 归属并解档已归档会话，防止 DSH 拦截已归档会话（turn/end: blocked）或被全局监听器误挂载只读档案
+      this._setupHandledAgentIds.add(effSid)
+      if (!readonly) await this.unarchiveSession(effSid)
       try {
         // DSH RC5 `ctx.agents.resume` 权威字段名为 `resumeSessionId`（同时保留 sessionId 兼容测试 mock）
         const resumeOpts = {
@@ -680,6 +709,9 @@ export class AgentSessionHost {
               workspace_root: this.workspaceRoot, node_id: live.nodeId, note: { id: note.id },
             })))
           }
+          if (reason?.kind === 'blocked') {
+            this.telemetry?.recordEvent?.('followup_turn_blocked', { sessionId, role })
+          }
           if (reason?.kind === 'error' && reason?.error) {
             const err = new Error(String(reason.error.message || reason.error.code || 'turn_error'))
             err.code = reason.error.code
@@ -693,8 +725,10 @@ export class AgentSessionHost {
             this.telemetry?.recordEvent?.('transient_provider_retry', { sessionId, role, attempt, delayMs, error })
           },
         },
-      ).catch(() => {
-        // 非瞬态或耗尽重试后交由上层 inspectLastTurnEndReason 统一处置
+      ).catch((err) => {
+        if (err?.code !== 'CONTENT_REFUSED') {
+          this.telemetry?.recordEvent?.('followup_turn_error', { sessionId, role, error: String(err?.message || err) })
+        }
       })
     } finally {
       if (signal) signal.removeEventListener('abort', onAbortSignal)

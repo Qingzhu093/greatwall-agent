@@ -216,6 +216,19 @@ def claim_runtime_effects(
                 item["payload"] = json.loads(item.get("payload_json") or "{}")
             except Exception:
                 item["payload"] = {}
+            if item["kind"] == "RUN_INTERNAL_SURVEY":
+                req_id = item["payload"]["survey_req_id"]
+                conn.execute(
+                    """
+                    UPDATE internal_survey_requests SET status = 'RUNNING', updated_at = ?
+                    WHERE survey_req_id = ? AND status IN ('PENDING', 'RUNNING')
+                    """,
+                    (now, req_id),
+                )
+                survey = conn.execute(
+                    "SELECT status FROM internal_survey_requests WHERE survey_req_id = ?", (req_id,),
+                ).fetchone()
+                item["survey_status"] = survey["status"]
             claimed.append(item)
 
     return {"owner_instance_id": owner, "claimed": claimed, "count": len(claimed)}
@@ -329,5 +342,14 @@ def complete_runtime_effect(
                 WHERE seq = ?
                 """,
                 (st_u, str(last_error or "")[:800], eff_handle, now, comp_at, int(seq)),
+            )
+        if row["kind"] == "RUN_INTERNAL_SURVEY" and st_u in ("PENDING", "FAILED", "CANCELLED"):
+            req_id = json.loads(row["payload_json"])["survey_req_id"]
+            conn.execute(
+                """
+                UPDATE internal_survey_requests SET status = ?, error_note = ?, updated_at = ?
+                WHERE survey_req_id = ? AND status IN ('PENDING', 'RUNNING')
+                """,
+                ("PENDING" if st_u == "PENDING" else "FAILED", last_error, now, req_id),
             )
     return {"seq": int(seq), "status": st_u, "updated": True}

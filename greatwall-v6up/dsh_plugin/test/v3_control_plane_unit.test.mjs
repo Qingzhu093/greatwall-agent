@@ -23,6 +23,7 @@ import {
   evaluateContextClockTrigger,
   sampleAgentContextPressure,
   shouldConcludeTurnAfterTool,
+  syncLivePressureToDb,
 } from '../lib/clock_and_turn_gap.js'
 import {
   AgentSessionHost,
@@ -105,7 +106,7 @@ test('DSH RC5 流式拒答：首次回合与续跑均保留错误码并写入遥
 })
 
 test('1. 8套Preset、10角色路由与平台感知原生工具白名单', () => {
-  assert.equal(ALL_31_MCP_TOOLS.size, 47)
+  assert.equal(ALL_31_MCP_TOOLS.size, 53)
   assert.ok(ROLE_MCP_TOOLS.works_engineer.includes('register_question_instrument'))
   assert.ok(ROLE_MCP_TOOLS.works_engineer.includes('upgrade_instrument_with_calibration'))
   assert.ok(ROLE_MCP_TOOLS.works_engineer.includes('resolve_works_ticket'))
@@ -173,6 +174,24 @@ test('2. 平台感知原生工具挂载强断言 (assertRequiredNativeTools)', (
   assert.doesNotThrow(() => assertRequiredNativeTools('logistics_coordinator', [], 'win32'))
   assert.throws(() => assertRequiredNativeTools('supervisory_committee', ['read'], 'win32'), /纯 DB 治理/)
   assert.throws(() => assertRequiredNativeTools('gw_chief', [], 'win32'), /缺少.*read.*glob.*grep/)
+})
+
+test('读与搜索参数锚定独立沙箱，且仅拦截独立上级目录段', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gw_read_default_'))
+  try {
+    const worktree = fs.mkdtempSync(path.join(root, 'node_'))
+    const guard = createSandboxCallEvaluator({ role: 'explorer', workspaceRoot: root, worktreeAbsPath: worktree })
+    const glob = { name: 'glob', arguments: Object.freeze({ pattern: '*.py' }) }
+    const grep = { name: 'grep', arguments: Object.freeze({ pattern: 'range 1..10...', path: '.' }) }
+    const read = { name: 'read', arguments: Object.freeze({ file_path: '.' }) }
+    for (const call of [glob, grep, read]) assert.equal(guard(call), undefined)
+    assert.deepEqual([glob.arguments.path, grep.arguments.path, read.arguments.file_path], [worktree, worktree, worktree])
+    assert.equal(guard({ name: 'read', arguments: { file_path: 'proof..draft.py' } }), undefined)
+    assert.match(guard({ name: 'read', arguments: { file_path: 'tools/../proof.py' } }), /SANDBOX_VIOLATION/)
+    assert.match(guard({ name: 'grep', arguments: { path: 'tools\\..\\proof.py', pattern: 'x' } }), /SANDBOX_VIOLATION/)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('3. 双隔离沙箱 Guard：探索Worktree + 动态只读遗嘱 + 空白盲审沙箱 + 工造司禁改worktrees', () => {
@@ -246,12 +265,35 @@ test('3. 双隔离沙箱 Guard：探索Worktree + 动态只读遗嘱 + 空白盲
   }
 })
 
-test('4. 500k 物理时钟（无 eval_count 门槛）与 Stage 1 REVISE/REFUTED 回合收尾', () => {
+test('同一会话的压力采样按采样顺序落库', async () => {
+  const agent = { session: {} }
+  const writes = []
+  let pressure = 120_000
+  let releaseFirst
+  const gate = new Promise((resolve) => { releaseFirst = resolve })
+  const ctx = { tokenMeter: { measure: () => ({ totalTokens: pressure }) } }
+  const bridge = {
+    async control(_method, { pressure_tokens }) {
+      if (pressure_tokens === 120_000) await gate
+      writes.push(pressure_tokens)
+    },
+  }
+  const first = syncLivePressureToDb(ctx, agent, bridge, '.', 'node-1')
+  pressure = 190_000
+  const next = syncLivePressureToDb(ctx, agent, bridge, '.', 'node-1')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(writes, [])
+  releaseFirst()
+  await Promise.all([first, next])
+  assert.deepEqual(writes, [120_000, 190_000])
+})
+
+test('4. 360k 物理时钟（无 eval_count 门槛）与 Stage 1 REVISE/REFUTED 回合收尾', () => {
   // 零观测纯推导节点在 37% 照常触发 REFLECT_37
-  assert.equal(evaluateContextClockTrigger({ pressureTokens: 184_999, firstReflectionUnlocked: false }).trigger, null)
-  assert.equal(evaluateContextClockTrigger({ pressureTokens: 185_000, firstReflectionUnlocked: false }).trigger, 'REFLECT_37')
+  assert.equal(evaluateContextClockTrigger({ pressureTokens: 133_199, firstReflectionUnlocked: false }).trigger, null)
+  assert.equal(evaluateContextClockTrigger({ pressureTokens: 133_200, firstReflectionUnlocked: false }).trigger, 'REFLECT_37')
   assert.equal(evaluateContextClockTrigger({ pressureTokens: 200_000, firstReflectionUnlocked: true }).trigger, null)
-  assert.equal(evaluateContextClockTrigger({ pressureTokens: 350_000, firstReflectionUnlocked: true }).trigger, 'HANDOFF_70')
+  assert.equal(evaluateContextClockTrigger({ pressureTokens: 252_000, firstReflectionUnlocked: true }).trigger, 'HANDOFF_70')
 
   // 采样器优先 sessionProjections，降级 tokenMeter
   const fakeCtx = {
@@ -291,7 +333,7 @@ test('5. GreatwallMcpBridge 分级超时与 Python 31 窄工具实时握手冒�
     assert.equal(bridge.resolveControlTimeoutMs('control_plane/recover_heavy_jobs'), 300_000)
 
     const tools = await bridge.listTools()
-    assert.equal(tools.length, 47)
+    assert.equal(tools.length, 53)
     const snap = await bridge.control('control_plane/schedule_snapshot', {})
     assert.equal(snap?.ok, true)
     assert.equal(snap?.data?.stage, 'STAGE1_PARSE0')
@@ -951,13 +993,21 @@ test('18. 双向沙箱放行公开输入/https URL/dsh-spill-*，严防内部向
     assert.match(String(evalVer({ name: 'read', arguments: { file_path: path.join(rulingsDir, 'ruling_new.md') } })), /SANDBOX_VIOLATION/)
     assert.equal(evalVer({ name: 'read', arguments: { file_path: spillFile } }), undefined)
 
-    // surveyor web_fetch https:// 零误杀
     const evalSurv = createSandboxCallEvaluator({
-      role: 'library_surveyor',
+      role: 'external_surveyor',
       workspaceRoot: ws,
       protectedDirs: [path.join(tmpRoot, 'plugin_data')],
     })
-    assert.equal(evalSurv({ name: 'web_fetch', arguments: { url: 'https://arxiv.org/abs/2401.00001' } }), undefined)
+    for (const [url, expected] of [
+      ['https://arxiv.org/abs/2401.00001', 'https://arxiv.org/html/2401.00001'],
+      ['https://arxiv.org/pdf/math.GT/0309136v2.pdf', 'https://arxiv.org/html/math.GT/0309136v2'],
+      ['https://export.arxiv.org/api/query?id_list=2401.00001', 'https://export.arxiv.org/api/query?id_list=2401.00001'],
+    ]) {
+      const exec = { name: 'web_fetch', arguments: Object.freeze({ url }) }
+      assert.equal(evalSurv(exec), undefined)
+      assert.equal(exec.arguments.url, expected)
+    }
+    assert.match(evalSurv({ name: 'read', arguments: { file_path: ws } }), /SANDBOX_VIOLATION/)
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true })
   }
@@ -1403,7 +1453,7 @@ test('26. GreatwallMcpBridge.describeContracts 实时握手与 Node 静态契约
   try {
     const snap1 = await bridge.describeContracts()
     const pyAll = [...new Set(Object.values(snap1.role_mcp_tools || {}).flat())].sort()
-    assert.equal(snap1.tool_count, 47)
+    assert.equal(snap1.tool_count, 53)
     assert.deepEqual(pyAll, [...ALL_MCP_TOOLS].sort())
     assert.deepEqual([...snap1.readonly_blocked_mcp_tools].sort(), [...READONLY_BLOCKED_MCP_TOOLS].sort())
     assert.deepEqual([...snap1.long_running_mcp_tools].sort(), [...LONG_RUNNING_MCP_TOOLS].sort())
@@ -1682,7 +1732,7 @@ test('31. Phase 2B RC5 严格 JSON Schema 适配：遍历全量 47 工具 100% �
 
   try {
     const tools = await bridge.listTools()
-    assert.equal(tools.length, 47)
+    assert.equal(tools.length, 53)
     for (const t of tools) {
       const adapted = normalizeSchemaForDsh(t.inputSchema, { toolName: t.name })
       assertRc5StrictSchema(adapted, t.name)

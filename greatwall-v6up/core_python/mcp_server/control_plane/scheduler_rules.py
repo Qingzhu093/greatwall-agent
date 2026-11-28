@@ -28,6 +28,7 @@ from .snapshot_queries import (
     fetch_l3_counts_by_question,
     fetch_parse0_subquestions_and_order,
     fetch_snapshot_queues_and_tables,
+    fetch_streetlight_warning_questions,
     fetch_subproblem_states,
     fetch_topology_raw_data,
     fetch_v03_queues,
@@ -76,13 +77,17 @@ def get_question_order_status(conn: sqlite3.Connection) -> dict[str, dict[str, A
     req_qs, q_order = fetch_parse0_subquestions_and_order(conn)
     full_l3_counts, any_l3_counts = fetch_l3_counts_by_question(conn)
 
+    terminal = {r["question_id"] for r in conn.execute(
+        "SELECT question_id FROM subproblem_runtime_state WHERE dispatch_state IN ('STOPPED_SOLVED','PAUSED_SATURATED','CLOSED')"
+    )}
+
     status_map: dict[str, dict[str, Any]] = {}
     for q in req_qs:
         unmet_prev: list[str] = []
         if q in q_order:
             idx = q_order.index(q)
             for prev_q in q_order[:idx]:
-                if full_l3_counts.get(prev_q, 0) < 1:
+                if prev_q not in terminal and full_l3_counts.get(prev_q, 0) < 1:
                     unmet_prev.append(prev_q)
         status_map[q] = {
             "unmet_order_questions": unmet_prev,
@@ -107,11 +112,17 @@ def compute_family_concentration_alerts(conn: sqlite3.Connection) -> list[dict[s
         fam = str(r["family_id"] or "unclassified")
         by_q.setdefault(q, {}).setdefault(fam, set()).add(b)
 
+    arrs = active_arrangements(conn)
     alerts: list[dict[str, Any]] = []
     for q, fam_map in sorted(by_q.items()):
         total_active = sum(len(bs) for bs in fam_map.values())
         if total_active < min_branches:
             continue
+        q_pol = effective_policy(arrs, question_id=q)
+        q_max = int(q_pol.get("max_active_branches", 3))
+        q_dp = str(q_pol.get("dispatch_policy", "NORMAL"))
+        avail_slots = max(0, q_max - total_active)
+        can_fork_now = q_dp == "NORMAL" and avail_slots > 0
         for fam, bs in sorted(fam_map.items()):
             cnt = len(bs)
             share = cnt / float(total_active)
@@ -122,6 +133,10 @@ def compute_family_concentration_alerts(conn: sqlite3.Connection) -> list[dict[s
                         "family_id": fam,
                         "branch_count_in_family": cnt,
                         "total_active_branches": total_active,
+                        "max_active_branches": q_max,
+                        "available_branch_slots": avail_slots,
+                        "dispatch_policy": q_dp,
+                        "can_fork_now": can_fork_now,
                         "share": round(share, 4),
                         "branches": sorted(bs),
                     }
@@ -246,16 +261,23 @@ def compute_topology_and_revision_health(
                 }
             )
 
+    arrs_topo = active_arrangements(conn)
     understaffed_questions: list[dict[str, Any]] = []
     check_qs = sorted(active_families_by_q.keys()) if qf.upper() == "ALL" else [qf]
     for q in check_qs:
         q_info = order_status.get(q, {})
         if not q_info.get("unlocked", True) or q_info.get("full_goal_l3_count", 0) > 0:
             continue
+        q_pol = effective_policy(arrs_topo, question_id=q)
+        q_max = int(q_pol.get("max_active_branches", 3))
+        q_dp = str(q_pol.get("dispatch_policy", "NORMAL"))
         reg_fams = active_families_by_q.get(q, [])
         live_fams = sorted(live_families_by_q.get(q, set()))
         missing_fams = [f for f in reg_fams if f not in live_fams]
         live_b_list = live_branches_by_q.get(q, [])
+        avail_q_slots = max(0, q_max - len(live_b_list))
+        if q_dp != "NORMAL" or avail_q_slots <= 0:
+            continue
         is_degenerated = len(reg_fams) >= 2 and len(live_b_list) < min(2, len(reg_fams)) and free_slots > 0
         if missing_fams and (is_degenerated or len(live_b_list) == 0):
             understaffed_questions.append(
@@ -265,6 +287,8 @@ def compute_topology_and_revision_health(
                     "active_families_in_flight": live_fams,
                     "missing_active_family_ids": missing_fams,
                     "active_branch_count": len(live_b_list),
+                    "max_active_branches": q_max,
+                    "available_branch_slots": avail_q_slots,
                     "free_explorer_slots": free_slots,
                     "single_branch_monopoly": len(live_b_list) == 1 and len(reg_fams) >= 2,
                 }
@@ -424,8 +448,12 @@ def schedule_control_plane_snapshot(
     human_stop_active = bool(closure_state.get("human_stop_requested_at"))
     order_status = get_question_order_status(conn)
     subproblem_states = fetch_subproblem_states(conn)
+    streetlight_questions = fetch_streetlight_warning_questions(conn)
     subproblem_states = {
-        qid: {**row, **effective_policy(arrangements, qid, base=row)}
+        qid: {
+            **row, **effective_policy(arrangements, qid, base=row),
+            "streetlight_warning": "STREETLIGHT_WARNING" if qid in streetlight_questions else None,
+        }
         for qid, row in subproblem_states.items()
     }
     human_named = {row["target_id"]: row["target_generation"] for row in conn.execute(
@@ -585,6 +613,7 @@ def schedule_control_plane_snapshot(
                 closure_gate = budget_gate
 
     stop_new_dispatch = bool(human_stop_active or closure_gate.get("closure_allowed"))
+    project_paused_all = effective_policy(arrangements, "", "").get("dispatch_policy") == "PAUSED_ALL"
 
     subproblem_runtime_list = [subproblem_states[q] for q in sorted(subproblem_states.keys())]
     living_surveys_dict = v03_q["living_surveys"]
@@ -630,7 +659,10 @@ def schedule_control_plane_snapshot(
             row for row in understaffed_questions
             if subproblem_states.get(row["question_id"], {}).get("dispatch_policy", "NORMAL") == "NORMAL"
         ],
-        "orphaned_blind_review_revisions": [] if stop_new_dispatch else orphaned_revisions,
+        "orphaned_blind_review_revisions": [] if stop_new_dispatch else [
+            row for row in orphaned_revisions
+            if subproblem_states.get(row.get("question_id", ""), {}).get("dispatch_policy", "NORMAL") == "NORMAL"
+        ],
         "stalled_or_aborted_branches": stalled_branches,
         "slot_utilization": topology_health.get("slot_utilization") or {"active_branches_count": 0, "slot_cap": slot_cap, "free_slots": slot_cap},
         "active_supervisory_alert": active_supervisory_alert,
@@ -640,7 +672,10 @@ def schedule_control_plane_snapshot(
         "slot_cap": slot_cap,
         "max_worker_slots": load_runtime_config()["max_concurrent_workers_hard_cap"],
         "triage_locked_branches": sorted(triage_locked_branches),
-        "family_concentration_alerts": family_concentration_alerts,
+        "family_concentration_alerts": [
+            row for row in family_concentration_alerts
+            if subproblem_states.get(row.get("question_id", ""), {}).get("dispatch_policy", "NORMAL") == "NORMAL"
+        ],
         "ambiguous_spec_alerts": qdata["ambiguous_alerts"],
         "unhealthy_instruments": qdata["unhealthy_instruments"],
         "pending_surveys": qdata["pending_surveys"],
@@ -661,6 +696,7 @@ def schedule_control_plane_snapshot(
         "living_surveys": living_surveys_dict,
         "living_surveys_list": living_surveys_list,
         "pending_effects_count": v03_q["pending_effects_count"],
+        "project_paused_all": project_paused_all,
         "human_stop_active": human_stop_active,
         "closure_state": closure_state,
         "closure_gate": closure_gate,

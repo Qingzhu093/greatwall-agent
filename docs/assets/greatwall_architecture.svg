@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 1010" width="1440" height="1010" font-family="'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 1000" width="1440" height="1000" font-family="'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">
   <defs>
     <filter id="cardShadow" x="-2%" y="-2%" width="104%" height="106%">
       <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0F172A" flood-opacity="0.06"/>
@@ -26,54 +26,54 @@
     </marker>
   </defs>
 
-  <!-- White Academic Canvas -->
-  <rect x="0" y="0" width="1440" height="1010" fill="#FFFFFF"/>
+  <!-- Clean Academic White Canvas -->
+  <rect x="0" y="0" width="1440" height="1000" fill="#FFFFFF"/>
 
   <!-- Header Bar -->
   <rect x="28" y="18" width="1384" height="54" rx="10" fill="#F8FAFC" stroke="#CBD5E1" stroke-width="1.2"/>
-  <text x="50" y="43" font-size="19" font-weight="700" fill="#0F172A">GreatWall Agent (v0.3.0-alpha.2) — System Architecture Overview</text>
-  <text x="50" y="62" font-size="12" fill="#475569">Four Orthogonal Engineering Pillars · 10 Physically Isolated Roles × 44 Narrow Tools · Superagent HCI × Macro Wave Conference</text>
+  <text x="50" y="43" font-size="19" font-weight="700" fill="#0F172A">GreatWall Agent (v0.3.2) — System Architecture Overview</text>
+  <text x="50" y="62" font-size="12" fill="#475569">Four Subsystems · 10 Role-Isolated Agents × 53 Narrow MCP Tools · Stateful Search Kernel × Stateless Short Sessions</text>
   <rect x="1194" y="30" width="200" height="28" rx="14" fill="#EFF6FF" stroke="#93C5FD" stroke-width="1"/>
-  <text x="1294" y="48" font-size="11.5" font-weight="600" fill="#1D4ED8" text-anchor="middle">Apache 2.0 + DCO · v0.3</text>
+  <text x="1294" y="48" font-size="11.5" font-weight="600" fill="#1D4ED8" text-anchor="middle">Apache 2.0 + DCO · v0.3.2</text>
 
   <!-- ====================================================================== -->
-  <!-- BAND 1: INFRASTRUCTURE ENGINEERING (设施工程 · 内外双界面控制底座)         -->
+  <!-- BAND 1: INFRASTRUCTURE & HUMAN-AGENT CONTROL PLANE                     -->
   <!-- ====================================================================== -->
   <g filter="url(#cardShadow)">
     <rect x="28" y="88" width="1384" height="148" rx="12" fill="#F8FAFC" stroke="#334155" stroke-width="1.6"/>
   </g>
-  <rect x="44" y="99" width="276" height="24" rx="5" fill="#1E293B"/>
-  <text x="182" y="115" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">1. 设施工程 · Infrastructure (内外双界面)</text>
-  <text x="334" y="115" font-size="11.5" fill="#475569">Superagent 人机总控 · 轻量只读三问 UI · Outbox 副作用队列 · 单机进程锁 · 立项与口径仲裁</text>
+  <rect x="44" y="99" width="310" height="24" rx="5" fill="#1E293B"/>
+  <text x="199" y="115" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">1. 设施工程 · Infrastructure &amp; Control Plane</text>
+  <text x="368" y="115" font-size="11.5" fill="#475569">人机交互总控 · 只读观测面板 · 异步任务编排与并发锁 · 立项契约与口径仲裁</text>
 
-  <!-- Left: Superagent & Human Interface (向外界面) -->
+  <!-- Left: Human-Agent Interface -->
   <rect x="44" y="132" width="496" height="90" rx="8" fill="#FFFFFF" stroke="#7C3AED" stroke-width="1.5"/>
   <rect x="56" y="141" width="76" height="18" rx="4" fill="#7C3AED"/>
   <text x="94" y="154" font-size="10.5" font-weight="700" fill="#FFFFFF" text-anchor="middle">人机总控</text>
-  <text x="140" y="154" font-size="12.6" font-weight="700" fill="#0F172A">Superagent (gw-chief · 0 写/0 Shell) + 三问只读 UI</text>
-  <text x="56" y="175" font-size="10.8" fill="#334155">• 信息输出靠轻量领域态 UI；自由指令经 gw-chief 整理为 8 类确认单（Action Card 双端幂等）</text>
-  <text x="56" y="192" font-size="10.8" fill="#334155">• 两阶段院内事件过滤（95% 噪音止步 UI）· Compacting + 弹性锚点卡 + 外键回忆链</text>
-  <text x="56" y="209" font-size="10.8" fill="#334155">• 保留克制逃生舱：一键查原始会话 · 物理急停 · 45% 暂停直连子节点与 SHA-256 对账</text>
+  <text x="140" y="154" font-size="12.6" font-weight="700" fill="#0F172A">常驻总控 (gw_chief · 只读审码) + 只读状态面板</text>
+  <text x="56" y="175" font-size="10.8" fill="#334155">• 统一承接研究者指令：支持直执运行调度与发送分支提示，高危变更走审批卡确认</text>
+  <text x="56" y="192" font-size="10.8" fill="#334155">• 置顶动态摘要 + 按需分页查账，减少长程运行中的信息过载与上下文遗忘</text>
+  <text x="56" y="209" font-size="10.8" fill="#334155">• 保留直接介入通道：随时查看任意子节点会话、紧急暂停或接管对话并校验代码变更</text>
 
-  <!-- Connector: Superagent <-> Orchestrator -->
+  <!-- Connector: Chief <-> Orchestrator -->
   <line x1="541" y1="177" x2="563" y2="177" stroke="#7C3AED" stroke-width="1.5" marker-start="url(#arrowViolet)" marker-end="url(#arrowViolet)"/>
 
-  <!-- Middle: Plugin Orchestrator & Outbox Runtime (向内底座) -->
+  <!-- Middle: Plugin Runtime & Orchestrator -->
   <rect x="566" y="132" width="494" height="90" rx="8" fill="#FFFFFF" stroke="#1E293B" stroke-width="1.6"/>
-  <text x="580" y="152" font-size="12.8" font-weight="700" fill="#0F172A">DSH 插件执行层 (Orchestrator · runtime/ · sessions/)</text>
-  <text x="580" y="173" font-size="10.8" fill="#334155">• 8 套单源 Preset (RC5 native) · ctx.agents.resume 按固定编号冷恢复与阶段工具裁剪</text>
-  <text x="580" y="191" font-size="10.8" fill="#334155">• host.lock 单机进程锁 · runtime_effects 60s 租约 Outbox · maxWorkers + 1 人类优先槽</text>
-  <text x="580" y="209" font-size="10.8" fill="#334155">• 429/5xx 指数退避 · 单待办 2 次熔断 · 45% 让权 (source.rpcId + ctx.jobs 清理)</text>
+  <text x="580" y="152" font-size="12.8" font-weight="700" fill="#0F172A">DSH 插件编排层 (Orchestrator · Runtime · Sandbox Guard)</text>
+  <text x="580" y="173" font-size="10.8" fill="#334155">• 8 套角色预设与权限裁剪 · 支持按固定会话 ID 从磁盘恢复短会话 (resume)</text>
+  <text x="580" y="191" font-size="10.8" fill="#334155">• host.lock 防双开 · Outbox 副作用队列（11 类异步任务）· 并发槽位与人类优先预留槽</text>
+  <text x="580" y="209" font-size="10.8" fill="#334155">• 网络瞬态重试 · 单项任务熔断 · 路径规范化与目录隔离守卫</text>
 
   <!-- Connector: Orchestrator <-> Supervisory -->
   <line x1="1061" y1="177" x2="1081" y2="177" stroke="#475569" stroke-width="1.4" marker-start="url(#arrowSlate)" marker-end="url(#arrowSlate)"/>
 
-  <!-- Right: Supervisory Committee (立项与口径仲裁) -->
+  <!-- Right: Supervisory Committee -->
   <rect x="1084" y="132" width="312" height="90" rx="8" fill="#FFFFFF" stroke="#475569" stroke-width="1.4"/>
-  <text x="1098" y="152" font-size="12.4" font-weight="700" fill="#0F172A">立项与口径仲裁 (supervisory)</text>
-  <text x="1098" y="173" font-size="10.8" fill="#334155">• 零代码/零终端/零外网，专注两件事：</text>
-  <text x="1098" y="191" font-size="10.8" fill="#334155">• Stage 1 签发 Parse 0 契约与测量策略</text>
-  <text x="1098" y="209" font-size="10.8" fill="#334155">• 口径歧义仲裁（子题级版本防连坐）</text>
+  <text x="1098" y="152" font-size="12.4" font-weight="700" fill="#0F172A">立项与合规监察 (supervisory_committee)</text>
+  <text x="1098" y="173" font-size="10.8" fill="#334155">• 无文件读写、无终端、无外网权限：</text>
+  <text x="1098" y="191" font-size="10.8" fill="#334155">• Stage 1 签发课题契约 (Parse 0) 与完成标准</text>
+  <text x="1098" y="209" font-size="10.8" fill="#334155">• 题意歧义告警与 Stage 3 结项条件核验</text>
 
   <!-- ====================================================================== -->
   <!-- ORCHESTRATION DISTRIBUTION BUS (Band 1 -> Band 2)                      -->
@@ -83,194 +83,193 @@
   <line x1="250" y1="252" x2="250" y2="276" stroke="#0284C7" stroke-width="1.6" marker-end="url(#arrowBlue)"/>
   <line x1="720" y1="252" x2="720" y2="276" stroke="#D97706" stroke-width="1.6" marker-end="url(#arrowAmber)"/>
   <line x1="1190" y1="252" x2="1190" y2="276" stroke="#059669" stroke-width="1.6" marker-end="url(#arrowGreen)"/>
-  <rect x="826" y="241" width="340" height="20" rx="4" fill="#FFFFFF"/>
-  <text x="996" y="255" font-size="10.8" font-weight="600" fill="#475569" text-anchor="middle">按 Outbox 事务事件按需拉起/唤醒无状态短会话（用完即释）</text>
+  <rect x="836" y="241" width="320" height="20" rx="4" fill="#FFFFFF"/>
+  <text x="996" y="255" font-size="10.8" font-weight="600" fill="#475569" text-anchor="middle">依据状态库快照与 Outbox 事件按需调度短会话</text>
 
   <!-- ====================================================================== -->
-  <!-- BAND 2: THREE SCIENTIFIC ENGINEERING PILLARS (三大科研业务工程)          -->
+  <!-- BAND 2: THREE CORE SCIENTIFIC SUBSYSTEMS                               -->
   <!-- ====================================================================== -->
 
-  <!-- COLUMN 1: INSTRUMENT SCIENCE ENGINEERING (仪器科学工程 · 工造司) -->
+  <!-- COLUMN 1: INSTRUMENT SCIENCE ENGINEERING -->
   <g filter="url(#cardShadow)">
     <rect x="28" y="280" width="444" height="236" rx="12" fill="#F0F9FF" stroke="#0369A1" stroke-width="1.6"/>
   </g>
-  <rect x="44" y="292" width="268" height="24" rx="5" fill="#0284C7"/>
-  <text x="178" y="308" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">2. 仪器科学工程 · 工造司 (Works)</text>
-  <text x="324" y="308" font-size="11" font-weight="600" fill="#0369A1">6 MCP + 受限Shell</text>
+  <rect x="44" y="292" width="286" height="24" rx="5" fill="#0284C7"/>
+  <text x="187" y="308" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">2. 仪器科学工程 · Instrument Science</text>
+  <text x="342" y="308" font-size="11" font-weight="600" fill="#0369A1">6 MCP + 受限终端</text>
 
   <rect x="44" y="324" width="412" height="56" rx="7" fill="#FFFFFF" stroke="#7DD3FC" stroke-width="1.1"/>
-  <text x="56" y="342" font-size="12" font-weight="700" fill="#0C4A6E">极薄通用容器 &amp; 三档同码协议 (isolated_runner)</text>
-  <text x="56" y="359" font-size="10.9" fill="#334155">• VERDICT / PROBE / ENV 统一 evaluate(artifact, spec, tier)，支持 0 判定器开局</text>
-  <text x="56" y="374" font-size="10.9" fill="#334155">• probe (诊断不记账) · official (正式 [Obs###]) · heavy (冻结现场异步排队)</text>
+  <text x="56" y="342" font-size="12" font-weight="700" fill="#0C4A6E">通用隔离评测容器与三档调用 (isolated_runner)</text>
+  <text x="56" y="359" font-size="10.8" fill="#334155">• 支持判定器 / 探针 / 仿真环境三类插件，允许纯理论题无判定器开局</text>
+  <text x="56" y="374" font-size="10.8" fill="#334155">• 同一候选代码支持 probe（诊断）、official（正式记录）与 heavy（异步重计算）</text>
 
   <rect x="44" y="388" width="412" height="56" rx="7" fill="#FFFFFF" stroke="#7DD3FC" stroke-width="1.1"/>
-  <text x="56" y="406" font-size="12" font-weight="700" fill="#0C4A6E">四态物理隔离（仪器坏不罚人）&amp; 四元复合缓存</text>
-  <text x="56" y="423" font-size="10.9" fill="#334155">• OK / CANDIDATE_ERROR / INSTRUMENT_ERROR / INFRA_ERROR</text>
-  <text x="56" y="438" font-size="10.6" fill="#475569">• 平台错零处罚且穿透缓存 · 4 哈希复合键同步服务人工改码 SHA-256 对账</text>
+  <text x="56" y="406" font-size="12" font-weight="700" fill="#0C4A6E">四态错误归因、复合缓存与观测代码快照</text>
+  <text x="56" y="423" font-size="10.8" fill="#334155">• 区分正常完成、候选缺陷、仪器故障与基础设施错误（平台错不归责探索者）</text>
+  <text x="56" y="438" font-size="10.6" fill="#475569">• 正式观测自动冻结当次代码快照，后续在分支内增写分析脚本不影响结果复现</text>
 
   <rect x="44" y="452" width="412" height="52" rx="7" fill="#FFFFFF" stroke="#7DD3FC" stroke-width="1.1"/>
-  <text x="56" y="470" font-size="12" font-weight="700" fill="#0C4A6E">自声明校准集无死锁升版 &amp; 五条耦合管道</text>
-  <text x="56" y="487" font-size="10.8" fill="#334155">• 接前线痛点 / 盲审 EXPLOIT / 圆桌 DISCRIMINATOR / 人类反例 → 同步全局总览</text>
+  <text x="56" y="470" font-size="12" font-weight="700" fill="#0C4A6E">校准集回归升版与工单运维 (works_engineer)</text>
+  <text x="56" y="487" font-size="10.8" fill="#334155">• 仪器升级须通过自声明正/负校准样本回归，支持保留原始输出按需重评</text>
 
-  <!-- COLUMN 2: LOGISTICS ENGINEERING (后勤工程 · 一线与单分支快流转) -->
+  <!-- COLUMN 2: LOGISTICS & LINEAGE ENGINEERING -->
   <g filter="url(#cardShadow)">
     <rect x="498" y="280" width="444" height="236" rx="12" fill="#FFFBEB" stroke="#B45309" stroke-width="1.6"/>
   </g>
-  <rect x="514" y="292" width="268" height="24" rx="5" fill="#D97706"/>
-  <text x="648" y="308" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">3. 后勤工程 · 一线与快流转 (Logistics)</text>
-  <text x="794" y="308" font-size="11" font-weight="600" fill="#B45309">控制面直落 + 4 MCP</text>
+  <rect x="514" y="292" width="286" height="24" rx="5" fill="#D97706"/>
+  <text x="657" y="308" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">3. 后勤与谱系工程 · Logistics &amp; Lineage</text>
+  <text x="812" y="308" font-size="11" font-weight="600" fill="#B45309">控制面直落 + 5 MCP</text>
 
   <rect x="514" y="324" width="412" height="56" rx="7" fill="#FFFFFF" stroke="#FCD34D" stroke-width="1.1"/>
-  <text x="526" y="342" font-size="12" font-weight="700" fill="#78350F">中观六类快流转（确定性直落 + 局部引理拆交）</text>
-  <text x="526" y="359" font-size="10.9" fill="#334155">• 常规去向 (续班/盲审/修Bug≤3/反例/缺引理挂起) 控制面直落，疑难唤分诊员</text>
-  <text x="526" y="374" font-size="10.9" fill="#334155">• 活节点顺手拆交局部引理走一次性盲审，绝不锁死正在推进的原分支</text>
+  <text x="526" y="342" font-size="12" font-weight="700" fill="#78350F">节点交接分诊与异步快照送审</text>
+  <text x="526" y="359" font-size="10.8" fill="#334155">• 常规交接去向（续跑、送审、修 Bug、挂起等）由确定性控制面直接落库</text>
+  <text x="526" y="374" font-size="10.8" fill="#334155">• 支持将阶段成果切出快照异步送审，原研究分支不停工继续推进下一代</text>
 
   <rect x="514" y="388" width="412" height="56" rx="7" fill="#FFFFFF" stroke="#FCD34D" stroke-width="1.1"/>
-  <text x="526" y="406" font-size="12" font-weight="700" fill="#78350F">执行大外环护栏：成长保护期 &amp; 旁路双供体合体</text>
-  <text x="526" y="423" font-size="10.9" fill="#334155">• 新学派 / 合体 / 人类种子 (HUMAN_SEEDED) 享 2 班保护期，>50% 聚拢自动告警</text>
-  <text x="526" y="438" font-size="10.6" fill="#475569">• 融合另建旁路支线只读挂载 .greatwall_donors/，原纯血分支毫发无损</text>
+  <text x="526" y="406" font-size="12" font-weight="700" fill="#78350F">多路线并行隔离、成长保护期与跨路线融合</text>
+  <text x="526" y="423" font-size="10.8" fill="#334155">• 按方法族维护多样性（单路线占比 &gt;50% 触发分流），新路线享 1 代保护期</text>
+  <text x="526" y="438" font-size="10.6" fill="#475569">• 跨路线融合时另建独立分支并只读挂载参考源码，不破坏原有纯血分支</text>
 
   <rect x="514" y="452" width="412" height="52" rx="7" fill="#FFFFFF" stroke="#FCD34D" stroke-width="1.1"/>
-  <text x="526" y="470" font-size="12" font-weight="700" fill="#78350F">三道子题停工锁 &amp; 全员阻塞自报</text>
-  <text x="526" y="487" font-size="10.8" fill="#334155">• 锁一最新口径 FULL_GOAL 即停 · 锁二满投入窗待人拍板 · 锁三预算保险丝/全阻塞告警</text>
+  <text x="526" y="470" font-size="12" font-weight="700" fill="#78350F">子题进度控制、串行解锁与预算熔断</text>
+  <text x="526" y="487" font-size="10.8" fill="#334155">• 达标自动停派、按题序平滑解锁后续子题，保留最短投入窗与总预算上限</text>
 
-  <!-- COLUMN 3: LIBRARY ENGINEERING (图书馆工程 · 四角色分权与宏观大外环) -->
+  <!-- COLUMN 3: LIBRARY, PEER-REVIEW & CONFERENCE ENGINEERING -->
   <g filter="url(#cardShadow)">
     <rect x="968" y="280" width="444" height="236" rx="12" fill="#ECFDF5" stroke="#047857" stroke-width="1.6"/>
   </g>
-  <rect x="984" y="292" width="278" height="24" rx="5" fill="#059669"/>
-  <text x="1123" y="308" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">4. 图书馆工程 · 真伪法庭与大外环</text>
-  <text x="1272" y="308" font-size="11" font-weight="600" fill="#047857">四角色物理分权</text>
+  <rect x="984" y="292" width="290" height="24" rx="5" fill="#059669"/>
+  <text x="1129" y="308" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">4. 图书馆与评审工程 · Library &amp; Review</text>
+  <text x="1286" y="308" font-size="11" font-weight="600" fill="#047857">四角色分权</text>
 
   <rect x="984" y="324" width="412" height="56" rx="7" fill="#FFFFFF" stroke="#6EE7B7" stroke-width="1.1"/>
-  <text x="996" y="342" font-size="12" font-weight="700" fill="#064E3B">四角色一对一隔离（外采 / 盲审 / 圆桌主席 / 综述官）</text>
-  <text x="996" y="359" font-size="10.9" fill="#334155">• 仅 external_surveyor 联网且物理禁读内藏；其余三角色绝对断网</text>
-  <text x="996" y="374" font-size="10.9" fill="#334155">• 硬资产过盲审随时独立入库，按每题一目录维护 ≤1500 字《子题全局总览》</text>
+  <text x="996" y="342" font-size="12" font-weight="700" fill="#064E3B">外藏文献、内藏研究库与按需院内综述</text>
+  <text x="996" y="359" font-size="10.8" fill="#334155">• 仅外采员可联网检索公开文献 [R###]（禁读内部成果）；其余三角色断网</text>
+  <text x="996" y="374" font-size="10.8" fill="#334155">• 综述官维护子题全局总览，并响应专题综述请求（仅作客观归纳，不代出方案）</text>
 
   <rect x="984" y="388" width="412" height="56" rx="7" fill="#FFFFFF" stroke="#6EE7B7" stroke-width="1.1"/>
-  <text x="996" y="406" font-size="12" font-weight="700" fill="#064E3B">空白沙箱两阶段盲审 · 降级收编 · 悬赏核销</text>
-  <text x="996" y="423" font-size="10.9" fill="#334155">• Stage 1 实跑锁账本 (含 PARTIAL_PASS) → Stage 2 写锁内核对子题生效口径</text>
-  <text x="996" y="438" font-size="10.6" fill="#475569">• 达标停派与基线门槛两步分离 · ACCEPT_NARROWED 同事务收编 L3+L2 · 核销缺口唤醒</text>
+  <text x="996" y="406" font-size="12" font-weight="700" fill="#064E3B">独立空白沙箱两阶段评审 (library_verifier)</text>
+  <text x="996" y="423" font-size="10.8" fill="#334155">• 阶段一盲态复现锁定严谨度；阶段二解盲评估新颖度与重要性，防查重与边缘内卷</text>
+  <text x="996" y="438" font-size="10.6" fill="#475569">• 严打过度声称，支持降级收编有效引理；确证结果入 L3，实锤证伪入 L2</text>
 
   <rect x="984" y="452" width="412" height="52" rx="7" fill="#FFFFFF" stroke="#6EE7B7" stroke-width="1.1"/>
-  <text x="996" y="470" font-size="12" font-weight="700" fill="#064E3B">脉冲式宏观大外环四拍 &amp; Stage 3 不可变冻结一步终核</text>
-  <text x="996" y="487" font-size="10.8" fill="#334155">• 硬对账 → 2 轮封存伴随红蓝圆桌 → 1500 字导览 → 6 类树调整 · 冻结包哈希一步结项</text>
+  <text x="996" y="470" font-size="12" font-weight="700" fill="#064E3B">周期性跨分支同行研讨会与终局复核 (conference_chair)</text>
+  <text x="996" y="487" font-size="10.8" fill="#334155">• 定期汇总各分支进展、开展结构化点对点讨论、调整研究树并裁定多篇组合收敛</text>
 
-  <!-- Inter-Ministry horizontal flow arrow (Logistics <-> Library) -->
+  <!-- Inter-Subsystem horizontal flow arrow (Logistics <-> Library) -->
   <line x1="942" y1="396" x2="965" y2="396" stroke="#475569" stroke-width="1.6" marker-start="url(#arrowSlate)" marker-end="url(#arrowSlate)"/>
   <text x="954" y="386" font-size="9.5" font-weight="700" fill="#475569" text-anchor="middle">送审/调树</text>
 
   <!-- ====================================================================== -->
-  <!-- BAND 3: FRONTIER RESEARCH UNITS (基层并发科研单元群 × W)                -->
+  <!-- BAND 3: FRONTIER RESEARCH UNITS                                        -->
   <!-- ====================================================================== -->
   <line x1="250" y1="519" x2="250" y2="551" stroke="#0284C7" stroke-width="1.6" marker-end="url(#arrowBlue)" marker-start="url(#arrowBlue)"/>
-  <text x="260" y="539" font-size="10.5" fill="#0369A1">三档仪器调用 / 自动报修</text>
+  <text x="260" y="539" font-size="10.5" fill="#0369A1">三档仪器评测 / 故障报修</text>
 
   <line x1="720" y1="519" x2="720" y2="551" stroke="#D97706" stroke-width="1.6" marker-end="url(#arrowAmber)" marker-start="url(#arrowAmber)"/>
-  <text x="730" y="539" font-size="10.5" fill="#B45309">交班直落 · 派生分支 · 保护与合体</text>
+  <text x="730" y="539" font-size="10.5" fill="#B45309">交接落库 · 分支派生 · 融合挂载</text>
 
   <line x1="1190" y1="519" x2="1190" y2="551" stroke="#059669" stroke-width="1.6" marker-end="url(#arrowGreen)" marker-start="url(#arrowGreen)"/>
-  <text x="1200" y="539" font-size="10.5" fill="#047857">0% 拉 [R] · 37% 三步拉总览与 L3/L2 · 封存参会</text>
+  <text x="1200" y="539" font-size="10.5" fill="#047857">0% 查外藏 · 37% 查内藏与综述 · 封存后参会</text>
 
   <g filter="url(#cardShadow)">
-    <rect x="28" y="556" width="1384" height="208" rx="12" fill="#EEF2FF" stroke="#4F46E5" stroke-width="1.6"/>
+    <rect x="28" y="556" width="1384" height="204" rx="12" fill="#EEF2FF" stroke="#4F46E5" stroke-width="1.6"/>
   </g>
   <rect x="44" y="568" width="332" height="24" rx="5" fill="#4F46E5"/>
-  <text x="210" y="584" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">微观单班岗：一线并发科研单元群 × W</text>
-  <text x="390" y="584" font-size="11.5" fill="#3730A3">每节点绑定独立 Git Worktree 与开工口径 · 单节点内 1:1 配对 · 支持 45% 暂停直连与 handback_to_chief</text>
+  <text x="210" y="584" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">一线并行科研探索单元（并发数 W）</text>
+  <text x="390" y="584" font-size="11.5" fill="#3730A3">每分支独占独立 Git Worktree 与版本化口径 · 节点内探索者与伴随助手 1:1 配对 · 随时支持人类接入对话</text>
 
   <!-- Explorer box -->
-  <rect x="44" y="602" width="644" height="62" rx="8" fill="#FFFFFF" stroke="#6366F1" stroke-width="1.3"/>
-  <text x="58" y="622" font-size="12.8" font-weight="700" fill="#312E81">一线科研人员 (explorer · 7 MCP + Worktree 读写 &amp; 平台 Shell)</text>
-  <text x="58" y="639" font-size="11" fill="#334155">• 独立推导、反例构造、数值仿真与 &lt;worktree&gt;/tools/ 资产沉淀（零外网，写权死锁本目录）</text>
-  <text x="58" y="655" font-size="11" fill="#334155">• 70% 水位动态锁死写权，亲笔写《科研遗嘱》后退场；人类直连遇全局诉求调 handback_to_chief</text>
+  <rect x="44" y="602" width="644" height="60" rx="8" fill="#FFFFFF" stroke="#6366F1" stroke-width="1.3"/>
+  <text x="58" y="621" font-size="12.6" font-weight="700" fill="#312E81">一线科研探索者 (explorer · 11 MCP + Worktree 读写与终端)</text>
+  <text x="58" y="638" font-size="10.8" fill="#334155">• 在独立目录内开展推导、仿真与代码实验，无外网权限，写入严格限定在本分支 Worktree</text>
+  <text x="58" y="653" font-size="10.8" fill="#334155">• 52% 反思期与 70% 交接期自动切入只读态；遇全局诉求调用 handback_to_chief 转交总控</text>
 
   <!-- 1:1 Pairing Connector -->
-  <line x1="691" y1="633" x2="749" y2="633" stroke="#4F46E5" stroke-width="2" marker-start="url(#arrowIndigo)" marker-end="url(#arrowIndigo)"/>
-  <rect x="703" y="611" width="34" height="16" rx="4" fill="#EEF2FF"/>
-  <text x="720" y="623" font-size="10.5" font-weight="700" fill="#4338CA" text-anchor="middle">1 : 1</text>
+  <line x1="691" y1="632" x2="749" y2="632" stroke="#4F46E5" stroke-width="2" marker-start="url(#arrowIndigo)" marker-end="url(#arrowIndigo)"/>
+  <rect x="703" y="610" width="34" height="16" rx="4" fill="#EEF2FF"/>
+  <text x="720" y="622" font-size="10.5" font-weight="700" fill="#4338CA" text-anchor="middle">1 : 1</text>
 
   <!-- Companion box -->
-  <rect x="752" y="602" width="644" height="62" rx="8" fill="#FFFFFF" stroke="#6366F1" stroke-width="1.3"/>
-  <text x="766" y="622" font-size="12.8" font-weight="700" fill="#312E81">单节点专属伴随助手 (lineage_companion · gw-comp-&lt;node_id&gt; 按需 resume)</text>
-  <text x="766" y="639" font-size="11" fill="#334155">• 0% 备 ≤2200 字前情提要即释放内存；37% 问诊、70% 核对硬盘归档封存均按固定 ID 从盘重开</text>
-  <text x="766" y="655" font-size="11" fill="#334155">• 70% 封存后触发器锁死档案；若后续被唤上圆桌，宿主物理撤写权仅挂发言工具，会后彻底归档</text>
+  <rect x="752" y="602" width="644" height="60" rx="8" fill="#FFFFFF" stroke="#6366F1" stroke-width="1.3"/>
+  <text x="766" y="621" font-size="12.6" font-weight="700" fill="#312E81">节点伴随助手 (lineage_companion · 11 MCP · 仅只读本分支)</text>
+  <text x="766" y="638" font-size="10.8" fill="#334155">• 按固定会话 ID 按需唤醒：开工前编写前情摘要、37% 主持元反思、70% 核对工件与观测并封存交接</text>
+  <text x="766" y="653" font-size="10.8" fill="#334155">• 节点封存后数据库触发器锁定档案；后续若被唤入同行研讨会，物理剥离全部写权限仅保留发言</text>
 
   <!-- Timeline Bar inside Band 3 -->
-  <rect x="44" y="674" width="1352" height="78" rx="8" fill="#FFFFFF" stroke="#A5B4FC" stroke-width="1.2"/>
-  <text x="58" y="693" font-size="11.5" font-weight="700" fill="#312E81">单班岗自适应上下文时钟轴（pressure_pct = pressure_tokens / W，其中 W = min(500k, model_physical_window)）：</text>
+  <rect x="44" y="672" width="1352" height="76" rx="8" fill="#FFFFFF" stroke="#A5B4FC" stroke-width="1.2"/>
+  <text x="58" y="691" font-size="11.4" font-weight="700" fill="#312E81">单代探索者上下文时钟周期（默认有效窗口 W = min(360k, 模型物理窗口)，由内核与宿主共享单一水位）：</text>
 
-  <rect x="58" y="702" width="218" height="40" rx="6" fill="#F8FAFC" stroke="#94A3B8" stroke-width="1"/>
-  <text x="167" y="718" font-size="11" font-weight="700" fill="#1E293B" text-anchor="middle">0% 开工准备</text>
-  <text x="167" y="733" font-size="10" fill="#475569" text-anchor="middle">助手查全馆重写 ≤2200 提要</text>
+  <rect x="58" y="700" width="218" height="39" rx="6" fill="#F8FAFC" stroke="#94A3B8" stroke-width="1"/>
+  <text x="167" y="716" font-size="11" font-weight="700" fill="#1E293B" text-anchor="middle">0% 启动准备</text>
+  <text x="167" y="731" font-size="10" fill="#475569" text-anchor="middle">整理上代遗留与会议纪要 (≤5000字)</text>
 
-  <line x1="276" y1="722" x2="296" y2="722" stroke="#6366F1" stroke-width="1.5" marker-end="url(#arrowIndigo)"/>
+  <line x1="276" y1="719" x2="296" y2="719" stroke="#6366F1" stroke-width="1.5" marker-end="url(#arrowIndigo)"/>
 
-  <rect x="300" y="702" width="246" height="40" rx="6" fill="#EFF6FF" stroke="#60A5FA" stroke-width="1"/>
-  <text x="423" y="718" font-size="11" font-weight="700" fill="#1E40AF" text-anchor="middle">0% – 37% 独立探索净室</text>
-  <text x="423" y="733" font-size="10" fill="#334155" text-anchor="middle">开公开 inputs/ 与外藏 [R] · 锁内藏防跟风</text>
+  <rect x="300" y="700" width="246" height="39" rx="6" fill="#EFF6FF" stroke="#60A5FA" stroke-width="1"/>
+  <text x="423" y="716" font-size="11" font-weight="700" fill="#1E40AF" text-anchor="middle">0% – 37% 前期独立探索</text>
+  <text x="423" y="731" font-size="10" fill="#334155" text-anchor="middle">可查公开题面与外藏 · 锁定内藏防趋同</text>
 
-  <line x1="546" y1="722" x2="566" y2="722" stroke="#6366F1" stroke-width="1.5" marker-end="url(#arrowIndigo)"/>
+  <line x1="546" y1="719" x2="566" y2="719" stroke="#6366F1" stroke-width="1.5" marker-end="url(#arrowIndigo)"/>
 
-  <rect x="570" y="702" width="278" height="40" rx="6" fill="#FEF3C7" stroke="#F59E0B" stroke-width="1"/>
-  <text x="709" y="718" font-size="11" font-weight="700" fill="#92400E" text-anchor="middle">37% 外部专家问诊（无评测门槛）</text>
-  <text x="709" y="733" font-size="10" fill="#334155" text-anchor="middle">2 轮短对话 + 夜科学题 + 三不给 → 解锁全馆</text>
+  <rect x="570" y="700" width="246" height="39" rx="6" fill="#FEF3C7" stroke="#F59E0B" stroke-width="1"/>
+  <text x="693" y="716" font-size="11" font-weight="700" fill="#92400E" text-anchor="middle">37% 结构化元反思</text>
+  <text x="693" y="731" font-size="10" fill="#334155" text-anchor="middle">11 类诊断问诊 · 解锁内藏与院内综述</text>
 
-  <line x1="848" y1="722" x2="868" y2="722" stroke="#6366F1" stroke-width="1.5" marker-end="url(#arrowIndigo)"/>
+  <line x1="816" y1="719" x2="836" y2="719" stroke="#6366F1" stroke-width="1.5" marker-end="url(#arrowIndigo)"/>
 
-  <rect x="872" y="702" width="224" height="40" rx="6" fill="#ECFDF5" stroke="#34D399" stroke-width="1"/>
-  <text x="984" y="718" font-size="11" font-weight="700" fill="#065F46" text-anchor="middle">37% – 70% 三步自主翻资料</text>
-  <text x="984" y="733" font-size="10" fill="#334155" text-anchor="middle">1500字总览 → 简介卡 → 原文 (可45%接管)</text>
+  <rect x="840" y="700" width="252" height="39" rx="6" fill="#ECFDF5" stroke="#34D399" stroke-width="1"/>
+  <text x="966" y="716" font-size="11" font-weight="700" fill="#065F46" text-anchor="middle">52% 暂停编程反思 (Context Holiday)</text>
+  <text x="966" y="731" font-size="10" fill="#334155" text-anchor="middle">随机灵感卡 · 提交可证伪假设后继续实验</text>
 
-  <line x1="1096" y1="722" x2="1116" y2="722" stroke="#6366F1" stroke-width="1.5" marker-end="url(#arrowIndigo)"/>
+  <line x1="1092" y1="719" x2="1112" y2="719" stroke="#6366F1" stroke-width="1.5" marker-end="url(#arrowIndigo)"/>
 
-  <rect x="1120" y="702" width="262" height="40" rx="6" fill="#FCE7F3" stroke="#EC4899" stroke-width="1"/>
-  <text x="1251" y="718" font-size="11" font-weight="700" fill="#9D174D" text-anchor="middle">70% 两步清醒交班 / 断线抢救</text>
-  <text x="1251" y="733" font-size="10" fill="#334155" text-anchor="middle">亲笔遗嘱 → 助手核硬盘封存 + 拆交引理</text>
+  <rect x="1116" y="700" width="266" height="39" rx="6" fill="#FCE7F3" stroke="#EC4899" stroke-width="1"/>
+  <text x="1249" y="716" font-size="11" font-weight="700" fill="#9D174D" text-anchor="middle">70% 交接封存 / 异常抢救</text>
+  <text x="1249" y="731" font-size="10" fill="#334155" text-anchor="middle">亲笔交接总结 → 伴随核对落库与异步投稿</text>
 
   <!-- ====================================================================== -->
-  <!-- BAND 4: STORAGE & BIDIRECTIONAL ISOLATION BOUNDARY (底层真相与隔离边界) -->
+  <!-- BAND 4: STORAGE & ISOLATION BOUNDARY                                   -->
   <!-- ====================================================================== -->
-  <line x1="210" y1="802" x2="210" y2="767" stroke="#0D9488" stroke-width="1.8" marker-end="url(#arrowTeal)"/>
-  <text x="220" y="789" font-size="10.5" font-weight="600" fill="#0F766E">只读挂载公开输入与对应子题生效口径裁决</text>
+  <line x1="210" y1="798" x2="210" y2="763" stroke="#0D9488" stroke-width="1.8" marker-end="url(#arrowTeal)"/>
+  <text x="220" y="785" font-size="10.5" font-weight="600" fill="#0F766E">只读挂载公开题面、数据与有效口径文档</text>
 
-  <line x1="880" y1="767" x2="880" y2="800" stroke="#334155" stroke-width="1.8" marker-start="url(#arrowSlate)" marker-end="url(#arrowSlate)"/>
-  <text x="892" y="788" font-size="10.5" font-weight="600" fill="#334155">双池 stdio JSON-RPC 2.0（44 窄 MCP 工具 + 30+ control_plane 原语 + 实时取消）</text>
+  <line x1="880" y1="763" x2="880" y2="796" stroke="#334155" stroke-width="1.8" marker-start="url(#arrowSlate)" marker-end="url(#arrowSlate)"/>
+  <text x="892" y="784" font-size="10.5" font-weight="600" fill="#334155">stdio JSON-RPC 2.0 双池服务（53 个内核窄 MCP 工具 + 控制面原语 + 实时取消）</text>
 
   <!-- Left Box: Public Workspace Inputs -->
   <g filter="url(#cardShadow)">
-    <rect x="28" y="804" width="444" height="182" rx="12" fill="#F0FDFA" stroke="#0D9488" stroke-width="1.6"/>
+    <rect x="28" y="800" width="444" height="176" rx="12" fill="#F0FDFA" stroke="#0D9488" stroke-width="1.6"/>
   </g>
-  <rect x="44" y="816" width="268" height="23" rx="5" fill="#0D9488"/>
-  <text x="178" y="832" font-size="11.8" font-weight="700" fill="#FFFFFF" text-anchor="middle">工作区公开输入区（开放外部 → 内部）</text>
-  <text x="44" y="860" font-size="11.5" font-weight="700" fill="#115E59">目录：inputs/ · source_materials/ · rulings/</text>
-  <text x="44" y="880" font-size="11" fill="#334155">• 原始题面、公开数据集与《补充裁决文档》草稿</text>
-  <text x="44" y="898" font-size="11" fill="#334155">• 仅人类批准提案落签才冻结升版（废除扫盘自动静默升版）</text>
-  <text x="44" y="916" font-size="11" fill="#334155">• 随分支与盲审沙箱构建只读同步至 &lt;sandbox&gt;/inputs/</text>
-  <text x="44" y="938" font-size="10.8" fill="#0F766E">• 终局交付工作区可读副本：&lt;workspace&gt;/final_delivery/（五件套）</text>
-  <text x="44" y="958" font-size="10.8" fill="#64748B">• 全过程工作区磁盘零过程审批/汇报类 .md 公文</text>
+  <rect x="44" y="812" width="268" height="23" rx="5" fill="#0D9488"/>
+  <text x="178" y="828" font-size="11.8" font-weight="700" fill="#FFFFFF" text-anchor="middle">工作区公开输入与终局交付目录</text>
+  <text x="44" y="856" font-size="11.4" font-weight="700" fill="#115E59">目录：inputs/ · source_materials/ · rulings/</text>
+  <text x="44" y="876" font-size="10.9" fill="#334155">• 课题原始题面、公开数据集与经确认生效的补充口径文档</text>
+  <text x="44" y="894" font-size="10.9" fill="#334155">• 随研究分支与盲审沙箱创建只读同步至各自 &lt;sandbox&gt;/inputs/</text>
+  <text x="44" y="912" font-size="10.9" fill="#334155">• 严禁在工作区磁盘生成过程性审批或交接类 Markdown 公文</text>
+  <text x="44" y="934" font-size="10.8" fill="#0F766E">• 终局交付可读副本：&lt;workspace&gt;/final_delivery/（五件套）</text>
+  <text x="44" y="954" font-size="10.6" fill="#64748B">• 仅经人类批准的提案才触发口径版本递增，避免静默漂移</text>
 
   <!-- Right Box: External Protected Data Area -->
   <g filter="url(#cardShadow)">
-    <rect x="498" y="804" width="914" height="182" rx="12" fill="#FFF5F5" stroke="#DC2626" stroke-width="1.6" stroke-dasharray="7,4"/>
+    <rect x="498" y="800" width="914" height="176" rx="12" fill="#FFF5F5" stroke="#DC2626" stroke-width="1.6" stroke-dasharray="7,4"/>
   </g>
-  <rect x="514" y="816" width="388" height="23" rx="5" fill="#B91C1C"/>
-  <text x="708" y="832" font-size="11.8" font-weight="700" fill="#FFFFFF" text-anchor="middle">工作区外受控数据区（严防内部 → 外部 · $PLUGIN_DATA）</text>
-  <text x="916" y="832" font-size="11" font-weight="700" fill="#B91C1C">探索者与盲审沙箱物理禁读（realpath 守卫 + 环境变量隔离）</text>
+  <rect x="514" y="812" width="388" height="23" rx="5" fill="#B91C1C"/>
+  <text x="708" y="828" font-size="11.8" font-weight="700" fill="#FFFFFF" text-anchor="middle">工作区外受控数据目录（$PLUGIN_DATA）</text>
+  <text x="916" y="828" font-size="11" font-weight="700" fill="#B91C1C">探索者与盲审沙箱物理禁读（路径规范化校验 + 环境变量隔离）</text>
 
-  <rect x="514" y="850" width="470" height="122" rx="8" fill="#FFFFFF" stroke="#991B1B" stroke-width="1.2"/>
-  <text x="528" y="869" font-size="12.4" font-weight="700" fill="#7F1D1D">Python Single-Writer 真相内核 · greatwall.db (SQLite WAL)</text>
-  <text x="528" y="889" font-size="10.9" fill="#334155">• 26 组表 + 排雷视图 + 2 FTS5 + BEGIN IMMEDIATE 单写者短锁</text>
-  <text x="528" y="907" font-size="10.9" fill="#334155">• 新增核心表：subproblem_runtime_state | runtime_effects | node_interventions</text>
-  <text x="528" y="925" font-size="10.9" fill="#334155">  control_proposals | open_lemma_gaps | subproblem_living_surveys | wave_conferences</text>
-  <text x="528" y="943" font-size="10.9" fill="#334155">• 四条硬触发器：锁 Stage 1 · 强校验 L3 · 重评联动 · 锁已封存交班档案</text>
-  <text x="528" y="961" font-size="10.6" fill="#64748B">• 支持 v0.2.0-alpha.1 旧库原地无损升级迁移与真实核验口径回填</text>
+  <rect x="514" y="846" width="470" height="118" rx="8" fill="#FFFFFF" stroke="#991B1B" stroke-width="1.2"/>
+  <text x="528" y="865" font-size="12.2" font-weight="700" fill="#7F1D1D">Python 单写者状态内核 · greatwall.db (SQLite WAL)</text>
+  <text x="528" y="885" font-size="10.8" fill="#334155">• 33 张物理表 + 2 个只读视图 + 2 个全文检索索引 (FTS5)</text>
+  <text x="528" y="903" font-size="10.8" fill="#334155">• 全部写事务通过 BEGIN IMMEDIATE 进程级单写者锁串行化</text>
+  <text x="528" y="921" font-size="10.8" fill="#334155">• 4 条硬触发器：锁盲审阶段一 · 强校验 L3 入库 · 重评联动 · 锁已封存节点</text>
+  <text x="528" y="939" font-size="10.6" fill="#64748B">• 支持旧版数据库原地无损热迁移与跨纪元 epoch_id 写入隔离</text>
 
-  <rect x="1000" y="850" width="396" height="122" rx="8" fill="#FFFFFF" stroke="#991B1B" stroke-width="1.2"/>
-  <text x="1014" y="869" font-size="12.4" font-weight="700" fill="#7F1D1D">受控持久化产物、临时沙箱与不可变冻结目录</text>
-  <text x="1014" y="889" font-size="10.9" fill="#334155">• eval_artifacts/&lt;obs_id&gt;/ — Stage A 原始输出（升版按需重评）</text>
-  <text x="1014" y="907" font-size="10.9" fill="#334155">• snapshots/&lt;branch_id&gt;/ — 节点物理快照与合体次供体切片</text>
-  <text x="1014" y="925" font-size="10.9" fill="#334155">• _hidden_calibrations/ — 隐藏保留集与校准集（仅执行域可读）</text>
-  <text x="1014" y="943" font-size="10.9" fill="#334155">• blind_sandboxes/ — 现建现删空白盲审沙箱（零外网隔离）</text>
-  <text x="1014" y="961" font-size="10.9" fill="#991B1B">• frozen_deliveries/&lt;id&gt;/ — Stage 3 只读不可变冻结快照（防审A放B）</text>
+  <rect x="1000" y="846" width="396" height="118" rx="8" fill="#FFFFFF" stroke="#991B1B" stroke-width="1.2"/>
+  <text x="1014" y="865" font-size="12.2" font-weight="700" fill="#7F1D1D">受控产物、隐藏校准集与不可变冻结目录</text>
+  <text x="1014" y="885" font-size="10.8" fill="#334155">• eval_artifacts/&lt;obs_id&gt;/ — 观测原始输出与轻量代码快照</text>
+  <text x="1014" y="903" font-size="10.8" fill="#334155">• snapshots/&lt;branch_id&gt;/ — 分支节点快照与融合参考切片</text>
+  <text x="1014" y="921" font-size="10.8" fill="#334155">• _hidden_calibrations/ — 隐藏校准集（仅评测执行域可读）</text>
+  <text x="1014" y="939" font-size="10.8" fill="#334155">• blind_sandboxes/ — 随审随建、审毕即删的独立盲审沙箱</text>
+  <text x="1014" y="955" font-size="10.8" fill="#991B1B">• frozen_deliveries/&lt;id&gt;/ — Stage 3 不可变终核交付快照</text>
 </svg>

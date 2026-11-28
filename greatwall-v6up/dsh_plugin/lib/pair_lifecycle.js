@@ -8,6 +8,7 @@
  * 4. 注入 `.greatwall_donors/` 只读双供体目录清单（杂交分支 `SYNTHESIS`）与最新口径提示，彻底移除旧五车道。
  * @module dsh-greatwall-v6up/pair_lifecycle
  */
+import { runContextHoliday } from './host/context_holiday.js'
 import fs from 'node:fs'
 import path from 'node:path'
 import { sampleAgentContextPressure, syncLivePressureToDb } from './clock_and_turn_gap.js'
@@ -95,7 +96,7 @@ export async function runPreSpawnBriefingWithCompanion(port, node, { signal = nu
     keepAliveAfterIdle: false,
     archiveOnComplete: false,
     signal,
-    prompt: `阶段 PRE_SPAWN：请调用 get_companion_context(branch_id="${node.branch_id}", node_id="${node.node_id}", mode="PRE_SPAWN")，按五段滚动压缩预算 (<=2200字) 调用 save_lineage_briefing 写入本代初始看板。`,
+    prompt: `阶段 PRE_SPAWN：请调用 get_companion_context(branch_id="${node.branch_id}", node_id="${node.node_id}", mode="PRE_SPAWN")。消化本脉 latest_wave_takeaways、退修反馈和专题综述。融合分支先读 DONOR_MANIFEST.md。自主重写五段看板，合计不超过 5000 字，调用 save_lineage_briefing。`,
   })
   return compRes
 }
@@ -107,10 +108,7 @@ export async function runReflect37SocraticDialogue(orchestrator, node, expSessio
 ### Explorer 黑匣子外部轨迹摘要 (去思维链)
 ${latestBlackbox}
 
-请先调用 get_companion_context(branch_id="${node.branch_id}", node_id="${node.node_id}", mode="REFLECT_37") 获取本脉 dead_ends 摘要、同题 L3/L2 目录卡与夜科学题库，切换外部首席专家视角：
-1. 必查第 7 类 Attractor Tasks + 1 项症状匹配类别；
-2. 最多给探索者指出 <=2 条高信号馆藏编号指针；
-3. 附 1 道尖锐夜科学启发性追问（<=300字），待探索者只读作答后调 record_reflection_and_unlock_pull 解锁内藏与《子题全局总览》！`
+请先调用 get_companion_context(branch_id="${node.branch_id}", node_id="${node.node_id}", mode="REFLECT_37") 获取本脉死胡同、同题目录卡与 C01–C11 元反思目录。对症选择 1–2 类、给出至多 2 条证据编号，并提出最多两轮诊断问题。每轮应答不超过 500 字。完成后用 record_reflection_and_unlock_pull 解锁内藏、总览与专题综述。`
 
   const runner = typeof orchestrator.resumeOrSpawnAgent === 'function'
     ? orchestrator.resumeOrSpawnAgent
@@ -140,13 +138,15 @@ ${latestBlackbox}
   try {
     for (let round = 1; round <= 2; round++) {
       if (hasUnlockedSignal()) break
-      const questionText = lastCompText || '请对照 Attractor Tasks 与当前推导/观测，简洁说明核心前提是否存在人为吸引子盲区（<=300字）？'
+      if (!lastCompText.trim()) break
+      const questionText = lastCompText
       const expReply = await orchestrator.continueAliveAgent(
         expSessionId,
-        `[伴随助手 37% 专家诊断 Round ${round}]（请仅做纯文本简短只读作答 <=300 字，不要修改代码或运行耗时脚本）：\n${questionText}`,
+        `[伴随助手 37% 专家诊断 Round ${round}]（请用不超过 500 字的纯文本回答）：\n${questionText}`,
         { signal },
       )
-      const answerText = expReply.lastAssistantText || '已核查当前假设与证据边界，准备结合馆藏与全局总览继续推进。'
+      const answerText = expReply.lastAssistantText
+      if (!answerText?.trim()) break
       const compNext = await orchestrator.continueAliveAgent(
         compHandle.sessionId,
         `[探索者 Round ${round} 回答]：\n${answerText}\n\n若诊断已明请立刻调用 record_reflection_and_unlock_pull 写入反思并置位解锁内藏！`,
@@ -205,7 +205,7 @@ ${effectiveWill || '(请直接依据工作树与客观观测核对)'}
 ### 探索者退场前黑匣子轨迹摘要
 ${latestBlackbox || '(无额外轨迹)'}
 
-请调用 get_companion_context(branch_id="${node.branch_id}", node_id="${node.node_id}", mode="HANDOFF_70")，写出严格 A/B 双栏手记（<2000字）与 <100 字纯 mechanism_summary；若去向清晰可附带 recommended_triage 由控制面确定性直落，若有独立成熟局部引理可附带 local_lemma_submissions 拆交一次性盲审，调 submit_node_handoff 封存落库！`
+请调用 get_companion_context(branch_id="${node.branch_id}", node_id="${node.node_id}", mode="HANDOFF_70")，A/B 双栏和遗嘱合计不超过 5000 字，mechanism_summary 少于 100 字。有夜科学赌注时用 holiday_bet_outcome 按观测核销。成熟的阶段稿用 manuscript_submissions 非阻塞送审。调用 submit_node_handoff 封存落库。`
 
   const runner = typeof orchestrator.resumeOrSpawnAgent === 'function'
     ? orchestrator.resumeOrSpawnAgent
@@ -249,7 +249,7 @@ export async function driveExplorerCompanionPair(
   const effWindow = Number(
     (typeof orchestrator.getEffectiveContextWindow === 'function' ? orchestrator.getEffectiveContextWindow() : 0) ||
       node.effective_context_window ||
-      500_000,
+      360_000,
   )
   const availableInstruments = (snap?.active_instruments || []).filter(
     (inst) => inst && inst.health_status !== 'UNHEALTHY' && (String(inst.question_id || '') === String(qid) || String(inst.question_id || '') === 'ALL'),
@@ -311,14 +311,18 @@ export async function driveExplorerCompanionPair(
 
   let latestBlackbox = expRes.blackboxSummary
   let interrupted = expRes.isAbnormalEnd
+  let lastTurnEndReason = expRes.turnEndReason || null
   let interruptReason = expRes.turnEndReason ? JSON.stringify(expRes.turnEndReason) : ''
   let terminatedExternally = false
   let yieldedToHuman = false
   let pausedByHost = false
   let finishCurrentTurn = false
+  let waveHibernateReason = ''
   let earlyHandoffAuthorized = false
   let explorerWillText = ''
   let reflectedDone = Boolean(node.first_reflection_unlocked)
+  const holidayPct = orchestrator.getContextHolidayPct?.() ?? 0.52
+  let holidayDue = false
   let currentTurnSignals = expRes.turnSignals || []
   let currentNativeThresholds = expRes.nativeThresholds || []
   // 续跑同一历史会话时，以节点已记账水位作为基线，仅增量累加本次新增 Token
@@ -381,6 +385,11 @@ export async function driveExplorerCompanionPair(
         return false
       }
       const ctrlState = String(rowData.control_state || 'AUTO_RUNNING')
+      if (ctrlState === 'DRAIN_AFTER_TURN' && rowData.pending_handoff_reason?.startsWith('HIBERNATED_BY_WAVE_CONFERENCE')) {
+        waveHibernateReason = rowData.pending_handoff_reason
+        finishCurrentTurn = true
+        return true
+      }
       if (ctrlState === 'PAUSE_DRAINING' || ctrlState === 'HUMAN_ACTIVE') {
         yieldedToHuman = true
         orchestrator.recordEvent?.('explorer_yielded_to_human', { nodeId: node.node_id, controlState: ctrlState })
@@ -396,6 +405,8 @@ export async function driveExplorerCompanionPair(
         return true
       }
       if (rowData.first_reflection_unlocked) reflectedDone = true
+      holidayDue = reflectedDone && rowData.holiday_completed === false
+        && rowData.pressure_tokens / rowData.effective_context_window >= holidayPct
       if (rowData.trigger === 'HANDOFF_70' && !hasTrigger('HANDOFF_70')) {
         currentNativeThresholds.push({ trigger: 'HANDOFF_70', pressurePct: rowData.pressure_pct, sourceHook: 'db_sync' })
       } else if (rowData.trigger === 'REFLECT_37' && !reflectedDone && !hasTrigger('REFLECT_37')) {
@@ -410,13 +421,29 @@ export async function driveExplorerCompanionPair(
     while (!interrupted) {
       const stillActive = await checkNodeControlAndStatus()
       if (!stillActive) break
-      if (earlyHandoffAuthorized || hasTrigger('HANDOFF_70')) break
+      if (earlyHandoffAuthorized || waveHibernateReason) break
+      if (holidayDue) {
+        const holidayReply = await runContextHoliday(orchestrator, node.node_id, expSessionId, holidayPct, signal)
+        if (holidayReply) {
+          latestBlackbox = holidayReply.blackboxSummary || latestBlackbox
+          lastTurnEndReason = holidayReply.turnEndReason ?? lastTurnEndReason
+          currentTurnSignals = holidayReply.turnSignals || currentTurnSignals
+          currentNativeThresholds = holidayReply.nativeThresholds || currentNativeThresholds
+          if (holidayReply.isAbnormalEnd) {
+            interrupted = true
+            interruptReason = JSON.stringify(holidayReply.turnEndReason)
+          }
+        }
+        continue
+      }
+      if (hasTrigger('HANDOFF_70')) break
 
       if (hasTrigger('REFLECT_37') && !reflectedDone) {
         const refRes = await runReflect37SocraticDialogue(orchestrator, node, expSessionId, latestBlackbox, signal)
         if (refRes?.unlocked) reflectedDone = true
         if (!(await checkNodeControlAndStatus())) break
         if (earlyHandoffAuthorized) break
+        if (holidayDue) continue
 
         const postReflectPrompt = reflectedDone
           ? '伴随助手已完成 37% 专家诊断并解锁内藏 L3/L2、《子题全局总览》与本脉 DAG！请按需调 get_living_survey / query_library_catalog 推进 37–70% 深度攻坚。'
@@ -424,6 +451,7 @@ export async function driveExplorerCompanionPair(
         const cont = await orchestrator.continueAliveAgent(expSessionId, postReflectPrompt, { signal })
         turnsUsed += 1
         latestBlackbox = cont.blackboxSummary || latestBlackbox
+        lastTurnEndReason = cont.turnEndReason ?? lastTurnEndReason
         currentTurnSignals = cont.turnSignals || currentTurnSignals
         currentNativeThresholds = cont.nativeThresholds || currentNativeThresholds
         if (cont.isAbnormalEnd) {
@@ -444,6 +472,7 @@ export async function driveExplorerCompanionPair(
       const cont = await orchestrator.continueAliveAgent(expSessionId, contPrompt, { signal })
       turnsUsed += 1
       latestBlackbox = cont.blackboxSummary || latestBlackbox
+      lastTurnEndReason = cont.turnEndReason ?? lastTurnEndReason
       currentTurnSignals = cont.turnSignals || currentTurnSignals
       currentNativeThresholds = cont.nativeThresholds || currentNativeThresholds
       if (cont.isAbnormalEnd) {
@@ -470,13 +499,16 @@ export async function driveExplorerCompanionPair(
       try {
         const willTurn = await orchestrator.continueAliveAgent(
           expSessionId,
-          earlyHandoffAuthorized
+          waveHibernateReason
+            ? '【圆桌休眠 · 只读交班】请简要列出已完成的客观事实、绑定观测编号及一句科研遗嘱，留给封存伴随。'
+            : earlyHandoffAuthorized
             ? '【人类授权提前交班 · 只读文本回合】已锁定只读态，请亲笔总结本代客观成果、死胡同与《科研遗嘱》，写完即退场。'
             : '【70% 清醒收官 · 只读文本回合】已锁定只读态（严禁改码/跑脚本/调写工具），请亲笔总结：(1) 客观进展与工件路径；(2) 已证实死胡同；(3) 留给下代的《科研遗嘱》。',
           { signal },
         )
         explorerWillText = willTurn.lastAssistantText || ''
         latestBlackbox = willTurn.blackboxSummary || latestBlackbox
+        lastTurnEndReason = willTurn.turnEndReason ?? lastTurnEndReason
       } catch {}
       if (callControl) {
         await callControl('control_plane/record_pending_handoff', {
@@ -484,7 +516,7 @@ export async function driveExplorerCompanionPair(
           node_id: node.node_id,
           mode: 'HANDOFF_70',
           explorer_will_md: explorerWillText,
-          reason: earlyHandoffAuthorized ? 'EARLY_HANDOFF_AUTHORIZED' : 'HANDOFF_70',
+          reason: waveHibernateReason || (earlyHandoffAuthorized ? 'EARLY_HANDOFF_AUTHORIZED' : 'HANDOFF_70'),
         }).catch(() => {})
       }
     } else if (callControl) {
@@ -505,7 +537,7 @@ export async function driveExplorerCompanionPair(
     try {
       if (finishCurrentTurn) await orchestrator.settleSessionJobs(expSessionId, { signal })
     } finally {
-      await expRes.dispose(disposeStatus, expRes.turnEndReason, { archive: keepUnarchived ? false : undefined })
+      await expRes.dispose(disposeStatus, lastTurnEndReason, { archive: keepUnarchived ? false : undefined })
     }
     if (terminatedExternally) {
       await disposeNodeCompanion(orchestrator, node.node_id, 'terminated_external')

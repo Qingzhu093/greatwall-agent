@@ -1,4 +1,4 @@
-/** GreatWall v0.3 子题活体全局总览（<=1500字）、OPEN 悬赏缺口与大外环圆桌视图。 */
+/** 子题活体总览、承重缺口与波次圆桌视图。 */
 function LivingSurveyView({ data }) {
   const [expandedWaves, setExpandedWaves] = (typeof React !== "undefined" && typeof React.useState === "function")
     ? React.useState({})
@@ -8,6 +8,7 @@ function LivingSurveyView({ data }) {
   const surveys = Array.isArray(rawSurveys) ? rawSurveys : Object.values(rawSurveys || {});
   const gaps = (insp.open_lemma_gaps || []).filter((g) => g.status === "OPEN");
   const waves = insp.wave_conferences || [];
+  const extCards = insp.external_literature_cards || [];
 
   return jsxs("div", {
     style: { display: "flex", flexDirection: "column", gap: "9px" },
@@ -15,7 +16,31 @@ function LivingSurveyView({ data }) {
       jsxs("div", {
         className: "gw-card",
         children: [
-          jsx("div", { className: "gw-card-hd", children: `子题全局总览（<=1500 字导览索引，共 ${surveys.length} 份）` }),
+          jsx("div", { className: "gw-card-hd", children: `左翼外藏文献卡 R###（共 ${extCards.length} 张）` }),
+          extCards.length === 0
+            ? jsx("div", { className: "gw-muted", children: "尚无外藏文献卡，Stage 1 对外采编完成后将自动呈现。" })
+            : extCards.map((c) =>
+                jsxs("div", {
+                  className: "gw-item",
+                  children: [
+                    jsxs("div", {
+                      className: "gw-row",
+                      children: [
+                        jsx("strong", { className: "gw-mono", children: `${c.ref_id} (${c.question_id})` }),
+                        c.read_depth ? jsx("span", { className: "gw-badge gw-b-info", children: c.read_depth }) : null
+                      ]
+                    }),
+                    jsx("div", { children: c.title }),
+                    c.abstract_md ? jsx("div", { className: "gw-muted", children: String(c.abstract_md).slice(0, 220) }) : null
+                  ]
+                }, c.ref_id)
+              )
+        ]
+      }),
+      jsxs("div", {
+        className: "gw-card",
+        children: [
+          jsx("div", { className: "gw-card-hd", children: `右翼内藏 · 子题全局总览（<=4000 字阶段总览，共 ${surveys.length} 份）` }),
           surveys.length === 0
             ? jsx("div", { className: "gw-muted", children: "尚无已发布的《子题全局总览》，首个波次圆桌完成后将自动呈现。" })
             : surveys.map((sv) =>
@@ -25,7 +50,7 @@ function LivingSurveyView({ data }) {
                     jsxs("div", {
                       className: "gw-row",
                       children: [
-                        jsx("strong", { children: `${sv.question_id} · r${sv.revision} (${sv.total_chars}/1500 字)` }),
+                        jsx("strong", { children: `${sv.question_id} · r${sv.revision} (${sv.total_chars}/4000 字)` }),
                         jsx("span", { className: "gw-badge gw-b-info", children: sv.trigger_reason || "WAVE" })
                       ]
                     }),
@@ -37,7 +62,13 @@ function LivingSurveyView({ data }) {
                         `[3. 排雷雷达]\n${sv.sec3_avoidance_radar_md || ""}`,
                         `[4. 明确缺口]\n${sv.sec4_explicit_gaps_md || ""}`
                       ].join("\n\n")
-                    })
+                    }),
+                    sv.marginal_notes_md ? jsxs("details", {
+                      children: [
+                        jsx("summary", { children: "边缘研究注记" }),
+                        jsx("pre", { className: "gw-pre", children: sv.marginal_notes_md })
+                      ]
+                    }) : null
                   ]
                 }, sv.survey_id)
               )

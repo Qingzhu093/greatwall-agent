@@ -76,7 +76,7 @@ class TestV03ResearchEngines(unittest.TestCase):
 
     def test_01_registry_10_roles_44_tools_and_external_isolation(self) -> None:
         self.assertEqual(len(CANONICAL_ROLES), 10)
-        self.assertEqual(len(TOOL_SPECS), 47)
+        self.assertEqual(len(TOOL_SPECS), 53)
         # 废弃五车道已彻底移除
         tool_names = {s["name"] for s in TOOL_SPECS}
         self.assertNotIn("dispatch_stagnation_five_lanes", tool_names)
@@ -115,7 +115,7 @@ class TestV03ResearchEngines(unittest.TestCase):
         n2 = b2["data"]["node_id"]
         bid2 = b2["data"]["branch_id"]
         # 默认 2 班岗保护期与确定性 companion_session_id
-        self.assertEqual(b1["data"]["protection_generations_left"], 2)
+        self.assertEqual(b1["data"]["protection_generations_left"], 1)
         self.assertEqual(b1["data"]["companion_session_id"], f"gw-comp-{n1}")
 
         # 2. 0-37% 净室：explorer 被拒读 living_survey，但 lineage_companion 0% 直接可读
@@ -172,6 +172,7 @@ class TestV03ResearchEngines(unittest.TestCase):
             "review_id": local_rev_id, "question_id": "Q1",
             "ledger_items": [{"claim": "N<=64 bound", "evidence_location_and_quote": "missing edge case N=2"}],
             "stage1_verdict": "REVISE",
+            "rigor_score": 5,
             "revision_or_refutation_reason": "Edge case N=2 omitted",
         }, "ver_local")
         self.assertTrue(s1_local["ok"], s1_local)
@@ -202,6 +203,7 @@ class TestV03ResearchEngines(unittest.TestCase):
             "review_id": rev2_id, "question_id": "Q1",
             "ledger_items": [{"claim": "Symmetric coercivity c=1/4", "evidence_location_and_quote": "verified algebraically"}],
             "stage1_verdict": "PARTIAL_PASS",
+            "rigor_score": 8,
             "exploit_ticket_payload": {"instrument_id": "inst_dummy", "summary": "detected edge rounding exploit"},
         }, "ver_2")
         self.assertTrue(s1_p["ok"], s1_p)
@@ -215,6 +217,7 @@ class TestV03ResearchEngines(unittest.TestCase):
         s2_n = self._call("submit_stage2_unblind_verdict", "library_verifier", {
             "review_id": rev2_id,
             "final_verdict": "ACCEPT_NARROWED",
+            "novelty_score": 8, "significance_score": 8,
             "l3_entry_kind": "POS_THEOREM",
             "goal_coverage": "PARTIAL_OR_LEMMA",
             "publish_tier": "VERIFIED_INCREMENTAL",
@@ -267,10 +270,11 @@ class TestV03ResearchEngines(unittest.TestCase):
                 "review_id": rev_id, "question_id": qid,
                 "ledger_items": [{"claim": f"{qid} full proof", "evidence_location_and_quote": "solve.py verified"}],
                 "stage1_verdict": "PASS",
+                "rigor_score": 8,
             }, f"ver_{qid}")["ok"])
             self.assertTrue(self._call("get_unblinded_manuscript_and_peers", "library_verifier", {"review_id": rev_id}, f"ver_{qid}")["ok"])
             s2 = self._call("submit_stage2_unblind_verdict", "library_verifier", {
-                "review_id": rev_id, "final_verdict": "ACCEPT",
+                "review_id": rev_id, "final_verdict": "ACCEPT", "novelty_score": 8, "significance_score": 8,
                 "l3_entry_kind": "POS_THEOREM", "goal_coverage": "FULL_GOAL", "publish_tier": "BASELINE_UPDATE",
                 "title": f"Complete Theorem for {qid}",
                 "abstract_md": f"Complete rigorously verified proof and runnable artifact solve.py solving {qid} under spec v0.",
@@ -333,7 +337,7 @@ class TestV03ResearchEngines(unittest.TestCase):
         verd = self._call("submit_conference_verdict", "conference_chair", {
             "conference_id": cid,
             "actions": [
-                {"action": "OPEN_NEW_BRANCH", "family_id": "fam_q1", "mechanism_signature": "v1 boundary B constructive proof"},
+                {"action_type": "OPEN_NEW_BRANCH", "family_id": "fam_q1", "mechanism_signature": "v1 boundary B constructive proof"},
             ],
             "rationale_md": "Spawn new branch for Q1 spec v1.",
         }, "chair_1")
@@ -359,10 +363,11 @@ class TestV03ResearchEngines(unittest.TestCase):
             "review_id": rev_v1, "question_id": "Q1",
             "ledger_items": [{"claim": "Q1 v1 full", "evidence_location_and_quote": "solve_v1.py"}],
             "stage1_verdict": "PASS",
+            "rigor_score": 8,
         }, "ver_q1_v1")["ok"])
         self.assertTrue(self._call("get_unblinded_manuscript_and_peers", "library_verifier", {"review_id": rev_v1}, "ver_q1_v1")["ok"])
         s2_v1 = self._call("submit_stage2_unblind_verdict", "library_verifier", {
-            "review_id": rev_v1, "final_verdict": "ACCEPT",
+            "review_id": rev_v1, "final_verdict": "ACCEPT", "novelty_score": 8, "significance_score": 8,
             "l3_entry_kind": "POS_THEOREM", "goal_coverage": "FULL_GOAL", "publish_tier": "BASELINE_UPDATE",
             "title": "Q1 Complete Theorem v1",
             "abstract_md": "Complete verified proof of Q1 under revised spec v1 including boundary condition B.",
@@ -393,6 +398,7 @@ class TestV03ResearchEngines(unittest.TestCase):
         final_sign = self._call("submit_stage2_unblind_verdict", "library_verifier", {
             "review_id": f"STAGE3_FINAL_AUDIT:{did}",
             "final_verdict": "ACCEPT",
+            "novelty_score": 8, "significance_score": 8,
         }, "ver_stage3")
         self.assertTrue(final_sign["ok"], final_sign)
         self.assertEqual(final_sign["data"]["closure_status"], "CLOSED_VERIFIED")

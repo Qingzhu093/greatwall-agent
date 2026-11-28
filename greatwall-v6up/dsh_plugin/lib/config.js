@@ -13,7 +13,9 @@ export const DEFAULT_PLUGIN_CONFIG = Object.freeze({
   dataDir: '',
   requestTimeoutMs: 60_000,
   longToolTimeoutMs: 300_000,
-  chiefAnchorHardCapChars: 1500,
+  chiefAnchorHardCapChars: 2400,
+  maxEffectiveContextWindow: 360_000,
+  contextHolidayPct: 0.52,
   defaultAgentOptions: Object.freeze({}),
 })
 
@@ -49,6 +51,14 @@ export const CONFIG_SCHEMA_DESCRIPTOR = Object.freeze({
       type: 'number',
       default: DEFAULT_PLUGIN_CONFIG.chiefAnchorHardCapChars,
       description: 'gw-chief 现况锚点卡字数上限，按子题数在上限内伸缩。',
+    },
+    maxEffectiveContextWindow: {
+      type: 'number', default: DEFAULT_PLUGIN_CONFIG.maxEffectiveContextWindow,
+      description: '单班岗上下文窗口上限（tokens），仍受模型物理窗口约束。',
+    },
+    contextHolidayPct: {
+      type: 'number', default: DEFAULT_PLUGIN_CONFIG.contextHolidayPct,
+      description: '夜科学停码水位，允许 0.42–0.62。',
     },
     defaultAgentOptions: {
       type: 'object',
@@ -86,12 +96,15 @@ function validateFallbackStandardSchema(input) {
       issues.push({ message: `${strKey} 必须为字符串`, path: [strKey] })
     }
   }
-  for (const numKey of ['requestTimeoutMs', 'longToolTimeoutMs', 'chiefAnchorHardCapChars']) {
+  for (const numKey of ['requestTimeoutMs', 'longToolTimeoutMs', 'chiefAnchorHardCapChars', 'maxEffectiveContextWindow']) {
     const val = raw[numKey]
     if (val !== undefined && (typeof val !== 'number' || !Number.isFinite(val) || val <= 0)) {
       issues.push({ message: `${numKey} 必须为正有限数字`, path: [numKey] })
     }
   }
+  if (raw.contextHolidayPct !== undefined && (
+    typeof raw.contextHolidayPct !== 'number' || !(raw.contextHolidayPct >= 0.42 && raw.contextHolidayPct <= 0.62)
+  )) issues.push({ message: 'contextHolidayPct 须在 0.42–0.62', path: ['contextHolidayPct'] })
   if (raw.defaultAgentOptions !== undefined) {
     if (!raw.defaultAgentOptions || typeof raw.defaultAgentOptions !== 'object' || Array.isArray(raw.defaultAgentOptions)) {
       issues.push({ message: 'defaultAgentOptions 必须为对象', path: ['defaultAgentOptions'] })
@@ -127,6 +140,8 @@ function validateFallbackStandardSchema(input) {
       requestTimeoutMs,
       longToolTimeoutMs,
       chiefAnchorHardCapChars,
+      maxEffectiveContextWindow: Math.floor(raw.maxEffectiveContextWindow ?? DEFAULT_PLUGIN_CONFIG.maxEffectiveContextWindow),
+      contextHolidayPct: raw.contextHolidayPct ?? DEFAULT_PLUGIN_CONFIG.contextHolidayPct,
       defaultAgentOptions: sanitizeAgentOptions(raw.defaultAgentOptions),
     },
   }
@@ -156,6 +171,10 @@ try {
       longToolTimeoutMs: Schema.number().min(1000).default(300_000).description(CONFIG_SCHEMA_DESCRIPTOR.properties.longToolTimeoutMs.description),
       chiefAnchorHardCapChars: Schema.number().min(400).max(4000).default(DEFAULT_PLUGIN_CONFIG.chiefAnchorHardCapChars)
         .description(CONFIG_SCHEMA_DESCRIPTOR.properties.chiefAnchorHardCapChars.description),
+      maxEffectiveContextWindow: Schema.number().min(1).default(DEFAULT_PLUGIN_CONFIG.maxEffectiveContextWindow)
+        .description(CONFIG_SCHEMA_DESCRIPTOR.properties.maxEffectiveContextWindow.description),
+      contextHolidayPct: Schema.number().min(0.42).max(0.62).default(DEFAULT_PLUGIN_CONFIG.contextHolidayPct)
+        .description(CONFIG_SCHEMA_DESCRIPTOR.properties.contextHolidayPct.description),
       defaultAgentOptions: Schema.object({
         provider: Schema.string().description('默认模型提供方'),
         model: Schema.string().description('默认模型 ID'),
@@ -195,6 +214,8 @@ export function resolvePluginConfig(rawConfig = {}, defaultCorePythonRoot = '') 
     requestTimeoutMs,
     longToolTimeoutMs,
     chiefAnchorHardCapChars,
+    maxEffectiveContextWindow: sanitizePositiveInt(src.maxEffectiveContextWindow, DEFAULT_PLUGIN_CONFIG.maxEffectiveContextWindow),
+    contextHolidayPct: src.contextHolidayPct ?? DEFAULT_PLUGIN_CONFIG.contextHolidayPct,
     defaultAgentOptions,
   }
 }

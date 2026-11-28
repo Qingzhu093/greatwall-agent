@@ -1,29 +1,29 @@
-# dsh-greatwall-v6up（`v0.3.1`）
+# dsh-greatwall-v6up（`v0.3.2`）
 
 长城科研共同体 **GreatWall Agent V6-Up** 的 DeepSeek Harness Cordis 插件包，最低宿主版本为 **`0.2.2-rc.5`**。
 
-## `v0.3.1` 核心升级亮点
+## `v0.3.2` 核心升级亮点（统合 `v0.3.1` 运维总控平面）
 
-1. **常驻科研总控 (`gw-chief`) 与人类运行安排闭环**：
-   - 独立 Preset **`greatwall-chief`（「长城 · 科研总控 (gw-chief)」）**：物理零写码/零终端/零外网，通过 `cordis:group` 隔离启用 `@deepseek-ai/dsh-compaction-basic` 与弹性字数「全院现况锚点卡」（防压缩断链），支持手开会话自动收编；
-   - 人类在总控当面下令即可直执 **版本化 `run_arrangements`**（主次优先级、`NO_NEW_DISPATCH`、单题分支硬上限、在途收尾策略、到期/批次结束后自动恢复）、分支撤编/挂起/接管、导师便签与完整蓝图种枝，并返回四态 `operation_receipts`；
-   - 仅 4 类高危宪章动作（改题升版 / 部分结题 / 推进新纪元归档 / 后台圆桌拍板）走双端幂等确认单，通过 [`lib/sessions/chief_runtime.js`](./lib/sessions/chief_runtime.js) 注册 DSH RC5 原生 `actionCards`（`greatwall_proposal`）；
-   - [`lib/orchestrate_tool.js`](./lib/orchestrate_tool.js) 保持 `init / start / status / stop` 4 个极简薄入口供 Headless 与冷启动拉起。
-2. **设施运行底座升级（`lib/runtime/` & `lib/sessions/`）**：
-   - `instance_lock.js`：`host.lock` 单实例独占锁防双活 + 死 PID 自动回收；
-   - `worker_slots.js`：`maxWorkers` 普通槽 + `+1` 人类优先保留槽；
-   - `transient_retry.js`：429 / 5xx / 网络瞬时错误原地指数退避（15s→30s→60s），401 / `CONTENT_REFUSED` 零重试快失败；
-   - `effects_consumer.js`：消费 SQLite 持久化 Outbox（60s 租约续期、崩溃认领、热注入 `NOTIFY_POLICY_CHANGED`、路由 `NOTIFY_CHIEF`）；
-   - `human_takeover.js`：基于 DSH `user/message` + `source.rpcId` + 插件自发白名单精准识别人类插话让权，并经原生 `ctx.jobs` 清理残留后台 Shell 作业（无服务时平滑降级）。
-3. **宏观大外环四拍脉冲与确定性会话唤醒**：
-   - [`lib/orchestrator/wave_conference_runner.js`](./lib/orchestrator/wave_conference_runner.js) 确定性驱动 4 拍圆桌：代码硬对账 → 按 Round 1/2 `ctx.agents.resume` 唤醒已封存 `gw-comp-<node_id>`（物理撤除写权仅挂 `SEALED_COMPANION_CONFERENCE_TOOLS`）→ 零外网 `library_chronicler` 刷新 `<=1500` 字总览 → 原地 `resume` 同一 `gw-chair-<conference_id>` 拍板；参会助手 `<2` 名时自动跳过互辩直入总览刷新；会后严格先 `dispose()` 再 `archiveSession()`。
-4. **动态 Config Schema 与模块化三问前端（`client_src/`）**：
-   - [`lib/config.js`](./lib/config.js) 优先动态探测宿主 `@deepseek-ai/schemastery`（原生支持 Plugin Manager 自动表单渲染），缺宿主时自动回退零依赖 Standard Schema v1；
-   - 前端彻底拆分为 [`client_src/`](./client_src/)（`ThreeQuestionsView` / `LivingSurveyView` / `BranchDetailDrawer` / `api.js` / `styles.js`），经零依赖 [`tools/build_client.mjs`](./tools/build_client.mjs) 生成 [`lib/client.js`](./lib/client.js)，纯 `--dsw-alias-*` 令牌且零 `dsh-client-ui-primitives` 依赖。
+1. **学术文献馆重塑、观测快照解耦与三维反路灯盲审**：
+   - **观测瞬间轻量代码快照（`frozen_code_snapshot_path`）**：每次 `official / heavy` 评测同步冻结入口文件与本地 `tools/` 快照，彻底解除后续增写辅助脚本引发的交班拒绑锁；
+   - **默认非阻塞微型学术论文投稿（`manuscript_submissions`）**：70% 交班随时切出阶段成果快照送审，原分支不停工直接续推下一代；馆藏完整记录署名、学派、引文网、三维评分与公开审稿评语；
+   - **两阶段三维盲审（`Rigor / Novelty / Significance`）**：Stage 1 盲评严密性并严打过度声称（`PARTIAL_PASS -> ACCEPT_NARROWED`）；Stage 2 注入《全馆摘要锚点包》评定新颖性与重要性，`novelty <= 3` 判 `REJECT_DUPLICATE` 查重退稿，`significance <= 4` 强制分流至 `MARGINAL_NOTE` 掐断边角料路灯效应；
+   - **零外网院内专题综述员（`Archive Surveyor` 模式）**：`library_chronicler` 按需响应 `request_internal_survey`（通过 `RUN_INTERNAL_SURVEY` 异步 Outbox 驱动），出具 `800–4000` 字带精确编号的客观专题综述。
+2. **脉冲式同行拼图工作坊、三阶段无损执行与双模收敛**：
+   - [`lib/orchestrator/wave_conference_runner.js`](./lib/orchestrator/wave_conference_runner.js) 确定性驱动 4 拍同行工作坊：第 1 拍确定性硬账本与三问议程 → 第 2 拍 `ctx.agents.resume` 唤醒各脉已封存 `gw-comp-<node_id>`（物理撤除档案写权，Round 2 强制点对点回复链 `CRITIQUE_SEAM / ENDORSE_AND_OFFER / WARN_STREETLIGHT / CONFIRM_TAKEAWAY`）并落盘 `<=6000` 字不截断纪要与各脉 `peer_takeaways_json` → 第 3 拍零外网 `library_chronicler` 刷新核心四栏 `<=4000` 字 + 边缘隔离栏 `<=1500` 字总览 → 第 4 拍原地 `resume` 同一 `gw-chair-<conference_id>` 签发宏观决断；
+   - 执行器严格按 **Phase 1 先休眠腾槽与真实打捞遗产 → Phase 2 合体（豁免单学派 `>50%` 锁并生成 `DONOR_MANIFEST.md`）与开枝 → Phase 3 工单与双模收敛（`CONVERGE_FULL_COMPOSITE` 组合终核通关 / `CONVERGE_SATURATED` 饱和止盈，均自动解锁 `question_order` 后续子题）** 落地；散会后由下代伴随助手自主消化 `latest_wave_takeaways` 执笔重写 `<=3600` 字看板。
+3. **微观 `360k` 四段时钟、完整 11 类元反思与 52% 停码夜科学绿洲**：
+   - 单班岗默认有效窗口收紧至 `360,000` tokens（`maxEffectiveContextWindow` 可配）；37% 问诊补齐 11 类元反思（含 `C11_RESEARCH_TASTE` 科研品味，单轮 `<=500` 字）；
+   - 新增 **52% 停码夜科学绿洲**（`contextHolidayPct = 0.52`，[`lib/host/context_holiday.js`](./lib/host/context_holiday.js)）：宿主物理只读锁 2 回合，仅豁免放行 `submit_holiday_bet` 登记可证伪赌注，随后解锁在 `52%–70%` 实测验证；
+   - 沙箱守卫（[`lib/read_isolated_sandbox.js`](./lib/read_isolated_sandbox.js)）支持 `read / glob / grep` 缺省路径自动锚定绑定沙箱、精确路径段 `..` 校验，以及 `external_surveyor` arXiv `/html/` 自动改写。
+4. **常驻科研总控 (`gw-chief`) 与设施运行底座（继承 `v0.3.1`）**：
+   - 独立 Preset **`greatwall-chief`**（物理零写码/零终端/零外网、弹性 `<=1500` 字置顶锚点卡与 `chief_read` 分页器），人类当面下令可直执版本化 `run_arrangements`、导师便签、8000 字蓝图种枝并返回四态 `operation_receipts`；仅 4 类高危宪章动作走双端幂等确认单；
+   - `instance_lock.js` + `worker_slots.js`（`maxWorkers + 1` 人类优先槽）+ `effects_consumer.js`（11 类 Outbox 副作用并发消费）+ `human_takeover.js`（`source.rpcId` 人类插话让权与 `ctx.jobs` 清理）；
+   - [`lib/config.js`](./lib/config.js) 动态探测 `@deepseek-ai/schemastery`（含 `maxEffectiveContextWindow` 与 `contextHolidayPct` 表单项），前端 [`client_src/`](./client_src/) 经 [`tools/build_client.mjs`](./tools/build_client.mjs) 构建生成 [`lib/client.js`](./lib/client.js)。
 
 ## 8 套单源角色 Preset（[`cordis.patch.yml`](./cordis.patch.yml)）
 
-覆盖全院 10 大角色与 47 个窄 MCP 工具，全量挂载 `@deepseek-ai/dsh-tool-executor-native`：
+覆盖全院 10 大角色与 53 个窄 MCP 工具，全量挂载 `@deepseek-ai/dsh-tool-executor-native`：
 
 - `greatwall-chief`：Superagent 总控（零写/零终端/零外网，启用 `dsh-compaction-basic`）
 - `greatwall-explorer`：一线探索者（读写 fs + search + 平台 Shell，锁在分支 worktree，严禁开启 `pruner`）
@@ -31,7 +31,7 @@
 - `greatwall-companion`：单节点伴随助手（只读 fs + search，确定性 ID `gw-comp-<node_id>` 跨阶段按需 `resume`，封存参会撤写权）
 - `greatwall-works`：科研仪器科（读写 fs + search + 平台 Shell，锁在 `evaluators/` 与 `skills/`，禁改 `worktrees/`）
 - `greatwall-external-surveyor`：对外文献采编（**唯一挂载 `dsh-tool-web`**，物理禁读院内成果与工作树）
-- `greatwall-chronicler`：对内综述与终稿官（零外网/零终端/零写盘，专司 `<=1500` 字总览与 Stage 3 冻结导出）
+- `greatwall-chronicler`：对内综述与终稿官（零外网、零终端、零写盘，维护 4000 字核心总览和 1500 字边缘附栏，撰写专题报告并冻结终稿）
 - `greatwall-db-only`：物理 0 原生工具（专供 `logistics_coordinator`、`supervisory_committee` 与 `conference_chair` 纯 SQLite 状态机驱动）
 
 ## 从 DSH 0.2.2-rc.3 升级到 0.2.2-rc.5 说明
@@ -43,6 +43,6 @@
 
 ```bash
 npm run build:client   # 从 client_src/ 重新生成 lib/client.js
-npm test               # 运行 62+ 项 Node 单测、v0.3.1 运行安排/总控/圆桌测试与 L2 假模型全链路沙盘
-npm run doctor         # 运行 8 项环境、47 工具 × 10 角色跨层契约、8 套 Preset 与红线一键体检
+npm test               # 运行 64 项 Node 单测、v0.3.2 运维/夜科学/圆桌测试与 L2 假模型全链路沙盘
+npm run doctor         # 检查 53 个工具、10 个角色、8 套 Preset 与运行环境
 ```

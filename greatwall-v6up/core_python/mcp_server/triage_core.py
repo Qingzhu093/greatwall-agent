@@ -264,8 +264,8 @@ def execute_triage_core(
                 INSERT INTO review_queue(
                     review_id, question_id, source_node_id, source_type, proposer_session_id,
                     review_status, manuscript_title, spec_revision, column_a_snapshot_md, column_b_snapshot_md,
-                    bound_obs_ids_json, artifact_rel_path, artifact_snapshot_abs_path, sanitized_code_diff_md, created_at, updated_at
-                ) VALUES (?, ?, ?, 'LEVEL1_MANUSCRIPT', ?, 'STAGE1_BLIND', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    bound_obs_ids_json, artifact_rel_path, artifact_snapshot_abs_path, sanitized_code_diff_md, non_blocking, created_at, updated_at
+                ) VALUES (?, ?, ?, 'LEVEL1_MANUSCRIPT', ?, 'STAGE1_BLIND', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                 """,
                 (
                     rev_id,
@@ -324,8 +324,8 @@ def execute_triage_core(
                 INSERT INTO review_queue(
                     review_id, question_id, source_node_id, source_type, proposer_session_id,
                     review_status, manuscript_title, spec_revision, column_a_snapshot_md, column_b_snapshot_md,
-                    bound_obs_ids_json, artifact_rel_path, sanitized_code_diff_md, created_at, updated_at
-                ) VALUES (?, ?, ?, 'LEVEL4A_BARRIER', ?, 'STAGE1_BLIND', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    bound_obs_ids_json, artifact_rel_path, sanitized_code_diff_md, non_blocking, created_at, updated_at
+                ) VALUES (?, ?, ?, 'LEVEL4A_BARRIER', ?, 'STAGE1_BLIND', ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                 """,
                 (
                     rev_id,
@@ -497,7 +497,7 @@ def execute_triage_core(
         sync_approved_public_inputs(workspace_root, prot_wt, shared_rels, spec_revision=active_q_spec_rev, question_id=qid)
         sync_public_instruments_and_skills_to_worktree(conn, workspace_root, prot_wt)
         prot_nid = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
-        default_prot = int(cfg.get("default_protection_generations", 2))
+        default_prot = int(cfg.get("branch_growth_protection_generations", cfg.get("default_protection_generations", 1)))
         with rw_immediate_tx(conn):
             deferred = _defer_continuation(conn, node, fid, now)
             if deferred:
@@ -513,7 +513,7 @@ def execute_triage_core(
                     worktree_abs_path, retained_snapshot_abs_path, requires_json, spec_revision,
                     branch_kind, protection_generations_left, companion_session_id,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 1, 'EXPLORING', ?, ?, ?, ?, 'PURE', ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, 1, 'EXPLORING', ?, ?, ?, ?, 'PROTECTED', ?, ?, ?, ?)
                 """,
                 (
                     prot_nid,

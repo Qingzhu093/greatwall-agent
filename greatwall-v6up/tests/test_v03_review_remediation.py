@@ -160,6 +160,7 @@ class TestV03ReviewRemediation(unittest.TestCase):
             review_id=rev_id,
             question_id=question_id,
             stage1_verdict="PASS",
+            rigor_score=8,
             ledger_items=[{"claim": "主推导", "evidence_location_and_quote": "manuscript_column_a.md:1 通过", "verdict": "PASS"}],
         )
         self.assertTrue(s1["ok"], s1)
@@ -169,6 +170,7 @@ class TestV03ReviewRemediation(unittest.TestCase):
             session_id=f"sv_{rev_id}",
             review_id=rev_id,
             final_verdict="ACCEPT",
+            novelty_score=8, significance_score=8,
             l3_entry_kind="POS_THEOREM",
             goal_coverage=goal_coverage,
             publish_tier=publish_tier,
@@ -394,6 +396,7 @@ class TestV03ReviewRemediation(unittest.TestCase):
             review_id=lrev_id,
             question_id="Q1",
             stage1_verdict="REVISE",
+            rigor_score=5,
             ledger_items=[{"claim": "边界常数", "evidence_location_and_quote": "lemma_proof.py:1 常数因子漏了 2", "verdict": "FAIL"}],
             revision_or_refutation_reason="补齐常数因子 2",
         )

@@ -66,6 +66,7 @@ def find_latest_spec_full_goal_l3(
           AND ledger_type = 'L3_VERIFIED'
           AND is_active = 1
           AND goal_coverage = 'FULL_GOAL'
+          AND publish_tier != 'MARGINAL_NOTE'
           AND verified_spec_revision >= ?
         ORDER BY verified_spec_revision DESC, created_at DESC
         LIMIT 1

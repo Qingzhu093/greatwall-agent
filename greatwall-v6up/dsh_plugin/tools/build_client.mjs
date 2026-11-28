@@ -6,6 +6,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import './build_contracts.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PLUGIN_ROOT = path.resolve(__dirname, '..')

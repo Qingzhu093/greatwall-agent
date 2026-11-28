@@ -129,16 +129,16 @@ export function extractModelBindingFromEvents(events) {
 
 /**
  * 计算有效上下文窗口上限：取真实模型物理窗口与显式/默认安全上限的较小值，
- * 杜绝 272k 模型按 500k 计算 37%/70% 永远到不了阈值的问题。
+ * 杜绝 272k 模型按 360k 计算 37%/70% 永远到不了阈值的问题。
  */
 export function resolveEffectiveContextWindow({
   explicitWindow = 0,
   modelWindow = 0,
-  runtimeDefaultWindow = 500_000,
+  runtimeDefaultWindow = 360_000,
 } = {}) {
   const exp = Number(explicitWindow || 0)
   const mod = Number(modelWindow || 0)
-  const defCap = Math.max(1, Number(runtimeDefaultWindow || 500_000))
+  const defCap = Math.max(1, Number(runtimeDefaultWindow || 360_000))
   const desiredCap = Number.isFinite(exp) && exp > 0 ? Math.round(exp) : defCap
   if (Number.isFinite(mod) && mod > 0) {
     return Math.min(desiredCap, Math.round(mod))
@@ -157,7 +157,7 @@ export async function resolveAuthoritativeModelBinding({
   configDefaultOptions = {},
   persistedBinding = null,
   fallbackSessionIds = [],
-  runtimeDefaultWindow = 500_000,
+  runtimeDefaultWindow = 360_000,
 } = {}) {
   let provider = ''
   let model = ''

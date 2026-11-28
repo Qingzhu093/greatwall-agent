@@ -7,7 +7,7 @@
  * - 第 2 拍（红蓝 2 轮互辩）：Node 侧按 Round 1 -> Round 2 顺序通过 `resumeOrSpawnAgent` 唤醒
  *   已封存 `gw-comp-<node_id>`（物理撤除档案写工具，仅挂 `submit_conference_statement`），
  *   结束后唤醒 `gw-chair-<conference_id>` 调用 `record_conference_minutes` 切至 `SURVEY_REFRESHING`；
- * - 第 3 拍（1500 字总览刷新）：拉起零外网 `library_chronicler` 调 `publish_living_survey` 切至 `ADJUDICATING`；
+ * - 第 3 拍：零外网 `library_chronicler` 刷新总览后，会议才进入 `ADJUDICATING`；
  * - 第 4 拍（宏观拍板）：原地 `resume` 同一 `gw-chair-<conference_id>` 读最新总览调 `submit_conference_verdict`；
  * - 会后清理：所有参会已封存助手与主席会话严格按「先 `dispose()`、再 `archiveSession()`」封存。
  * @module dsh-greatwall-v6up/orchestrator/wave_conference_runner
@@ -32,45 +32,47 @@ export class WaveConferenceRunner {
     const status = String(conf.status || '')
     const chairSid = String(conf.chair_session_id || `gw-chair-${cid}`)
 
-    let participants = []
-    try {
-      participants = Array.isArray(conf.participant_nodes)
-        ? conf.participant_nodes
-        : JSON.parse(conf.participant_nodes_json || '[]')
-    } catch {
-      participants = []
-    }
+    const participants = conf.participant_nodes ?? JSON.parse(conf.participant_nodes_json ?? '[]')
+    const agenda = JSON.parse(conf.agenda_json ?? '{}')
+    const ledger = JSON.parse(conf.critiques_ledger_json ?? '[]')
+    const agendaText = [
+      ...(agenda.questions ?? []), agenda.human_agenda_md, agenda.streetlight_warning,
+    ].filter(Boolean).join('\n')
 
-    // 第 2 拍：Round 1 交叉质询 -> Round 2 辩护补证 -> 主席落盘纪要
+    const maxRounds = Math.max(2, Math.min(4, Number(agenda.discussion_rounds || 2)))
+
     if (status === 'ROUND_1_CRITIQUE' || status === 'ROUND_2_REBUTTAL') {
       const startRound = status === 'ROUND_1_CRITIQUE' ? 1 : 2
-      for (let roundNo = startRound; roundNo <= 2; roundNo++) {
+      for (let roundNo = startRound; roundNo <= maxRounds; roundNo++) {
         if (signal?.aborted) return { advanced: false, reason: 'aborted' }
-        for (const p of participants) {
-          if (signal?.aborted) return { advanced: false, reason: 'aborted' }
-          const nid = String(p.node_id || '')
-          const bid = String(p.branch_id || '')
-          const compSid = String(p.companion_session_id || `gw-comp-${nid}`)
-          if (!nid) continue
-          const roundLabel = roundNo === 1 ? 'Round 1（点对点红蓝质询）' : 'Round 2（直面质疑与互补方案）'
-          await this.port.resumeOrSpawnAgent({
+        const alreadySpoken = new Set(ledger.filter((item) => item.round === roundNo).map((item) => item.node_id))
+        const speechRules = roundNo === 1
+          ? '使用 PROPOSE_AND_SELF_AUDIT，列实证底座、自查失效范围，将未验证模块放入 unverified_ideas。'
+          : `阅读前面各轮全部发言。选择 CRITIQUE_SEAM、ENDORSE_AND_OFFER、WARN_STREETLIGHT 或 CONFIRM_TAKEAWAY。${participants.length >= 2 ? 'target_node_ids 必须点名至少一位其他参会者。' : ''}`
+        const roundResults = await Promise.all(participants.filter((p) => !alreadySpoken.has(p.node_id)).map((p) => {
+          const nid = p.node_id
+          const bid = p.branch_id
+          const compSid = p.companion_session_id || `gw-comp-${nid}`
+          return this.port.resumeOrSpawnAgent({
             role: 'lineage_companion',
             sessionId: compSid,
             nodeId: nid,
             branchId: bid,
             questionId: qid,
-            cwd: p.worktree_abs_path || this.port.workspaceRoot,
             uiLabel: formatNodeSessionTitle('lineage_companion', { questionId: qid, nodeId: nid, suffix: `圆桌W${waveNo}R${roundNo}` }),
             shortTransaction: true,
-            archiveOnComplete: true,
+            archiveOnComplete: roundNo >= maxRounds,
             allowedMcpOverride: SEALED_COMPANION_CONFERENCE_TOOLS,
             signal,
-            prompt: `【宏观大外环 Wave ${waveNo} · ${roundLabel}】你作为已封存节点 ${nid} 的代表参会（已物理撤除档案写权）。请先调 get_companion_context(branch_id="${bid}", node_id="${nid}", mode="CONFERENCE_PARTICIPANT") 阅读代码硬账本与已有发言，然后调用 submit_conference_statement(conference_id="${cid}", node_id="${nid}", round_no=${roundNo}, statement_md="...", target_node_ids=[...]) 提交直指核心分歧或互补点的简明发言。`,
+            prompt: `【Wave ${waveNo} 同行研讨 · 第 ${roundNo}/${maxRounds} 轮】\n${agendaText}\n以封存节点 ${nid} 代表参会。调用 get_companion_context(branch_id="${bid}", node_id="${nid}", mode="CONFERENCE_PARTICIPANT") 阅读硬账本和已提交的发言。调用 submit_conference_statement(conference_id="${cid}", node_id="${nid}", round_no=${roundNo}, ...)，最多 1200 字。${speechRules}`,
           })
+        }))
+        if (roundResults.some((r) => r?.isAbnormalEnd)) {
+          return { advanced: false, reason: `round_${roundNo}_abnormal_end` }
         }
       }
 
-      // 2 轮交锋结束，由圆桌主席落盘纪要切 SURVEY_REFRESHING
+      // 上半场多轮交锋结束，由圆桌主席落盘纪要切 SURVEY_REFRESHING
       await this.port.resumeOrSpawnAgent({
         role: 'conference_chair',
         sessionId: chairSid,
@@ -79,12 +81,12 @@ export class WaveConferenceRunner {
         shortTransaction: false,
         archiveOnComplete: false,
         signal,
-        prompt: `【宏观大外环 Wave ${waveNo} · 第 2 拍纪要】请调用 get_conference_dossier(conference_id="${cid}") 审阅本波代码硬账本与 2 轮红蓝交锋，提炼核心共识、实质分歧与需验证假设，调用 record_conference_minutes(conference_id="${cid}", minutes_md="...") 落盘纪要以触发综述官刷新《子题全局总览》。`,
+        prompt: `【宏观大外环 Wave ${waveNo} · 上半场纪要】请调用 get_conference_dossier(conference_id="${cid}") 审阅本波代码硬账本与全部 ${maxRounds} 轮同行发言，提炼证据共识、接口风险与承重缺口，调用 record_conference_minutes(conference_id="${cid}", minutes_md="...") 提交不超过 6000 字的纪要以触发综述官刷新《子题全局总览》。`,
       })
       return { advanced: true, nextExpectedStatus: 'SURVEY_REFRESHING' }
     }
 
-    // 第 3 拍：零外网 library_chronicler 刷新 <=1500 字《子题全局总览》切至 ADJUDICATING
+    // 第 3 拍总览发布后圆桌才能进入 ADJUDICATING。
     if (status === 'SURVEY_REFRESHING') {
       await this.port.spawnAndRunAgent({
         role: 'library_chronicler',
@@ -93,7 +95,7 @@ export class WaveConferenceRunner {
         shortTransaction: true,
         archiveOnComplete: true,
         signal,
-        prompt: `【宏观大外环 Wave ${waveNo} · 第 3 拍刷新总览】请调用 get_chronicler_snapshot(question_id="${qid}", conference_id="${cid}")，结合硬账本、圆桌纪要与全量已审 L3/L2，调用 publish_living_survey(question_id="${qid}", conference_id="${cid}", ...) 发布 <=1500 字最新《子题全局总览与明确缺口导览》（严禁泄露他派私有未审思路）。`,
+        prompt: `【宏观大外环 Wave ${waveNo} · 第 3 拍刷新总览】请调用 get_chronicler_snapshot(question_id="${qid}", conference_id="${cid}")，结合硬账本、圆桌纪要与全量已审 L3/L2，调用 publish_living_survey(question_id="${qid}", conference_id="${cid}", ...) 发布不超过 4000 字核心四栏。第四栏只录承重缺口，边缘争议移入独立 marginal_notes_md 附栏。`,
       })
       return { advanced: true, nextExpectedStatus: 'ADJUDICATING' }
     }
@@ -108,7 +110,7 @@ export class WaveConferenceRunner {
         shortTransaction: true,
         archiveOnComplete: true,
         signal,
-        prompt: `【宏观大外环 Wave ${waveNo} · 第 4 拍宏观拍板】综述官已刷新最新《子题全局总览》！请先调用 get_conference_dossier(conference_id="${cid}") 仔细研读 latest_living_survey 中的 Explicit Gaps 与各分支保护期状态，然后调用 submit_conference_verdict(conference_id="${cid}", actions=[...], rationale_md="...") 签发宏观树结构调整单（严禁提前 RETIRE 保护期内分支）。`,
+        prompt: `【宏观大外环 Wave ${waveNo} · 第 4 拍宏观拍板】综述官已刷新最新《子题全局总览》！请先调用 get_conference_dossier(conference_id="${cid}") 仔细研读 latest_living_survey 中的 Explicit Gaps 与各分支保护期状态，然后调用 submit_conference_verdict(conference_id="${cid}", actions=[...], rationale_md="...") 使用 action_type 签发宏观调整单。按需点名跨脉供体与嫁接目标，或选择组合核验、饱和止盈。尊重成长保护期。`,
       })
       return { advanced: true, nextExpectedStatus: 'COMPLETED_OR_PENDING_HUMAN' }
     }

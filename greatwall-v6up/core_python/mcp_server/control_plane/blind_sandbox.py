@@ -144,7 +144,8 @@ def stage_blind_review_sandbox(
         ph = ",".join("?" for _ in obs_ids)
         rows = conn.execute(
             f"""
-            SELECT obs_id, question_id, instrument_id, instrument_version, tier, obs_status, tracks_json, details_text, created_at
+            SELECT obs_id, question_id, instrument_id, instrument_version, tier, obs_status, tracks_json,
+                   details_text, created_at, frozen_code_snapshot_path
             FROM observations
             WHERE obs_id IN ({ph})
             ORDER BY obs_id
@@ -152,6 +153,17 @@ def stage_blind_review_sandbox(
             tuple(obs_ids),
         ).fetchall()
         for r in rows:
+            code_snapshot = None
+            if r["frozen_code_snapshot_path"]:
+                src = Path(r["frozen_code_snapshot_path"]).resolve()
+                if not src.is_dir() or not src.is_relative_to(paths["eval_artifacts_dir"].resolve()):
+                    raise FailClosedError(ERR_NOT_FOUND, f"观测 {r['obs_id']} 的冻结代码快照缺失或越界")
+                code_snapshot = f"obs_snapshots/{r['obs_id']}"
+                dst = sandbox_dir / code_snapshot
+                shutil.copytree(src, dst, symlinks=False)
+                staged_files.extend(
+                    fp.relative_to(sandbox_dir).as_posix() for fp in sorted(dst.rglob("*")) if fp.is_file()
+                )
             obs_records.append(
                 {
                     "obs_id": str(r["obs_id"]),
@@ -163,6 +175,7 @@ def stage_blind_review_sandbox(
                     "tracks": json.loads(r["tracks_json"] or "{}"),
                     "details": str(r["details_text"] or ""),
                     "created_at": str(r["created_at"]),
+                    "code_snapshot_rel_path": code_snapshot,
                 }
             )
     (sandbox_dir / "observations.json").write_text(
@@ -170,6 +183,24 @@ def stage_blind_review_sandbox(
         encoding="utf-8",
     )
     staged_files.append("observations.json")
+
+    if rev["source_type"] == "COMPOSITE_FULL_GOAL":
+        ids = json.loads(rev["composite_entry_ids_json"])
+        entries = conn.execute(
+            """
+            SELECT entry_id, title, exact_verified_scope_md, body_proof_or_code_md
+            FROM internal_research_ledger WHERE entry_id IN (SELECT value FROM json_each(?))
+            ORDER BY entry_id
+            """,
+            (rev["composite_entry_ids_json"],),
+        ).fetchall()
+        if len(entries) != len(ids):
+            raise FailClosedError(ERR_NOT_FOUND, "组合完备核验的子论文缺失")
+        (sandbox_dir / "composite_entries.json").write_text(
+            _SENSITIVE_COMMENT_RE.sub("<REDACTED_ID>", json.dumps([dict(r) for r in entries], ensure_ascii=False)),
+            encoding="utf-8",
+        )
+        staged_files.append("composite_entries.json")
 
     # 4. 只读拷入公开题面、公开输入与手稿绑定 `spec_revision` 的《补充裁决文档》至 inputs/
     #    （若手稿绑定旧口径 vK < latest_spec_revision，挂载历史快照 ruling_revisions/vK/，绝不把事后新裁决混进旧手稿盲审！）

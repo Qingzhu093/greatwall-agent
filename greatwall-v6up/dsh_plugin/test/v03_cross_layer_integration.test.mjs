@@ -167,7 +167,7 @@ test('cross-2 (#2 & #10): 真实 Python ui_inspector 与 getControlStatus 喂入
         },
       },
     })
-    assert.ok(JSON.stringify(vLivDictOnly).includes('Q1 · r1 (120/1500 字)'))
+    assert.ok(JSON.stringify(vLivDictOnly).includes('Q1 · r1 (120/4000 字)'))
   } finally {
     await bridge.dispose()
     env.cleanup()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import uuid
@@ -50,6 +51,9 @@ def load_runtime_config() -> dict[str, Any]:
         sub = raw.get(section)
         if isinstance(sub, dict):
             flat.update(sub)
+    configured_cap = os.environ.get("GREATWALL_CONTEXT_WINDOW_CAP")
+    if configured_cap is not None:
+        flat["context_window_cap_tokens"] = int(configured_cap)
     flat["_raw"] = raw
     return flat
 
@@ -70,7 +74,7 @@ def load_holiday_prompts() -> list[dict[str, Any]]:
         if m_id:
             if cur is not None:
                 items.append(cur)
-            cur = {"id": int(m_id.group(1)), "scope": "reflect_37", "text": ""}
+            cur = {"id": int(m_id.group(1)), "scope": "holiday_52", "text": ""}
             continue
         if cur is None:
             continue
@@ -84,6 +88,16 @@ def load_holiday_prompts() -> list[dict[str, Any]]:
     if cur is not None:
         items.append(cur)
     return items
+
+
+@lru_cache(maxsize=1)
+def load_meta_reflection_categories() -> dict[str, str]:
+    resource = core_python_root() / "prompts" / "meta_reflection_categories.yaml"
+    return {
+        key.strip(): json.loads(value.strip())
+        for line in resource.read_text(encoding="utf-8").splitlines()[1:]
+        for key, value in [line.split(":", 1)]
+    }
 
 
 def next_prefixed_id(conn: sqlite3.Connection, table: str, id_col: str, prefix: str, width: int = 3) -> str:
@@ -187,9 +201,9 @@ def resolve_effective_context_window(
     explicit_window: int | None = None,
     cfg: dict[str, Any] | None = None,
 ) -> int:
-    """解析节点有效上下文窗口 W = min(500,000, model_physical_window)（显式传入 > 节点实测窗口 > Parse0 合同窗口 > cap 500,000）。"""
+    """解析节点有效上下文窗口 W = min(360,000, model_physical_window)（显式传入 > 节点实测窗口 > Parse0 合同窗口 > cap 360,000）。"""
     c = cfg or load_runtime_config()
-    cap = max(1, int(c.get("context_window_cap_tokens", c.get("context_window_tokens", 500000))))
+    cap = max(1, int(c.get("context_window_cap_tokens", c.get("context_window_tokens", 360000))))
     for cand in (explicit_window, node_window):
         if cand is not None:
             try:
@@ -222,11 +236,11 @@ def compute_clock_signal(
     effective_context_window: int | None = None,
     context_window_tokens: int | None = None,
 ) -> dict[str, Any]:
-    """基于节点真实有效上下文窗口 W = min(500,000, model_window) 计算回合间隙信号（v3.0 彻底废除 `eval_count >= 1` 前置门槛）。"""
+    """基于节点真实有效上下文窗口 W = min(360,000, model_window) 计算回合间隙信号（v3.0 彻底废除 `eval_count >= 1` 前置门槛）。"""
     c = cfg or load_runtime_config()
-    cap = max(1, int(c.get("context_window_cap_tokens", c.get("context_window_tokens", 500000))))
+    cap = max(1, int(c.get("context_window_cap_tokens", c.get("context_window_tokens", 360000))))
     raw_win = effective_context_window if effective_context_window is not None else context_window_tokens
-    window = min(cap, int(raw_win)) if (raw_win and int(raw_win) > 0) else cap
+    window = min(cap, int(raw_win)) if raw_win and int(raw_win) > 0 else cap
     reflect_pct = float(c.get("context_reflect_hint_pct", 0.37))
     handoff_pct = float(c.get("context_handoff_pct", 0.70))
     pct = float(pressure_tokens) / float(max(1, window))

@@ -333,7 +333,11 @@ def operator_command(
     pending: set[str] = set()
     failed: list[dict] = []
     data: dict[str, Any] = {}
-    with rw_immediate_tx(conn):
+    from .proposals import pending_wave_proposal_target
+    from .wave_verdict_actions import prepare_wave_growth
+
+    wave_target = pending_wave_proposal_target(conn, details["proposal_id"]) if operation == "approve_wave_verdict" and details.get("proposal_id") else None
+    with prepare_wave_growth(conn, workspace_root, wave_target) as prepared_growth, rw_immediate_tx(conn):
         if not conn.execute("SELECT 1 FROM parse0_contract WHERE contract_id='active'").fetchone():
             raise FailClosedError(ERR_LOCKED, "请先签署 Parse 0，再修改运行安排")
         if handback_id:
@@ -392,6 +396,65 @@ def operator_command(
                 ticket_type=str(details.get("ticket_type") or "PAIN_POINT"), instrument_id=details.get("instrument_id"),
                 description=str(details.get("description") or ""), source=actor_source,
             ))
+        elif operation == "cancel_ticket":
+            from .lifecycle_ops import cancel_works_ticket
+            res_cancel = cancel_works_ticket(
+                conn, ticket_id=str(details.get("ticket_id") or ""),
+                reason=str(details.get("reason") or details.get("summary_md") or ""), actor=actor_source,
+            )
+            data.update({
+                "ticket_id": res_cancel["ticket_id"],
+                "ticket_status": res_cancel["status"],
+                "resolution": res_cancel["resolution"],
+                "cancel_reason": res_cancel["cancel_reason"],
+            })
+        elif operation == "request_survey":
+            qid = str(details.get("question_id") or "ALL").strip() or "ALL"
+            topic = str(details.get("topic_query") or "").strip()
+            reason = str(details.get("reason") or details.get("summary_md") or "科研总控按人类指示定向补采外藏文献").strip()
+            if not topic:
+                raise FailClosedError(ERR_INVALID_INPUT, "request_survey 必填 details.topic_query（检索主题）")
+            req_id = f"srv_{uuid4().hex[:10]}"
+            conn.execute(
+                """INSERT INTO survey_requests(req_id, question_id, node_id, topic_query, reason, status, created_at, updated_at)
+                   VALUES(?, ?, 'gw_chief', ?, ?, 'PENDING', ?, ?)""",
+                (req_id, qid, topic, reason, now, now),
+            )
+            data.update({"req_id": req_id, "question_id": qid, "topic_query": topic, "survey_status": "PENDING"})
+        elif operation == "open_wave_conference":
+            from .wave_engine import check_and_open_wave_conference
+            qid = str(details.get("question_id") or "").strip()
+            if not qid or qid.upper() == "ALL":
+                raise FailClosedError(ERR_INVALID_INPUT, "open_wave_conference 必须指定单个子题 details.question_id（如 Q1）")
+            qrow = conn.execute("SELECT dispatch_state FROM subproblem_runtime_state WHERE question_id=?", (qid,)).fetchone()
+            if qrow is None:
+                raise FailClosedError(ERR_NOT_FOUND, f"子题 {qid!r} 不存在")
+            if str(qrow["dispatch_state"]) in ("CLOSED", "STOPPED_SOLVED"):
+                raise FailClosedError(ERR_CONFLICT, f"子题 {qid!r} 已结题 ({qrow['dispatch_state']})，无需再开圆桌")
+            existing_conf = conn.execute(
+                "SELECT conference_id, status FROM wave_conferences WHERE question_id=? AND status NOT IN ('COMPLETED','CANCELLED','EXPIRED','FAILED') LIMIT 1",
+                (qid,),
+            ).fetchone()
+            if existing_conf is not None:
+                raise FailClosedError(ERR_CONFLICT, f"子题 {qid!r} 已有进行中的圆桌 {existing_conf['conference_id']}（{existing_conf['status']}）")
+            opened = check_and_open_wave_conference(
+                conn,
+                question_id=qid,
+                force=True,
+                human_agenda_md=details.get("human_agenda_md", ""),
+                discussion_rounds=details.get("discussion_rounds"),
+            )
+            if not opened:
+                raise FailClosedError(ERR_CONFLICT, f"子题 {qid!r} 当前无法召开圆桌会议")
+            data.update({
+                "conference_id": opened["conference_id"],
+                "question_id": qid,
+                "wave_no": opened["wave_no"],
+                "conference_status": opened["status"],
+                "participant_count": opened["participant_count"],
+                "discussion_rounds": opened["discussion_rounds"],
+                "chair_session_id": opened["chair_session_id"],
+            })
         elif operation == "approve_wave_verdict":
             from .proposals import approve_control_proposal
             proposal_id = str(details.get("proposal_id") or "")
@@ -399,7 +462,8 @@ def operator_command(
             if row is None or row["action_type"] != "APPROVE_WAVE_VERDICT":
                 raise FailClosedError(ERR_INVALID_INPUT, "请提供待签批的圆桌裁决提案")
             data.update(approve_control_proposal(conn, workspace_root=workspace_root, proposal_id=proposal_id,
-                                                 decision="APPROVE", approved_by_source=actor_source))
+                                                 decision="APPROVE", approved_by_source=actor_source,
+                                                 prepared_growth=prepared_growth))
         elif operation == "recover_queue":
             res = conn.execute(
                 """UPDATE runtime_effects SET status='PENDING',owner_instance_id='',lease_expires_at=NULL,

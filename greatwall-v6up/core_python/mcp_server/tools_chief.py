@@ -127,11 +127,67 @@ def tool_chief_get_overview_snapshot(
         ).fetchall()
     ]
 
+    external_cards = [
+        {
+            "ref_id": str(c["ref_id"]),
+            "question_id": str(c["question_id"]),
+            "title": str(c["title"]),
+            "read_depth": str(c["read_depth"] or ""),
+        }
+        for c in conn.execute(
+            """
+            SELECT ref_id, question_id, title, read_depth
+            FROM external_literature_cards
+            WHERE (? = 'ALL' OR question_id = ? OR question_id = 'ALL')
+            ORDER BY ref_id ASC LIMIT 30
+            """,
+            (qf.upper(), qf),
+        ).fetchall()
+    ]
+
+    open_tickets = [
+        {
+            "ticket_id": str(t["ticket_id"]),
+            "question_id": str(t["question_id"]),
+            "ticket_type": str(t["ticket_type"]),
+            "instrument_id": t["instrument_id"],
+            "status": str(t["status"]),
+            "created_at": str(t["created_at"]),
+        }
+        for t in conn.execute(
+            """
+            SELECT ticket_id, question_id, ticket_type, instrument_id, status, created_at
+            FROM works_engineering_queue
+            WHERE status = 'OPEN' AND (? = 'ALL' OR question_id = ? OR question_id = 'ALL')
+            ORDER BY created_at DESC LIMIT 20
+            """,
+            (qf.upper(), qf),
+        ).fetchall()
+    ]
+    pending_surveys = [
+        {
+            "req_id": str(s["req_id"]),
+            "question_id": str(s["question_id"]),
+            "node_id": str(s["node_id"]),
+            "topic_query": str(s["topic_query"])[:180],
+            "created_at": str(s["created_at"]),
+        }
+        for s in conn.execute(
+            """
+            SELECT req_id, question_id, node_id, topic_query, created_at
+            FROM survey_requests
+            WHERE status = 'PENDING' AND (? = 'ALL' OR question_id = ? OR question_id = 'ALL')
+            ORDER BY created_at ASC LIMIT 20
+            """,
+            (qf.upper(), qf),
+        ).fetchall()
+    ]
+
     return build_tool_receipt(
         conn=conn,
         tool_name="chief_get_overview_snapshot",
         question_id=qf,
-        next_step_guidance="已按 Inline & Spill 返回骨架视图；如需深查任一条证据或原会话锚点，请调用 chief_trace_entity。",
+        next_step_guidance="已按 Inline & Spill 返回骨架视图（含左翼外藏文献卡、待处理工单、待查新队列与 Parse 0 契约摘要）；如需深查任一条证据或阅读完整契约/外藏卡，请调 chief_trace_entity 或 chief_read。",
         data={
             "epoch_id": epoch_id(conn),
             "active_arrangements": arrangements if qf == "ALL" else [
@@ -151,6 +207,12 @@ def tool_chief_get_overview_snapshot(
             "stage": str(p0["stage"]) if p0 else "UNINITIALIZED",
             "autonomy_mode": effective_policy(arrangements).get("autonomy_mode", str(p0["autonomy_mode"]) if p0 else "WAVE_CONFIRM"),
             "latest_spec_revision": int(p0["latest_spec_revision"] or 0) if p0 else 0,
+            "contract_signed": bool(p0 and str(p0["human_signed_at"] or "").strip()),
+            "contract_goal_preview": str(p0["goal_and_completion_md"] or "")[:600] if p0 else "",
+            "external_literature_count": len(external_cards),
+            "external_literature_cards": external_cards,
+            "open_works_tickets": open_tickets,
+            "pending_survey_requests": pending_surveys,
             "closure": dict(closure) if closure else {"status": "OPEN"},
             "subproblems": subproblems,
             "pending_proposals": pending_proposals,
@@ -200,44 +262,81 @@ def tool_chief_trace_entity(
             str(r["conference_id"])
             for r in conn.execute("SELECT conference_id FROM wave_conferences WHERE question_id = ? ORDER BY wave_no DESC LIMIT 5", (eid,)).fetchall()
         ]
+        ext_cards = [
+            {
+                "ref_id": str(r["ref_id"]),
+                "question_id": str(r["question_id"]),
+                "title": str(r["title"]),
+                "read_depth": str(r["read_depth"] or ""),
+            }
+            for r in conn.execute(
+                "SELECT ref_id, question_id, title, read_depth FROM external_literature_cards WHERE question_id = ? OR question_id = 'ALL' ORDER BY ref_id ASC LIMIT 20",
+                (eid,),
+            ).fetchall()
+        ]
         data = {
             "entity_type": "question",
             "state": dict(row),
             "latest_survey": dict(sv) if sv else None,
-            "next_hop_ids": {"l3_entry_ids": l3_ids, "open_gap_ids": gap_ids, "conference_ids": conf_ids},
+            "external_literature_cards": ext_cards,
+            "next_hop_ids": {
+                "external_ref_ids": [c["ref_id"] for c in ext_cards],
+                "l3_entry_ids": l3_ids,
+                "open_gap_ids": gap_ids,
+                "conference_ids": conf_ids,
+            },
         }
     elif et == "entry":
         row = conn.execute("SELECT * FROM internal_research_ledger WHERE entry_id = ?", (eid,)).fetchone()
         if row is None:
-            raise FailClosedError(ERR_NOT_FOUND, f"馆藏条目 {eid!r} 不存在")
-        qid = str(row["question_id"])
-        rev = (
-            conn.execute("SELECT review_id, source_node_id, review_status, final_verdict FROM review_queue WHERE review_id = ?", (row["verified_review_id"],)).fetchone()
-            if row["verified_review_id"]
-            else None
-        )
-        data = {
-            "entity_type": "entry",
-            "entry": {
-                "entry_id": str(row["entry_id"]),
-                "question_id": qid,
-                "ledger_type": str(row["ledger_type"]),
-                "l3_entry_kind": row["l3_entry_kind"],
-                "goal_coverage": row["goal_coverage"],
-                "publish_tier": str(row["publish_tier"]),
-                "verified_spec_revision": int(row["verified_spec_revision"] or 0),
-                "title": str(row["title"]),
-                "abstract_md": str(row["abstract_md"]),
-                "exact_verified_scope_md": row["exact_verified_scope_md"],
-                "exact_refuted_scope_md": row["exact_refuted_scope_md"],
-                "body_preview_md": str(row["body_proof_or_code_md"] or "")[:1200],
-            },
-            "next_hop_ids": {
-                "review_id": str(row["verified_review_id"] or ""),
-                "source_node_id": str(rev["source_node_id"]) if rev else "",
-                "bound_obs_ids": json.loads(row["bound_obs_ids_json"] or "[]"),
-            },
-        }
+            ext = conn.execute("SELECT * FROM external_literature_cards WHERE ref_id = ?", (eid,)).fetchone()
+            if ext is None:
+                raise FailClosedError(ERR_NOT_FOUND, f"馆藏条目 {eid!r} 不存在")
+            qid = str(ext["question_id"])
+            data = {
+                "entity_type": "entry",
+                "entry": {
+                    "entry_id": str(ext["ref_id"]),
+                    "question_id": qid,
+                    "ledger_type": "EXTERNAL_R",
+                    "title": str(ext["title"]),
+                    "read_depth": str(ext["read_depth"] or ""),
+                    "support_scope": str(ext["support_scope"] or ""),
+                    "source_citation": str(ext["source_citation"] or ""),
+                    "abstract_md": str(ext["abstract_md"] or ""),
+                    "created_at": str(ext["created_at"] or ""),
+                },
+                "next_hop_ids": {},
+            }
+        else:
+            qid = str(row["question_id"])
+            rev = (
+                conn.execute("SELECT review_id, source_node_id, review_status, final_verdict FROM review_queue WHERE review_id = ?", (row["verified_review_id"],)).fetchone()
+                if row["verified_review_id"]
+                else None
+            )
+            data = {
+                "entity_type": "entry",
+                "entry": {
+                    "entry_id": str(row["entry_id"]),
+                    "question_id": qid,
+                    "ledger_type": str(row["ledger_type"]),
+                    "l3_entry_kind": row["l3_entry_kind"],
+                    "goal_coverage": row["goal_coverage"],
+                    "publish_tier": str(row["publish_tier"]),
+                    "verified_spec_revision": int(row["verified_spec_revision"] or 0),
+                    "title": str(row["title"]),
+                    "abstract_md": str(row["abstract_md"]),
+                    "exact_verified_scope_md": row["exact_verified_scope_md"],
+                    "exact_refuted_scope_md": row["exact_refuted_scope_md"],
+                    "body_preview_md": str(row["body_proof_or_code_md"] or "")[:1200],
+                },
+                "next_hop_ids": {
+                    "review_id": str(row["verified_review_id"] or ""),
+                    "source_node_id": str(rev["source_node_id"]) if rev else "",
+                    "bound_obs_ids": json.loads(row["bound_obs_ids_json"] or "[]"),
+                },
+            }
     elif et == "review":
         row = conn.execute("SELECT * FROM review_queue WHERE review_id = ?", (eid,)).fetchone()
         if row is None:
@@ -377,7 +476,7 @@ def tool_chief_get_wave_digest(
     question_id: str,
     conference_id: str | None = None,
 ) -> dict[str, Any]:
-    """读取子题最新 1500 字总览与对应波次圆桌纪要/调整建议。"""
+    """读取子题最新 4000 字阶段总览与对应波次圆桌纪要/调整建议。"""
     enforce_role_tool_permission(conn, caller_role, "chief_get_wave_digest", session_id=session_id)
     qid = str(question_id or "").strip()
     if conference_id:

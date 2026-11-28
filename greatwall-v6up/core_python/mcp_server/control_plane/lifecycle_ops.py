@@ -306,12 +306,12 @@ def sync_session_pressure(
     effective_context_window: int | None = None,
     context_window_tokens: int | None = None,
 ) -> dict[str, Any]:
-    """将宿主 DSH TokenMeter 采样的真实压力水位与模型有效窗口 W = min(500k, model_window) 同步至 SQLite，并返回实时 node_status 与 control_state。"""
+    """将宿主 DSH TokenMeter 采样的真实压力水位与模型有效窗口 W = min(360k, model_window) 同步至 SQLite，并返回实时 node_status 与 control_state。"""
     row = conn.execute(
         """
         SELECT node_id, question_id, node_status, control_state, control_generation, pressure_tokens,
                personal_turn_active, human_modified, artifact_dirty_since_last_obs,
-               first_reflection_unlocked, effective_context_window
+               first_reflection_unlocked, effective_context_window, pending_handoff_reason, holiday_completed
         FROM lineage_nodes
         WHERE node_id = ?
         """,
@@ -347,6 +347,8 @@ def sync_session_pressure(
         "question_id": str(row["question_id"]),
         "node_status": str(row["node_status"]),
         "control_state": str(row["control_state"] or "AUTO_RUNNING"),
+        "pending_handoff_reason": row["pending_handoff_reason"],
+        "holiday_completed": bool(row["holiday_completed"]),
         "control_generation": int(row["control_generation"] or 1),
         "personal_turn_active": bool(int(row["personal_turn_active"] or 0)),
         "human_modified": bool(int(row["human_modified"] or 0)),
@@ -411,11 +413,13 @@ def submit_works_ticket(
     instrument_id: str | None = None,
     description: str = "",
     source: str = "main_controller",
+    reporter_session_id: str = "",
 ) -> dict[str, Any]:
-    """控制面/主控向科研仪器科（works_engineering_queue）直接签发正式 OPEN 工单。
+    """向科研仪器科（works_engineering_queue）签发正式 OPEN 工单，内置三道防洪阀：
 
-    适用场景：主控或人类在运行期间发现明显的仪器逻辑缺陷、接口错误、校准集漏洞或缺失探针，
-    通过控制面正规通道入队并立即唤醒工造司（works_engineer）定向修复与升版，严禁越权直改 DB。
+    1. **同键 OPEN 幂等合并**：同 (question_id, ticket_type, instrument_id) 已有 OPEN 工单时直接合并附加报告，绝不重复刷单；
+    2. **单会话限额**：非人类/非总控角色每会话最多新开 2 张工单，防止单个探索者刷爆队列；
+    3. **全院 OPEN 队列软上限**：OPEN 总数 >= 8 时拦截非总控/非人类的低优工单（PAIN_POINT / DUPLICATE_TOOL）。
     """
     desc = str(description or "").strip()
     if not desc:
@@ -429,15 +433,91 @@ def submit_works_ticket(
         )
     iid = str(instrument_id).strip() if instrument_id else None
     src = str(source or "main_controller").strip() or "main_controller"
-    tid = f"tkt_{uuid.uuid4().hex[:10]}"
+    sid = str(reporter_session_id or "").strip()
+    is_privileged = src in ("main_controller", "human_ui", "gw_chief_human", "branch_handback", "chief_direct")
     now = utc_now_iso()
-    payload = {
-        "source": src,
-        "description": desc,
-        "instrument_id": iid,
-        "submitted_at": now,
-    }
+
     with rw_immediate_tx(conn):
+        # 防洪阀 1：同键 OPEN 幂等合并（防多分支对同一仪器重复刷单）
+        existing = conn.execute(
+            """
+            SELECT ticket_id, payload_json, created_at
+            FROM works_engineering_queue
+            WHERE status = 'OPEN'
+              AND question_id = ?
+              AND ticket_type = ?
+              AND COALESCE(instrument_id, '') = COALESCE(?, '')
+            ORDER BY created_at ASC LIMIT 1
+            """,
+            (qid, ttype, iid),
+        ).fetchone()
+        if existing is not None:
+            try:
+                old_payload = json.loads(existing["payload_json"] or "{}")
+            except Exception:
+                old_payload = {}
+            extras = list(old_payload.get("additional_reports") or [])
+            # 完整保留每一条补充报修正文（绝不截断），前端/展示层再按需折叠，确保工造司可按原描述完整复现
+            if len(extras) < 20:
+                extras.append({"source": src, "session_id": sid, "description": desc, "at": now})
+            old_payload["additional_reports"] = extras
+            old_payload["report_count"] = int(old_payload.get("report_count") or 1) + 1
+            conn.execute(
+                "UPDATE works_engineering_queue SET payload_json = ?, updated_at = ? WHERE ticket_id = ?",
+                (json.dumps(old_payload, ensure_ascii=False), now, existing["ticket_id"]),
+            )
+            return {
+                "ticket_id": str(existing["ticket_id"]),
+                "question_id": qid,
+                "ticket_type": ttype,
+                "instrument_id": iid,
+                "status": "OPEN",
+                "source": src,
+                "description": desc,
+                "deduplicated": True,
+                "report_count": old_payload["report_count"],
+                "created_at": str(existing["created_at"]),
+            }
+
+        if not is_privileged:
+            # 防洪阀 2：按在途未结案（status='OPEN'）做背压——每会话最多 2 张在途工单，结案即自动释放
+            if sid:
+                open_mine = [
+                    str(r["ticket_id"])
+                    for r in conn.execute(
+                        """
+                        SELECT ticket_id FROM works_engineering_queue
+                        WHERE status = 'OPEN'
+                          AND json_extract(payload_json, '$.reporter_session_id') = ?
+                        ORDER BY created_at ASC
+                        """,
+                        (sid,),
+                    ).fetchall()
+                ]
+                if len(open_mine) >= 2:
+                    raise FailClosedError(
+                        ERR_INVALID_INPUT,
+                        f"你提交的工单（{', '.join(open_mine)}）正在由工造司处理中，请耐心等待结案后再提新单；当前请先在本地继续推进（补充同类问题可直接传相同 instrument_id 合并附加说明）。",
+                    )
+            # 防洪阀 3：全院 OPEN 队列 >= 8 时拦截非高优工单
+            open_cnt = conn.execute(
+                "SELECT COUNT(*) FROM works_engineering_queue WHERE status = 'OPEN'"
+            ).fetchone()[0]
+            if int(open_cnt or 0) >= 8 and ttype not in ("EXPLOIT", "INSTRUMENT_ERROR"):
+                raise FailClosedError(
+                    ERR_INVALID_INPUT,
+                    f"工造司当前队列较忙（待处理 {open_cnt} 张），请耐心等待现有工单消化后再提低优 {ttype} 工单；紧急缺陷请标 INSTRUMENT_ERROR 或上报 gw_chief。",
+                )
+
+        tid = f"tkt_{uuid.uuid4().hex[:10]}"
+        payload = {
+            "source": src,
+            "reporter_session_id": sid,
+            "description": desc,
+            "instrument_id": iid,
+            "report_count": 1,
+            "submitted_at": now,
+        }
         conn.execute(
             """
             INSERT INTO works_engineering_queue(
@@ -455,8 +535,46 @@ def submit_works_ticket(
         "status": "OPEN",
         "source": src,
         "description": desc,
+        "deduplicated": False,
+        "report_count": 1,
         "created_at": now,
     }
+
+
+def cancel_works_ticket(
+    conn: sqlite3.Connection,
+    *,
+    ticket_id: str,
+    reason: str = "",
+    actor: str = "gw_chief_human",
+) -> dict[str, Any]:
+    """撤回/取消尚未结案的 OPEN 工单（置为 WONTFIX 并留痕），供总控或人类在误派时及时止损。"""
+    tid = str(ticket_id or "").strip()
+    if not tid:
+        raise FailClosedError(ERR_INVALID_INPUT, "ticket_id 不能为空")
+    now = utc_now_iso()
+    with rw_immediate_tx(conn):
+        row = conn.execute(
+            "SELECT ticket_id, status, payload_json FROM works_engineering_queue WHERE ticket_id = ?",
+            (tid,),
+        ).fetchone()
+        if row is None:
+            raise FailClosedError(ERR_NOT_FOUND, f"工单 {tid!r} 不存在")
+        if str(row["status"]) != "OPEN":
+            raise FailClosedError(ERR_INVALID_INPUT, f"工单 {tid!r} 当前状态为 {row['status']}，仅 OPEN 工单可撤回")
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except Exception:
+            payload = {}
+        payload["resolution"] = "WONTFIX"
+        payload["cancelled_by"] = actor
+        payload["cancel_reason"] = str(reason or "人类/总控主动撤单").strip()
+        payload["cancelled_at"] = now
+        conn.execute(
+            "UPDATE works_engineering_queue SET status = 'RESOLVED', payload_json = ?, updated_at = ? WHERE ticket_id = ?",
+            (json.dumps(payload, ensure_ascii=False), now, tid),
+        )
+    return {"ticket_id": tid, "status": "RESOLVED", "resolution": "WONTFIX", "cancel_reason": payload["cancel_reason"]}
 
 
 def pass_stage1_parse0_gate(conn: sqlite3.Connection) -> dict[str, Any]:

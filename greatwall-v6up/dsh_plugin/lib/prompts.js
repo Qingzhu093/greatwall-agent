@@ -1,23 +1,16 @@
 /**
- * GreatWall Agent v0.3 十大标准角色契约、47 个去重窄工具路由表与平台感知原生工具白名单。
+ * GreatWall Agent 十大角色契约与平台感知原生工具白名单。
  * 权威单一契约源位于 `core_python/mcp_server/tool_registry.py`，由跨层架构测试与 doctor 强制校验 100% 同步。
  * @module dsh-greatwall-v6up/prompts
  */
 import fs from 'node:fs'
 import path from 'node:path'
 
-export const CANONICAL_ROLES = Object.freeze([
-  'gw_chief',
-  'supervisory_committee',
-  'works_engineer',
-  'explorer',
-  'lineage_companion',
-  'logistics_coordinator',
-  'external_surveyor',
-  'library_chronicler',
-  'library_verifier',
-  'conference_chair',
-])
+const contracts = JSON.parse(fs.readFileSync(new URL('./contracts.generated.json', import.meta.url), 'utf8'))
+export const CONTRACTS_SCHEMA_VERSION = contracts.schema_version
+export const CANONICAL_ROLES = Object.freeze(contracts.canonical_roles)
+export const READONLY_BLOCKED_MCP_TOOLS = Object.freeze(new Set(contracts.readonly_blocked_mcp_tools))
+export const LONG_RUNNING_MCP_TOOLS = Object.freeze(new Set(contracts.long_running_mcp_tools))
 
 export const ROLE_EFFORT_MAP = Object.freeze({
   gw_chief: 'medium',
@@ -32,79 +25,9 @@ export const ROLE_EFFORT_MAP = Object.freeze({
   supervisory_committee: 'low',
 })
 
-/** 10 角色授权 MCP 窄工具精确白名单（总去重 47 个，与 Python tool_registry.py 100% 一致）。 */
-export const ROLE_MCP_TOOLS = Object.freeze({
-  gw_chief: Object.freeze([
-    'chief_get_overview_snapshot',
-    'chief_trace_entity',
-    'chief_read',
-    'chief_operate',
-    'chief_send_branch_note',
-    'chief_seed_branch',
-    'chief_preview_impact',
-    'chief_propose_control_action',
-  ]),
-  explorer: Object.freeze([
-    'run_isolated_eval',
-    'get_living_survey',
-    'query_library_catalog',
-    'get_library_entry',
-    'request_literature_survey',
-    'read_lineage_graph',
-    'handback_to_chief',
-  ]),
-  lineage_companion: Object.freeze([
-    'get_living_survey',
-    'query_library_catalog',
-    'get_library_entry',
-    'get_companion_context',
-    'save_lineage_briefing',
-    'record_reflection_and_unlock_pull',
-    'submit_node_handoff',
-    'submit_conference_statement',
-  ]),
-  logistics_coordinator: Object.freeze([
-    'get_logistics_dashboard',
-    'register_method_family',
-    'triage_node',
-    'fork_branch',
-  ]),
-  external_surveyor: Object.freeze([
-    'get_survey_requests',
-    'publish_external_literature_card',
-  ]),
-  library_chronicler: Object.freeze([
-    'get_chronicler_snapshot',
-    'publish_living_survey',
-    'export_stage3_final_delivery',
-  ]),
-  conference_chair: Object.freeze([
-    'get_conference_dossier',
-    'record_conference_minutes',
-    'submit_conference_verdict',
-  ]),
-  library_verifier: Object.freeze([
-    'get_blind_manuscript',
-    'submit_stage1_blind_ledger',
-    'get_unblinded_manuscript_and_peers',
-    'submit_stage2_unblind_verdict',
-    'propose_salvaged_lemma',
-  ]),
-  works_engineer: Object.freeze([
-    'get_works_engineering_queue',
-    'register_question_instrument',
-    'upgrade_instrument_with_calibration',
-    'recompute_stage_b_only',
-    'update_skill_ledger',
-    'resolve_works_ticket',
-  ]),
-  supervisory_committee: Object.freeze([
-    'get_supervisory_audit_snapshot',
-    'check_stage2_closure_gate',
-    'record_compliance_check',
-    'register_saved_graph_query',
-  ]),
-})
+export const ROLE_MCP_TOOLS = Object.freeze(Object.fromEntries(
+  Object.entries(contracts.role_mcp_tools).map(([role, tools]) => [role, Object.freeze(tools)]),
+))
 
 /** 已封存伴随助手进入圆桌参会态时的只读窄工具子集（物理卸载全部档案写工具）。 */
 export const SEALED_COMPANION_CONFERENCE_TOOLS = Object.freeze([
@@ -184,19 +107,7 @@ export function formatNodeSessionTitle(role, { questionId = '', branchId = '', n
 }
 
 /** 触发回合优雅收尾（exec.concludeTurn）的工具集合（与 Python tool_registry.py 同步）。 */
-export const TURN_CONCLUDING_TOOLS = Object.freeze(new Set([
-  'save_lineage_briefing',
-  'record_reflection_and_unlock_pull',
-  'submit_node_handoff',
-  'submit_conference_statement',
-  'publish_living_survey',
-  'export_stage3_final_delivery',
-  'record_conference_minutes',
-  'submit_conference_verdict',
-  'submit_stage1_blind_ledger',
-  'submit_stage2_unblind_verdict',
-  'record_compliance_check',
-]))
+export const TURN_CONCLUDING_TOOLS = Object.freeze(new Set(contracts.turn_concluding_tools))
 
 export function loadCoreRuntimeConfig(corePythonRoot) {
   const cfgPath = path.join(corePythonRoot, 'config.json')

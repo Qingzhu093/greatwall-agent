@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS runtime_effects (
         'CANCEL_NODE_SESSION',
         'WAKE_BLOCKED_BRANCH',
         'REFRESH_LIVING_SURVEY',
+        'RUN_INTERNAL_SURVEY',
         'RUN_WAVE_CONFERENCE',
         'NOTIFY_POLICY_CHANGED',
         'NOTIFY_CHIEF', 'DELIVER_BRANCH_NOTE', 'DELIVER_HANDBACK_RECEIPT'
@@ -118,6 +119,8 @@ CREATE TABLE IF NOT EXISTS open_lemma_gaps (
     blocked_node_id TEXT NOT NULL REFERENCES lineage_nodes(node_id),
     formal_statement_md TEXT NOT NULL,
     verification_spec_md TEXT NOT NULL DEFAULT '',
+    gap_tier TEXT NOT NULL DEFAULT 'LOAD_BEARING' CHECK(gap_tier IN ('LOAD_BEARING', 'IMPROVEMENT')),
+    source_entry_id TEXT,
     status TEXT NOT NULL DEFAULT 'OPEN' CHECK(status IN ('OPEN', 'FULFILLED', 'CANCELLED')),
     fulfilled_by_entry_id TEXT REFERENCES internal_research_ledger(entry_id),
     created_at TEXT NOT NULL,
@@ -153,7 +156,7 @@ CREATE TABLE IF NOT EXISTS control_proposals (
 CREATE INDEX IF NOT EXISTS idx_proposals_status ON control_proposals(status, created_at);
 
 -- ============================================================================
--- 25. 子题活体综述导览表 (subproblem_living_surveys，<=1500 字高密度导览索引)
+-- 25. 子题活体综述导览表 (subproblem_living_surveys，<=4000 字阶段总览索引)
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS subproblem_living_surveys (
     survey_id TEXT PRIMARY KEY,
@@ -163,7 +166,8 @@ CREATE TABLE IF NOT EXISTS subproblem_living_surveys (
     sec2_l3_lemma_tree_md TEXT NOT NULL,
     sec3_avoidance_radar_md TEXT NOT NULL,
     sec4_explicit_gaps_md TEXT NOT NULL,
-    total_chars INTEGER NOT NULL CHECK(total_chars <= 1500),
+    marginal_notes_md TEXT NOT NULL DEFAULT '' CHECK(length(marginal_notes_md) <= 1500),
+    total_chars INTEGER NOT NULL CHECK(total_chars <= 4000),
     trigger_reason TEXT NOT NULL DEFAULT 'MANUAL',
     created_at TEXT NOT NULL,
     UNIQUE(question_id, revision)
@@ -191,10 +195,14 @@ CREATE TABLE IF NOT EXISTS wave_conferences (
     )),
     participant_nodes_json TEXT NOT NULL,
     critiques_ledger_json TEXT NOT NULL DEFAULT '[]',
-    minutes_md TEXT NOT NULL DEFAULT '',
+    agenda_json TEXT NOT NULL DEFAULT '{}',
+    human_agenda_md TEXT NOT NULL DEFAULT '',
+    minutes_md TEXT NOT NULL DEFAULT '' CHECK(length(minutes_md) <= 6000),
+    peer_takeaways_json TEXT NOT NULL DEFAULT '{}',
     linked_survey_id TEXT REFERENCES subproblem_living_surveys(survey_id),
     chair_session_id TEXT NOT NULL DEFAULT '',
     verdict_json TEXT,
+    convergence_mode TEXT CHECK(convergence_mode IN ('NONE', 'CONVERGE_FULL_COMPOSITE', 'CONVERGE_SATURATED') OR convergence_mode IS NULL),
     synthesis_budget_nodes INTEGER NOT NULL DEFAULT 2,
     created_at TEXT NOT NULL,
     completed_at TEXT,

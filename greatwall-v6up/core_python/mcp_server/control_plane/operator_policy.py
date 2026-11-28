@@ -21,7 +21,9 @@ DRAIN_BY_POLICY = {"NO_NEW_DISPATCH": "FINISH_CURRENT_TURN", "PAUSED_ALL": "IMME
 OCCUPIED_BRANCHES = """
     SELECT DISTINCT n.branch_id FROM lineage_nodes n
     LEFT JOIN operator_runtime_slots s ON s.node_id = n.node_id
-    WHERE n.question_id = ? AND (
+    WHERE n.question_id = ?
+      AND NOT (n.control_state IN ('DRAIN_AFTER_TURN','HIBERNATED') AND n.pending_handoff_reason LIKE 'HIBERNATED_BY_WAVE_CONFERENCE%')
+      AND (
         s.node_id IS NOT NULL OR (
             n.node_status IN ('EXPLORING','ACTIVE_REVISING','AWAITING_TRIAGE','PENDING_REVIEW')
             AND n.control_state NOT IN ('HIBERNATED','HUMAN_ACTIVE')
@@ -103,7 +105,7 @@ def worker_slot_cap(policy: dict, requested: int | None = None) -> int:
 
 def check_question_branch_quota(
     conn: sqlite3.Connection, question_id: str, *, family_id: str = "",
-    replacing_branch_id: str = "", human_named: bool = False,
+    replacing_branch_id: str = "", human_named: bool = False, released_branch_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     state = conn.execute("SELECT * FROM subproblem_runtime_state WHERE question_id=?", (question_id,)).fetchone()
     policy = effective_policy(active_arrangements(conn), question_id, base=dict(state) if state else None)
@@ -119,7 +121,7 @@ def check_question_branch_quota(
     ).fetchone():
         raise FailClosedError(ERR_LOCKED, f"学派 {family_id} 已归档，请先显式恢复")
     branches = {row["branch_id"] for row in conn.execute(OCCUPIED_BRANCHES, (question_id,))}
-    if len(branches - {replacing_branch_id}) >= policy["max_active_branches"]:
+    if len(branches - {replacing_branch_id} - (released_branch_ids or set())) >= policy["max_active_branches"]:
         raise FailClosedError(ERR_LOCKED, f"{question_id} 活跃分支已达到上限 {policy['max_active_branches']}")
     return policy
 

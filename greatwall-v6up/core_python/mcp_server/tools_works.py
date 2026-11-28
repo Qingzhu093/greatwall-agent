@@ -236,6 +236,8 @@ def tool_upgrade_instrument_with_calibration(
     artifact_schema: str | None = None,
     default_spec: dict[str, Any] | None = None,
     cancel_event: Any = None,
+    resolved_ticket_ids: list[str] | None = None,
+    upgrade_summary_md: str = "",
 ) -> dict[str, Any]:
     """校准集回归驱动仪器升版（100% 过校准即直接升版，支持同步更新 artifact_schema 与 default_spec，仅局部将该仪器旧观测入待重评队列，绝零误杀他题）。"""
     enforce_role_tool_permission(conn, caller_role, "upgrade_instrument_with_calibration", session_id=session_id)
@@ -247,6 +249,11 @@ def tool_upgrade_instrument_with_calibration(
         raise FailClosedError(ERR_NOT_FOUND, f"仪器 {instrument_id!r} 尚未注册，请先调 register_question_instrument")
     if str(cur["question_id"]) != str(question_id):
         raise FailClosedError(ERR_INVALID_INPUT, f"仪器 {instrument_id!r} 归属 {cur['question_id']!r} 而非 {question_id!r}")
+
+    ticket_ids = list(dict.fromkeys(resolved_ticket_ids or []))
+    summary = upgrade_summary_md.strip()
+    if ticket_ids and not summary:
+        raise FailClosedError(ERR_INVALID_INPUT, "结案 resolved_ticket_ids 时必须提供非空 upgrade_summary_md")
 
     new_abs = _resolve_ws_or_core_file(workspace_root, new_instrument_rel_path)
     norm_new_rel = _norm_rel_path(workspace_root, new_abs, new_instrument_rel_path)
@@ -358,11 +365,18 @@ def tool_upgrade_instrument_with_calibration(
         if queued_obs:
             propagate_dependency_recheck(conn, queued_obs)
 
-        # 关闭该仪器此前打开的故障工单
-        conn.execute(
-            "UPDATE works_engineering_queue SET status = 'RESOLVED', updated_at = ? WHERE instrument_id = ? AND ticket_type = 'INSTRUMENT_ERROR' AND status = 'OPEN'",
-            (now, instrument_id),
-        )
+        for ticket_id in ticket_ids:
+            updated = conn.execute(
+                """
+                UPDATE works_engineering_queue
+                SET status = 'RESOLVED', resolution_note = ?, resolved_by_version = ?, updated_at = ?
+                WHERE ticket_id = ? AND question_id = ? AND instrument_id = ? AND status = 'OPEN'
+                """,
+                (f"[Instrument v{new_ver} 校准通过自动结案] {summary}", new_ver, now,
+                 ticket_id, question_id, instrument_id),
+            )
+            if updated.rowcount != 1:
+                raise FailClosedError(ERR_INVALID_INPUT, f"工单 {ticket_id!r} 必须属于本子题、仪器且处于 OPEN")
 
     sync_public_instruments_to_all_active_worktrees(conn, workspace_root)
 
@@ -381,6 +395,7 @@ def tool_upgrade_instrument_with_calibration(
             "new_instrument_sha256": new_sha,
             "calibration_report": cal_report,
             "pending_revalidation_obs_ids": queued_obs,
+            "resolved_ticket_ids": ticket_ids,
         },
     )
 
@@ -455,6 +470,7 @@ def tool_recompute_stage_b_only(
         instrument_path=inst_abs,
         instrument_role=str(new_inst["instrument_role"]),
         stage_a_output_path=stage_a_path,
+        code_snapshot_path=obs["frozen_code_snapshot_path"],
         spec=spec,
         tier=str(obs["tier"]),
         cancel_event=cancel_event,
@@ -568,9 +584,9 @@ def tool_recompute_stage_b_only(
             INSERT INTO observations(
                 obs_id, question_id, branch_id, node_id, instrument_id, instrument_version, tier,
                 candidate_entry_sha256, tools_dir_sha256, spec_sha256, instrument_sha256, cache_key,
-                stage_a_artifact_path, revalidated_from_obs_id, obs_status, tracks_json,
+                frozen_code_snapshot_path, stage_a_artifact_path, revalidated_from_obs_id, obs_status, tracks_json,
                 details_text, linguistic_prediction, spec_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 new_obs_id,
@@ -584,6 +600,7 @@ def tool_recompute_stage_b_only(
                 str(obs["tools_dir_sha256"]),
                 str(obs["spec_sha256"]),
                 str(new_inst["instrument_sha256"]),
+                obs["frozen_code_snapshot_path"],
                 stage_a_path,
                 obs_id,
                 new_obs_status,
@@ -743,39 +760,27 @@ def tool_resolve_works_ticket(
     if len(note) < 5:
         raise FailClosedError(ERR_INVALID_INPUT, "resolution_note 须至少 5 个字符，清楚写明核查结果或处理依据")
 
-    row = conn.execute("SELECT * FROM works_engineering_queue WHERE ticket_id = ?", (tid,)).fetchone()
-    if row is None:
-        raise FailClosedError(ERR_NOT_FOUND, f"工单 {tid!r} 不存在")
-    if str(row["status"]) == "RESOLVED":
-        return build_tool_receipt(
-            conn=conn,
-            tool_name="resolve_works_ticket",
-            question_id=str(row["question_id"]),
-            next_step_guidance=f"工单 {tid} 此前已结案，幂等跳过。",
-            data={"ticket_id": tid, "status": "RESOLVED", "idempotent_skip": True},
-        )
-
-    try:
-        payload = json.loads(row["payload_json"] or "{}")
-        if not isinstance(payload, dict):
-            payload = {"raw_payload": payload}
-    except Exception:
-        payload = {"raw_payload": str(row["payload_json"] or "")}
-
     now = utc_now_iso()
-    payload["resolution"] = res_u
-    payload["resolution_note"] = note
-    payload["resolved_by_session"] = str(session_id or "")
-    payload["resolved_at"] = now
-
     with rw_immediate_tx(conn):
+        row = conn.execute("SELECT * FROM works_engineering_queue WHERE ticket_id = ?", (tid,)).fetchone()
+        if row is None:
+            raise FailClosedError(ERR_NOT_FOUND, f"工单 {tid!r} 不存在")
+        if row["status"] != "OPEN":
+            return build_tool_receipt(
+                conn=conn,
+                tool_name="resolve_works_ticket",
+                question_id=row["question_id"],
+                next_step_guidance=f"工单 {tid} 已结案为 {row['status']}。",
+                data={"ticket_id": tid, "status": row["status"],
+                      "resolution_note": row["resolution_note"], "idempotent_skip": True},
+            )
         conn.execute(
             """
             UPDATE works_engineering_queue
-            SET status = 'RESOLVED', payload_json = ?, updated_at = ?
+            SET status = ?, resolution_note = ?, updated_at = ?
             WHERE ticket_id = ?
             """,
-            (json.dumps(payload, ensure_ascii=False), now, tid),
+            (res_u, note, now, tid),
         )
 
     return build_tool_receipt(
@@ -787,8 +792,44 @@ def tool_resolve_works_ticket(
             "ticket_id": tid,
             "ticket_type": str(row["ticket_type"]),
             "question_id": str(row["question_id"]),
-            "status": "RESOLVED",
+            "status": res_u,
             "resolution": res_u,
             "resolution_note": note,
         },
+    )
+
+
+def tool_submit_works_ticket(
+    conn: sqlite3.Connection,
+    caller_role: str,
+    session_id: str,
+    question_id: str = "ALL",
+    ticket_type: str = "PAIN_POINT",
+    description: str = "",
+    instrument_id: str | None = None,
+) -> dict[str, Any]:
+    """全院共享的工造司报修/公共工具需求入口（内置同键 OPEN 幂等合并、单会话限 2 单与全院队列软上限防洪阀）。"""
+    enforce_role_tool_permission(conn, caller_role, "submit_works_ticket", session_id=session_id)
+    from .control_plane.lifecycle_ops import submit_works_ticket
+
+    res = submit_works_ticket(
+        conn,
+        question_id=question_id,
+        ticket_type=ticket_type,
+        instrument_id=instrument_id,
+        description=description,
+        source=f"role:{caller_role}",
+        reporter_session_id=str(session_id or ""),
+    )
+    msg = (
+        f"同类工单 {res['ticket_id']} 正在由工造司处理中，已将你的补充说明合并附入（累计 {res.get('report_count', 1)} 条），请耐心等待，无需重复刷单。"
+        if res.get("deduplicated")
+        else f"工单 {res['ticket_id']} ({res['ticket_type']}) 已进入工造司队列等待处理，请耐心等待并继续推进当前任务。"
+    )
+    return build_tool_receipt(
+        conn=conn,
+        tool_name="submit_works_ticket",
+        question_id=str(res["question_id"]),
+        next_step_guidance=msg,
+        data=res,
     )

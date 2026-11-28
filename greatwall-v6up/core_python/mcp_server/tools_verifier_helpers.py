@@ -11,9 +11,11 @@ from .control_plane.effects_outbox import enqueue_runtime_effect
 from .control_plane.subproblem_locks import get_subproblem_active_spec_revision
 from .db_schema import (
     ERR_CONFLICT,
+    ERR_INVALID_INPUT,
+    ERR_LOCKED,
     FailClosedError,
 )
-from .mcp_core_helpers import load_runtime_config, next_prefixed_id
+from .mcp_core_helpers import load_runtime_config, next_prefixed_id, record_declared_refs
 
 
 def require_non_self_review(
@@ -39,7 +41,105 @@ def require_non_self_review(
 
 def is_local_lemma_review(rev: sqlite3.Row) -> bool:
     """裁决 2：从活节点独立拆交的局部引理走一次性盲审，绝不锁死也不打断继续推进的原分支。"""
-    return str(rev["source_type"] or "").strip().upper() == "LOCAL_LEMMA_SUBMISSION"
+    return bool(rev["non_blocking"])
+
+
+def validate_review_score(name: str, score: int | None) -> None:
+    if type(score) is not int or not 1 <= score <= 10:
+        raise FailClosedError(ERR_INVALID_INPUT, f"{name} 必须是 1–10 的整数")
+
+
+def require_unclosed_stage2(conn: sqlite3.Connection, review_id: str) -> None:
+    row = conn.execute("SELECT review_status FROM review_queue WHERE review_id = ?", (review_id,)).fetchone()
+    if row["review_status"] != "STAGE2_UNBLIND":
+        raise FailClosedError(ERR_LOCKED, f"审稿单 {review_id} 已有终判")
+
+
+def review_author(conn: sqlite3.Connection, review: sqlite3.Row) -> tuple[str | None, str | None, str | None]:
+    if review["source_type"] == "COMPOSITE_FULL_GOAL":
+        return None, None, None
+    node = conn.execute(
+        "SELECT node_id, branch_id, family_id FROM lineage_nodes WHERE node_id = ?",
+        (review["source_node_id"],),
+    ).fetchone()
+    return tuple(node) if node is not None else (review["source_node_id"], None, None)
+
+
+def build_peer_calibration_pack(conn: sqlite3.Connection, question_id: str) -> dict[str, Any]:
+    contract = conn.execute(
+        "SELECT goal_and_completion_md, latest_ruling_summary_md FROM parse0_contract WHERE contract_id = 'active'"
+    ).fetchone()
+    papers = conn.execute(
+        """
+        SELECT entry_id, title, scope_md, author_family_id, rigor_score, novelty_score,
+               significance_score, overall_score, publish_tier, verified_spec_revision
+        FROM v_library_mini_papers_catalog
+        WHERE question_id = ? AND ledger_type = 'L3_VERIFIED'
+        """,
+        (question_id,),
+    )
+    gaps = conn.execute(
+        """
+        SELECT gap_id, blocked_node_id, formal_statement_md, verification_spec_md
+        FROM open_lemma_gaps WHERE question_id = ? AND status = 'OPEN' AND gap_tier = 'LOAD_BEARING'
+        ORDER BY created_at
+        """,
+        (question_id,),
+    )
+    radar = conn.execute("SELECT * FROM v_library_avoidance_radar WHERE question_id = ?", (question_id,))
+    return {
+        "goal_and_completion_md": contract["goal_and_completion_md"] if contract else "",
+        "latest_ruling_summary_md": contract["latest_ruling_summary_md"] if contract else "",
+        "papers": [dict(row) for row in papers],
+        "open_lemma_gaps": [dict(row) for row in gaps],
+        "avoidance_radar": [dict(row) for row in radar],
+    }
+
+
+def composite_entries(conn: sqlite3.Connection, review: sqlite3.Row) -> list[dict[str, Any]]:
+    ids = json.loads(review["composite_entry_ids_json"])
+    result = [dict(row) for row in conn.execute(
+        """
+        SELECT * FROM internal_research_ledger
+        WHERE entry_id IN (SELECT value FROM json_each(?)) AND question_id = ?
+          AND ledger_type = 'L3_VERIFIED' AND is_active = 1 AND publish_tier != 'MARGINAL_NOTE'
+          AND verified_spec_revision >= ? AND rigor_score >= 7
+        ORDER BY entry_id
+        """,
+        (review["composite_entry_ids_json"], review["question_id"],
+         get_subproblem_active_spec_revision(conn, review["question_id"])),
+    )]
+    if len(ids) < 2 or len(result) != len(ids):
+        raise FailClosedError(ERR_LOCKED, "组合完备核验须包含至少两篇当前口径且严密性达标的有效 L3")
+    return result
+
+
+def validate_library_citations(
+    conn: sqlite3.Connection, ids: list[str], *, question_id: str | None = None,
+) -> list[str]:
+    unique_ids = list(dict.fromkeys(ids))
+    for ref in unique_ids:
+        row = conn.execute(
+            """
+            SELECT question_id FROM internal_research_ledger WHERE entry_id = ? AND is_active = 1
+            UNION ALL SELECT question_id FROM external_literature_cards WHERE ref_id = ?
+            """,
+            (ref, ref),
+        ).fetchone()
+        if row is None:
+            raise FailClosedError(ERR_INVALID_INPUT, f"引用 {ref!r} 不存在或已失效")
+        if question_id is not None and row["question_id"] not in (question_id, "ALL"):
+            raise FailClosedError(ERR_INVALID_INPUT, f"引用 {ref!r} 超出子题 {question_id} 专题范围")
+    return unique_ids
+
+
+def record_publication_citations(
+    conn: sqlite3.Connection, entry_id: str, citations: list[str], session_id: str, *, composite: bool,
+) -> None:
+    record_declared_refs(
+        conn, source_id=entry_id, declared_refs=citations, session_id=session_id,
+        default_edge_type="REQUIRED_PREMISE" if composite else "MOTIVATING_REF",
+    )
 
 
 def archive_to_l2_and_seal(
@@ -52,16 +152,21 @@ def archive_to_l2_and_seal(
     refuted_scope: str,
     now: str,
     seal_source_node: bool = True,
+    rigor_score: int | None = None,
+    novelty_score: int | None = None,
+    significance_score: int | None = None,
+    reviewer_comment_md: str = "",
 ) -> str:
     entry_id = next_prefixed_id(conn, "internal_research_ledger", "entry_id", "L2-")
     conn.execute(
         """
         INSERT INTO internal_research_ledger(
-            entry_id, question_id, ledger_type, l3_entry_kind, goal_coverage, l2_category,
+            entry_id, question_id, ledger_type, l3_entry_kind, goal_coverage, publish_tier, l2_category,
             title, abstract_md, exact_verified_scope_md, exact_refuted_scope_md,
             body_proof_or_code_md, bound_obs_ids_json, verified_review_id,
-            verified_spec_revision, is_active, created_at
-        ) VALUES (?, ?, 'L2_FAILURE_RECORD', NULL, NULL, ?, ?, ?, NULL, ?, ?, ?, ?, ?, 1, ?)
+            verified_spec_revision, is_active, created_at, author_node_id, author_branch_id, author_family_id,
+            rigor_score, novelty_score, significance_score, reviewer_comment_md
+        ) VALUES (?, ?, 'L2_FAILURE_RECORD', NULL, NULL, '', ?, ?, ?, NULL, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             entry_id,
@@ -75,6 +180,9 @@ def archive_to_l2_and_seal(
             str(rev["review_id"]),
             int(rev["spec_revision"] or 0),
             now,
+            *review_author(conn, rev),
+            rigor_score if rigor_score is not None else rev["rigor_score"],
+            novelty_score, significance_score, reviewer_comment_md,
         ),
     )
     if seal_source_node and not is_local_lemma_review(rev):
@@ -104,6 +212,30 @@ def apply_revise_or_exhaust(
             """,
             (now, json.dumps(revision_items, ensure_ascii=False), now, rev["review_id"]),
         )
+        latest = conn.execute(
+            """
+            SELECT target.node_id
+            FROM lineage_nodes author
+            JOIN lineage_nodes target ON target.branch_id = author.branch_id AND target.question_id = author.question_id
+            WHERE author.node_id = ?
+            ORDER BY target.generation DESC LIMIT 1
+            """,
+            (rev["source_node_id"],),
+        ).fetchone()
+        if latest is not None:
+            item = {"review_id": rev["review_id"], "revision_requests": revision_items, "created_at": now}
+            conn.execute(
+                """
+                UPDATE lineage_nodes SET pending_review_feedback_json =
+                    json_insert(pending_review_feedback_json, '$[#]', json(?)) WHERE node_id = ?
+                """,
+                (json.dumps(item, ensure_ascii=False), latest["node_id"]),
+            )
+            enqueue_runtime_effect(
+                conn, effect_key=f"review_feedback:{rev['review_id']}", kind="DELIVER_BRANCH_NOTE",
+                target_type="NODE", target_id=latest["node_id"],
+                payload={"message": f"快照稿 {rev['review_id']} 已退修，请查阅分支待处理审稿意见。"},
+            )
         return {
             "exhausted_to_l2": False,
             "local_lemma_one_shot": True,
@@ -202,7 +334,7 @@ def fulfill_open_gaps_and_wake_branches(
     active_spec_rev = get_subproblem_active_spec_revision(conn, question_id)
     for gid in clean_ids:
         gap = conn.execute(
-            "SELECT * FROM open_lemma_gaps WHERE gap_id = ? AND question_id = ? AND status = 'OPEN'",
+            "SELECT * FROM open_lemma_gaps WHERE gap_id = ? AND question_id = ? AND status = 'OPEN' AND gap_tier = 'LOAD_BEARING'",
             (gid, question_id),
         ).fetchone()
         if gap is None:

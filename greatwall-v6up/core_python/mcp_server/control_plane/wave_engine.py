@@ -9,16 +9,14 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
-import os
-import shutil
 import sqlite3
 import uuid
-from pathlib import Path
 from typing import Any
 
+from ..db.enums import ALLOWED_CONFERENCE_SPEECH_ACTS
 from ..db_schema import (
-    ALLOWED_WAVE_VERDICT_ACTIONS,
     ERR_CONFLICT,
     ERR_INVALID_INPUT,
     ERR_LOCKED,
@@ -29,13 +27,17 @@ from ..db_schema import (
 )
 from ..mcp_core_helpers import load_runtime_config
 from .effects_outbox import enqueue_runtime_effect
-from .lifecycle_ops import submit_works_ticket
 from .proposals import create_control_proposal
+from .snapshot_queries import fetch_streetlight_warning_questions
 from .subproblem_locks import evaluate_subproblem_locks, get_subproblem_active_spec_revision
-from .workspace_sync import (
-    restore_retained_candidate_snapshot,
-    sync_approved_public_inputs,
-    sync_public_instruments_and_skills_to_worktree,
+from .operator_policy import active_arrangements, effective_policy
+from .wave_verdict_actions import PreparedBranch, execute_wave_phases, prepare_wave_growth, validate_wave_actions
+
+
+_WORKSHOP_QUESTIONS = (
+    "拼图覆盖核对：馆藏与实证覆盖哪些子域，剩下哪些承重缺口？",
+    "接口排雷与嫁接：前提、坐标系和退化边界在哪里断裂，怎样修补？",
+    "反路灯自省：哪些边缘争论应停止投入，是否具备组合完备或饱和止盈条件？",
 )
 
 
@@ -54,6 +56,7 @@ def build_wave_hard_ledger(conn: sqlite3.Connection, question_id: str) -> dict[s
             FROM lineage_nodes
             WHERE question_id = ?
               AND node_status IN ('EXPLORING','ACTIVE_REVISING','AWAITING_TRIAGE','PENDING_REVIEW')
+              AND control_state NOT IN ('HIBERNATED','DRAIN_AFTER_TURN')
             GROUP BY branch_id
             """,
             (qid,),
@@ -63,10 +66,11 @@ def build_wave_hard_ledger(conn: sqlite3.Connection, question_id: str) -> dict[s
         dict(r)
         for r in conn.execute(
             """
-            SELECT entry_id, l3_entry_kind, goal_coverage, publish_tier, verified_spec_revision, title, created_at
+            SELECT entry_id, l3_entry_kind, goal_coverage, publish_tier, verified_spec_revision, title, created_at,
+                   author_family_id, exact_verified_scope_md, rigor_score, novelty_score, significance_score, overall_score
             FROM internal_research_ledger
             WHERE question_id = ? AND ledger_type = 'L3_VERIFIED' AND is_active = 1
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, entry_id DESC
             """,
             (qid,),
         ).fetchall()
@@ -86,7 +90,7 @@ def build_wave_hard_ledger(conn: sqlite3.Connection, question_id: str) -> dict[s
     open_gaps = [
         dict(r)
         for r in conn.execute(
-            "SELECT gap_id, blocked_node_id, formal_statement_md, created_at FROM open_lemma_gaps WHERE question_id = ? AND status = 'OPEN' ORDER BY created_at ASC",
+            "SELECT gap_id, blocked_node_id, formal_statement_md, created_at FROM open_lemma_gaps WHERE question_id = ? AND status = 'OPEN' AND gap_tier = 'LOAD_BEARING' ORDER BY created_at ASC",
             (qid,),
         ).fetchall()
     ]
@@ -109,6 +113,7 @@ def build_wave_hard_ledger(conn: sqlite3.Connection, question_id: str) -> dict[s
         "active_branches": active_branches,
         "verified_l3_count": len(l3_rows),
         "verified_l3": l3_rows,
+        "streetlight_warning": "STREETLIGHT_WARNING" if qid in fetch_streetlight_warning_questions(conn) else None,
         "refuted_l2_count": len(l2_rows),
         "refuted_l2": l2_rows,
         "open_lemma_gaps": open_gaps,
@@ -117,16 +122,34 @@ def build_wave_hard_ledger(conn: sqlite3.Connection, question_id: str) -> dict[s
 
 
 def _collect_sealed_conference_participants(conn: sqlite3.Connection, question_id: str) -> list[dict[str, Any]]:
-    """收集各活跃分支最近一代已封存交班记录的伴随助手（不打断在跑慢分支）。"""
+    """收集各活跃分支及本波刚封存结案（非休眠裁撤）分支最近一代已封存交班记录的伴随助手。"""
     qid = str(question_id)
+    last_conf = conn.execute(
+        """
+        SELECT created_at FROM wave_conferences
+        WHERE question_id = ? AND status = 'COMPLETED'
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        (qid,),
+    ).fetchone()
+    last_conf_at = str(last_conf["created_at"] or "") if last_conf else ""
     branch_rows = conn.execute(
         """
         SELECT DISTINCT branch_id
         FROM lineage_nodes
         WHERE question_id = ?
-          AND node_status IN ('EXPLORING','ACTIVE_REVISING','AWAITING_TRIAGE','PENDING_REVIEW','BLOCKED_L4B')
+          AND control_state NOT IN ('HIBERNATED','DRAIN_AFTER_TURN')
+          AND (
+              node_status IN ('EXPLORING','ACTIVE_REVISING','AWAITING_TRIAGE','PENDING_REVIEW','BLOCKED_L4B')
+              OR (
+                  node_status = 'SEALED'
+                  AND briefing_sealed_at IS NOT NULL
+                  AND (? = '' OR briefing_sealed_at > ?)
+              )
+          )
+        ORDER BY branch_id
         """,
-        (qid,),
+        (qid, last_conf_at, last_conf_at),
     ).fetchall()
     participants: list[dict[str, Any]] = []
     for br in branch_rows:
@@ -134,7 +157,7 @@ def _collect_sealed_conference_participants(conn: sqlite3.Connection, question_i
         sealed = conn.execute(
             """
             SELECT node_id, branch_id, family_id, generation, branch_kind, companion_session_id,
-                   briefing_sealed_at, mechanism_summary, evidence_grade, column_a_facts_md
+                   briefing_sealed_at, mechanism_summary, evidence_grade, column_a_facts_md, bound_obs_ids_json
             FROM lineage_nodes
             WHERE question_id = ? AND branch_id = ? AND briefing_sealed_at IS NOT NULL
             ORDER BY generation DESC, created_at DESC LIMIT 1
@@ -155,7 +178,14 @@ def _collect_sealed_conference_participants(conn: sqlite3.Connection, question_i
                 "generation": int(sealed["generation"] or 1),
                 "branch_kind": str(sealed["branch_kind"] or "PURE"),
                 "companion_session_id": str(sealed["companion_session_id"] or f"gw-comp-{sealed['node_id']}"),
-                "mechanism_summary": str(sealed["mechanism_summary"] or ""),
+                "mechanism_summary": sealed["mechanism_summary"],
+                "column_a_facts_md": sealed["column_a_facts_md"],
+                "observations": [dict(row) for row in conn.execute(
+                    """
+                    SELECT obs_id, obs_status, tracks_json FROM observations
+                    WHERE obs_id IN (SELECT value FROM json_each(?)) ORDER BY obs_id
+                    """, (sealed["bound_obs_ids_json"],),
+                )],
                 "evidence_grade": str(sealed["evidence_grade"] or "NONE"),
                 "slow_branch_snapshot": bool(live_in_flight and str(live_in_flight["node_id"]) != str(sealed["node_id"])),
                 "in_flight_generation": int(live_in_flight["generation"]) if live_in_flight else None,
@@ -164,11 +194,19 @@ def _collect_sealed_conference_participants(conn: sqlite3.Connection, question_i
     return participants
 
 
-def check_and_open_wave_conference(conn: sqlite3.Connection, *, question_id: str, force: bool = False) -> dict[str, Any] | None:
+def check_and_open_wave_conference(
+    conn: sqlite3.Connection, *, question_id: str, force: bool = False,
+    human_agenda_md: str = "", discussion_rounds: int | None = None,
+) -> dict[str, Any] | None:
     """检查子题是否达到宏观大外环触发节拍；达标则原子建会并决定进 ROUND_1_CRITIQUE 或跳过互辩直入 SURVEY_REFRESHING。"""
     qid = str(question_id)
     qrow = conn.execute("SELECT * FROM subproblem_runtime_state WHERE question_id = ?", (qid,)).fetchone()
-    if qrow is None or str(qrow["dispatch_state"]) != "DISPATCHING":
+    if qrow is None:
+        return None
+    dstate = str(qrow["dispatch_state"])
+    if not force and dstate != "DISPATCHING":
+        return None
+    if force and dstate in ("CLOSED", "STOPPED_SOLVED"):
         return None
 
     # 已有进行中的会议时不重复开会
@@ -186,6 +224,13 @@ def check_and_open_wave_conference(conn: sqlite3.Connection, *, question_id: str
     cfg = load_runtime_config()
     mult = int(cfg.get("wave_conference_branch_multiplier", 2))
     min_nodes = int(cfg.get("wave_conference_min_completed_nodes", 2))
+    raw_rounds = cfg.get("wave_conference_discussion_rounds", 2) if discussion_rounds is None else discussion_rounds
+    try:
+        max_rounds = int(raw_rounds)
+    except (TypeError, ValueError) as exc:
+        raise FailClosedError(ERR_INVALID_INPUT, f"discussion_rounds 须为 2–4 的整数，实收 {raw_rounds!r}") from exc
+    if not 2 <= max_rounds <= 4:
+        raise FailClosedError(ERR_INVALID_INPUT, f"discussion_rounds 须在 2–4 轮之间，实收 {max_rounds}")
 
     active_branch_cnt = int(
         conn.execute(
@@ -215,13 +260,28 @@ def check_and_open_wave_conference(conn: sqlite3.Connection, *, question_id: str
     chair_sid = f"gw-chair-{conf_id}"
     now = utc_now_iso()
 
+    hard_ledger = build_wave_hard_ledger(conn, qid)
+    agenda = {
+        "questions": list(_WORKSHOP_QUESTIONS),
+        "human_agenda_md": human_agenda_md,
+        "discussion_rounds": max_rounds,
+        "streetlight_warning": hard_ledger["streetlight_warning"],
+        "hard_ledger": hard_ledger,
+    }
     with rw_immediate_tx(conn):
+        if conn.execute(
+            """
+            SELECT 1 FROM wave_conferences WHERE question_id = ?
+              AND status NOT IN ('COMPLETED','CANCELLED','EXPIRED','FAILED') LIMIT 1
+            """, (qid,),
+        ).fetchone() is not None:
+            return None
         conn.execute(
             """
             INSERT INTO wave_conferences(
                 conference_id, question_id, wave_no, status, participant_nodes_json,
-                critiques_ledger_json, minutes_md, chair_session_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, '[]', ?, ?, ?)
+                agenda_json, human_agenda_md, critiques_ledger_json, minutes_md, chair_session_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?)
             """,
             (
                 conf_id,
@@ -229,6 +289,8 @@ def check_and_open_wave_conference(conn: sqlite3.Connection, *, question_id: str
                 wave_no,
                 init_status,
                 json.dumps(participants, ensure_ascii=False),
+                json.dumps(agenda, ensure_ascii=False),
+                human_agenda_md,
                 "" if init_status == "ROUND_1_CRITIQUE" else "（本波已封存分支不足 2 条，跳过多方互辩直入总览刷新与宏观开拓）",
                 chair_sid,
                 now,
@@ -256,6 +318,7 @@ def check_and_open_wave_conference(conn: sqlite3.Connection, *, question_id: str
         "wave_no": wave_no,
         "status": init_status,
         "participant_count": len(participants),
+        "discussion_rounds": max_rounds,
         "chair_session_id": chair_sid,
     }
 
@@ -268,99 +331,58 @@ def append_conference_statement(
     round_no: int,
     statement_md: str,
     target_node_ids: list[str] | None = None,
+    speech_act: str = "PROPOSE_AND_SELF_AUDIT",
+    unverified_ideas: list[str] | None = None,
 ) -> dict[str, Any]:
-    """已封存伴随助手在圆桌第 1/2 轮提交点对点红蓝交锋发言。"""
-    conf = conn.execute("SELECT * FROM wave_conferences WHERE conference_id = ?", (str(conference_id),)).fetchone()
-    if conf is None:
-        raise FailClosedError(ERR_NOT_FOUND, f"圆桌会议 {conference_id!r} 不存在")
-    st = str(conf["status"])
-    rno = int(round_no)
-    if rno == 1 and st != "ROUND_1_CRITIQUE":
-        raise FailClosedError(ERR_LOCKED, f"会议 {conference_id!r} 当前为 {st}，不接受第 1 轮发言")
-    if rno == 2 and st != "ROUND_2_REBUTTAL":
-        raise FailClosedError(ERR_LOCKED, f"会议 {conference_id!r} 当前为 {st}，不接受第 2 轮辩护")
-    if rno not in (1, 2):
-        raise FailClosedError(ERR_INVALID_INPUT, "圆桌仅允许第 1 轮或第 2 轮发言")
-
-    clean_stmt = str(statement_md or "").strip()
-    if len(clean_stmt) < 20:
-        raise FailClosedError(ERR_INVALID_INPUT, "圆桌发言至少 20 字，须直指实质冲突或互补点")
-
-    participants = json.loads(conf["participant_nodes_json"] or "[]")
-    valid_nids = {str(p["node_id"]) for p in participants}
-    if str(node_id) not in valid_nids:
-        raise FailClosedError(ERR_LOCKED, f"节点 {node_id!r} 不在本次圆桌参会名单中")
-
-    ledger = json.loads(conf["critiques_ledger_json"] or "[]")
+    clean_stmt = statement_md.strip()
+    ideas = [f"[UNVERIFIED] {idea.strip()}" for idea in (unverified_ideas or []) if idea.strip()]
+    total_chars = len(clean_stmt) + sum(map(len, ideas))
+    if len(clean_stmt) < 20 or total_chars > 1200:
+        raise FailClosedError(ERR_INVALID_INPUT, f"圆桌发言当前 {total_chars} 字，正文至少 20 字、总长上限 1200 字")
+    if type(round_no) is not int or not 1 <= round_no <= 4:
+        raise FailClosedError(ERR_INVALID_INPUT, "圆桌轮次须为 1–4 的整数")
+    if speech_act not in ALLOWED_CONFERENCE_SPEECH_ACTS or (round_no == 1) != (speech_act == "PROPOSE_AND_SELF_AUDIT"):
+        raise FailClosedError(ERR_INVALID_INPUT, f"第 {round_no} 轮不允许 speech_act={speech_act!r}")
+    targets = list(dict.fromkeys(target_node_ids or []))
     now = utc_now_iso()
-    ledger.append(
-        {
-            "round": rno,
-            "node_id": str(node_id),
-            "target_node_ids": [str(x).strip() for x in (target_node_ids or []) if str(x).strip()],
-            "statement_md": clean_stmt[:1800],
-            "at": now,
-        }
-    )
-
-    # 若第 1 轮全员发言完毕，自动推进至 ROUND_2_REBUTTAL
-    next_status = st
-    if rno == 1:
-        r1_speakers = {str(item["node_id"]) for item in ledger if int(item.get("round", 0)) == 1}
-        if valid_nids.issubset(r1_speakers):
-            next_status = "ROUND_2_REBUTTAL"
-
     with rw_immediate_tx(conn):
+        conf = conn.execute("SELECT * FROM wave_conferences WHERE conference_id = ?", (conference_id,)).fetchone()
+        if conf is None:
+            raise FailClosedError(ERR_NOT_FOUND, f"圆桌会议 {conference_id!r} 不存在")
+        agenda = json.loads(conf["agenda_json"] or "{}")
+        max_rounds = max(2, min(4, int(agenda.get("discussion_rounds") or 2)))
+        if round_no > max_rounds:
+            raise FailClosedError(ERR_INVALID_INPUT, f"本场圆桌上半场共设 {max_rounds} 轮，不接受第 {round_no} 轮发言")
+        expected_status = "ROUND_1_CRITIQUE" if round_no == 1 else "ROUND_2_REBUTTAL"
+        if conf["status"] != expected_status:
+            raise FailClosedError(ERR_LOCKED, f"会议当前为 {conf['status']}，不接受第 {round_no} 轮发言")
+        participants = json.loads(conf["participant_nodes_json"])
+        valid = {p["node_id"] for p in participants}
+        if node_id not in valid:
+            raise FailClosedError(ERR_LOCKED, f"节点 {node_id!r} 不在本次圆桌参会名单中")
+        if round_no >= 2 and len(valid) >= 2 and not targets:
+            raise FailClosedError(ERR_INVALID_INPUT, f"第 {round_no} 轮须点名至少一位参会同行：target_node_ids")
+        if set(targets) - (valid - {node_id}):
+            raise FailClosedError(ERR_INVALID_INPUT, "圆桌只能点名回应其他参会节点")
+        ledger = json.loads(conf["critiques_ledger_json"])
+        if round_no > 2 and not any(item["round"] == round_no - 1 for item in ledger):
+            raise FailClosedError(ERR_LOCKED, f"第 {round_no - 1} 轮尚无发言，不可跳过直接进入第 {round_no} 轮")
+        if any(item["round"] == round_no and item["node_id"] == node_id for item in ledger):
+            raise FailClosedError(ERR_LOCKED, "该节点本轮已提交发言")
+        ledger.append({
+            "round": round_no, "node_id": node_id, "target_node_ids": targets, "speech_act": speech_act,
+            "statement_md": clean_stmt, "unverified_ideas": ideas, "at": now,
+        })
+        complete_r1 = round_no == 1 and valid <= {item["node_id"] for item in ledger if item["round"] == 1}
+        next_status = "ROUND_2_REBUTTAL" if complete_r1 else conf["status"]
         conn.execute(
             "UPDATE wave_conferences SET critiques_ledger_json = ?, status = ? WHERE conference_id = ?",
-            (json.dumps(ledger, ensure_ascii=False), next_status, str(conference_id)),
+            (json.dumps(ledger, ensure_ascii=False), next_status, conference_id),
         )
-
     return {
-        "conference_id": str(conference_id),
-        "round": rno,
-        "status": next_status,
-        "total_statements": len(ledger),
+        "conference_id": conference_id, "round": round_no, "discussion_rounds": max_rounds,
+        "status": next_status, "total_statements": len(ledger),
     }
-
-
-def _mount_secondary_donor_readonly(
-    conn: sqlite3.Connection,
-    *,
-    secondary_node_id: str,
-    target_worktree: Path,
-) -> str:
-    """将次供体节点快照只读拷贝挂载到 `.greatwall_donors/<secondary_node_id>/`（绝不涂改原纯血分支）。"""
-    sec = conn.execute(
-        "SELECT node_id, retained_snapshot_abs_path, worktree_abs_path FROM lineage_nodes WHERE node_id = ?",
-        (secondary_node_id,),
-    ).fetchone()
-    if sec is None:
-        raise FailClosedError(ERR_NOT_FOUND, f"次供体节点 {secondary_node_id!r} 不存在")
-    snap_raw = str(sec["retained_snapshot_abs_path"] or "").strip()
-    wt_raw = str(sec["worktree_abs_path"] or "").strip()
-    src = Path(snap_raw) if (snap_raw and Path(snap_raw).is_dir()) else (Path(wt_raw) if (wt_raw and Path(wt_raw).is_dir()) else None)
-    donor_dir = target_worktree / ".greatwall_donors" / secondary_node_id
-    donor_dir.mkdir(parents=True, exist_ok=True)
-    if src is not None:
-        for item in src.iterdir():
-            if item.name in (".git", "__pycache__", ".venv", "inputs", ".greatwall_donors"):
-                continue
-            dst = donor_dir / item.name
-            if item.is_dir():
-                shutil.copytree(item, dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".git"), dirs_exist_ok=True)
-            elif item.is_file():
-                shutil.copy2(item, dst)
-        for fp in donor_dir.rglob("*"):
-            if fp.is_file():
-                try:
-                    os.chmod(fp, 0o444)
-                except OSError:
-                    pass
-    return donor_dir.relative_to(target_worktree).as_posix()
-
-
-from .operator_policy import active_arrangements, check_question_branch_quota, effective_policy
 
 
 def execute_approved_wave_verdict(
@@ -368,263 +390,24 @@ def execute_approved_wave_verdict(
     *,
     workspace_root: str,
     conference_id: str,
+    prepared_growth: dict[int, PreparedBranch] | None = None,
 ) -> dict[str, Any]:
-    """按时间线单调铁律与成长保护期护栏，落地执行宏观大外环 6 类树结构调整单。"""
-    conf = conn.execute("SELECT * FROM wave_conferences WHERE conference_id = ?", (str(conference_id),)).fetchone()
-    if conf is None:
-        raise FailClosedError(ERR_NOT_FOUND, f"圆桌会议 {conference_id!r} 不存在")
-    if str(conf["status"]) not in ("ADJUDICATING", "PENDING_HUMAN_APPROVAL"):
-        raise FailClosedError(ERR_CONFLICT, f"会议 {conference_id!r} 当前状态为 {conf['status']}，无法执行裁决落地")
-
-    qid = str(conf["question_id"])
-    verdict = json.loads(conf["verdict_json"] or "{}")
-    actions = verdict.get("actions") if isinstance(verdict, dict) else []
-    if not isinstance(actions, list):
-        actions = []
-
-    p0 = conn.execute("SELECT shared_inputs_json FROM parse0_contract WHERE contract_id = 'active'").fetchone()
-    shared_rels = json.loads(p0["shared_inputs_json"] or "[]") if p0 else []
-    active_rev = get_subproblem_active_spec_revision(conn, qid)
+    """先腾槽，再开枝合体，最后执行工单与收敛。"""
+    staging = (
+        prepare_wave_growth(conn, workspace_root, conference_id)
+        if prepared_growth is None else nullcontext(prepared_growth)
+    )
     now = utc_now_iso()
-
-    executed: list[dict[str, Any]] = []
-    skipped: list[dict[str, Any]] = []
-
-    with rw_immediate_tx(conn):
-        for act_obj in actions:
-            if not isinstance(act_obj, dict):
-                continue
-            kind = str(act_obj.get("action") or "").strip().upper()
-            if kind not in ALLOWED_WAVE_VERDICT_ACTIONS:
-                skipped.append({"action": kind, "reason": "unknown_action"})
-                continue
-
-            if kind == "OPEN_NEW_BRANCH":
-                fid = str(act_obj.get("family_id") or f"fam_{qid.lower()}_{uuid.uuid4().hex[:6]}").strip()
-                try:
-                    check_question_branch_quota(conn, qid, family_id=fid)
-                except FailClosedError as exc:
-                    skipped.append({"action": kind, "reason": exc.message})
-                    continue
-                sig = str(act_obj.get("mechanism_signature") or act_obj.get("rationale") or "大外环定向开拓新学派").strip()
-                contrast = str(act_obj.get("orthogonal_contrast") or "针对全局总览明确缺口正交开拓").strip()
-                new_bid = f"b_{qid.lower()}_{fid[:10]}_{uuid.uuid4().hex[:5]}"
-                new_nid = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
-                wt_dir = Path(os.path.realpath(workspace_root)) / "worktrees" / new_bid
-                wt_dir.mkdir(parents=True, exist_ok=True)
-                sync_approved_public_inputs(workspace_root, wt_dir, shared_rels, spec_revision=active_rev, question_id=qid)
-                sync_public_instruments_and_skills_to_worktree(conn, workspace_root, wt_dir)
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO method_families(family_id, question_id, mechanism_signature, orthogonal_contrast, family_status, created_at)
-                    VALUES (?, ?, ?, ?, 'ACTIVE', ?)
-                    """,
-                    (fid, qid, sig[:240], contrast[:240], now),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO lineage_nodes(
-                        node_id, question_id, branch_id, family_id, generation,
-                        branch_kind, protection_generations_left, companion_session_id,
-                        node_status, worktree_abs_path, mechanism_summary, will_md, spec_revision,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, 1, 'PURE', 2, ?, 'EXPLORING', ?, ?, ?, ?, ?, ?)
-                    """,
-                    (new_nid, qid, new_bid, fid, f"gw-comp-{new_nid}", str(wt_dir), sig[:99], str(act_obj.get("gap_directive_md") or sig), active_rev, now, now),
-                )
-                executed.append({"action": kind, "branch_id": new_bid, "node_id": new_nid, "family_id": fid, "worktree_abs_path": str(wt_dir)})
-
-            elif kind == "PROTECT":
-                src_nid = str(act_obj.get("source_node_id") or "").strip()
-                src = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ? AND question_id = ?", (src_nid, qid)).fetchone()
-                if src is None:
-                    skipped.append({"action": kind, "source_node_id": src_nid, "reason": "node_not_found"})
-                    continue
-                try:
-                    check_question_branch_quota(conn, qid, family_id=str(src["family_id"] or ""))
-                except FailClosedError as exc:
-                    skipped.append({"action": kind, "reason": exc.message})
-                    continue
-                new_bid = f"b_{qid.lower()}_prot_{uuid.uuid4().hex[:5]}"
-                new_nid = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
-                wt_dir = Path(os.path.realpath(workspace_root)) / "worktrees" / new_bid
-                wt_dir.mkdir(parents=True, exist_ok=True)
-                snap_raw = str(src["retained_snapshot_abs_path"] or "").strip()
-                if snap_raw and Path(snap_raw).is_dir():
-                    restore_retained_candidate_snapshot(snap_raw, str(wt_dir))
-                sync_approved_public_inputs(workspace_root, wt_dir, shared_rels, spec_revision=active_rev, question_id=qid)
-                sync_public_instruments_and_skills_to_worktree(conn, workspace_root, wt_dir)
-                conn.execute(
-                    """
-                    INSERT INTO lineage_nodes(
-                        node_id, question_id, branch_id, family_id, parent_node_id, generation,
-                        branch_kind, protection_generations_left, companion_session_id,
-                        node_status, worktree_abs_path, retained_snapshot_abs_path,
-                        mechanism_summary, will_md, spec_revision, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 1, 'PROTECTED', 2, ?, 'EXPLORING', ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        new_nid,
-                        qid,
-                        new_bid,
-                        str(src["family_id"] or ""),
-                        src_nid,
-                        f"gw-comp-{new_nid}",
-                        str(wt_dir),
-                        snap_raw or None,
-                        str(act_obj.get("rationale") or src["mechanism_summary"] or "反常保护分叉")[:99],
-                        str(act_obj.get("rationale") or ""),
-                        active_rev,
-                        now,
-                        now,
-                    ),
-                )
-                executed.append({"action": kind, "branch_id": new_bid, "node_id": new_nid, "source_node_id": src_nid})
-
-            elif kind == "SPAWN_SYNTHESIS":
-                pri_nid = str(act_obj.get("primary_donor_node_id") or "").strip()
-                sec_nid = str(act_obj.get("secondary_donor_node_id") or "").strip()
-                pri = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ? AND question_id = ?", (pri_nid, qid)).fetchone()
-                sec = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ? AND question_id = ?", (sec_nid, qid)).fetchone()
-                if pri is None or sec is None:
-                    skipped.append({"action": kind, "reason": "donor_not_found"})
-                    continue
-                try:
-                    check_question_branch_quota(conn, qid, family_id=str(pri["family_id"] or ""))
-                except FailClosedError as exc:
-                    skipped.append({"action": kind, "reason": exc.message})
-                    continue
-                budget = max(1, int(act_obj.get("budget_nodes") or conf["synthesis_budget_nodes"] or 2))
-                new_bid = f"b_{qid.lower()}_syn_{uuid.uuid4().hex[:5]}"
-                new_nid = f"node_{qid.lower()}_{uuid.uuid4().hex[:8]}"
-                wt_dir = Path(os.path.realpath(workspace_root)) / "worktrees" / new_bid
-                wt_dir.mkdir(parents=True, exist_ok=True)
-                pri_snap = str(pri["retained_snapshot_abs_path"] or "").strip()
-                if pri_snap and Path(pri_snap).is_dir():
-                    restore_retained_candidate_snapshot(pri_snap, str(wt_dir))
-                donor_rel = _mount_secondary_donor_readonly(conn, secondary_node_id=sec_nid, target_worktree=wt_dir)
-                sync_approved_public_inputs(workspace_root, wt_dir, shared_rels, spec_revision=active_rev, question_id=qid)
-                sync_public_instruments_and_skills_to_worktree(conn, workspace_root, wt_dir)
-                goal_txt = str(act_obj.get("synthesis_goal_md") or act_obj.get("rationale") or "旁路双供体融合验证")
-                conn.execute(
-                    """
-                    INSERT INTO lineage_nodes(
-                        node_id, question_id, branch_id, family_id, parent_node_id, generation,
-                        branch_kind, protection_generations_left, branch_budget_nodes_left,
-                        companion_session_id, secondary_donor_node_id,
-                        node_status, worktree_abs_path, retained_snapshot_abs_path,
-                        mechanism_summary, will_md, spec_revision, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 1, 'SYNTHESIS', 2, ?, ?, ?, 'EXPLORING', ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        new_nid,
-                        qid,
-                        new_bid,
-                        str(pri["family_id"] or ""),
-                        pri_nid,
-                        budget,
-                        f"gw-comp-{new_nid}",
-                        sec_nid,
-                        str(wt_dir),
-                        pri_snap or None,
-                        goal_txt[:99],
-                        f"[Synthesis Target] 主供体={pri_nid}, 次供体只读挂载={donor_rel}。目标：{goal_txt}",
-                        active_rev,
-                        now,
-                        now,
-                    ),
-                )
-                executed.append(
-                    {
-                        "action": kind,
-                        "branch_id": new_bid,
-                        "node_id": new_nid,
-                        "primary_donor_node_id": pri_nid,
-                        "secondary_donor_node_id": sec_nid,
-                        "donor_mount_rel": donor_rel,
-                    }
-                )
-
-            elif kind == "HIBERNATE":
-                target_bid = str(act_obj.get("branch_id") or "").strip()
-                live_node = conn.execute(
-                    """
-                    SELECT * FROM lineage_nodes
-                    WHERE question_id = ? AND branch_id = ?
-                      AND node_status IN ('EXPLORING','ACTIVE_REVISING','AWAITING_TRIAGE')
-                    ORDER BY generation DESC LIMIT 1
-                    """,
-                    (qid, target_bid),
-                ).fetchone()
-                if live_node is None:
-                    skipped.append({"action": kind, "branch_id": target_bid, "reason": "no_live_node"})
-                    continue
-                # 成长保护期护栏：保护期内严禁裁撤
-                if int(live_node["protection_generations_left"] or 0) > 0:
-                    skipped.append({"action": kind, "branch_id": target_bid, "reason": "protected_by_growth_window"})
-                    continue
-                # 时间线单调防误裁：若该分支自会议开始后刚新过审了 L3，自动跳过不误裁
-                fresh_l3 = conn.execute(
-                    """
-                    SELECT 1 FROM internal_research_ledger l
-                    JOIN review_queue r ON r.review_id = l.verified_review_id
-                    JOIN lineage_nodes n ON n.node_id = r.source_node_id
-                    WHERE l.ledger_type = 'L3_VERIFIED' AND l.is_active = 1
-                      AND n.branch_id = ? AND l.created_at >= ?
-                    LIMIT 1
-                    """,
-                    (target_bid, str(conf["created_at"])),
-                ).fetchone()
-                if fresh_l3 is not None:
-                    skipped.append({"action": kind, "branch_id": target_bid, "reason": "fresh_l3_verified_during_wave"})
-                    continue
-                conn.execute(
-                    "UPDATE lineage_nodes SET node_status = 'SEALED', pending_handoff_reason = 'HIBERNATED_BY_WAVE_CONFERENCE', updated_at = ? WHERE node_id = ?",
-                    (now, str(live_node["node_id"])),
-                )
-                enqueue_runtime_effect(
-                    conn,
-                    effect_key=f"drain:{live_node['node_id']}:hibernate:{conference_id}",
-                    kind="DRAIN_AND_STOP_NODE",
-                    target_type="NODE",
-                    target_id=str(live_node["node_id"]),
-                    target_generation=int(live_node["control_generation"] or 1),
-                    payload={"reason": "HIBERNATED_BY_WAVE_CONFERENCE", "salvage_audit": bool(act_obj.get("salvage_audit", False))},
-                    supersede_older_kinds=("SPAWN_PAIR",),
-                )
-                executed.append(
-                    {
-                        "action": kind,
-                        "branch_id": target_bid,
-                        "sealed_node_id": str(live_node["node_id"]),
-                        "salvage_audit": bool(act_obj.get("salvage_audit", False)),
-                    }
-                )
-
-            elif kind == "DISCRIMINATOR":
-                tkt = submit_works_ticket(
-                    conn,
-                    question_id=qid,
-                    ticket_type="DISCRIMINATOR",
-                    instrument_id=act_obj.get("instrument_id"),
-                    description=str(act_obj.get("description") or act_obj.get("rationale") or "圆桌定向鉴别探针需求"),
-                    source=f"wave_conference:{conference_id}",
-                )
-                executed.append({"action": kind, "ticket_id": tkt["ticket_id"]})
-
-            elif kind == "PAUSE_FOR_HUMAN":
-                lock_res = evaluate_subproblem_locks(
-                    conn,
-                    question_id=qid,
-                    semantic_saturation_requested=True,
-                    saturation_reason_md=str(act_obj.get("rationale") or "宏观大外环确认明确缺口已穷尽"),
-                )
-                q_eval = (lock_res.get("evaluated") or [{}])[0]
-                if q_eval.get("dispatch_state") == "PAUSED_SATURATED":
-                    executed.append({"action": kind, "dispatch_state": "PAUSED_SATURATED"})
-                else:
-                    skipped.append({"action": kind, "reason": "min_commitment_window_not_met"})
-
+    with staging as prepared, rw_immediate_tx(conn):
+        conf = conn.execute("SELECT * FROM wave_conferences WHERE conference_id = ?", (conference_id,)).fetchone()
+        if conf is None:
+            raise FailClosedError(ERR_NOT_FOUND, f"圆桌会议 {conference_id!r} 不存在")
+        if conf["status"] not in ("ADJUDICATING", "PENDING_HUMAN_APPROVAL"):
+            raise FailClosedError(ERR_CONFLICT, f"会议 {conference_id!r} 当前状态为 {conf['status']}，无法执行裁决")
+        qid = conf["question_id"]
+        actions = json.loads(conf["verdict_json"])["actions"]
+        validate_wave_actions(actions)
+        executed, skipped = execute_wave_phases(conn, conf, actions, prepared, now)
         conn.execute(
             "UPDATE wave_conferences SET status = 'COMPLETED', completed_at = ? WHERE conference_id = ?",
             (now, str(conference_id)),
@@ -675,17 +458,16 @@ def mark_wave_conference_failed(
         return {"conference_id": str(conference_id), "status": cur_status, "already_terminal": True}
     now = utc_now_iso()
     qid = str(conf["question_id"])
-    note = str(reason or "CIRCUIT_BREAKER_STALLED")[:500]
+    note = str(reason or "CIRCUIT_BREAKER_STALLED")
     with rw_immediate_tx(conn):
         conn.execute(
             """
             UPDATE wave_conferences
             SET status = 'FAILED',
-                minutes_md = CASE WHEN minutes_md = '' THEN ? ELSE minutes_md || char(10) || ? END,
                 completed_at = ?
             WHERE conference_id = ? AND status NOT IN ('COMPLETED','CANCELLED','EXPIRED','FAILED')
             """,
-            (f"[FAILED] {note}", f"[FAILED] {note}", now, str(conference_id)),
+            (now, str(conference_id)),
         )
         enqueue_runtime_effect(
             conn,
@@ -720,13 +502,12 @@ def submit_wave_verdict_decision(
         raise FailClosedError(ERR_LOCKED, f"会议 {conference_id!r} 状态为 {conf['status']}，仅 ADJUDICATING 可提交裁决")
 
     actions = verdict_payload.get("actions") if isinstance(verdict_payload, dict) else None
-    if not isinstance(actions, list):
-        raise FailClosedError(ERR_INVALID_INPUT, "verdict_payload.actions 必须为动作数组")
+    validate_wave_actions(actions)
 
     p0 = conn.execute("SELECT autonomy_mode FROM parse0_contract WHERE contract_id = 'active'").fetchone()
     baseline_autonomy = str(p0["autonomy_mode"] or "WAVE_CONFIRM") if p0 else "WAVE_CONFIRM"
     autonomy = effective_policy(active_arrangements(conn)).get("autonomy_mode", baseline_autonomy)
-    has_high_risk_pause = any(str(a.get("action") or "").upper() == "PAUSE_FOR_HUMAN" for a in actions if isinstance(a, dict))
+    has_high_risk_pause = any(a["action_type"] == "PAUSE_FOR_HUMAN" for a in actions)
     need_human = autonomy != "AUTOPILOT" or has_high_risk_pause
 
     with rw_immediate_tx(conn):

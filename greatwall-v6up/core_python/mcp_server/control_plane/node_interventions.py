@@ -394,7 +394,7 @@ def authorize_early_handoff(
         raise FailClosedError(ERR_NOT_FOUND, f"节点 {node_id!r} 不存在")
     if str(node["node_status"]) not in ("EXPLORING", "ACTIVE_REVISING"):
         raise FailClosedError(ERR_LOCKED, f"节点 {node_id!r} 状态为 {node['node_status']}，无法授权提前交班")
-    if actor_source not in ("human_ui", "chief_approved"):
+    if actor_source not in ("human_ui", "chief_approved", "chief_direct"):
         raise FailClosedError(ERR_INVALID_INPUT, "authorize_early_handoff 必须由真实人类授权触发")
 
     now = utc_now_iso()

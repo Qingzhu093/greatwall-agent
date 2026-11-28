@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from typing import Any
@@ -50,7 +51,7 @@ def tool_get_living_survey(
     node_id: str,
     question_id: str,
 ) -> dict[str, Any]:
-    """一级导览总览 Pull：拉取指定子题最新《子题全局总览（<=1500字）》与高优 OPEN 悬赏缺口。"""
+    """一级导览总览 Pull：拉取指定子题最新《子题全局总览（<=4000字）》与高优 OPEN 悬赏缺口。"""
     enforce_role_tool_permission(conn, caller_role, "get_living_survey", session_id=session_id, node_id=node_id)
     node = conn.execute("SELECT question_id, first_reflection_unlocked FROM lineage_nodes WHERE node_id = ?", (node_id,)).fetchone()
     if node is None:
@@ -66,7 +67,7 @@ def tool_get_living_survey(
         """
         SELECT survey_id, question_id, revision, trigger_reason,
                sec1_baseline_and_instruments_md, sec2_l3_lemma_tree_md,
-               sec3_avoidance_radar_md, sec4_explicit_gaps_md, total_chars, created_at
+               sec3_avoidance_radar_md, sec4_explicit_gaps_md, marginal_notes_md, total_chars, created_at
         FROM subproblem_living_surveys
         WHERE question_id = ?
         ORDER BY revision DESC LIMIT 1
@@ -79,7 +80,7 @@ def tool_get_living_survey(
             """
             SELECT gap_id, blocked_node_id, formal_statement_md, verification_spec_md, created_at
             FROM open_lemma_gaps
-            WHERE question_id = ? AND status = 'OPEN'
+            WHERE question_id = ? AND status = 'OPEN' AND gap_tier = 'LOAD_BEARING'
             ORDER BY created_at ASC LIMIT 12
             """,
             (qid,),
@@ -211,34 +212,19 @@ def tool_query_library_catalog(
         else:
             ltypes = ("L3_VERIFIED",) if scope_u == "INTERNAL_L3" else (("L2_FAILURE_RECORD",) if scope_u == "INTERNAL_L2" else ("L3_VERIFIED", "L2_FAILURE_RECORD"))
             ph = ",".join("?" for _ in ltypes)
-            if fts_q:
-                rows = conn.execute(
-                    f"""
-                    SELECT l.entry_id, l.question_id, l.ledger_type, l.l3_entry_kind, l.goal_coverage,
-                           l.publish_tier, l.verified_spec_revision, l.l2_category, l.title, l.abstract_md
-                    FROM internal_research_ledger l
-                    JOIN internal_research_fts f ON f.rowid = l.rowid
-                    WHERE internal_research_fts MATCH ?
-                      AND l.is_active = 1
-                      AND l.ledger_type IN ({ph})
-                      AND (? = 'ALL' OR l.question_id = ?)
-                    ORDER BY l.entry_id
-                    """,
-                    (fts_q, *ltypes, question_id, question_id),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    f"""
-                    SELECT entry_id, question_id, ledger_type, l3_entry_kind, goal_coverage,
-                           publish_tier, verified_spec_revision, l2_category, title, abstract_md
-                    FROM internal_research_ledger
-                    WHERE is_active = 1
-                      AND ledger_type IN ({ph})
-                      AND (? = 'ALL' OR question_id = ?)
-                    ORDER BY entry_id
-                    """,
-                    (*ltypes, question_id, question_id),
-                ).fetchall()
+            fts_clause = """
+              AND l.rowid IN (SELECT rowid FROM internal_research_fts WHERE internal_research_fts MATCH ?)
+            """ if fts_q else ""
+            rows = conn.execute(
+                f"""
+                SELECT c.*, l.l2_category
+                FROM v_library_mini_papers_catalog c JOIN internal_research_ledger l ON l.entry_id = c.entry_id
+                WHERE c.ledger_type IN ({ph}) AND (? = 'ALL' OR c.question_id = ?) {fts_clause}
+                ORDER BY c.is_marginal, COALESCE(c.significance_score, 5) DESC,
+                         COALESCE(c.overall_score, 5.0) DESC, c.created_at DESC, c.entry_id
+                """,
+                (*ltypes, question_id, question_id, *((fts_q,) if fts_q else ())),
+            ).fetchall()
             for r in rows:
                 cards.append(
                     {
@@ -252,6 +238,17 @@ def tool_query_library_catalog(
                         "l2_category": r["l2_category"],
                         "title": str(r["title"]),
                         "abstract_preview": str(r["abstract_md"])[:350],
+                        "scope_md": r["scope_md"],
+                        "author_node_id": r["author_node_id"],
+                        "author_branch_id": r["author_branch_id"],
+                        "author_family_id": r["author_family_id"],
+                        "rigor_score": r["rigor_score"],
+                        "novelty_score": r["novelty_score"],
+                        "significance_score": r["significance_score"],
+                        "overall_score": r["overall_score"],
+                        "is_marginal": bool(r["is_marginal"]),
+                        "tags": json.loads(r["tags_json"]),
+                        "cited_entries": json.loads(r["cited_entries_json"]),
                     }
                 )
 
@@ -299,13 +296,20 @@ def tool_get_library_entry(
             raise FailClosedError(ERR_LOCKED, f"0-37% 独思期物理锁定内藏条目 {entry_id!r}，完成 37% 反思后开放")
         with rw_immediate_tx(conn):
             record_fact_edge(conn, source_id=node_id, target_id=entry_id, edge_type="READ", session_id=session_id)
+        observations = [dict(row) for row in conn.execute(
+            """
+            SELECT obs_id, instrument_id, instrument_version, tier, obs_status, tracks_json, details_text
+            FROM observations WHERE obs_id IN (SELECT value FROM json_each(?)) ORDER BY obs_id
+            """,
+            (led["bound_obs_ids_json"],),
+        )]
         return build_tool_receipt(
             conn=conn,
             tool_name="get_library_entry",
             question_id=str(node["question_id"]),
             node_id=node_id,
             next_step_guidance=f"已拉取内藏 {led['ledger_type']} 条目 {entry_id} 并静默记录参考 READ 轨迹。",
-            data={"wing": str(led["ledger_type"]), "entry": dict(led)},
+            data={"wing": str(led["ledger_type"]), "entry": dict(led), "observations": observations},
         )
 
     raise FailClosedError(ERR_NOT_FOUND, f"图书馆条目 {entry_id!r} 不存在")

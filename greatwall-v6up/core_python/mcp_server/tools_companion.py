@@ -10,13 +10,13 @@ v0.3 核心升级：
 from __future__ import annotations
 
 import json
-import random
 import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any
 
-from ..evaluators.isolated_runner import compute_recursive_dir_sha256, sha256_file
+from ..evaluators.isolated_runner import sha256_file
+from .db.enums import ALLOWED_HOLIDAY_OUTCOMES
 from .control_plane_service import (
     backup_retained_candidate_snapshot,
     check_and_open_wave_conference,
@@ -41,13 +41,14 @@ from .db_schema import (
 from .mcp_core_helpers import (
     build_tool_receipt,
     enforce_role_tool_permission,
-    load_holiday_prompts,
+    load_meta_reflection_categories,
     load_runtime_config,
     next_prefixed_id,
     record_fact_edge,
     resolve_effective_context_window,
 )
 from .triage_core import evaluate_auto_triage_eligibility, execute_triage_core
+from .control_plane.wave_verdict_actions import enqueue_salvage_review
 
 
 def tool_get_companion_context(
@@ -78,7 +79,7 @@ def tool_get_companion_context(
             raise FailClosedError(ERR_LOCKED, f"节点 {node_id!r} 尚未完成 70% 封存，禁止进入圆桌参会态")
         conf = conn.execute(
             """
-            SELECT conference_id, question_id, wave_no, status, critiques_ledger_json, created_at
+            SELECT conference_id, question_id, wave_no, status, critiques_ledger_json, agenda_json, created_at
             FROM wave_conferences
             WHERE question_id = ? AND status IN ('ROUND_1_CRITIQUE', 'ROUND_2_REBUTTAL', 'SURVEY_REFRESHING')
             ORDER BY wave_no DESC LIMIT 1
@@ -105,7 +106,8 @@ def tool_get_companion_context(
                         "conference_id": str(conf["conference_id"]),
                         "wave_no": int(conf["wave_no"]),
                         "status": str(conf["status"]),
-                        "critiques_ledger": json.loads(conf["critiques_ledger_json"] or "[]"),
+                        "critiques_ledger": json.loads(conf["critiques_ledger_json"]),
+                        "agenda": json.loads(conf["agenda_json"]),
                     }
                     if conf
                     else None
@@ -154,6 +156,36 @@ def tool_get_companion_context(
         donors_dir = Path(str(node["worktree_abs_path"])) / ".greatwall_donors"
         donor_mounts = sorted(p.name for p in donors_dir.iterdir() if p.is_dir()) if donors_dir.is_dir() else []
 
+        wave = conn.execute(
+            """
+            SELECT c.conference_id, c.minutes_md, c.peer_takeaways_json, s.*
+            FROM wave_conferences c LEFT JOIN subproblem_living_surveys s ON s.survey_id = c.linked_survey_id
+            WHERE c.question_id = ? AND c.status = 'COMPLETED' ORDER BY c.wave_no DESC LIMIT 1
+            """,
+            (qid,),
+        ).fetchone()
+        wave_takeaways = None
+        if wave is not None:
+            packed = json.loads(wave["peer_takeaways_json"])
+            wave_takeaways = {
+                "conference_id": wave["conference_id"], "minutes_md": wave["minutes_md"],
+                "peer_takeaways": packed.get(branch_id, []),
+                "living_survey": {key: wave[key] for key in wave.keys() if key.startswith("sec") or key == "marginal_notes_md"},
+            }
+        feedback = [
+            item for ancestor in (parent_node, node) if ancestor is not None
+            for item in json.loads(ancestor["pending_review_feedback_json"])
+        ]
+        reports = [dict(row) for row in conn.execute(
+            """
+            SELECT r.survey_req_id, r.question_id, r.report_md, r.cited_entry_ids_json, r.cited_obs_ids_json
+            FROM internal_survey_requests r JOIN lineage_nodes n ON n.node_id = r.requester_node_id
+            WHERE n.branch_id = ? AND r.status = 'FULFILLED'
+            ORDER BY r.fulfilled_at DESC LIMIT 2
+            """,
+            (branch_id,),
+        )]
+
         payload: dict[str, Any] = {
             "mode": "PRE_SPAWN",
             "node_id": node_id,
@@ -164,6 +196,9 @@ def tool_get_companion_context(
             "active_spec_revision": active_spec_rev,
             "node_status": str(node["node_status"]),
             "donor_mount_dirs": donor_mounts,
+            "latest_wave_takeaways": wave_takeaways,
+            "pending_review_feedback": feedback,
+            "internal_survey_reports": reports,
             "latest_living_survey_revision": int(sv_row["revision"]) if sv_row else 0,
             "active_instruments": active_instruments,
             "previous_briefing": dict(prev_briefing) if prev_briefing else None,
@@ -187,7 +222,7 @@ def tool_get_companion_context(
             tool_name="get_companion_context",
             question_id=qid,
             node_id=node_id,
-            next_step_guidance="请执行定额滚动重写 Rewrite_<=2200(旧看板, 上代最新手记) 并调 save_lineage_briefing（总长 <= 2200 字，段 5 整体替换最新遗嘱）。",
+            next_step_guidance="请执行定额滚动重写 Rewrite_<=5000(旧看板, 上代最新手记) 并调 save_lineage_briefing（总长 <= 5000 字，段 5 整体替换最新遗嘱）。",
             data=payload,
         )
 
@@ -201,8 +236,6 @@ def tool_get_companion_context(
                 ERR_LOCKED,
                 f"当前上下文水位 {cur_tokens}/{win} ({cur_tokens / win:.1%}) 未达到 {reflect_pct:.0%} 阈值，严禁提前拉取 REFLECT_37 专属馆藏目录与死胡同摘要！",
             )
-        all_prompts = [p for p in load_holiday_prompts() if p.get("scope") == "reflect_37"]
-        sampled = random.sample(all_prompts, k=min(2, len(all_prompts))) if all_prompts else []
 
         dead_ends_summary = [
             {
@@ -254,7 +287,7 @@ def tool_get_companion_context(
             tool_name="get_companion_context",
             question_id=qid,
             node_id=node_id,
-            next_step_guidance="请切换外部严苛专家视角（临床诊断师 + 情报员），给盲区诊断、最多 2 条相关 L2/L3 或死胡同编号指针与 1 道夜科学追问，完成 <=2 轮后调 record_reflection_and_unlock_pull。",
+            next_step_guidance="请切换外部严苛专家视角（临床诊断师 + 情报员），从 C01–C11 对症选 1–2 类，给盲区诊断与最多 2 条相关证据编号，完成不超过两轮后调 record_reflection_and_unlock_pull。",
             data={
                 "mode": "REFLECT_37",
                 "node_id": node_id,
@@ -264,7 +297,7 @@ def tool_get_companion_context(
                 "observations": obs_rows,
                 "lineage_dead_ends_summary": dead_ends_summary,
                 "central_library_l3_l2_catalog_preview": library_catalog_preview,
-                "sampled_holiday_prompts": sampled,
+                "meta_reflection_categories": load_meta_reflection_categories(),
             },
         )
 
@@ -289,12 +322,13 @@ def tool_get_companion_context(
         question_id=qid,
         node_id=node_id,
         next_step_guidance=(
-            "请对照探索者亲笔遗嘱、Worktree Diff 与客观 [Obs###] 写 <2000 字 A/B 双栏手记与 <100 字纯 mechanism_summary；"
+            "请对照探索者亲笔遗嘱、Worktree Diff 与客观 [Obs###] 写 <=5000 字 A/B 双栏手记与 <100 字纯 mechanism_summary；"
             "可附带 recommended_triage 加速常规直落，或对独立局部引理附带 local_lemma_submissions 拆交一次性盲审，调用 submit_node_handoff 落库封存。"
         ),
         data={
             "mode": mode_u,
             "node_id": node_id,
+            "holiday_bet": json.loads(node["holiday_bet_json"]),
             "branch_id": branch_id,
             "question_id": qid,
             "family_id": node["family_id"],
@@ -323,7 +357,7 @@ def tool_save_lineage_briefing(
     sec4_dead_ends: str,
     sec5_immediate_will: str,
 ) -> dict[str, Any]:
-    """定额滚动重压缩看板：唯一硬限制为五段非空且总长 <= 2200 字。"""
+    """定额滚动重压缩看板：唯一硬限制为五段非空且总长 <= 5000 字。"""
     enforce_role_tool_permission(conn, caller_role, "save_lineage_briefing", session_id=session_id, node_id=node_id)
     node = conn.execute("SELECT question_id, branch_id, briefing_sealed_at FROM lineage_nodes WHERE node_id = ?", (node_id,)).fetchone()
     if node is None:
@@ -345,7 +379,7 @@ def tool_save_lineage_briefing(
             raise FailClosedError(ERR_INVALID_INPUT, f"看板段落 {name!r} 不可为空或仅标点占位")
 
     cfg = load_runtime_config()
-    max_total = int(cfg.get("max_briefing_chars", 2200))
+    max_total = int(cfg.get("max_briefing_chars", 5000))
     total_chars = sum(len(v) for v in sections.values())
     if total_chars > max_total:
         raise FailClosedError(
@@ -394,9 +428,9 @@ def tool_record_reflection_and_unlock_pull(
     session_id: str,
     node_id: str,
     selected_categories: list[str],
-    holiday_prompt_id: int,
     turns: list[dict[str, Any]],
     verdict_3state: str,
+    holiday_prompt_id: int | None = None,
 ) -> dict[str, Any]:
     """记录 37% 元反思并当场置位 first_reflection_unlocked = 1（绝不设 eval_count 门槛）。"""
     enforce_role_tool_permission(conn, caller_role, "record_reflection_and_unlock_pull", session_id=session_id, node_id=node_id)
@@ -416,23 +450,26 @@ def tool_record_reflection_and_unlock_pull(
             f"当前上下文水位 {pressure}/{window} ({pressure / window:.1%}) 未达到 {reflect_pct:.0%} 反思阈值，严禁提前解锁内藏！",
         )
 
-    if not isinstance(selected_categories, list) or not selected_categories:
-        raise FailClosedError(ERR_INVALID_INPUT, "selected_categories 必须包含至少第 7 类 Attractor Tasks")
-    if not any("7" in str(c) or "attractor" in str(c).lower() for c in selected_categories):
-        raise FailClosedError(ERR_INVALID_INPUT, "每次 37% 元反思必查第 7 类 Attractor Tasks")
-
-    if isinstance(holiday_prompt_id, bool) or not isinstance(holiday_prompt_id, int) or not (1 <= holiday_prompt_id <= 28):
-        raise FailClosedError(ERR_INVALID_INPUT, "holiday_prompt_id 必须为 1–28 之间的整数")
+    categories = load_meta_reflection_categories()
+    if (
+        not isinstance(selected_categories, list) or len(selected_categories) not in (1, 2)
+        or any(not isinstance(category, str) or category not in categories for category in selected_categories)
+        or len(set(selected_categories)) != len(selected_categories)
+    ):
+        raise FailClosedError(ERR_INVALID_INPUT, "selected_categories 须从 C01–C11 选择 1–2 个不同类别")
+    if holiday_prompt_id is not None and (type(holiday_prompt_id) is not int or not 1 <= holiday_prompt_id <= 28):
+        raise FailClosedError(ERR_INVALID_INPUT, "兼容字段 holiday_prompt_id 仅允许 1–28 或 null")
 
     max_turns = int(cfg.get("reflection_max_turns", 2))
-    max_chars_turn = int(cfg.get("reflection_max_chars_per_turn", 300))
+    max_chars_turn = int(cfg.get("reflection_max_chars_per_turn", 500))
     if not isinstance(turns, list) or len(turns) == 0 or len(turns) > max_turns:
         raise FailClosedError(ERR_INVALID_INPUT, f"turns 必须包含 1 到 {max_turns} 轮精简问答")
     for idx, t in enumerate(turns):
         if not isinstance(t, dict) or not str(t.get("question", "")).strip() or not str(t.get("answer", "")).strip():
             raise FailClosedError(ERR_INVALID_INPUT, f"turns[{idx}] 必须同时包含非空 question 与 answer")
         if len(str(t["question"]).strip()) > max_chars_turn or len(str(t["answer"]).strip()) > max_chars_turn:
-            raise FailClosedError(ERR_INVALID_INPUT, f"turns[{idx}] 问答超出每轮 <= {max_chars_turn} 字精简约束")
+            actual = max(len(str(t["question"]).strip()), len(str(t["answer"]).strip()))
+            raise FailClosedError(ERR_INVALID_INPUT, f"第 {idx + 1} 轮当前 {actual} 字，上限 {max_chars_turn} 字，请精简后重交")
 
     verdict_u = str(verdict_3state or "").strip().upper()
     if verdict_u not in ALLOWED_VERDICT_3STATE:
@@ -444,7 +481,6 @@ def tool_record_reflection_and_unlock_pull(
         {
             "at": now,
             "selected_categories": [str(c) for c in selected_categories],
-            "holiday_prompt_id": holiday_prompt_id,
             "turns": turns,
             "verdict_3state": verdict_u,
         }
@@ -477,6 +513,90 @@ def _enqueue_pain_point(conn: sqlite3.Connection, question_id: str, node_id: str
     )
 
 
+_VALID_FORMAL_OBSERVATIONS = frozenset({"VALID_PASS", "MEASURED_REJECTION", "VALID_UNDECIDED"})
+
+
+def _handoff_observations(
+    conn: sqlite3.Connection, node_id: str, obs_ids: list[str],
+) -> list[sqlite3.Row]:
+    return [
+        _find_handoff_observation(conn, node_id, obs_id)
+        for obs_id in obs_ids
+    ]
+
+
+def _find_handoff_observation(conn: sqlite3.Connection, node_id: str, obs_id: str) -> sqlite3.Row:
+    obs = conn.execute(
+        """
+        WITH RECURSIVE ancestry(node_id, parent_node_id) AS (
+            SELECT node_id, parent_node_id FROM lineage_nodes WHERE node_id = ?
+            UNION
+            SELECT n.node_id, n.parent_node_id
+            FROM lineage_nodes n JOIN ancestry a ON n.node_id = a.parent_node_id
+        )
+        SELECT o.* FROM observations o JOIN ancestry a ON a.node_id = o.node_id
+        WHERE o.obs_id = ? AND o.tier IN ('official', 'heavy')
+          AND o.question_id = (SELECT question_id FROM lineage_nodes WHERE node_id = ?)
+        """,
+        (node_id, obs_id, node_id),
+    ).fetchone()
+    if obs is None:
+        raise FailClosedError(ERR_NOT_FOUND, f"正式观测 {obs_id!r} 不属于节点 {node_id!r} 的本题谱系")
+    return obs
+
+
+def _prepare_manuscripts(
+    conn: sqlite3.Connection, node: sqlite3.Row, workspace_root: str, candidate_rel_path: str | None,
+    manuscripts: list[dict[str, Any]], legacy_submissions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    prepared = []
+    seen_titles: set[str] = set()
+    for entries, legacy in ((manuscripts, False), (legacy_submissions, True)):
+        for entry in entries:
+            proof_key = "column_a_self_contained_proof_md" if legacy else "claim_and_proof_md"
+            scope_key = "column_b_scope_notes_md" if legacy else "exact_scope_md"
+            required = ("title", proof_key) if legacy else (
+                "title", "abstract_md", proof_key, scope_key, "bound_obs_ids", "declared_citations", "tags",
+            )
+            if not isinstance(entry, dict) or any(key not in entry for key in required):
+                raise FailClosedError(ERR_INVALID_INPUT, f"投稿必须提供 {', '.join(required)}")
+            title, proof = entry["title"].strip(), entry[proof_key].strip()
+            scope = entry.get(scope_key, "").strip()
+            abstract = "" if legacy else entry["abstract_md"].strip()
+            if not title or (legacy and len(proof) < 20) or (not legacy and not (abstract and proof and scope)):
+                raise FailClosedError(ERR_INVALID_INPUT, "投稿须有标题和自包含证明，新稿还需提供摘要与精确成立域")
+            norm_title = " ".join(title.lower().split())
+            if norm_title in seen_titles:
+                continue
+            seen_titles.add(norm_title)
+            obs_ids = entry.get("bound_obs_ids", [])
+            rows = _handoff_observations(conn, node["node_id"], obs_ids)
+            if any(row["obs_status"] not in _VALID_FORMAL_OBSERVATIONS for row in rows):
+                raise FailClosedError(ERR_INVALID_INPUT, "投稿只允许绑定有效正式观测")
+            artifact = entry.get("artifact_rel_path", candidate_rel_path) if legacy else candidate_rel_path
+            citations = [] if legacy else entry["declared_citations"]
+            tags = [] if legacy else entry["tags"]
+            background = scope if legacy else (
+                f"摘要：{abstract}\n\n精确成立域：{scope}\n\n标签：{', '.join(tags)}"
+            )
+            prepared.append({
+                "title": title, "proof": proof, "scope": background, "bound_obs_ids": obs_ids,
+                "declared_citations": citations, "artifact_rel_path": artifact,
+                "non_blocking": entry.get("non_blocking", True),
+                "source_type": "LOCAL_LEMMA_SUBMISSION" if legacy else "SNAPSHOT_MANUSCRIPT",
+            })
+    if sum(not item["non_blocking"] for item in prepared) > 1:
+        raise FailClosedError(ERR_INVALID_INPUT, "一次交班只能提交一份阻塞终稿")
+    for item in prepared:
+        item["snapshot_abs_path"] = backup_retained_candidate_snapshot(
+            workspace_root=workspace_root,
+            branch_id=f"lemma_{node['node_id']}_{uuid.uuid4().hex[:10]}",
+            worktree_abs_path=node["worktree_abs_path"],
+            candidate_rel_path=item["artifact_rel_path"],
+        )
+    return prepared
+
+
 def tool_submit_node_handoff(
     conn: sqlite3.Connection,
     workspace_root: str,
@@ -497,6 +617,8 @@ def tool_submit_node_handoff(
     tool_pain_point: str | None = None,
     recommended_triage: dict[str, Any] | None = None,
     local_lemma_submissions: list[dict[str, Any]] | None = None,
+    manuscript_submissions: list[dict[str, Any]] | None = None,
+    holiday_bet_outcome: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """70% 交班独占写 DAG 页、落封存锁、支持独立局部引理拆交与常规确定性直落。"""
     enforce_role_tool_permission(conn, caller_role, "submit_node_handoff", session_id=session_id, node_id=node_id)
@@ -576,80 +698,20 @@ def tool_submit_node_handoff(
         raise FailClosedError(ERR_INVALID_INPUT, "column_a_facts_md、column_b_hypothesis_md 与 will_md 必须非空")
 
     cfg = load_runtime_config()
-    max_handoff = int(cfg.get("max_handoff_chars", 2000))
+    max_handoff = int(cfg.get("max_handoff_chars", 5000))
     if len(col_a) + len(col_b) + len(will) > max_handoff:
         raise FailClosedError(ERR_INVALID_INPUT, f"交接手记总字数超限：{len(col_a) + len(col_b) + len(will)} > {max_handoff} 字")
 
     clean_obs_ids = [str(o).strip() for o in (obs_ids or []) if str(o).strip()]
-    bound_obs_rows: list[sqlite3.Row] = []
-    for oid in clean_obs_ids:
-        row = conn.execute(
-            "SELECT obs_id, node_id, tier, obs_status, candidate_entry_sha256, tools_dir_sha256 FROM observations WHERE obs_id = ?",
-            (oid,),
-        ).fetchone()
-        if row is None or str(row["node_id"]) != node_id:
-            raise FailClosedError(ERR_NOT_FOUND, f"声明绑定的正式观测 {oid!r} 不存在或不属于节点 {node_id!r}")
-        bound_obs_rows.append(row)
+    bound_obs_rows = _handoff_observations(conn, node_id, clean_obs_ids)
     if grade == "MEASURED":
-        if not clean_obs_ids:
-            raise FailClosedError(ERR_INVALID_INPUT, "evidence_grade='MEASURED' 时必须绑定至少 1 条真实 [Obs###]")
-        has_valid_measured_obs = any(
-            str(r["obs_status"]) in ("VALID_PASS", "MEASURED_REJECTION", "VALID_UNDECIDED")
-            for r in bound_obs_rows
-        )
-        if not has_valid_measured_obs:
-            raise FailClosedError(
-                ERR_INVALID_INPUT,
-                "evidence_grade='MEASURED' 要求至少绑定 1 条有效实测观测（VALID_PASS / MEASURED_REJECTION / VALID_UNDECIDED），禁止仅以 CANDIDATE_ERROR 等失败收据交班！",
-            )
-
-    # 人工改码/脏工件防错绑旧收据校验（问题 #12）
-    if bound_obs_rows:
-        wt_abs = str(node["worktree_abs_path"] or "").strip()
-        eff_cand_rel = str(candidate_rel_path or node["candidate_rel_path"] or "").strip()
-        curr_cand_sha = ""
-        curr_tools_sha = ""
-        if wt_abs and Path(wt_abs).is_dir():
-            if eff_cand_rel:
-                try:
-                    cfp = safe_resolve_in_worktree(wt_abs, eff_cand_rel)
-                    if cfp.is_file():
-                        curr_cand_sha = sha256_file(cfp)
-                except FailClosedError:
-                    curr_cand_sha = ""
-            curr_tools_sha = compute_recursive_dir_sha256(Path(wt_abs) / "tools")
-
-        if int(node["artifact_dirty_since_last_obs"] or 0) == 1:
-            raise FailClosedError(
-                ERR_LOCKED,
-                "节点自人工改码后存在未对账变更（artifact_dirty_since_last_obs=1），禁止绑定改码前旧观测收据交班；请先重跑 run_isolated_eval(tier='official') 获取新版本收据！",
-            )
-        valid_official_rows = [
-            r
-            for r in bound_obs_rows
-            if str(r["tier"]) in ("official", "heavy")
-            and str(r["obs_status"]) in ("VALID_PASS", "MEASURED_REJECTION", "VALID_UNDECIDED")
-        ]
-        if valid_official_rows and curr_cand_sha:
-            any_cand_match = any(
-                (not str(r["candidate_entry_sha256"] or "")) or str(r["candidate_entry_sha256"]) == curr_cand_sha
-                for r in valid_official_rows
-            )
-            if not any_cand_match:
-                raise FailClosedError(
-                    ERR_LOCKED,
-                    f"候选文件 {eff_cand_rel!r} 当前 SHA-256 与声明绑定的所有正式观测收据均不一致（疑似改码后未重评），拒绝交班！",
-                )
-        if valid_official_rows and curr_tools_sha:
-            any_tools_match = any(
-                (not str(r["tools_dir_sha256"] or "")) or str(r["tools_dir_sha256"]) == curr_tools_sha
-                for r in valid_official_rows
-            )
-            if not any_tools_match:
-                raise FailClosedError(
-                    ERR_LOCKED,
-                    "当前工作树 tools/ 目录 SHA-256 与声明绑定的所有正式观测收据均不一致（疑似改码后未重评），拒绝交班！",
-                )
+        valid_rows = [row for row in bound_obs_rows if row["obs_status"] in _VALID_FORMAL_OBSERVATIONS]
+        if not valid_rows:
+            raise FailClosedError(ERR_INVALID_INPUT, "MEASURED 交班必须绑定至少一条有效正式观测")
+        if node["artifact_dirty_since_last_obs"] and candidate_rel_path:
+            current = safe_resolve_in_worktree(node["worktree_abs_path"], candidate_rel_path)
+            if current.is_file() and sha256_file(current) not in {row["candidate_entry_sha256"] for row in valid_rows}:
+                raise FailClosedError(ERR_LOCKED, "人工修改后的候选尚无对应实测，旧观测仍可作为历史证据绑定")
 
     clean_dead_ends: list[dict[str, Any]] = []
     for idx, de in enumerate(dead_ends or []):
@@ -671,41 +733,34 @@ def tool_submit_node_handoff(
             }
         )
 
-    # 校验可选独立局部引理拆交（裁决 2：一次性盲审、绝不锁原分支）
-    clean_lemmas: list[dict[str, Any]] = []
-    for idx, lm in enumerate(local_lemma_submissions or []):
-        if not isinstance(lm, dict):
-            raise FailClosedError(ERR_INVALID_INPUT, f"local_lemma_submissions[{idx}] 必须为对象")
-        l_title = str(lm.get("title") or "").strip()
-        l_col_a = str(lm.get("column_a_self_contained_proof_md") or "").strip()
-        l_col_b = str(lm.get("column_b_scope_notes_md") or "").strip()
-        l_obs = [str(o).strip() for o in (lm.get("bound_obs_ids") or []) if str(o).strip()]
-        if not l_title or len(l_col_a) < 20:
-            raise FailClosedError(ERR_INVALID_INPUT, f"local_lemma_submissions[{idx}] 缺少 title 或 >=20 字自包含证明")
-        clean_lemmas.append(
-            {
-                "title": l_title,
-                "column_a": l_col_a,
-                "column_b": l_col_b,
-                "bound_obs_ids": l_obs,
-                "artifact_rel_path": str(lm.get("artifact_rel_path") or candidate_rel_path or "").strip() or None,
-            }
-        )
+    bet = json.loads(node["holiday_bet_json"])
+    if "testable_hypothesis_md" in bet:
+        if holiday_bet_outcome is None or holiday_bet_outcome.get("outcome") not in ALLOWED_HOLIDAY_OUTCOMES:
+            raise FailClosedError(ERR_INVALID_INPUT, "已登记夜科学赌注，须填写 holiday_bet_outcome")
+        note = holiday_bet_outcome.get("note_md", "").strip()
+        if not note:
+            raise FailClosedError(ERR_INVALID_INPUT, "夜科学赌注核销必须说明 note_md")
+        outcome = holiday_bet_outcome["outcome"]
+        bet.update(outcome=outcome, note_md=note)
+        if outcome == "FALSIFIED":
+            tested = next((row for row in bound_obs_rows if row["obs_status"] in _VALID_FORMAL_OBSERVATIONS), None)
+            clean_dead_ends.append({
+                "category": "SCIENTIFIC_REFUTATION", "scope_condition_md": bet["testable_hypothesis_md"],
+                "failure_mechanism_md": note, "bound_obs_id": tested["obs_id"] if tested else None,
+            })
+    elif holiday_bet_outcome is not None:
+        raise FailClosedError(ERR_INVALID_INPUT, "本节点没有待核销的夜科学赌注")
 
+    clean_lemmas = _prepare_manuscripts(
+        conn, node, workspace_root, candidate_rel_path, manuscript_submissions or [], local_lemma_submissions or [],
+    )
+    blocking = any(not item["non_blocking"] for item in clean_lemmas)
+    wave_hibernation = node["pending_handoff_reason"].startswith("HIBERNATED_BY_WAVE_CONFERENCE")
     sanitized_diff = extract_sanitized_code_diff_md(
-        worktree_abs_path=str(node["worktree_abs_path"]),
+        worktree_abs_path=node["worktree_abs_path"],
         candidate_rel_path=candidate_rel_path,
         previous_snapshot_abs_path=node["retained_snapshot_abs_path"],
     )
-
-    # 为每条拆交的局部引理分别建不可覆盖的独立物理快照，绝不覆盖原分支主快照
-    for idx, lm in enumerate(clean_lemmas):
-        lm["snapshot_abs_path"] = backup_retained_candidate_snapshot(
-            workspace_root=workspace_root,
-            branch_id=f"lemma_{node_id}_{idx}_{uuid.uuid4().hex[:6]}",
-            worktree_abs_path=str(node["worktree_abs_path"]),
-            candidate_rel_path=lm["artifact_rel_path"] or candidate_rel_path,
-        )
 
     inserted_dead_end_ids: list[str] = []
     created_lemma_review_ids: list[str] = []
@@ -715,7 +770,8 @@ def tool_submit_node_handoff(
         conn.execute(
             """
             UPDATE lineage_nodes
-            SET node_status = 'AWAITING_TRIAGE',
+            SET node_status = ?,
+                control_state = CASE WHEN ? THEN 'HIBERNATED' ELSE control_state END,
                 mechanism_summary = ?,
                 evidence_grade = ?,
                 column_a_facts_md = ?,
@@ -727,10 +783,13 @@ def tool_submit_node_handoff(
                 pending_handoff_mode = NULL,
                 pending_handoff_reason = '',
                 briefing_sealed_at = ?,
+                holiday_bet_json = ?,
                 updated_at = ?
             WHERE node_id = ?
             """,
             (
+                "SEALED" if wave_hibernation else ("PENDING_REVIEW" if blocking else "AWAITING_TRIAGE"),
+                wave_hibernation,
                 mech,
                 grade,
                 col_a,
@@ -740,6 +799,7 @@ def tool_submit_node_handoff(
                 candidate_rel_path,
                 json.dumps(clean_obs_ids, ensure_ascii=False),
                 now,
+                json.dumps(bet, ensure_ascii=False),
                 now,
                 node_id,
             ),
@@ -774,27 +834,37 @@ def tool_submit_node_handoff(
                 INSERT INTO review_queue(
                     review_id, question_id, source_node_id, source_type, proposer_session_id,
                     review_status, manuscript_title, spec_revision, column_a_snapshot_md, column_b_snapshot_md,
-                    bound_obs_ids_json, artifact_rel_path, artifact_snapshot_abs_path, sanitized_code_diff_md, created_at, updated_at
-                ) VALUES (?, ?, ?, 'LOCAL_LEMMA_SUBMISSION', ?, 'STAGE1_BLIND', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    bound_obs_ids_json, artifact_rel_path, artifact_snapshot_abs_path, sanitized_code_diff_md,
+                    non_blocking, declared_citations_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'STAGE1_BLIND', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     lrev_id,
                     question_id,
                     node_id,
+                    lm["source_type"],
                     session_id or f"comp_{node_id}",
                     lm["title"],
                     node_spec_rev,
-                    lm["column_a"],
-                    lm["column_b"],
+                    lm["proof"],
+                    lm["scope"],
                     json.dumps(lm["bound_obs_ids"], ensure_ascii=False),
                     lm["artifact_rel_path"],
                     lm["snapshot_abs_path"],
                     sanitized_diff,
+                    int(lm["non_blocking"]),
+                    json.dumps(lm["declared_citations"], ensure_ascii=False),
                     now,
                     now,
                 ),
             )
             created_lemma_review_ids.append(lrev_id)
+
+        if wave_hibernation and node["pending_handoff_reason"].endswith(":SALVAGE"):
+            sealed = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ?", (node_id,)).fetchone()
+            salvage_id = enqueue_salvage_review(conn, sealed, now)
+            if salvage_id:
+                created_lemma_review_ids.append(salvage_id)
 
         if tool_pain_point and str(tool_pain_point).strip():
             _enqueue_pain_point(conn, question_id, node_id, str(tool_pain_point).strip(), now)
@@ -807,10 +877,33 @@ def tool_submit_node_handoff(
             metadata={"role": caller_role, "evidence_grade": grade},
         )
 
-    # 裁决 2：判定是否满足确定性直落边界
+    # 裁决 2：判定是否满足确定性直落边界（防一稿两投：已提交非阻塞快照稿时严禁再叠加阻塞 LEVEL_1 重复送审并误杀分支）
     updated_node = conn.execute("SELECT * FROM lineage_nodes WHERE node_id = ?", (node_id,)).fetchone()
-    can_auto, auto_reason, auto_params = evaluate_auto_triage_eligibility(
-        conn, node=updated_node, recommended_triage=recommended_triage
+    deduped_blocking_level1 = False
+    if clean_lemmas and not blocking and node["family_id"]:
+        if recommended_triage is None:
+            recommended_triage = {
+                "assigned_family_id": node["family_id"],
+                "triage_level": "ROUTINE_CONTINUATION",
+                "action": "CONTINUE",
+                "rationale": "阶段稿已快照异步送审，原分支按谱系续班",
+            }
+        elif isinstance(recommended_triage, dict):
+            rec_lvl = str(recommended_triage.get("triage_level") or "").strip().upper()
+            rec_act = str(recommended_triage.get("action") or "").strip().upper()
+            if rec_lvl == "LEVEL_1" or rec_act == "SUBMIT_BLIND_REVIEW":
+                deduped_blocking_level1 = True
+                recommended_triage = {
+                    **recommended_triage,
+                    "assigned_family_id": recommended_triage.get("assigned_family_id") or node["family_id"],
+                    "triage_level": "ROUTINE_CONTINUATION",
+                    "action": "CONTINUE",
+                    "rationale": (
+                        f"{str(recommended_triage.get('rationale') or '').strip()}（已通过非阻塞快照送审，避免重复走阻塞 LEVEL_1 冻结分支，原分支继续接班）"
+                    ).strip(),
+                }
+    can_auto, auto_reason, auto_params = (False, "已安排休眠或终稿盲审", {}) if blocking or wave_hibernation else evaluate_auto_triage_eligibility(
+        conn, node=updated_node, recommended_triage=recommended_triage,
     )
     auto_triage_result: dict[str, Any] | None = None
     if can_auto:
@@ -831,10 +924,10 @@ def tool_submit_node_handoff(
 
     parts = [f"节点 {node_id} 已封存落库（状态 {final_status}，追加 {len(inserted_dead_end_ids)} 条 dead_ends）"]
     if created_lemma_review_ids:
-        parts.append(f"已独立拆交 {len(created_lemma_review_ids)} 份局部引理一次性盲审单 {created_lemma_review_ids}（未锁原分支）")
+        parts.append(f"已提交 {len(created_lemma_review_ids)} 份快照盲审稿 {created_lemma_review_ids}")
     if auto_triage_result is not None:
         parts.append(f"确定性控制面已直落分诊：{auto_triage_result['guidance']}")
-    else:
+    elif not blocking and not wave_hibernation:
         parts.append(f"保留 AWAITING_TRIAGE 等待按需拉起 logistics_coordinator（原因：{auto_reason}）")
     if opened_conf is not None:
         parts.append(f"子题 {question_id} 已达波次阈值，自动开启圆桌 {opened_conf['conference_id']} (Wave {opened_conf['wave_no']})")
@@ -852,6 +945,7 @@ def tool_submit_node_handoff(
             "evidence_grade": grade,
             "inserted_dead_end_ids": inserted_dead_end_ids,
             "created_lemma_review_ids": created_lemma_review_ids,
+            "deduped_blocking_level1": deduped_blocking_level1,
             "auto_triaged": auto_triage_result is not None,
             "auto_triage_fallback_reason": None if auto_triage_result is not None else auto_reason,
             "auto_triage_data": auto_triage_result["data"] if auto_triage_result is not None else None,

@@ -531,6 +531,7 @@ class TestPhase2ConcurrencyAndCancel(unittest.TestCase):
                         session_id="s_ver_stale",
                         review_id=f"STAGE3_FINAL_AUDIT:{deliv_a}",
                         final_verdict="ACCEPT",
+                        novelty_score=8, significance_score=8,
                         revision_requests=[],
                     )
                 st_row = conn.execute(
@@ -580,6 +581,7 @@ class TestPhase2ConcurrencyAndCancel(unittest.TestCase):
                     session_id="s_ver_b",
                     review_id=f"STAGE3_FINAL_AUDIT:{deliv_b}",
                     final_verdict="ACCEPT",
+                    novelty_score=8, significance_score=8,
                     revision_requests=[],
                 )
                 st_closed = conn.execute("SELECT status FROM project_closure_state WHERE id = 1").fetchone()

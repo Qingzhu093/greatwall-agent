@@ -68,7 +68,7 @@ export function apply(ctx, rawConfig = {}) {
   })
 
   const serviceApi = {
-    version: '0.3.0-alpha.3',
+    version: '0.3.2',
     pluginRoot: PLUGIN_ROOT,
     corePythonRoot: coreRoot,
     config,
